@@ -43,6 +43,7 @@ payload samples, or production capture logic.
 
 - [Format tiers](docs/tiers.md) explains cold, warm, grouped hot, and ultra hot.
 - [Chunked cold storage](docs/chunking.md) explains independent compression chunks.
+- [Compression policy](docs/compression.md) explains why chunks beat whole-file streams.
 - [Dynamic hot padding](docs/hot-padding.md) explains fixed-width level blocks.
 - [Conversion flow](docs/conversion.md) explains cold-to-hot materialization.
 - [Naming](docs/naming.md) lists prototype file extensions and magic values.
