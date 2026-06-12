@@ -2,8 +2,8 @@ use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, put_u8, ByteR
 use crate::types::{BookEvent, BookId, LevelChange};
 use crate::{AuraError, Result};
 
-pub const MAGIC: &[u8; 4] = b"AUR1";
-pub const VERSION: u16 = 1;
+pub const MAGIC: &[u8; 4] = crate::format::WARM_MAGIC;
+pub const VERSION: u16 = crate::format::FORMAT_VERSION;
 pub const LEVEL_SIZE: usize = 24;
 
 /// Tier 1 warm profile: resolved fixed-width values with exact level counts.

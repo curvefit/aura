@@ -3,8 +3,8 @@ use crate::types::{BookEvent, BookId, LevelChange};
 use crate::varint;
 use crate::{AuraError, Result};
 
-pub const MAGIC: &[u8; 4] = b"AUR0";
-pub const VERSION: u16 = 1;
+pub const MAGIC: &[u8; 4] = crate::format::COLD_MAGIC;
+pub const VERSION: u16 = crate::format::FORMAT_VERSION;
 
 /// Tier 0 cold profile: compact delta stream before outer chunk compression.
 pub fn encode_events(events: &[BookEvent]) -> Result<Vec<u8>> {

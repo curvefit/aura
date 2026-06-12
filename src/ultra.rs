@@ -3,8 +3,8 @@ use crate::stats::padded_event_slots;
 use crate::types::{BookEvent, BookId, LevelChange};
 use crate::{AuraError, Result};
 
-pub const MAGIC: &[u8; 4] = b"AUR3";
-pub const VERSION: u16 = 1;
+pub const MAGIC: &[u8; 4] = crate::format::ULTRA_HOT_MAGIC;
+pub const VERSION: u16 = crate::format::FORMAT_VERSION;
 pub const EVENT_HEADER_SIZE: usize = 32;
 pub const LEVEL_SIZE: usize = 24;
 
