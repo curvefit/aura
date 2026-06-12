@@ -84,6 +84,7 @@ pub fn encode_events(events: &[BookEvent], layout: UltraLayout) -> Result<Vec<u8
         put_u32_le(&mut out, event.asks.len() as u32);
         put_u64_le(&mut out, event.ts_event);
         put_u64_le(&mut out, event.sequence);
+        put_u32_le(&mut out, 0);
         encode_padded_levels(&event.bids, layout, &mut out);
         encode_padded_levels(&event.asks, layout, &mut out);
     }
@@ -125,6 +126,7 @@ pub fn decode_events(bytes: &[u8]) -> Result<(UltraLayout, Vec<BookEvent>)> {
         let ask_count = reader.read_u32_le()? as usize;
         let ts_event = reader.read_u64_le()?;
         let sequence = reader.read_u64_le()?;
+        let _header_padding = reader.read_u32_le()?;
         let bids = decode_padded_levels(&mut reader, bid_count, layout)?;
         let asks = decode_padded_levels(&mut reader, ask_count, layout)?;
         events.push(BookEvent::new(ts_event, sequence, book, bids, asks));
