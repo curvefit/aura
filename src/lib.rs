@@ -10,6 +10,7 @@ pub mod convert;
 pub mod error;
 pub mod format;
 pub mod grouped;
+pub mod schema;
 pub mod stats;
 pub mod synthetic;
 pub mod types;
@@ -18,4 +19,5 @@ pub mod varint;
 pub mod warm;
 
 pub use error::{AuraError, Result};
+pub use schema::{FieldDescriptor, FieldRole, FieldType, SchemaBuilder, SchemaDescriptor};
 pub use types::{BookEvent, BookId, LevelChange, Profile};
