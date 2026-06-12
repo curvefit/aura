@@ -10,6 +10,7 @@ pub mod error;
 pub mod stats;
 pub mod types;
 pub mod varint;
+pub mod warm;
 
 pub use error::{AuraError, Result};
 pub use types::{BookEvent, BookId, LevelChange, Profile};
