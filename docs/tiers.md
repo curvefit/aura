@@ -20,7 +20,7 @@ LevelChange
 ```
 
 `book_a` and `book_b` are neutral labels for any pair of related book streams.
-The format does not assume any exchange, product, or source-specific semantics.
+The format does not assume any venue, product, or provider-specific semantics.
 
 ## Tier 0: cold
 
