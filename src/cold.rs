@@ -43,6 +43,46 @@ fn encode_levels(levels: &[LevelChange], out: &mut Vec<u8>) {
     }
 }
 
+
+/// One independently encoded cold chunk. Compression is intentionally external so
+/// callers can choose zstd level and frame policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdChunk {
+    pub first_event_index: u64,
+    pub events: Vec<BookEvent>,
+    pub encoded_payload: Vec<u8>,
+}
+
+impl ColdChunk {
+    pub fn encode(first_event_index: u64, events: Vec<BookEvent>) -> Result<Self> {
+        let encoded_payload = encode_events(&events)?;
+        Ok(Self {
+            first_event_index,
+            events,
+            encoded_payload,
+        })
+    }
+
+    pub fn decode(first_event_index: u64, encoded_payload: Vec<u8>) -> Result<Self> {
+        let events = decode_events(&encoded_payload)?;
+        Ok(Self {
+            first_event_index,
+            events,
+            encoded_payload,
+        })
+    }
+}
+
+pub fn encode_chunks(events: &[BookEvent], target_events_per_chunk: usize) -> Result<Vec<ColdChunk>> {
+    let target = target_events_per_chunk.max(1);
+    let mut chunks = Vec::new();
+    for (idx, events) in events.chunks(target).enumerate() {
+        let first_event_index = (idx * target) as u64;
+        chunks.push(ColdChunk::encode(first_event_index, events.to_vec())?);
+    }
+    Ok(chunks)
+}
+
 pub fn decode_events(bytes: &[u8]) -> Result<Vec<BookEvent>> {
     let mut reader = ByteReader::new(bytes);
     if reader.read_exact(4)? != MAGIC {
@@ -94,6 +134,23 @@ fn decode_levels(reader: &mut ByteReader<'_>, count: usize) -> Result<Vec<LevelC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_chunks_round_trip_independently() {
+        let events = vec![
+            BookEvent::new(1, 1, BookId::BookA, vec![LevelChange::new(10, 1, 0)], vec![]),
+            BookEvent::new(2, 2, BookId::BookA, vec![LevelChange::new(11, 1, 0)], vec![]),
+            BookEvent::new(3, 3, BookId::BookB, vec![], vec![LevelChange::new(12, 1, 0)]),
+        ];
+
+        let chunks = encode_chunks(&events, 2).unwrap();
+
+        assert_eq!(2, chunks.len());
+        assert_eq!(0, chunks[0].first_event_index);
+        assert_eq!(2, chunks[1].first_event_index);
+        assert_eq!(events[..2], chunks[0].events);
+        assert_eq!(events[2..], chunks[1].events);
+    }
 
     #[test]
     fn cold_profile_round_trips_events() {
