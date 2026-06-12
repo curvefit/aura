@@ -6,23 +6,26 @@ replay layouts without tying the format to any specific data source.
 
 The public model is intentionally generic:
 
-- an ingest file stores normalized logical facts with generous integer fields,
+- `.aura` stores normalized logical facts with generous integer fields and
+  footer optimization stats when available,
 - a schema defines what a record means and what stats should be tracked,
 - `.aura0` is the compact compiled level,
 - `.aura1` is the replay-optimized compiled level,
-- compiled levels are rebuildable from canonical `.aura` files.
+- `.aura`, `.aura0`, and `.aura1` can round-trip through the same logical event
+  stream even when a derived `.aura` has to recompute footer stats.
 
 ## Format Levels
 
 | File | Level | Purpose |
 |---:|---|---|
-| `.aura` | Ingest | Canonical normalized facts plus seal-time optimization stats. |
+| `.aura` | Intermediate | Normalized facts plus seal-time optimization stats when known. |
 | `.aura0` | Aura0 | Compact cold encoding compiled from ingest stats. |
 | `.aura1` | Aura1 | Replay-optimized fixed/block encoding compiled from ingest stats. |
 
-The levels trade disk for parsing speed. `.aura` should be retained as source of
-truth; `.aura0` and `.aura1` are derived representations that can be
-regenerated.
+The levels trade disk for parsing speed. Live collectors normally write `.aura`
+first because it is the easiest place to collect footer stats, but `.aura` is
+not a one-way source format: a converter can replay `.aura0` or `.aura1` back
+into normalized `.aura` records and recompute any missing footer calculations.
 
 ## Repository Scope
 
