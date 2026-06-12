@@ -5,6 +5,7 @@
 
 pub mod bytes;
 pub mod chunk;
+pub mod cold;
 pub mod error;
 pub mod stats;
 pub mod types;
