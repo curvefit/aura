@@ -10,6 +10,7 @@ pub mod convert;
 pub mod error;
 pub mod grouped;
 pub mod stats;
+pub mod synthetic;
 pub mod types;
 pub mod ultra;
 pub mod varint;
