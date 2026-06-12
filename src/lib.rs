@@ -20,4 +20,5 @@ pub mod warm;
 
 pub use error::{AuraError, Result};
 pub use schema::{FieldDescriptor, FieldRole, FieldType, SchemaBuilder, SchemaDescriptor};
+pub use stats::{FieldStats, IngestStats, PhysicalWidth, RunHistogramEntry, ShapeStats};
 pub use types::{BookEvent, BookId, LevelChange, Profile};

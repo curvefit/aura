@@ -1,4 +1,183 @@
 use crate::types::BookEvent;
+use crate::{AuraError, Result};
+
+/// Smallest fixed integer width proven safe by ingest stats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PhysicalWidth {
+    I8,
+    I16,
+    I32,
+    I64,
+}
+
+impl PhysicalWidth {
+    pub const fn byte_width(self) -> u8 {
+        match self {
+            Self::I8 => 1,
+            Self::I16 => 2,
+            Self::I32 => 4,
+            Self::I64 => 8,
+        }
+    }
+}
+
+/// Observed range and variance for one logical integer field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldStats {
+    pub field_index: u16,
+    pub observed: u64,
+    pub min: i64,
+    pub max: i64,
+    pub max_abs_delta: u64,
+    pub monotonic_non_decreasing: bool,
+    previous: Option<i64>,
+}
+
+impl FieldStats {
+    pub const fn new(field_index: u16) -> Self {
+        Self {
+            field_index,
+            observed: 0,
+            min: 0,
+            max: 0,
+            max_abs_delta: 0,
+            monotonic_non_decreasing: true,
+            previous: None,
+        }
+    }
+
+    pub fn observe(&mut self, value: i64) {
+        if self.observed == 0 {
+            self.min = value;
+            self.max = value;
+        } else {
+            self.min = self.min.min(value);
+            self.max = self.max.max(value);
+        }
+
+        if let Some(previous) = self.previous {
+            self.max_abs_delta = self.max_abs_delta.max(abs_delta(previous, value));
+            if value < previous {
+                self.monotonic_non_decreasing = false;
+            }
+        }
+
+        self.previous = Some(value);
+        self.observed += 1;
+    }
+
+    pub fn absolute_width(&self) -> PhysicalWidth {
+        signed_width_for_range(self.min, self.max)
+    }
+
+    pub fn delta_width(&self) -> PhysicalWidth {
+        signed_width_for_abs_delta(self.max_abs_delta)
+    }
+}
+
+/// Timestamp grouping shape tracked during ingest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunHistogramEntry {
+    pub run_len: u32,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShapeStats {
+    pub max_records_per_timestamp: u32,
+    pub timestamp_run_histogram: Vec<RunHistogramEntry>,
+}
+
+impl ShapeStats {
+    pub fn observe_timestamp_run(&mut self, run_len: u32) {
+        if run_len == 0 {
+            return;
+        }
+        self.max_records_per_timestamp = self.max_records_per_timestamp.max(run_len);
+        match self
+            .timestamp_run_histogram
+            .binary_search_by_key(&run_len, |entry| entry.run_len)
+        {
+            Ok(idx) => self.timestamp_run_histogram[idx].count += 1,
+            Err(idx) => self
+                .timestamp_run_histogram
+                .insert(idx, RunHistogramEntry { run_len, count: 1 }),
+        }
+    }
+}
+
+/// Seal-time stats collected while writing a normalized `.aura` ingest file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestStats {
+    pub record_count: u64,
+    pub fields: Vec<FieldStats>,
+    pub shape: ShapeStats,
+}
+
+impl IngestStats {
+    pub fn new(field_count: usize) -> Result<Self> {
+        if field_count > u16::MAX as usize {
+            return Err(AuraError::InvalidValue("field count"));
+        }
+        Ok(Self {
+            record_count: 0,
+            fields: (0..field_count)
+                .map(|idx| FieldStats::new(idx as u16))
+                .collect(),
+            shape: ShapeStats::default(),
+        })
+    }
+
+    pub fn observe_record(&mut self) {
+        self.record_count += 1;
+    }
+
+    pub fn observe_i64(&mut self, field_index: u16, value: i64) -> Result<()> {
+        let field = self
+            .fields
+            .get_mut(usize::from(field_index))
+            .ok_or(AuraError::InvalidValue("field index"))?;
+        field.observe(value);
+        Ok(())
+    }
+
+    pub fn observe_timestamp_run(&mut self, run_len: u32) {
+        self.shape.observe_timestamp_run(run_len);
+    }
+
+    pub fn field(&self, field_index: u16) -> Option<&FieldStats> {
+        self.fields.get(usize::from(field_index))
+    }
+}
+
+pub const fn signed_width_for_range(min: i64, max: i64) -> PhysicalWidth {
+    if min >= i8::MIN as i64 && max <= i8::MAX as i64 {
+        PhysicalWidth::I8
+    } else if min >= i16::MIN as i64 && max <= i16::MAX as i64 {
+        PhysicalWidth::I16
+    } else if min >= i32::MIN as i64 && max <= i32::MAX as i64 {
+        PhysicalWidth::I32
+    } else {
+        PhysicalWidth::I64
+    }
+}
+
+pub const fn signed_width_for_abs_delta(max_abs_delta: u64) -> PhysicalWidth {
+    if max_abs_delta <= i8::MAX as u64 {
+        PhysicalWidth::I8
+    } else if max_abs_delta <= i16::MAX as u64 {
+        PhysicalWidth::I16
+    } else if max_abs_delta <= i32::MAX as u64 {
+        PhysicalWidth::I32
+    } else {
+        PhysicalWidth::I64
+    }
+}
+
+fn abs_delta(previous: i64, value: i64) -> u64 {
+    let delta = i128::from(value) - i128::from(previous);
+    delta.unsigned_abs() as u64
+}
 
 /// Seal-time summary used to choose hot layouts without decoding twice.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -110,5 +289,48 @@ mod tests {
         assert_eq!(8, padded_event_slots(1, 8));
         assert_eq!(8, padded_event_slots(8, 8));
         assert_eq!(16, padded_event_slots(9, 8));
+    }
+
+    #[test]
+    fn ingest_stats_track_ranges_deltas_and_shapes() {
+        let mut stats = IngestStats::new(2).unwrap();
+        stats.observe_record();
+        stats.observe_i64(0, 100).unwrap();
+        stats.observe_i64(1, -5).unwrap();
+        stats.observe_record();
+        stats.observe_i64(0, 104).unwrap();
+        stats.observe_i64(1, 120).unwrap();
+        stats.observe_timestamp_run(4);
+        stats.observe_timestamp_run(4);
+        stats.observe_timestamp_run(7);
+
+        let field = stats.field(0).unwrap();
+        assert_eq!(2, stats.record_count);
+        assert_eq!(100, field.min);
+        assert_eq!(104, field.max);
+        assert_eq!(4, field.max_abs_delta);
+        assert_eq!(PhysicalWidth::I8, field.absolute_width());
+        assert_eq!(PhysicalWidth::I8, field.delta_width());
+        assert_eq!(7, stats.shape.max_records_per_timestamp);
+        assert_eq!(
+            vec![
+                RunHistogramEntry {
+                    run_len: 4,
+                    count: 2
+                },
+                RunHistogramEntry {
+                    run_len: 7,
+                    count: 1
+                }
+            ],
+            stats.shape.timestamp_run_histogram
+        );
+    }
+
+    #[test]
+    fn width_helpers_promote_when_values_need_more_bytes() {
+        assert_eq!(PhysicalWidth::I8, signed_width_for_range(-10, 10));
+        assert_eq!(PhysicalWidth::I16, signed_width_for_range(-200, 10));
+        assert_eq!(PhysicalWidth::I32, signed_width_for_abs_delta(70_000));
     }
 }
