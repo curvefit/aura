@@ -10,6 +10,7 @@ pub mod error;
 pub mod grouped;
 pub mod stats;
 pub mod types;
+pub mod ultra;
 pub mod varint;
 pub mod warm;
 
