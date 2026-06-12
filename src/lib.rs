@@ -8,6 +8,7 @@ pub mod chunk;
 pub mod cold;
 pub mod convert;
 pub mod error;
+pub mod format;
 pub mod grouped;
 pub mod stats;
 pub mod synthetic;
