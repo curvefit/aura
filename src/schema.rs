@@ -47,6 +47,7 @@ pub enum FieldRole {
     Value = 7,
     Count = 8,
     Flag = 9,
+    PriceAnchor = 10,
 }
 
 impl FieldRole {
@@ -61,7 +62,40 @@ impl FieldRole {
             7 => Ok(Self::Value),
             8 => Ok(Self::Count),
             9 => Ok(Self::Flag),
+            10 => Ok(Self::PriceAnchor),
             _ => Err(AuraError::InvalidValue("field role")),
+        }
+    }
+}
+
+/// Logical relationship between fields used by Aura0 planners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum FieldRelation {
+    None = 0,
+    DeltaFromField(u16) = 1,
+}
+
+impl FieldRelation {
+    pub const fn kind_code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::DeltaFromField(_) => 1,
+        }
+    }
+
+    pub const fn related_field_index(self) -> Option<u16> {
+        match self {
+            Self::None => None,
+            Self::DeltaFromField(index) => Some(index),
+        }
+    }
+
+    pub fn from_codes(kind: u8, field_index: u16) -> Result<Self> {
+        match kind {
+            0 => Ok(Self::None),
+            1 => Ok(Self::DeltaFromField(field_index)),
+            _ => Err(AuraError::InvalidValue("field relation")),
         }
     }
 }
@@ -74,6 +108,7 @@ pub struct FieldDescriptor {
     pub field_type: FieldType,
     pub role: FieldRole,
     pub nullable: bool,
+    pub relation: FieldRelation,
 }
 
 /// Logical schema descriptor shared by ingest, Aura0, and Aura1.
@@ -118,12 +153,45 @@ impl SchemaBuilder {
         self.field_with_nullability(name, field_type, role, true)
     }
 
+    pub fn field_related_to(
+        self,
+        name: impl Into<String>,
+        field_type: FieldType,
+        role: FieldRole,
+        related_field_name: &str,
+    ) -> Self {
+        let related_index = self
+            .fields
+            .iter()
+            .find(|field| field.name == related_field_name)
+            .map(|field| field.index)
+            .unwrap_or(u16::MAX);
+        self.field_with_relation(
+            name,
+            field_type,
+            role,
+            false,
+            FieldRelation::DeltaFromField(related_index),
+        )
+    }
+
     fn field_with_nullability(
+        self,
+        name: impl Into<String>,
+        field_type: FieldType,
+        role: FieldRole,
+        nullable: bool,
+    ) -> Self {
+        self.field_with_relation(name, field_type, role, nullable, FieldRelation::None)
+    }
+
+    fn field_with_relation(
         mut self,
         name: impl Into<String>,
         field_type: FieldType,
         role: FieldRole,
         nullable: bool,
+        relation: FieldRelation,
     ) -> Self {
         self.fields.push(FieldDescriptor {
             index: self.fields.len() as u16,
@@ -131,6 +199,7 @@ impl SchemaBuilder {
             field_type,
             role,
             nullable,
+            relation,
         });
         self
     }
@@ -146,6 +215,14 @@ impl SchemaBuilder {
             validate_schema_name(&field.name)?;
             if !names.insert(field.name.as_str()) {
                 return Err(AuraError::InvalidValue("duplicate field name"));
+            }
+            if matches!(field.relation, FieldRelation::DeltaFromField(u16::MAX)) {
+                return Err(AuraError::InvalidValue("related field name"));
+            }
+            if let FieldRelation::DeltaFromField(related_index) = field.relation {
+                if usize::from(related_index) >= self.fields.len() || related_index == field.index {
+                    return Err(AuraError::InvalidValue("related field index"));
+                }
             }
         }
 
@@ -183,11 +260,10 @@ pub fn tick_schema() -> Result<SchemaDescriptor> {
 pub fn ohlcv_schema() -> Result<SchemaDescriptor> {
     SchemaBuilder::new("ohlcv_v1")
         .field("ts_open", FieldType::TimestampNs, FieldRole::Timestamp)
-        .field("instrument_id", FieldType::U32, FieldRole::Identifier)
-        .field("open", FieldType::I64, FieldRole::Price)
-        .field("high", FieldType::I64, FieldRole::Price)
-        .field("low", FieldType::I64, FieldRole::Price)
-        .field("close", FieldType::I64, FieldRole::Price)
+        .field("open", FieldType::I64, FieldRole::PriceAnchor)
+        .field_related_to("high", FieldType::I64, FieldRole::Price, "open")
+        .field_related_to("low", FieldType::I64, FieldRole::Price, "open")
+        .field_related_to("close", FieldType::I64, FieldRole::Price, "open")
         .field("volume", FieldType::I64, FieldRole::Quantity)
         .finish()
 }
@@ -211,7 +287,16 @@ fn schema_hash(name: &str, fields: &[FieldDescriptor]) -> u32 {
                 field.field_type as u8,
                 field.role as u8,
                 field.nullable as u8,
+                field.relation.kind_code(),
             ],
+        );
+        update_hash(
+            &mut hash,
+            &field
+                .relation
+                .related_field_index()
+                .unwrap_or(u16::MAX)
+                .to_le_bytes(),
         );
     }
     hash

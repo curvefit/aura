@@ -2,8 +2,11 @@ use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, put_u8, ByteR
 use crate::chunk::ChunkDescriptor;
 use crate::format::FORMAT_VERSION;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
-use crate::schema::{FieldDescriptor, FieldRole, FieldType, SchemaDescriptor};
-use crate::stats::{FieldStats, IngestStats, PhysicalWidth, RunHistogramEntry, ShapeStats};
+use crate::schema::{FieldDescriptor, FieldRelation, FieldRole, FieldType, SchemaDescriptor};
+use crate::stats::{
+    FieldStats, FieldStatsSummary, IngestStats, PhysicalWidth, RelatedFieldStats,
+    RunHistogramEntry, ShapeStats,
+};
 use crate::{AuraError, Result};
 
 pub const FOOTER_MAGIC: &[u8; 4] = b"AURF";
@@ -142,7 +145,11 @@ fn encode_schema(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Result<()> {
         put_u8(out, field.field_type as u8);
         put_u8(out, field.role as u8);
         put_u8(out, field.nullable as u8);
-        put_u8(out, 0);
+        put_u8(out, field.relation.kind_code());
+        put_u16_le(
+            out,
+            field.relation.related_field_index().unwrap_or(u16::MAX),
+        );
         put_string(out, &field.name)?;
     }
     Ok(())
@@ -158,7 +165,8 @@ fn decode_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
         let field_type = FieldType::from_code(reader.read_u8()?)?;
         let role = FieldRole::from_code(reader.read_u8()?)?;
         let nullable = reader.read_u8()? != 0;
-        let _reserved = reader.read_u8()?;
+        let relation_kind = reader.read_u8()?;
+        let related_field_index = reader.read_u16_le()?;
         let name = read_string(reader)?;
         fields.push(FieldDescriptor {
             index,
@@ -166,6 +174,7 @@ fn decode_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
             field_type,
             role,
             nullable,
+            relation: FieldRelation::from_codes(relation_kind, related_field_index)?,
         });
     }
     Ok(SchemaDescriptor {
@@ -185,7 +194,21 @@ fn encode_stats(stats: &IngestStats, out: &mut Vec<u8>) -> Result<()> {
         put_i64_le(out, field.max);
         put_u64_le(out, field.max_abs_delta);
         put_u8(out, field.monotonic_non_decreasing as u8);
+        put_u8(out, field.first_value.is_some() as u8);
+        put_i64_le(out, field.first_value.unwrap_or(0));
+        put_u8(out, field.fixed_step.is_some() as u8);
+        put_i64_le(out, field.fixed_step.unwrap_or(0));
+        put_u8(out, field.fixed_step_valid as u8);
         put_u8(out, 0);
+    }
+    put_u16_len(out, stats.related_fields.len(), "related stats count")?;
+    for related in &stats.related_fields {
+        put_u16_le(out, related.field_index);
+        put_u16_le(out, related.related_field_index);
+        put_u64_le(out, related.observed);
+        put_i64_le(out, related.min_delta);
+        put_i64_le(out, related.max_delta);
+        put_u64_le(out, related.max_abs_delta);
     }
     put_u32_le(out, stats.shape.max_records_per_timestamp);
     put_u32_len(
@@ -211,15 +234,43 @@ fn decode_stats(reader: &mut ByteReader<'_>) -> Result<IngestStats> {
         let max = reader.read_i64_le()?;
         let max_abs_delta = reader.read_u64_le()?;
         let monotonic_non_decreasing = reader.read_u8()? != 0;
+        let first_value = if reader.read_u8()? != 0 {
+            Some(reader.read_i64_le()?)
+        } else {
+            let _unused = reader.read_i64_le()?;
+            None
+        };
+        let fixed_step = if reader.read_u8()? != 0 {
+            Some(reader.read_i64_le()?)
+        } else {
+            let _unused = reader.read_i64_le()?;
+            None
+        };
+        let fixed_step_valid = reader.read_u8()? != 0;
         let _reserved = reader.read_u8()?;
-        fields.push(FieldStats::from_summary(
+        fields.push(FieldStats::from_summary(FieldStatsSummary {
             field_index,
             observed,
             min,
             max,
             max_abs_delta,
             monotonic_non_decreasing,
-        ));
+            first_value,
+            fixed_step,
+            fixed_step_valid,
+        }));
+    }
+    let related_count = reader.read_u16_le()? as usize;
+    let mut related_fields = Vec::with_capacity(related_count);
+    for _ in 0..related_count {
+        related_fields.push(RelatedFieldStats {
+            field_index: reader.read_u16_le()?,
+            related_field_index: reader.read_u16_le()?,
+            observed: reader.read_u64_le()?,
+            min_delta: reader.read_i64_le()?,
+            max_delta: reader.read_i64_le()?,
+            max_abs_delta: reader.read_u64_le()?,
+        });
     }
     let max_records_per_timestamp = reader.read_u32_le()?;
     let histogram_count = reader.read_u32_le()? as usize;
@@ -233,6 +284,7 @@ fn decode_stats(reader: &mut ByteReader<'_>) -> Result<IngestStats> {
     Ok(IngestStats {
         record_count,
         fields,
+        related_fields,
         shape: ShapeStats {
             max_records_per_timestamp,
             timestamp_run_histogram,
@@ -291,6 +343,10 @@ fn encode_plan_field(field: PhysicalFieldPlan, out: &mut Vec<u8>) {
     put_u16_le(out, field.field_index);
     put_u8(out, field.encoding as u8);
     put_u8(out, field.width.code());
+    put_u16_le(out, field.reference_field_index.unwrap_or(u16::MAX));
+    put_i64_le(out, field.base_value);
+    put_i64_le(out, field.step);
+    put_u64_le(out, field.estimated_bytes);
 }
 
 fn decode_plan_fields(
@@ -303,6 +359,13 @@ fn decode_plan_fields(
             field_index: reader.read_u16_le()?,
             encoding: FieldEncoding::from_code(reader.read_u8()?)?,
             width: PhysicalWidth::from_code(reader.read_u8()?)?,
+            reference_field_index: match reader.read_u16_le()? {
+                u16::MAX => None,
+                index => Some(index),
+            },
+            base_value: reader.read_i64_le()?,
+            step: reader.read_i64_le()?,
+            estimated_bytes: reader.read_u64_le()?,
         });
     }
     Ok(fields)

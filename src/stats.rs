@@ -1,9 +1,11 @@
+use crate::schema::{FieldRelation, SchemaDescriptor};
 use crate::types::BookEvent;
 use crate::{AuraError, Result};
 
 /// Smallest fixed integer width proven safe by ingest stats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PhysicalWidth {
+    Zero,
     I8,
     I16,
     I32,
@@ -13,6 +15,7 @@ pub enum PhysicalWidth {
 impl PhysicalWidth {
     pub const fn byte_width(self) -> u8 {
         match self {
+            Self::Zero => 0,
             Self::I8 => 1,
             Self::I16 => 2,
             Self::I32 => 4,
@@ -22,6 +25,7 @@ impl PhysicalWidth {
 
     pub const fn code(self) -> u8 {
         match self {
+            Self::Zero => 0,
             Self::I8 => 1,
             Self::I16 => 2,
             Self::I32 => 3,
@@ -31,6 +35,7 @@ impl PhysicalWidth {
 
     pub fn from_code(value: u8) -> Result<Self> {
         match value {
+            0 => Ok(Self::Zero),
             1 => Ok(Self::I8),
             2 => Ok(Self::I16),
             3 => Ok(Self::I32),
@@ -49,7 +54,23 @@ pub struct FieldStats {
     pub max: i64,
     pub max_abs_delta: u64,
     pub monotonic_non_decreasing: bool,
+    pub first_value: Option<i64>,
+    pub fixed_step: Option<i64>,
+    pub fixed_step_valid: bool,
     previous: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldStatsSummary {
+    pub field_index: u16,
+    pub observed: u64,
+    pub min: i64,
+    pub max: i64,
+    pub max_abs_delta: u64,
+    pub monotonic_non_decreasing: bool,
+    pub first_value: Option<i64>,
+    pub fixed_step: Option<i64>,
+    pub fixed_step_valid: bool,
 }
 
 impl PartialEq for FieldStats {
@@ -60,6 +81,9 @@ impl PartialEq for FieldStats {
             && self.max == other.max
             && self.max_abs_delta == other.max_abs_delta
             && self.monotonic_non_decreasing == other.monotonic_non_decreasing
+            && self.first_value == other.first_value
+            && self.fixed_step == other.fixed_step
+            && self.fixed_step_valid == other.fixed_step_valid
     }
 }
 
@@ -72,6 +96,9 @@ impl FieldStats {
             max: 0,
             max_abs_delta: 0,
             monotonic_non_decreasing: true,
+            first_value: None,
+            fixed_step: None,
+            fixed_step_valid: true,
             previous: None,
         }
     }
@@ -80,15 +107,22 @@ impl FieldStats {
         if self.observed == 0 {
             self.min = value;
             self.max = value;
+            self.first_value = Some(value);
         } else {
             self.min = self.min.min(value);
             self.max = self.max.max(value);
         }
 
         if let Some(previous) = self.previous {
+            let step = value - previous;
             self.max_abs_delta = self.max_abs_delta.max(abs_delta(previous, value));
             if value < previous {
                 self.monotonic_non_decreasing = false;
+            }
+            if self.observed == 1 {
+                self.fixed_step = Some(step);
+            } else if self.fixed_step != Some(step) {
+                self.fixed_step_valid = false;
             }
         }
 
@@ -96,21 +130,17 @@ impl FieldStats {
         self.observed += 1;
     }
 
-    pub const fn from_summary(
-        field_index: u16,
-        observed: u64,
-        min: i64,
-        max: i64,
-        max_abs_delta: u64,
-        monotonic_non_decreasing: bool,
-    ) -> Self {
+    pub const fn from_summary(summary: FieldStatsSummary) -> Self {
         Self {
-            field_index,
-            observed,
-            min,
-            max,
-            max_abs_delta,
-            monotonic_non_decreasing,
+            field_index: summary.field_index,
+            observed: summary.observed,
+            min: summary.min,
+            max: summary.max,
+            max_abs_delta: summary.max_abs_delta,
+            monotonic_non_decreasing: summary.monotonic_non_decreasing,
+            first_value: summary.first_value,
+            fixed_step: summary.fixed_step,
+            fixed_step_valid: summary.fixed_step_valid,
             previous: None,
         }
     }
@@ -121,6 +151,62 @@ impl FieldStats {
 
     pub fn delta_width(&self) -> PhysicalWidth {
         signed_width_for_abs_delta(self.max_abs_delta)
+    }
+
+    pub fn base_value(&self) -> i64 {
+        self.min
+    }
+
+    pub fn max_abs_base_delta(&self) -> u64 {
+        abs_delta(self.min, self.max)
+    }
+
+    pub fn base_delta_width(&self) -> PhysicalWidth {
+        signed_width_for_abs_delta(self.max_abs_base_delta())
+    }
+
+    pub fn has_implicit_fixed_step(&self) -> bool {
+        self.observed >= 2 && self.fixed_step_valid && self.fixed_step.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedFieldStats {
+    pub field_index: u16,
+    pub related_field_index: u16,
+    pub observed: u64,
+    pub min_delta: i64,
+    pub max_delta: i64,
+    pub max_abs_delta: u64,
+}
+
+impl RelatedFieldStats {
+    pub const fn new(field_index: u16, related_field_index: u16) -> Self {
+        Self {
+            field_index,
+            related_field_index,
+            observed: 0,
+            min_delta: 0,
+            max_delta: 0,
+            max_abs_delta: 0,
+        }
+    }
+
+    pub fn observe(&mut self, value: i64, related_value: i64) {
+        let delta = value - related_value;
+        if self.observed == 0 {
+            self.min_delta = delta;
+            self.max_delta = delta;
+        } else {
+            self.min_delta = self.min_delta.min(delta);
+            self.max_delta = self.max_delta.max(delta);
+        }
+        self.max_abs_delta = self.max_abs_delta.max(delta.unsigned_abs());
+        self.observed += 1;
+    }
+
+    pub fn delta_width(&self) -> PhysicalWidth {
+        signed_width_for_range(self.min_delta, self.max_delta)
     }
 }
 
@@ -160,6 +246,7 @@ impl ShapeStats {
 pub struct IngestStats {
     pub record_count: u64,
     pub fields: Vec<FieldStats>,
+    pub related_fields: Vec<RelatedFieldStats>,
     pub shape: ShapeStats,
 }
 
@@ -173,8 +260,21 @@ impl IngestStats {
             fields: (0..field_count)
                 .map(|idx| FieldStats::new(idx as u16))
                 .collect(),
+            related_fields: Vec::new(),
             shape: ShapeStats::default(),
         })
+    }
+
+    pub fn new_for_schema(schema: &SchemaDescriptor) -> Result<Self> {
+        let mut stats = Self::new(schema.fields.len())?;
+        for field in &schema.fields {
+            if let FieldRelation::DeltaFromField(related_field_index) = field.relation {
+                stats
+                    .related_fields
+                    .push(RelatedFieldStats::new(field.index, related_field_index));
+            }
+        }
+        Ok(stats)
     }
 
     pub fn observe_record(&mut self) {
@@ -190,12 +290,35 @@ impl IngestStats {
         Ok(())
     }
 
+    pub fn observe_i64_record(&mut self, schema: &SchemaDescriptor, values: &[i64]) -> Result<()> {
+        if values.len() != schema.fields.len() {
+            return Err(AuraError::InvalidValue("record field count"));
+        }
+        self.observe_record();
+        for field in &schema.fields {
+            self.observe_i64(field.index, values[usize::from(field.index)])?;
+        }
+        for related in &mut self.related_fields {
+            related.observe(
+                values[usize::from(related.field_index)],
+                values[usize::from(related.related_field_index)],
+            );
+        }
+        Ok(())
+    }
+
     pub fn observe_timestamp_run(&mut self, run_len: u32) {
         self.shape.observe_timestamp_run(run_len);
     }
 
     pub fn field(&self, field_index: u16) -> Option<&FieldStats> {
         self.fields.get(usize::from(field_index))
+    }
+
+    pub fn related_field(&self, field_index: u16) -> Option<&RelatedFieldStats> {
+        self.related_fields
+            .iter()
+            .find(|related| related.field_index == field_index)
     }
 }
 
