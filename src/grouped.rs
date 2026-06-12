@@ -84,10 +84,26 @@ mod tests {
 
         assert_eq!(
             vec![
-                EventGroup { start: 0, len: 4, ts_event: 1 },
-                EventGroup { start: 4, len: 1, ts_event: 1 },
-                EventGroup { start: 5, len: 1, ts_event: 2 },
-                EventGroup { start: 6, len: 2, ts_event: 3 },
+                EventGroup {
+                    start: 0,
+                    len: 4,
+                    ts_event: 1
+                },
+                EventGroup {
+                    start: 4,
+                    len: 1,
+                    ts_event: 1
+                },
+                EventGroup {
+                    start: 5,
+                    len: 1,
+                    ts_event: 2
+                },
+                EventGroup {
+                    start: 6,
+                    len: 2,
+                    ts_event: 3
+                },
             ],
             groups
         );
@@ -99,6 +115,9 @@ mod tests {
 
         let groups = plan_groups(&events, GroupPolicy { max_group_size: 8 });
 
-        assert_eq!(vec![8, 2], groups.iter().map(|group| group.len).collect::<Vec<_>>());
+        assert_eq!(
+            vec![8, 2],
+            groups.iter().map(|group| group.len).collect::<Vec<_>>()
+        );
     }
 }

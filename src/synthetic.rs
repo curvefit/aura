@@ -29,7 +29,11 @@ pub fn generate_events(config: SyntheticConfig) -> Vec<BookEvent> {
     for idx in 0..config.event_count {
         let ts_event = config.base_ts_event + ((idx / repeated) as u64 * config.ts_step);
         let sequence = idx as u64 + 1;
-        let book = if idx % 2 == 0 { BookId::BookA } else { BookId::BookB };
+        let book = if idx % 2 == 0 {
+            BookId::BookA
+        } else {
+            BookId::BookB
+        };
         let bid_count = 1 + (rng.next_usize() % max_levels);
         let ask_count = 1 + (rng.next_usize() % max_levels);
         events.push(BookEvent::new(
@@ -75,7 +79,10 @@ mod tests {
 
     #[test]
     fn generator_is_deterministic() {
-        let config = SyntheticConfig { event_count: 4, ..SyntheticConfig::default() };
+        let config = SyntheticConfig {
+            event_count: 4,
+            ..SyntheticConfig::default()
+        };
 
         assert_eq!(generate_events(config), generate_events(config));
     }

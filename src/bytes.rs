@@ -28,7 +28,10 @@ impl<'a> ByteReader<'a> {
     }
 
     pub fn read_exact(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = self.offset.checked_add(len).ok_or(AuraError::UnexpectedEof)?;
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(AuraError::UnexpectedEof)?;
         if end > self.bytes.len() {
             return Err(AuraError::UnexpectedEof);
         }

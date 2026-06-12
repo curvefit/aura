@@ -57,7 +57,11 @@ pub struct LevelChange {
 
 impl LevelChange {
     pub const fn new(price: i64, qty_a: i64, qty_b: i64) -> Self {
-        Self { price, qty_a, qty_b }
+        Self {
+            price,
+            qty_a,
+            qty_b,
+        }
     }
 
     pub const fn delete(price: i64) -> Self {

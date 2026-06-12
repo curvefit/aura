@@ -66,7 +66,6 @@ pub fn choose_largest_block_under_padding(
     Ok(best)
 }
 
-
 /// Tier 3 ultra profile: one fixed event header plus padded fixed-width levels.
 pub fn encode_events(events: &[BookEvent], layout: UltraLayout) -> Result<Vec<u8>> {
     UltraLayout::new(layout.block_size)?;
@@ -162,14 +161,23 @@ mod tests {
     #[test]
     fn ultra_profile_round_trips_padded_events() {
         let layout = UltraLayout::new(4).unwrap();
-        let events = vec![BookEvent::new(100, 7, BookId::BookA, vec![LevelChange::new(10, 1, 0)], vec![LevelChange::new(20, 2, 0), LevelChange::new(21, 3, 0)])];
+        let events = vec![BookEvent::new(
+            100,
+            7,
+            BookId::BookA,
+            vec![LevelChange::new(10, 1, 0)],
+            vec![LevelChange::new(20, 2, 0), LevelChange::new(21, 3, 0)],
+        )];
 
         let encoded = encode_events(&events, layout).unwrap();
         let (decoded_layout, decoded) = decode_events(&encoded).unwrap();
 
         assert_eq!(layout, decoded_layout);
         assert_eq!(events, decoded);
-        assert_eq!(4 + 2 + 2 + 8 + EVENT_HEADER_SIZE + 8 * LEVEL_SIZE, encoded.len());
+        assert_eq!(
+            4 + 2 + 2 + 8 + EVENT_HEADER_SIZE + 8 * LEVEL_SIZE,
+            encoded.len()
+        );
     }
 
     #[test]
@@ -186,7 +194,10 @@ mod tests {
     fn event_size_includes_padded_bid_and_ask_sections() {
         let layout = UltraLayout::new(8).unwrap();
 
-        assert_eq!(EVENT_HEADER_SIZE + 24 * LEVEL_SIZE, layout.event_bytes(3, 11));
+        assert_eq!(
+            EVENT_HEADER_SIZE + 24 * LEVEL_SIZE,
+            layout.event_bytes(3, 11)
+        );
     }
 
     #[test]

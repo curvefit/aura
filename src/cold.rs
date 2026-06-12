@@ -43,7 +43,6 @@ fn encode_levels(levels: &[LevelChange], out: &mut Vec<u8>) {
     }
 }
 
-
 /// One independently encoded cold chunk. Compression is intentionally external so
 /// callers can choose zstd level and frame policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,7 +72,10 @@ impl ColdChunk {
     }
 }
 
-pub fn encode_chunks(events: &[BookEvent], target_events_per_chunk: usize) -> Result<Vec<ColdChunk>> {
+pub fn encode_chunks(
+    events: &[BookEvent],
+    target_events_per_chunk: usize,
+) -> Result<Vec<ColdChunk>> {
     let target = target_events_per_chunk.max(1);
     let mut chunks = Vec::new();
     for (idx, events) in events.chunks(target).enumerate() {
@@ -138,9 +140,27 @@ mod tests {
     #[test]
     fn cold_chunks_round_trip_independently() {
         let events = vec![
-            BookEvent::new(1, 1, BookId::BookA, vec![LevelChange::new(10, 1, 0)], vec![]),
-            BookEvent::new(2, 2, BookId::BookA, vec![LevelChange::new(11, 1, 0)], vec![]),
-            BookEvent::new(3, 3, BookId::BookB, vec![], vec![LevelChange::new(12, 1, 0)]),
+            BookEvent::new(
+                1,
+                1,
+                BookId::BookA,
+                vec![LevelChange::new(10, 1, 0)],
+                vec![],
+            ),
+            BookEvent::new(
+                2,
+                2,
+                BookId::BookA,
+                vec![LevelChange::new(11, 1, 0)],
+                vec![],
+            ),
+            BookEvent::new(
+                3,
+                3,
+                BookId::BookB,
+                vec![],
+                vec![LevelChange::new(12, 1, 0)],
+            ),
         ];
 
         let chunks = encode_chunks(&events, 2).unwrap();

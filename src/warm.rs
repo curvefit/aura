@@ -88,7 +88,13 @@ mod tests {
                 vec![LevelChange::new(10, 1, 2)],
                 vec![LevelChange::new(20, 3, 4)],
             ),
-            BookEvent::new(200, 11, BookId::BookB, vec![], vec![LevelChange::delete(30)]),
+            BookEvent::new(
+                200,
+                11,
+                BookId::BookB,
+                vec![],
+                vec![LevelChange::delete(30)],
+            ),
         ];
 
         let encoded = encode_events(&events).unwrap();
