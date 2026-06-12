@@ -6,6 +6,7 @@
 pub mod bytes;
 pub mod chunk;
 pub mod cold;
+pub mod convert;
 pub mod error;
 pub mod grouped;
 pub mod stats;
