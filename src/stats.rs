@@ -19,10 +19,29 @@ impl PhysicalWidth {
             Self::I64 => 8,
         }
     }
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::I8 => 1,
+            Self::I16 => 2,
+            Self::I32 => 3,
+            Self::I64 => 4,
+        }
+    }
+
+    pub fn from_code(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::I8),
+            2 => Ok(Self::I16),
+            3 => Ok(Self::I32),
+            4 => Ok(Self::I64),
+            _ => Err(AuraError::InvalidValue("physical width")),
+        }
+    }
 }
 
 /// Observed range and variance for one logical integer field.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub struct FieldStats {
     pub field_index: u16,
     pub observed: u64,
@@ -31,6 +50,17 @@ pub struct FieldStats {
     pub max_abs_delta: u64,
     pub monotonic_non_decreasing: bool,
     previous: Option<i64>,
+}
+
+impl PartialEq for FieldStats {
+    fn eq(&self, other: &Self) -> bool {
+        self.field_index == other.field_index
+            && self.observed == other.observed
+            && self.min == other.min
+            && self.max == other.max
+            && self.max_abs_delta == other.max_abs_delta
+            && self.monotonic_non_decreasing == other.monotonic_non_decreasing
+    }
 }
 
 impl FieldStats {
@@ -64,6 +94,25 @@ impl FieldStats {
 
         self.previous = Some(value);
         self.observed += 1;
+    }
+
+    pub const fn from_summary(
+        field_index: u16,
+        observed: u64,
+        min: i64,
+        max: i64,
+        max_abs_delta: u64,
+        monotonic_non_decreasing: bool,
+    ) -> Self {
+        Self {
+            field_index,
+            observed,
+            min,
+            max,
+            max_abs_delta,
+            monotonic_non_decreasing,
+            previous: None,
+        }
     }
 
     pub fn absolute_width(&self) -> PhysicalWidth {
