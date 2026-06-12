@@ -22,7 +22,7 @@ impl Default for SyntheticConfig {
 }
 
 pub fn generate_events(config: SyntheticConfig) -> Vec<BookEvent> {
-    let mut rng = Lcg::new(0xAURA_C0DE);
+    let mut rng = Lcg::new(0xA07A_C0DE);
     let repeated = config.repeated_ts_run.max(1);
     let max_levels = config.max_levels_per_side.max(1);
     let mut events = Vec::with_capacity(config.event_count);
