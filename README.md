@@ -1,7 +1,7 @@
 # Aura
 
-Aura is an experimental binary replay codec lab for sparse book update streams.
-It explores how to move from compact archival storage to progressively faster
+Aura is an experimental binary event-file format lab. It explores how to write
+normalized ingest files once, then compile them into compact storage or fast
 replay layouts without tying the format to any specific data source.
 
 The public model is intentionally generic:
@@ -42,6 +42,8 @@ payload samples, or production capture logic.
 ## Docs
 
 - [Format levels](docs/tiers.md) explains ingest, Aura0, and Aura1.
+- [Aura container](docs/container.md) explains the header/body/footer shape.
+- [Schemas](docs/schemas.md) explains logical schema construction.
 - [Chunked storage](docs/chunking.md) explains independent compression chunks.
 - [Compression policy](docs/compression.md) explains why chunks beat whole-file streams.
 - [Aura1 block padding](docs/hot-padding.md) explains fixed-width replay blocks.

@@ -1,7 +1,8 @@
-//! Aura binary replay codec experiments for sparse book update streams.
+//! Aura binary event-file format experiments.
 //!
-//! Aura keeps the public model generic: events contain changed levels for a
-//! generic `book_a` or `book_b`, and codecs demonstrate storage/speed tradeoffs.
+//! Aura keeps ingest facts, logical schemas, seal-time stats, and compiled
+//! physical layouts separate so one canonical stream can become compact `.aura0`
+//! files or fast replay `.aura1` files.
 
 pub mod bytes;
 pub mod chunk;

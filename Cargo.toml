@@ -3,7 +3,7 @@ name = "aura-codec"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Experimental binary replay codecs for sparse book update streams"
+description = "Experimental binary event-file format and replay codec lab"
 repository = "https://github.com/L3data/aura"
 
 [lib]
