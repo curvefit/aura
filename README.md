@@ -45,6 +45,7 @@ payload samples, or production capture logic.
 - [Chunked cold storage](docs/chunking.md) explains independent compression chunks.
 - [Dynamic hot padding](docs/hot-padding.md) explains fixed-width level blocks.
 - [Conversion flow](docs/conversion.md) explains cold-to-hot materialization.
+- [Naming](docs/naming.md) lists prototype file extensions and magic values.
 
 ## Quick checks
 
