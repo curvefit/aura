@@ -54,6 +54,22 @@ Aura1 physical plan
 chunk table
 ```
 
+Aura0 field plans are footer-visible. A field plan records:
+
+```text
+field_index
+encoding
+width
+reference_field_index
+base_value
+step
+estimated_bytes
+```
+
+That is enough to represent base deltas for stable values, related-field deltas
+for schemas such as OHLCV, and implicit fixed-step timestamps where the per-row
+timestamp is reconstructed from `base_value + row_index * step`.
+
 The footer is what makes conversion deterministic. A converter can read the
 header, jump to the footer, select the compiled physical plan, and then process
 chunks without re-reading source payloads to discover ranges or group shapes.
