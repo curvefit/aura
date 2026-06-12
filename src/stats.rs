@@ -282,7 +282,7 @@ pub const fn round_up(value: u64, block: u64) -> u64 {
     if block == 0 || value == 0 {
         value
     } else {
-        ((value + block - 1) / block) * block
+        value.div_ceil(block) * block
     }
 }
 
@@ -294,7 +294,7 @@ pub fn padded_event_slots(count: usize, block_size: u16) -> usize {
     if count == 0 {
         0
     } else {
-        ((count + block - 1) / block) * block
+        count.div_ceil(block) * block
     }
 }
 
