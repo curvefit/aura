@@ -6,33 +6,33 @@ replay layouts without tying the format to any specific data source.
 
 The public model is intentionally generic:
 
-- an event has a timestamp, sequence, book identifier, and changed bid/ask levels,
-- a level has an integer price plus one or two integer quantity fields,
-- `book_a` and `book_b` are generic source-book labels,
-- cold files are the canonical archive,
-- faster files are rebuildable caches derived from cold files.
+- an ingest file stores normalized logical facts with generous integer fields,
+- a schema defines what a record means and what stats should be tracked,
+- `.aura0` is the compact compiled level,
+- `.aura1` is the replay-optimized compiled level,
+- compiled levels are rebuildable from canonical `.aura` files.
 
-## Format Tiers
+## Format Levels
 
-| Tier | Profile | Purpose |
+| File | Level | Purpose |
 |---:|---|---|
-| 0 | Cold | Small canonical archive: deltas, varints, chunked compression. |
-| 1 | Warm | Resolved replay: fixed integers, exact level counts, variable event size. |
-| 2 | Grouped Hot | Automatic same-timestamp grouping for compact hot experiments. |
-| 3 | Ultra Hot | One fixed event header plus fixed padded level blocks per event. |
+| `.aura` | Ingest | Canonical normalized facts plus seal-time optimization stats. |
+| `.aura0` | Aura0 | Compact cold encoding compiled from ingest stats. |
+| `.aura1` | Aura1 | Replay-optimized fixed/block encoding compiled from ingest stats. |
 
-The tiers trade disk for parsing speed. Tier 0 should be retained as source of
-truth; tiers 1-3 are local or derived representations that can be regenerated.
+The levels trade disk for parsing speed. `.aura` should be retained as source of
+truth; `.aura0` and `.aura1` are derived representations that can be
+regenerated.
 
 ## Repository Scope
 
 Aura documents and prototypes generic binary codec mechanics:
 
 - varint and zigzag delta encoding,
-- fixed-width resolved records,
+- fixed-width replay records,
 - dynamic padded level blocks,
 - chunk directories for independent compression frames,
-- cold-to-hot conversion paths,
+- ingest-to-compiled conversion paths,
 - synthetic benchmark inputs.
 
 It does not include venue-specific adapters, private source semantics, real
@@ -41,11 +41,11 @@ payload samples, or production capture logic.
 
 ## Docs
 
-- [Format tiers](docs/tiers.md) explains cold, warm, grouped hot, and ultra hot.
-- [Chunked cold storage](docs/chunking.md) explains independent compression chunks.
+- [Format levels](docs/tiers.md) explains ingest, Aura0, and Aura1.
+- [Chunked storage](docs/chunking.md) explains independent compression chunks.
 - [Compression policy](docs/compression.md) explains why chunks beat whole-file streams.
-- [Dynamic hot padding](docs/hot-padding.md) explains fixed-width level blocks.
-- [Conversion flow](docs/conversion.md) explains cold-to-hot materialization.
+- [Aura1 block padding](docs/hot-padding.md) explains fixed-width replay blocks.
+- [Conversion flow](docs/conversion.md) explains compiled materialization.
 - [Naming](docs/naming.md) lists prototype file extensions and magic values.
 
 ## Quick checks

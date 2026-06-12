@@ -1,32 +1,32 @@
-# Dynamic hot padding
+# Aura1 block padding
 
-Variable level counts prevent every event from having the same byte length. Aura
-handles this by keeping headers and levels fixed-width while padding the level
-sections per event.
+Variable event shapes prevent every logical event from having the same byte
+length. `.aura1` handles this by compiling records into fixed-width replay
+blocks chosen from ingest statistics.
 
-For a hot profile with `block_size = 8`:
-
-```text
-EventHeader fixed
-BidLevel[round_up(bid_count, 8)]
-AskLevel[round_up(ask_count, 8)]
-```
-
-An event with 3 bid changes and 11 ask changes stores:
+For a replay layout with `block_capacity = 4`:
 
 ```text
-bid slots: 8  = 3 real + 5 padding
-ask slots: 16 = 11 real + 5 padding
+BlockHeader fixed
+Slot[4]
 ```
 
-Large outliers are naturally split across more fixed-size blocks. They do not
-force every other event to pad to the same size.
-
-Candidate block sizes:
+Seven same-timestamp updates become two fixed-width blocks:
 
 ```text
-4, 8, 10, 16, 20, 32
+block 0: timestamp T, count 4, slots 0..3 real
+block 1: timestamp T, count 3, slots 0..2 real, slot 3 padding
 ```
 
-A hot builder should choose the largest block size whose padding overhead is
-acceptable for the file. Cold seal statistics can make this a one-pass decision.
+Logical order is block order, then slot order. Repeated timestamps are valid when
+a timestamp run exceeds the chosen capacity.
+
+Candidate capacities:
+
+```text
+1, 2, 4, 8, 16, 32
+```
+
+An `.aura1` builder should choose the largest capacity whose padding overhead is
+acceptable for the sealed file. The decision comes from `.aura` ingest stats, so
+the builder does not need to scan the raw source payloads again.

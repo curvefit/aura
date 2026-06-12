@@ -1,18 +1,16 @@
 use crate::Profile;
 
 pub const AURA_NAME: &str = "Aura";
-pub const COLD_MAGIC: &[u8; 4] = b"AUR0";
-pub const WARM_MAGIC: &[u8; 4] = b"AUR1";
-pub const GROUPED_HOT_MAGIC: &[u8; 4] = b"AUR2";
-pub const ULTRA_HOT_MAGIC: &[u8; 4] = b"AUR3";
+pub const INGEST_MAGIC: &[u8; 4] = b"AURA";
+pub const AURA0_MAGIC: &[u8; 4] = b"AUR0";
+pub const AURA1_MAGIC: &[u8; 4] = b"AUR1";
 pub const FORMAT_VERSION: u16 = 1;
 
 pub fn profile_extension(profile: Profile) -> &'static str {
     match profile {
-        Profile::Cold => ".aura.cold",
-        Profile::Warm => ".aura.warm",
-        Profile::GroupedHot => ".aura.group",
-        Profile::UltraHot => ".aura.hot",
+        Profile::Ingest => ".aura",
+        Profile::Aura0 => ".aura0",
+        Profile::Aura1 => ".aura1",
     }
 }
 
@@ -21,8 +19,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extensions_are_profile_specific() {
-        assert_eq!(".aura.cold", profile_extension(Profile::Cold));
-        assert_eq!(".aura.hot", profile_extension(Profile::UltraHot));
+    fn extensions_are_public_profiles() {
+        assert_eq!(".aura", profile_extension(Profile::Ingest));
+        assert_eq!(".aura0", profile_extension(Profile::Aura0));
+        assert_eq!(".aura1", profile_extension(Profile::Aura1));
     }
 }

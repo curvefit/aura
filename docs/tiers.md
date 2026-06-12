@@ -1,72 +1,48 @@
-# Aura format tiers
+# Aura format levels
 
-Aura uses one generic event model and several physical profiles. Each profile
-stores the same logical facts, but trades disk size for parsing speed.
+Aura uses one canonical ingest file and two compiled physical levels. Each level
+stores the same logical event stream, but optimizes for a different point in the
+disk-versus-replay-speed tradeoff.
 
-## Logical event
+## `.aura`: ingest
 
-```text
-BookEvent
-  ts_event
-  sequence
-  book_id = book_a | book_b
-  bids: [LevelChange]
-  asks: [LevelChange]
+`.aura` is the canonical normalized file written by collectors.
 
-LevelChange
-  price: scaled integer
-  qty_a: scaled integer
-  qty_b: scaled integer
-```
+- values are stored as generous logical integers such as `i64`/`u64`,
+- records are grouped by timestamp when the logical schema benefits from it,
+- the writer tracks field ranges, deltas, shape histograms, and group sizes,
+- the final stats and physical-layout decisions are written in a footer when the
+  file is sealed.
 
-`book_a` and `book_b` are neutral labels for any pair of related book streams.
-The format does not assume any venue, product, or provider-specific semantics.
+The ingest file should be easy for collectors to write correctly. It is not the
+smallest or fastest replay shape.
 
-## Tier 0: cold
+## `.aura0`: compact
 
-Cold is the canonical archive profile.
+`.aura0` is compiled from `.aura` stats for cold storage.
 
-- timestamp and sequence are delta encoded,
-- prices are zigzag delta encoded inside each side of each event,
-- quantities are stored as absolute scaled integers,
-- counts use varints,
-- files should be chunked and compressed independently.
+- integer widths are selected from observed ranges and deltas,
+- signed deltas use zigzag-compatible planning,
+- repeated values may be represented as offsets from bases or previous values,
+- chunk-local decode state keeps conversion parallelizable.
 
-Cold is smaller and still far faster to decode than text formats, but it is not
-intended to be the fastest replay shape.
+`.aura0` is the small file. It should remain reversible to `.aura1` through the
+logical stream.
 
-## Tier 1: warm
+## `.aura1`: replay
 
-Warm resolves deltas into fixed-width integer fields while keeping exact event
-lengths.
+`.aura1` is compiled from `.aura` stats for fast replay.
 
-- one event header per event,
-- fixed `i64` level fields,
-- exact bid/ask counts,
-- no level padding.
+- excessive `i64` fields are shrunk when stats prove a smaller width is safe,
+- records use fixed-width headers and slots,
+- same-timestamp events can be packed into fixed-width blocks,
+- repeated timestamps across adjacent blocks are valid when a run exceeds the
+  chosen block capacity.
 
-Warm is useful as an intermediate representation and as a simple replay format
-when disk still matters.
+For example, a timestamp with seven updates and a block capacity of four is
+encoded as two `.aura1` blocks with the same timestamp: one full block of four
+slots and one block with three real slots plus one padding slot. Logical order is
+file order, then slot order.
 
-## Tier 2: grouped hot
-
-Grouped hot is an optional hot experiment for repeated timestamps.
-
-- the encoder detects consecutive events sharing `ts_event`,
-- groups are emitted in powers of two such as 1, 2, 4, or 8,
-- group size falls back to 1 when grouping does not help.
-
-This tier is a compact-hot idea, not the default max-speed shape. It should earn
-its place with benchmarks.
-
-## Tier 3: ultra hot
-
-Ultra hot is the maximum parsing-speed profile.
-
-- one fixed-size event header per event,
-- timestamps and sequences are repeated,
-- levels are fixed-width records,
-- bid and ask sections are padded to a per-file block size.
-
-The parser can walk bytes with predictable pointer arithmetic. Ultra hot is a
-rebuildable cache, not the source of truth.
+`.aura1` should be bigger than `.aura0`, but it should be much easier to parse
+with predictable pointer arithmetic.

@@ -2,7 +2,7 @@
 
 Aura should prefer independently compressed chunks over whole-file compression.
 
-Cold profile:
+Aura0 profile:
 
 ```text
 chunked zstd
@@ -11,7 +11,7 @@ chunk directory required
 chunk-local decode state
 ```
 
-Hot profiles:
+Aura1 profile:
 
 ```text
 uncompressed for maximum replay speed
@@ -19,6 +19,6 @@ or chunked low-level zstd when disk matters
 ```
 
 Whole-file compression can produce slightly smaller files, but it makes parallel
-conversion, partial validation, and corruption isolation worse. The cold format
-should preserve enough per-chunk metadata to let workers convert chunks to hot
+conversion, partial validation, and corruption isolation worse. `.aura0` should
+preserve enough per-chunk metadata to let workers convert chunks to `.aura1`
 files independently.

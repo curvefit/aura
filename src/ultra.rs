@@ -3,7 +3,7 @@ use crate::stats::padded_event_slots;
 use crate::types::{BookEvent, BookId, LevelChange};
 use crate::{AuraError, Result};
 
-pub const MAGIC: &[u8; 4] = crate::format::ULTRA_HOT_MAGIC;
+pub const MAGIC: &[u8; 4] = crate::format::AURA1_MAGIC;
 pub const VERSION: u16 = crate::format::FORMAT_VERSION;
 pub const EVENT_HEADER_SIZE: usize = 32;
 pub const LEVEL_SIZE: usize = 24;
@@ -66,7 +66,7 @@ pub fn choose_largest_block_under_padding(
     Ok(best)
 }
 
-/// Tier 3 ultra profile: one fixed event header plus padded fixed-width levels.
+/// Aura1 prototype: one fixed event header plus padded fixed-width levels.
 pub fn encode_events(events: &[BookEvent], layout: UltraLayout) -> Result<Vec<u8>> {
     UltraLayout::new(layout.block_size)?;
     let mut out = Vec::new();
@@ -108,7 +108,7 @@ fn encode_level(level: LevelChange, out: &mut Vec<u8>) {
 pub fn decode_events(bytes: &[u8]) -> Result<(UltraLayout, Vec<BookEvent>)> {
     let mut reader = ByteReader::new(bytes);
     if reader.read_exact(4)? != MAGIC {
-        return Err(AuraError::InvalidMagic { expected: "AUR3" });
+        return Err(AuraError::InvalidMagic { expected: "AUR1" });
     }
     let version = reader.read_u16_le()?;
     if version != VERSION {

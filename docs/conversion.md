@@ -1,26 +1,29 @@
 # Conversion flow
 
-Cold is canonical. Other profiles are derived.
+`.aura` ingest files are canonical. `.aura0` and `.aura1` are compiled from the
+logical stream plus the seal-time stats stored in the ingest footer.
 
 ```text
-cold -> warm
-cold -> ultra hot
-warm -> ultra hot
+.aura  -> .aura0
+.aura  -> .aura1
+.aura0 -> .aura1
+.aura1 -> .aura0
 ```
 
-The conversion is intentionally simple when cold stores scaled integer facts:
+The conversion is intentionally simple when every level preserves the same
+logical facts:
 
 ```text
 decode chunk
-resolve timestamp and sequence deltas
-resolve price deltas
-copy absolute quantities
-write fixed-width hot events
+materialize logical records in file order
+apply the target physical plan
+write compact deltas or replay blocks
 ```
 
 This is easy to parallelize across chunks. Conversion should not require network
-access, text parsing, decimal parsing, or source-specific logic.
+access, text parsing, decimal parsing, or source-specific logic. Schema-specific
+logic belongs in the Aura schema definition, not in collectors or converters.
 
-The current crate provides small in-memory helpers for these transitions. The
-production version should stream chunk-by-chunk and write temporary output files
-that are atomically promoted after validation.
+The current crate provides small in-memory helpers for the older book prototype.
+The production version should stream chunk-by-chunk and write temporary output
+files that are atomically promoted after validation.

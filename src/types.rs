@@ -25,23 +25,24 @@ impl BookId {
     }
 }
 
-/// Aura storage/replay profile.
+/// Public Aura file profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum Profile {
-    Cold = 0,
-    Warm = 1,
-    GroupedHot = 2,
-    UltraHot = 3,
+    /// Canonical normalized ingest file with generous logical values.
+    Ingest = 0,
+    /// Compact cold file compiled from ingest statistics.
+    Aura0 = 1,
+    /// Replay-optimized file compiled from ingest statistics.
+    Aura1 = 2,
 }
 
 impl Profile {
     pub fn from_byte(value: u8) -> Result<Self> {
         match value {
-            0 => Ok(Self::Cold),
-            1 => Ok(Self::Warm),
-            2 => Ok(Self::GroupedHot),
-            3 => Ok(Self::UltraHot),
+            0 => Ok(Self::Ingest),
+            1 => Ok(Self::Aura0),
+            2 => Ok(Self::Aura1),
             other => Err(AuraError::InvalidProfile(other)),
         }
     }

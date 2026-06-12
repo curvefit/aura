@@ -18,7 +18,7 @@ pub struct EventGroup {
     pub ts_event: u64,
 }
 
-/// Plan same-timestamp groups for a compact hot profile.
+/// Plan same-timestamp groups for an Aura1 fixed-block layout.
 ///
 /// Group sizes are powers of two so readers can specialize 1/2/4/8 paths.
 pub fn plan_groups(events: &[BookEvent], policy: GroupPolicy) -> Vec<EventGroup> {
