@@ -1,0 +1,15 @@
+[package]
+name = "aura-codec"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Experimental binary replay codecs for sparse book update streams"
+repository = "https://github.com/L3data/aura"
+
+[lib]
+name = "aura_codec"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aura-size"
+path = "src/bin/aura_size.rs"
