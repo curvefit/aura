@@ -17,8 +17,12 @@ magic           AURA | AUR0 | AUR1
 version         format version
 profile         ingest | Aura0 | Aura1
 header_len      fixed header size
-schema_id       logical schema hash
+schema_id       logical schema registry key
 flags           sealed/open state
+base_time_ns    file-local time anchor
+stream_id       external stream dictionary key
+dictionary_id   external dictionary/version key
+schema_hash     resolved schema guardrail, zero if unavailable
 footer_offset   zero while open, patched when sealed
 footer_len      zero while open, patched when sealed
 reserved
@@ -26,6 +30,13 @@ reserved
 
 Open writers use zero footer pointers. When the file is sealed, the writer
 appends the footer and patches the header pointer.
+
+The fixed header intentionally stores compact registry IDs rather than strings
+or variable schemas. For market data, `stream_id` can resolve through the
+external dictionary to the venue, market type, exchange symbol, base, quote,
+contract type, tick size, and quantity step. `schema_id` is the fast parser
+lookup. `schema_hash` lets a reader reject a stale registry entry if the schema
+ID resolves to different fields than the file was written with.
 
 ## Body
 
@@ -53,6 +64,11 @@ Aura0 physical plan
 Aura1 physical plan
 chunk table
 ```
+
+The schema descriptor is the self-describing archive copy of the raw logical
+schema. A reader should use the header `schema_id` for fast-path parser lookup
+when its registry is available, then use the footer schema as the durable source
+of truth for unknown schemas, validation, and conversion.
 
 Aura0 field plans are footer-visible. A field plan records:
 

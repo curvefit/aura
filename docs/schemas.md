@@ -17,6 +17,11 @@ field descriptor
   relationship
 ```
 
+`schema_id` is the compact registry key used by the fixed file header. The full
+schema descriptor is still written into the footer so a file remains readable
+without the external registry and so registry lookups can be checked against the
+embedded schema.
+
 Collectors should write normalized `.aura` ingest values using generous integer
 types. The schema tells Aura what those values mean; ingest stats tell Aura how
 small or fast the compiled representation can be.
