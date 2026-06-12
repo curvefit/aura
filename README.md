@@ -37,3 +37,23 @@ Aura documents and prototypes generic binary codec mechanics:
 
 It does not include venue-specific adapters, private source semantics, real
 payload samples, or production capture logic.
+
+
+## Docs
+
+- [Format tiers](docs/tiers.md) explains cold, warm, grouped hot, and ultra hot.
+- [Chunked cold storage](docs/chunking.md) explains independent compression chunks.
+- [Dynamic hot padding](docs/hot-padding.md) explains fixed-width level blocks.
+- [Conversion flow](docs/conversion.md) explains cold-to-hot materialization.
+
+## Quick checks
+
+```bash
+cargo test
+cargo run --bin aura-size -- 10000 1 8
+cargo run --example roundtrip
+```
+
+The current code is a prototype skeleton. It is meant to preserve the important
+format ideas and make future benchmarking straightforward, not to claim a stable
+wire format yet.
