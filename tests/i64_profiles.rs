@@ -53,7 +53,7 @@ fn ingest_header_stores_parent_mapping_before_body() {
     assert_eq!(7u16.to_le_bytes(), file[18..20]);
     assert_eq!(6, file[20]);
     assert_eq!(0, file[21]);
-    assert_eq!(&[0, 0, 2, 2, 2, 0], &file[22..28]);
+    assert_eq!(&[255, 0, 2, 2, 2, 0], &file[22..28]);
     assert_eq!(3, read_u64_le(&file[header_len..header_len + 8]));
 }
 
@@ -76,7 +76,7 @@ fn ingest_header_stores_comment_after_parent_mapping() {
     assert_eq!(57, header_len);
     assert_eq!(6, file[20]);
     assert_eq!(29, file[21]);
-    assert_eq!(&[0, 0, 2, 2, 2, 0], &file[22..28]);
+    assert_eq!(&[255, 0, 2, 2, 2, 0], &file[22..28]);
     assert_eq!(comment.as_bytes(), &file[28..57]);
     assert_eq!(3, read_u64_le(&file[header_len..header_len + 8]));
 
@@ -113,7 +113,7 @@ fn ingest_i64_file_round_trips_rows_and_footer_plans() {
     assert_eq!(7, decoded.header.dictionary_id);
     assert_eq!(1_000_000_000, decoded.header.base_time_ns);
     assert_eq!(
-        &[0, 0, 2, 2, 2, 0],
+        &[255, 0, 2, 2, 2, 0],
         decoded.header.schema_mapping.as_slice()
     );
     assert_eq!(rows, decoded.rows);

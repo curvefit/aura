@@ -6,6 +6,7 @@ use crate::{AuraError, Result};
 const SCHEMA_ENCODING_PARENT_VECTOR: u8 = 0;
 const SCHEMA_ENCODING_FULL_FIELDS: u8 = 1;
 const DECODED_SCHEMA_NAME: &str = "schema";
+pub(crate) const SCHEMA_MAP_TIME_SLOT: u8 = u8::MAX;
 
 /// Logical field type recorded by an Aura schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -417,17 +418,25 @@ pub fn generic_i64_schema(
     builder.finish()
 }
 
-/// Build a positional i64 schema from one-based parent bytes.
+/// Build a positional i64 schema from compact time/parent bytes.
 ///
 /// `parent_slots[0]` describes the timestamp slot. Every later slot is a
-/// generic `i64` value. A parent byte of `0` means no related-field delta
-/// candidate; a parent byte of `N` means the slot may delta from slot `N - 1`.
+/// generic `i64` value. A parent byte of `255` marks the timestamp slot, `0`
+/// means no related-field delta candidate, and `1..254` means the slot may
+/// delta from slot `value - 1`.
 pub fn generic_i64_parent_schema(name: &str, parent_slots: &[u8]) -> Result<SchemaDescriptor> {
     if parent_slots.is_empty() || parent_slots.len() > u16::MAX as usize {
         return Err(AuraError::InvalidValue("parent slot count"));
     }
     let mut mappings = Vec::new();
+    let mut time_slot = None;
     for (field_index, parent_slot) in parent_slots.iter().copied().enumerate() {
+        if parent_slot == SCHEMA_MAP_TIME_SLOT {
+            if time_slot.replace(field_index).is_some() || field_index != 0 {
+                return Err(AuraError::InvalidValue("time slot"));
+            }
+            continue;
+        }
         if parent_slot == 0 {
             continue;
         }
@@ -439,6 +448,9 @@ pub fn generic_i64_parent_schema(name: &str, parent_slots: &[u8]) -> Result<Sche
             field_index as u16,
             parent_index as u16,
         ));
+    }
+    if time_slot != Some(0) {
+        return Err(AuraError::InvalidValue("time slot"));
     }
     generic_i64_schema(name, parent_slots.len() as u16 - 1, &mappings)
 }
@@ -489,7 +501,7 @@ fn parent_slots_for_generic_i64_schema(schema: &SchemaDescriptor) -> Option<Vec<
             {
                 return None;
             }
-            parent_slots.push(0);
+            parent_slots.push(SCHEMA_MAP_TIME_SLOT);
             continue;
         }
 

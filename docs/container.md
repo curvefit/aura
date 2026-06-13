@@ -24,9 +24,9 @@ offset  size  field
 8       8     start_time_ns  file-local time anchor
 16      2     stream_id      external stream dictionary key
 18      2     dictionary_id  external dictionary/version key
-20      1     schema_len     parent mapping byte count
+20      1     schema_len     time/parent mapping byte count
 21      1     comment_len    UTF-8 comment byte count
-22      N     schema_map     parent bytes
+22      N     schema_map     time marker and parent bytes
 22+N    M     comment_utf8   optional human-readable field labels
 ```
 
@@ -45,10 +45,11 @@ public file level the body and footer use.
 The front header intentionally stores compact stream IDs rather than strings or
 full schemas. For market data, `stream_id` can resolve through the external
 dictionary to the venue, market type, exchange symbol, base, quote, contract
-type, tick size, and quantity step. `schema_map` is a small parent mapping so
-the file shape is visible at the front. `comment_utf8` is optional human-facing
-text, such as CSV-style field labels. The stamped footer schema remains the
-authoritative schema copy.
+type, tick size, and quantity step. `schema_map` is a small time/parent mapping
+so the file shape is visible at the front: `255` marks the primary timestamp
+slot, `0` means no parent, and `1..254` means parent slot `value - 1`.
+`comment_utf8` is optional human-facing text, such as CSV-style field labels.
+The stamped footer schema remains the authoritative schema copy.
 
 ## Body
 

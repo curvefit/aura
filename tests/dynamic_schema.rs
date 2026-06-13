@@ -116,9 +116,10 @@ fn generic_i64_schema_rejects_invalid_related_mappings() {
 }
 
 #[test]
-fn generic_i64_parent_schema_maps_one_based_parent_bytes() {
+fn generic_i64_parent_schema_maps_time_and_parent_bytes() {
     let schema =
-        generic_i64_parent_schema("dynamic_ohlcv_plus_flow_v1", &[0, 0, 2, 2, 2, 0, 6, 6]).unwrap();
+        generic_i64_parent_schema("dynamic_ohlcv_plus_flow_v1", &[255, 0, 2, 2, 2, 0, 6, 6])
+            .unwrap();
 
     assert_eq!(8, schema.fields.len());
     assert_eq!("ts", schema.fields[0].name);
@@ -135,7 +136,8 @@ fn generic_i64_parent_schema_maps_one_based_parent_bytes() {
 #[test]
 fn generic_i64_parent_schema_drives_dynamic_aura0_related_deltas() {
     let schema =
-        generic_i64_parent_schema("dynamic_ohlcv_plus_flow_v1", &[0, 0, 2, 2, 2, 0, 6, 6]).unwrap();
+        generic_i64_parent_schema("dynamic_ohlcv_plus_flow_v1", &[255, 0, 2, 2, 2, 0, 6, 6])
+            .unwrap();
     let rows = vec![
         vec![
             1_000_000_000,
@@ -201,7 +203,8 @@ fn generic_i64_parent_schema_drives_dynamic_aura0_related_deltas() {
 #[test]
 fn generic_i64_parent_schema_uses_length_prefixed_parent_encoding() {
     let schema =
-        generic_i64_parent_schema("dynamic_ohlcv_plus_flow_v1", &[0, 0, 2, 2, 2, 0, 6, 6]).unwrap();
+        generic_i64_parent_schema("dynamic_ohlcv_plus_flow_v1", &[255, 0, 2, 2, 2, 0, 6, 6])
+            .unwrap();
     let rows = vec![vec![
         1_000_000_000,
         10_000,
@@ -225,17 +228,17 @@ fn generic_i64_parent_schema_uses_length_prefixed_parent_encoding() {
     let (schema_len, schema_encoding) = ingest_schema_block(&ingest);
 
     assert_eq!(10, schema_len);
-    assert_eq!(&[0, 8, 0, 0, 2, 2, 2, 0, 6, 6], schema_encoding);
+    assert_eq!(&[0, 8, 255, 0, 2, 2, 2, 0, 6, 6], schema_encoding);
 }
 
 #[test]
 fn generic_i64_parent_schema_rejects_forward_and_self_parents() {
     assert_eq!(
         Err(AuraError::InvalidValue("parent slot")),
-        generic_i64_parent_schema("bad_self_parent", &[1])
+        generic_i64_parent_schema("bad_self_parent", &[255, 2])
     );
     assert_eq!(
         Err(AuraError::InvalidValue("parent slot")),
-        generic_i64_parent_schema("bad_forward_parent", &[0, 3])
+        generic_i64_parent_schema("bad_forward_parent", &[255, 0, 4])
     );
 }

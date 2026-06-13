@@ -4,7 +4,7 @@ use crate::format::SEAL_MAGIC;
 use crate::header::{AuraHeader, HEADER_PREFIX_SIZE};
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding};
 use crate::program::{CompiledFooter, DecodeProgram};
-use crate::schema::{FieldRelation, SchemaDescriptor};
+use crate::schema::{FieldRelation, FieldRole, SchemaDescriptor, SCHEMA_MAP_TIME_SLOT};
 use crate::stats::IngestStats;
 use crate::{AuraError, PhysicalWidth, Profile, Result};
 
@@ -298,10 +298,21 @@ fn schema_parent_mapping(schema: &SchemaDescriptor) -> Result<Vec<u8>> {
         if usize::from(field.index) != position {
             return Err(AuraError::InvalidValue("schema field index"));
         }
-        let parent = match field.relation {
-            FieldRelation::None => 0,
-            FieldRelation::DeltaFromField(parent_index) => u8::try_from(parent_index + 1)
-                .map_err(|_| AuraError::InvalidValue("schema parent mapping"))?,
+        let parent = match (field.role, field.relation) {
+            (FieldRole::Timestamp, FieldRelation::None) => SCHEMA_MAP_TIME_SLOT,
+            (FieldRole::Timestamp, FieldRelation::DeltaFromField(_)) => {
+                return Err(AuraError::InvalidValue("schema time mapping"));
+            }
+            (_, FieldRelation::None) => 0,
+            (_, FieldRelation::DeltaFromField(parent_index)) => {
+                let parent_slot = parent_index
+                    .checked_add(1)
+                    .ok_or(AuraError::InvalidValue("schema parent mapping"))?;
+                if parent_slot >= u16::from(SCHEMA_MAP_TIME_SLOT) {
+                    return Err(AuraError::InvalidValue("schema parent mapping"));
+                }
+                parent_slot as u8
+            }
         };
         mapping.push(parent);
     }

@@ -2,7 +2,7 @@
 
 Aura schemas describe logical records. They are separate from physical layout.
 
-Every file repeats a compact parent mapping in the front header:
+Every file repeats a compact time/parent mapping in the front header:
 
 ```text
 schema_len    u8
@@ -11,10 +11,11 @@ schema_map    schema_len bytes
 comment_utf8  comment_len bytes
 ```
 
-Each byte is one-based: `0` means no parent, and `N` means the parent is slot
-`N - 1`. This header mapping is a quick file-shape preview and body-start
-metadata. It is not the full schema. `comment_utf8` is optional human-readable
-text, usually CSV-style labels; `comment_len = 0` means no comment.
+Each byte is self-describing: `255` marks the primary timestamp slot, `0` means
+no parent, and `1..254` means the parent is slot `value - 1`. This header
+mapping is a quick file-shape preview and body-start metadata. It is not the
+full schema. `comment_utf8` is optional human-readable text, usually CSV-style
+labels; `comment_len = 0` means no comment.
 
 ```text
 schema block
@@ -35,8 +36,8 @@ slot_count       u8
 parent_slots     slot_count bytes
 ```
 
-Slot `0` is the timestamp by convention. Slots `1..N` are generic `i64` values.
-This uses the same parent-byte convention as the front header.
+Slot `0` is the timestamp slot and is marked `255`. Slots `1..N` are generic
+`i64` values. This uses the same byte convention as the front header.
 
 Schema encoding type `1` is the full field-descriptor fallback for richer
 schemas:
@@ -94,7 +95,8 @@ one-minute bars.
 
 `generic_i64_parent_schema` is the compact parent-vector path for dynamic
 OHLCV-like records. The vector includes the timestamp slot. Each byte is
-one-based: `0` means no parent, and `N` means the parent is slot `N - 1`.
+self-describing: `255` means primary timestamp, `0` means no parent, and
+`1..254` means the parent is slot `value - 1`.
 
 ```text
 slots:
@@ -108,7 +110,7 @@ slots:
 7 taker_sell
 
 parents:
-0 0 2 2 2 0 6 6
+255 0 2 2 2 0 6 6
 ```
 
 This says high, low, and close may delta from open; taker buy and taker sell may
