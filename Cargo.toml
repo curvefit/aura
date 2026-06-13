@@ -13,3 +13,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "aura-size"
 path = "src/bin/aura_size.rs"
+
+[[bin]]
+name = "aura-parquet-ohlcv"
+path = "src/bin/parquet_ohlcv.rs"
+
+[dependencies]
+anyhow = "1"
+arrow = { version = "54", features = ["prettyprint"] }
+parquet = { version = "54", features = ["zstd"] }
