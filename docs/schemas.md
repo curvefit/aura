@@ -2,6 +2,20 @@
 
 Aura schemas describe logical records. They are separate from physical layout.
 
+Every file repeats a compact parent mapping in the front header:
+
+```text
+schema_len    u8
+comment_len   u8
+schema_map    schema_len bytes
+comment_utf8  comment_len bytes
+```
+
+Each byte is one-based: `0` means no parent, and `N` means the parent is slot
+`N - 1`. This header mapping is a quick file-shape preview and body-start
+metadata. It is not the full schema. `comment_utf8` is optional human-readable
+text, usually CSV-style labels; `comment_len = 0` means no comment.
+
 ```text
 schema block
   schema_len       u32 little-endian
@@ -10,7 +24,7 @@ schema block
 
 The footer schema block does not store a schema ID or schema name. The footer
 schema encoding is the archive copy that keeps a file readable without the
-external registry.
+external registry and is the authoritative stamped schema.
 
 Schema encoding type `0` is the compact parent-vector form for positional
 generic i64 records:
@@ -22,8 +36,7 @@ parent_slots     slot_count bytes
 ```
 
 Slot `0` is the timestamp by convention. Slots `1..N` are generic `i64` values.
-Each parent byte is one-based: `0` means no parent, and `N` means the parent is
-slot `N - 1`.
+This uses the same parent-byte convention as the front header.
 
 Schema encoding type `1` is the full field-descriptor fallback for richer
 schemas:

@@ -12,8 +12,8 @@ fn ingest_schema_block(file: &[u8]) -> (usize, &[u8]) {
     let seal_offset = file.len() - 8;
     let footer_len_offset = seal_offset - 4;
     let footer_len = read_u32_le(&file[footer_len_offset..seal_offset]) as usize;
-    let footer_offset = footer_len_offset - footer_len;
-    let schema_len_offset = footer_offset + 8;
+    let footer_start = footer_len_offset - footer_len;
+    let schema_len_offset = footer_start + 8;
     let schema_len = read_u32_le(&file[schema_len_offset..schema_len_offset + 4]) as usize;
     let schema_offset = schema_len_offset + 4;
     if schema_offset + schema_len > file.len() {
@@ -75,6 +75,7 @@ fn generic_i64_schema_drives_compiled_field_choices_without_ohlcv_names() {
         rows: rows.clone(),
         stream_id: 42,
         dictionary_id: 7,
+        header_comment: None,
     })
     .unwrap();
 
@@ -172,6 +173,7 @@ fn generic_i64_parent_schema_drives_dynamic_aura0_related_deltas() {
         rows: rows.clone(),
         stream_id: 42,
         dictionary_id: 7,
+        header_comment: None,
     })
     .unwrap();
 
@@ -216,6 +218,7 @@ fn generic_i64_parent_schema_uses_length_prefixed_parent_encoding() {
         rows,
         stream_id: 42,
         dictionary_id: 7,
+        header_comment: None,
     })
     .unwrap();
 

@@ -13,9 +13,77 @@ fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes.try_into().unwrap())
 }
 
+fn read_u64_le(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(bytes.try_into().unwrap())
+}
+
 fn trailer_footer_len(file: &[u8]) -> u32 {
     let seal_offset = file.len() - 8;
     read_u32_le(&file[seal_offset - 4..seal_offset])
+}
+
+fn trailer_footer_start(file: &[u8]) -> usize {
+    let seal_offset = file.len() - 8;
+    let footer_len_offset = seal_offset - 4;
+    footer_len_offset - trailer_footer_len(file) as usize
+}
+
+#[test]
+fn ingest_header_stores_parent_mapping_before_body() {
+    let schema = ohlcv_schema().unwrap();
+    let rows = sample_ohlcv_rows();
+    let file = records::encode_ingest_i64_file(records::I64FileInput {
+        schema,
+        rows,
+        stream_id: 1,
+        dictionary_id: 7,
+        header_comment: None,
+    })
+    .unwrap();
+
+    let header_len = usize::from(file[5]);
+
+    assert_eq!(b"AURA", &file[..4]);
+    assert_eq!(Profile::Ingest as u8, file[4]);
+    assert_eq!(28, header_len);
+    assert_eq!(1_000_000_000i64.to_le_bytes(), file[8..16]);
+    assert_eq!(1u16.to_le_bytes(), file[16..18]);
+    assert_eq!(7u16.to_le_bytes(), file[18..20]);
+    assert_eq!(6, file[20]);
+    assert_eq!(0, file[21]);
+    assert_eq!(&[0, 0, 2, 2, 2, 0], &file[22..28]);
+    assert_eq!(3, read_u64_le(&file[header_len..header_len + 8]));
+}
+
+#[test]
+fn ingest_header_stores_comment_after_parent_mapping() {
+    let schema = ohlcv_schema().unwrap();
+    let rows = sample_ohlcv_rows();
+    let comment = "ts,open,high,low,close,volume";
+    let file = records::encode_ingest_i64_file(records::I64FileInput {
+        schema,
+        rows,
+        stream_id: 1,
+        dictionary_id: 7,
+        header_comment: Some(comment.to_string()),
+    })
+    .unwrap();
+
+    let header_len = usize::from(file[5]);
+
+    assert_eq!(57, header_len);
+    assert_eq!(6, file[20]);
+    assert_eq!(29, file[21]);
+    assert_eq!(&[0, 0, 2, 2, 2, 0], &file[22..28]);
+    assert_eq!(comment.as_bytes(), &file[28..57]);
+    assert_eq!(3, read_u64_le(&file[header_len..header_len + 8]));
+
+    let decoded = records::decode_i64_file(&file).unwrap();
+    assert_eq!(comment, decoded.header.comment);
+
+    let aura0 = records::compile_i64_file(&file, Profile::Aura0).unwrap();
+    let decoded_aura0 = records::decode_i64_file(&aura0).unwrap();
+    assert_eq!(comment, decoded_aura0.header.comment);
 }
 
 #[test]
@@ -27,6 +95,7 @@ fn ingest_i64_file_round_trips_rows_and_footer_plans() {
         rows: rows.clone(),
         stream_id: 1,
         dictionary_id: 7,
+        header_comment: None,
     })
     .unwrap();
 
@@ -34,12 +103,17 @@ fn ingest_i64_file_round_trips_rows_and_footer_plans() {
 
     assert_eq!(Profile::Ingest, decoded.header.profile);
     assert_eq!(b"sealed:)", &file[file.len() - 8..]);
-    let footer_end = decoded.header.footer_offset as usize + trailer_footer_len(&file) as usize;
-    assert_eq!(file.len() - 12, footer_end);
+    assert_eq!(
+        file.len() - 12,
+        trailer_footer_start(&file) + trailer_footer_len(&file) as usize
+    );
     assert_eq!(1, decoded.header.stream_id);
     assert_eq!(7, decoded.header.dictionary_id);
     assert_eq!(1_000_000_000, decoded.header.base_time_ns);
-    assert_eq!(0, decoded.header.schema_hash);
+    assert_eq!(
+        &[0, 0, 2, 2, 2, 0],
+        decoded.header.schema_mapping.as_slice()
+    );
     assert_eq!(rows, decoded.rows);
     let footer = decoded.ingest_footer.as_ref().unwrap();
     assert_eq!(3, footer.stats.record_count);
@@ -64,18 +138,19 @@ fn i64_file_trailer_stores_footer_length_before_seal() {
         rows,
         stream_id: 1,
         dictionary_id: 7,
+        header_comment: None,
     })
     .unwrap();
 
     let seal_offset = file.len() - 8;
     let footer_len_offset = seal_offset - 4;
-    let decoded = records::decode_i64_file(&file).unwrap();
 
     assert_eq!(b"sealed:)", &file[seal_offset..]);
     assert_eq!(
-        (footer_len_offset - decoded.header.footer_offset as usize) as u32,
+        (footer_len_offset - trailer_footer_start(&file)) as u32,
         read_u32_le(&file[footer_len_offset..seal_offset])
     );
+    records::decode_i64_file(&file).unwrap();
 }
 
 #[test]
@@ -87,6 +162,7 @@ fn compiled_i64_profiles_round_trip_ingest_rows() {
         rows: rows.clone(),
         stream_id: 2,
         dictionary_id: 9,
+        header_comment: None,
     })
     .unwrap();
 
@@ -117,6 +193,7 @@ fn compiled_footer_omits_ingest_stats_and_uses_field_programs() {
         rows: rows.clone(),
         stream_id: 2,
         dictionary_id: 9,
+        header_comment: None,
     })
     .unwrap();
 
@@ -139,6 +216,7 @@ fn i64_file_decode_requires_trailing_seal_magic() {
         rows,
         stream_id: 1,
         dictionary_id: 7,
+        header_comment: None,
     })
     .unwrap();
     file.truncate(file.len() - 8);

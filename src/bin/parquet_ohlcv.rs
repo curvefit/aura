@@ -15,8 +15,8 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 #[derive(Debug, Clone)]
 struct Args {
     output: PathBuf,
-    stream_id: u32,
-    dictionary_id: u32,
+    stream_id: u16,
+    dictionary_id: u16,
     price_scale: i64,
     volume_scale: i64,
     inputs: Vec<PathBuf>,
@@ -74,6 +74,7 @@ fn main() -> Result<()> {
         rows: rows.clone(),
         stream_id: args.stream_id,
         dictionary_id: args.dictionary_id,
+        header_comment: Some("ts,open,high,low,close,volume".to_string()),
     })?;
     let aura0 = compile_i64_file(&aura, Profile::Aura0)?;
     let aura1 = compile_i64_file(&aura, Profile::Aura1)?;

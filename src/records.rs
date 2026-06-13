@@ -1,10 +1,10 @@
 use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, ByteReader};
 use crate::footer::AuraFooter;
 use crate::format::SEAL_MAGIC;
-use crate::header::{AuraHeader, HEADER_SIZE};
+use crate::header::{AuraHeader, HEADER_PREFIX_SIZE};
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding};
 use crate::program::{CompiledFooter, DecodeProgram};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{FieldRelation, SchemaDescriptor};
 use crate::stats::IngestStats;
 use crate::{AuraError, PhysicalWidth, Profile, Result};
 
@@ -12,8 +12,9 @@ use crate::{AuraError, PhysicalWidth, Profile, Result};
 pub struct I64FileInput {
     pub schema: SchemaDescriptor,
     pub rows: Vec<Vec<i64>>,
-    pub stream_id: u32,
-    pub dictionary_id: u32,
+    pub stream_id: u16,
+    pub dictionary_id: u16,
+    pub header_comment: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,13 +45,14 @@ pub fn encode_ingest_i64_file(input: I64FileInput) -> Result<Vec<u8>> {
         .first()
         .and_then(|row| row.first().copied())
         .unwrap_or(0);
+    let header_comment = input.header_comment.as_deref().unwrap_or("");
 
     encode_file(
         Profile::Ingest,
         input.stream_id,
         input.dictionary_id,
         base_time_ns,
-        0,
+        header_comment,
         body,
         footer,
     )
@@ -105,14 +107,14 @@ pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>
         decoded.header.stream_id,
         decoded.header.dictionary_id,
         decoded.header.base_time_ns,
-        0,
+        decoded.header.comment.as_str(),
         body,
         compiled_footer,
     )
 }
 
 pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
-    if bytes.len() < HEADER_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+    if bytes.len() < HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
         return Err(AuraError::UnexpectedEof);
     }
     let seal_offset = bytes.len() - SEAL_MAGIC.len();
@@ -123,22 +125,21 @@ pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
     }
     let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
     let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
-    let header = AuraHeader::decode(&bytes[..HEADER_SIZE])?;
-    let footer_offset = usize::try_from(header.footer_offset)
-        .map_err(|_| AuraError::InvalidValue("footer offset"))?;
-    let footer_end = footer_offset
-        .checked_add(footer_len)
-        .ok_or(AuraError::UnexpectedEof)?;
-    if footer_offset < HEADER_SIZE || footer_end > footer_len_offset {
+    let header_len = usize::from(bytes[5]);
+    if header_len < HEADER_PREFIX_SIZE || header_len > footer_len_offset {
         return Err(AuraError::UnexpectedEof);
     }
-    if footer_end < footer_len_offset {
-        return Err(AuraError::TrailingBytes(footer_len_offset - footer_end));
+    let header = AuraHeader::decode(&bytes[..header_len])?;
+    let footer_start = footer_len_offset
+        .checked_sub(footer_len)
+        .ok_or(AuraError::UnexpectedEof)?;
+    if footer_start < header_len {
+        return Err(AuraError::UnexpectedEof);
     }
-    let body = &bytes[HEADER_SIZE..footer_offset];
+    let body = &bytes[header_len..footer_start];
     match header.profile {
         Profile::Ingest => {
-            let footer = AuraFooter::decode(&bytes[footer_offset..footer_end])?;
+            let footer = AuraFooter::decode(&bytes[footer_start..footer_len_offset])?;
             let rows = decode_raw_body(body)?;
             validate_rows(&footer.schema, &rows)?;
             Ok(DecodedI64File {
@@ -150,7 +151,7 @@ pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
             })
         }
         Profile::Aura0 => {
-            let footer = CompiledFooter::decode(&bytes[footer_offset..footer_end])?;
+            let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
             let plan = footer.program.to_aura0_plan()?;
             let rows = decode_aura0_body(
                 body,
@@ -168,7 +169,7 @@ pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
             })
         }
         Profile::Aura1 => {
-            let footer = CompiledFooter::decode(&bytes[footer_offset..footer_end])?;
+            let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
             let plan = footer.program.to_aura1_plan(footer.block_capacity)?;
             let rows = decode_aura1_body(
                 body,
@@ -235,28 +236,26 @@ impl DecodedI64File {
 
 fn encode_file(
     profile: Profile,
-    stream_id: u32,
-    dictionary_id: u32,
+    stream_id: u16,
+    dictionary_id: u16,
     base_time_ns: i64,
-    schema_hash: u64,
+    header_comment: &str,
     body: Vec<u8>,
     footer: AuraFooter,
 ) -> Result<Vec<u8>> {
     let footer_bytes = footer.encode()?;
-    let footer_offset = HEADER_SIZE
-        .checked_add(body.len())
-        .ok_or(AuraError::InvalidValue("footer offset"))?;
     let footer_len =
         u32::try_from(footer_bytes.len()).map_err(|_| AuraError::InvalidValue("footer length"))?;
     let header = AuraHeader::new(profile)
         .with_stream(stream_id, dictionary_id, base_time_ns)
-        .with_schema_hash(schema_hash)
-        .with_footer_offset(footer_offset as u64);
+        .with_schema_mapping(schema_parent_mapping(&footer.schema)?)?
+        .with_comment(header_comment)?;
+    let header_bytes = header.encode()?;
 
     let mut out = Vec::with_capacity(
-        HEADER_SIZE + body.len() + footer_bytes.len() + FOOTER_LEN_SIZE + SEAL_MAGIC.len(),
+        header_bytes.len() + body.len() + footer_bytes.len() + FOOTER_LEN_SIZE + SEAL_MAGIC.len(),
     );
-    out.extend_from_slice(&header.encode());
+    out.extend_from_slice(&header_bytes);
     out.extend_from_slice(&body);
     out.extend_from_slice(&footer_bytes);
     put_u32_le(&mut out, footer_len);
@@ -266,33 +265,47 @@ fn encode_file(
 
 fn encode_compiled_file(
     profile: Profile,
-    stream_id: u32,
-    dictionary_id: u32,
+    stream_id: u16,
+    dictionary_id: u16,
     base_time_ns: i64,
-    schema_hash: u64,
+    header_comment: &str,
     body: Vec<u8>,
     footer: CompiledFooter,
 ) -> Result<Vec<u8>> {
     let footer_bytes = footer.encode()?;
-    let footer_offset = HEADER_SIZE
-        .checked_add(body.len())
-        .ok_or(AuraError::InvalidValue("footer offset"))?;
     let footer_len =
         u32::try_from(footer_bytes.len()).map_err(|_| AuraError::InvalidValue("footer length"))?;
     let header = AuraHeader::new(profile)
         .with_stream(stream_id, dictionary_id, base_time_ns)
-        .with_schema_hash(schema_hash)
-        .with_footer_offset(footer_offset as u64);
+        .with_schema_mapping(schema_parent_mapping(&footer.schema)?)?
+        .with_comment(header_comment)?;
+    let header_bytes = header.encode()?;
 
     let mut out = Vec::with_capacity(
-        HEADER_SIZE + body.len() + footer_bytes.len() + FOOTER_LEN_SIZE + SEAL_MAGIC.len(),
+        header_bytes.len() + body.len() + footer_bytes.len() + FOOTER_LEN_SIZE + SEAL_MAGIC.len(),
     );
-    out.extend_from_slice(&header.encode());
+    out.extend_from_slice(&header_bytes);
     out.extend_from_slice(&body);
     out.extend_from_slice(&footer_bytes);
     put_u32_le(&mut out, footer_len);
     out.extend_from_slice(SEAL_MAGIC);
     Ok(out)
+}
+
+fn schema_parent_mapping(schema: &SchemaDescriptor) -> Result<Vec<u8>> {
+    let mut mapping = Vec::with_capacity(schema.fields.len());
+    for (position, field) in schema.fields.iter().enumerate() {
+        if usize::from(field.index) != position {
+            return Err(AuraError::InvalidValue("schema field index"));
+        }
+        let parent = match field.relation {
+            FieldRelation::None => 0,
+            FieldRelation::DeltaFromField(parent_index) => u8::try_from(parent_index + 1)
+                .map_err(|_| AuraError::InvalidValue("schema parent mapping"))?,
+        };
+        mapping.push(parent);
+    }
+    Ok(mapping)
 }
 
 fn encode_raw_body(field_count: usize, rows: &[Vec<i64>]) -> Result<Vec<u8>> {

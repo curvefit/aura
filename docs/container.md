@@ -12,36 +12,41 @@ Seal
 
 ## Header
 
-The header is fixed-width and appears at byte zero.
+The front header starts at byte zero. Its fixed prefix is 22 bytes; `header_len`
+is the total front-header size and is the byte offset where the body starts.
 
 ```text
-magic           AURA
-profile         ingest | Aura0 | Aura1
-header_len      fixed header size
-version         format version
-reserved        zero
-reserved        zero
-base_time_ns    file-local time anchor
-stream_id       external stream dictionary key
-dictionary_id   external dictionary/version key
-schema_hash     embedded schema guardrail, zero if unavailable
-footer_offset   zero while open, patched when sealed
-reserved        zero
-reserved
+offset  size  field
+0       4     magic          AURA
+4       1     profile        ingest | Aura0 | Aura1
+5       1     header_len     total header bytes before body
+6       2     version        format version
+8       8     start_time_ns  file-local time anchor
+16      2     stream_id      external stream dictionary key
+18      2     dictionary_id  external dictionary/version key
+20      1     schema_len     parent mapping byte count
+21      1     comment_len    UTF-8 comment byte count
+22      N     schema_map     parent bytes
+22+N    M     comment_utf8   optional human-readable field labels
 ```
 
-Open writers use zero footer pointers. When the file is sealed, the writer
-appends the footer, patches the header pointer, writes the footer length, and
-writes the trailing seal magic.
+`header_len = 22 + schema_len + comment_len`. `comment_len = 0` means the file
+has no front-header comment.
+
+The header is write-once. When the file is sealed, the writer appends the
+footer, writes the footer length, and writes the trailing seal magic. No header
+field needs to be patched.
 
 The magic identifies the Aura container family. The `profile` byte identifies
 which public file level the body and footer use.
 
-The fixed header intentionally stores compact stream IDs rather than strings or
-variable schemas. For market data, `stream_id` can resolve through the external
+The front header intentionally stores compact stream IDs rather than strings or
+full schemas. For market data, `stream_id` can resolve through the external
 dictionary to the venue, market type, exchange symbol, base, quote, contract
-type, tick size, and quantity step. Schema identity lives in the footer schema
-block; `schema_hash` is only a guardrail for checking that embedded schema copy.
+type, tick size, and quantity step. `schema_map` is a small parent mapping so
+the file shape is visible at the front. `comment_utf8` is optional human-facing
+text, such as CSV-style field labels. The stamped footer schema remains the
+authoritative schema copy.
 
 ## Body
 
@@ -119,7 +124,7 @@ where the per-row timestamp is reconstructed from `base_value + row_index *
 step`.
 
 The footer is what makes conversion deterministic. A converter can read the
-header, jump to the footer, run the field program, and then process chunks
+trailer to locate the footer, run the field program, and then process chunks
 without re-reading source payloads to discover ranges or group shapes.
 
 ## Footer length and seal
@@ -136,3 +141,11 @@ The seal is the final eight bytes. `footer_len` is stored immediately before the
 seal and is not part of the footer itself. A reader can reject a file whose last
 eight bytes do not match the seal magic, then use the preceding length to find
 the footer.
+
+```text
+seal_offset       = file_len - 8
+footer_len_offset = seal_offset - 4
+footer_start      = footer_len_offset - footer_len
+body_start        = header_len
+body_end          = footer_start
+```
