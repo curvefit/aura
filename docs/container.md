@@ -112,8 +112,8 @@ Each field starts with a `u16` code:
 
 ```text
 bits 0..4    op: absolute | delta_base | delta_previous | delta_related | fixed_step
-bits 5..7    stored value width: zero | i8 | i16 | i32 | i64
-bits 8..10   constant width: zero | i8 | i16 | i32 | i64
+bits 5..7    stored value width: zero | i8 | i16 | i32 | i64 | i128
+bits 8..10   constant width: zero | i8 | i16 | i32 | i64 | i128
 bits 11..13  aux: inline related field index, or 7 for extended aux
 bit 14       has base constant
 bit 15       has step constant

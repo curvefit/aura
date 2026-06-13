@@ -25,6 +25,25 @@ fn field_code_packs_operation_width_const_width_aux_and_flags() {
 }
 
 #[test]
+fn field_code_accepts_i128_fixed_width_code() {
+    let code = FieldCode::new(
+        ProgramOp::Absolute,
+        PhysicalWidth::I128,
+        PhysicalWidth::Zero,
+        0,
+        false,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(5, PhysicalWidth::I128.code());
+    assert_eq!(16, PhysicalWidth::I128.byte_width());
+
+    let decoded = FieldCode::from_raw(code.raw()).unwrap();
+    assert_eq!(PhysicalWidth::I128, decoded.width().unwrap());
+}
+
+#[test]
 fn field_program_round_trips_extended_refs_and_constants() {
     let program = FieldProgram {
         code: FieldCode::new(

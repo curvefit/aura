@@ -434,6 +434,10 @@ fn write_const(out: &mut Vec<u8>, value: i64, width: PhysicalWidth) -> Result<()
             put_i64_le(out, value);
             Ok(())
         }
+        PhysicalWidth::I128 => {
+            out.extend_from_slice(&i128::from(value).to_le_bytes());
+            Ok(())
+        }
     }
 }
 
@@ -450,6 +454,15 @@ fn read_const(reader: &mut ByteReader<'_>, width: PhysicalWidth) -> Result<i64> 
             Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64)
         }
         PhysicalWidth::I64 => reader.read_i64_le(),
+        PhysicalWidth::I128 => {
+            let bytes = reader.read_exact(16)?;
+            let value = i128::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
+            ]);
+            i64::try_from(value).map_err(|_| AuraError::InvalidValue("i128 const"))
+        }
     }
 }
 

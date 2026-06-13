@@ -10,6 +10,7 @@ pub enum PhysicalWidth {
     I16,
     I32,
     I64,
+    I128,
 }
 
 impl PhysicalWidth {
@@ -20,6 +21,7 @@ impl PhysicalWidth {
             Self::I16 => 2,
             Self::I32 => 4,
             Self::I64 => 8,
+            Self::I128 => 16,
         }
     }
 
@@ -30,6 +32,7 @@ impl PhysicalWidth {
             Self::I16 => 2,
             Self::I32 => 3,
             Self::I64 => 4,
+            Self::I128 => 5,
         }
     }
 
@@ -40,6 +43,7 @@ impl PhysicalWidth {
             2 => Ok(Self::I16),
             3 => Ok(Self::I32),
             4 => Ok(Self::I64),
+            5 => Ok(Self::I128),
             _ => Err(AuraError::InvalidValue("physical width")),
         }
     }

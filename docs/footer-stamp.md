@@ -39,6 +39,21 @@ scale        i8  decimal scale used to normalize this slot
 instruction  u8  stamped physical operation, width, and flags
 ```
 
+For hot `.aura1` slots, the first hot instruction byte is the fixed integer
+width for non-timestamp slots:
+
+```text
+0 omitted/reserved
+1 i8
+2 i16
+3 i32
+4 i64
+5 i128
+```
+
+Timestamp slots are always logical `i64` nanoseconds; their hot byte is the
+stamped timestamp grouping code instead of an integer-width code.
+
 Scale is fixed-width and placed before any variable data so a parser can read it
 with one predictable offset:
 

@@ -36,6 +36,7 @@ Widths use this codebook:
 2 i16
 3 i32
 4 i64
+5 i128
 ```
 
 `aux` stores a related field index when it fits in three bits. `aux = 7` means
