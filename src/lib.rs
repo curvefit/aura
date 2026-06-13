@@ -30,7 +30,8 @@ pub use footer::{AuraFooter, CompressionDescriptor, CompressionKind};
 pub use header::{AuraHeader, FLAG_SEALED, HEADER_SIZE};
 pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 pub use schema::{
-    FieldDescriptor, FieldRelation, FieldRole, FieldType, SchemaBuilder, SchemaDescriptor,
+    FieldDescriptor, FieldRelation, FieldRole, FieldTransform, FieldType, RelatedFieldMapping,
+    SchemaBuilder, SchemaDescriptor, TransformCandidates,
 };
 pub use stats::{FieldStats, IngestStats, PhysicalWidth, RunHistogramEntry, ShapeStats};
 pub use types::{BookEvent, BookId, LevelChange, Profile};

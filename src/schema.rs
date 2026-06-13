@@ -100,6 +100,106 @@ impl FieldRelation {
     }
 }
 
+/// Reversible transforms a schema allows the physical planner to test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum FieldTransform {
+    Absolute = 0,
+    DeltaBase = 1,
+    DeltaPrevious = 2,
+    DeltaRelated = 3,
+    FixedStep = 4,
+    Delta2 = 5,
+    Midpoint = 6,
+    RoughStep = 7,
+    ZigzagVarint = 8,
+    Bitpack = 9,
+}
+
+impl FieldTransform {
+    pub const fn bit(self) -> u16 {
+        1u16 << (self as u8)
+    }
+}
+
+const KNOWN_TRANSFORM_BITS: u16 = FieldTransform::Absolute.bit()
+    | FieldTransform::DeltaBase.bit()
+    | FieldTransform::DeltaPrevious.bit()
+    | FieldTransform::DeltaRelated.bit()
+    | FieldTransform::FixedStep.bit()
+    | FieldTransform::Delta2.bit()
+    | FieldTransform::Midpoint.bit()
+    | FieldTransform::RoughStep.bit()
+    | FieldTransform::ZigzagVarint.bit()
+    | FieldTransform::Bitpack.bit();
+
+/// Bitset of transform candidates declared by a logical schema field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TransformCandidates(u16);
+
+impl TransformCandidates {
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub fn from_bits(bits: u16) -> Result<Self> {
+        if bits & !KNOWN_TRANSFORM_BITS != 0 {
+            return Err(AuraError::InvalidValue("transform candidates"));
+        }
+        Ok(Self(bits))
+    }
+
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+
+    pub const fn contains(self, transform: FieldTransform) -> bool {
+        self.0 & transform.bit() != 0
+    }
+
+    pub const fn with(self, transform: FieldTransform) -> Self {
+        Self(self.0 | transform.bit())
+    }
+
+    pub const fn default_for_role(role: FieldRole) -> Self {
+        match role {
+            FieldRole::Timestamp => Self::empty()
+                .with(FieldTransform::Absolute)
+                .with(FieldTransform::DeltaBase)
+                .with(FieldTransform::DeltaPrevious)
+                .with(FieldTransform::FixedStep)
+                .with(FieldTransform::RoughStep),
+            FieldRole::Identifier | FieldRole::Side | FieldRole::Flag => {
+                Self::empty().with(FieldTransform::Absolute)
+            }
+            _ => Self::empty()
+                .with(FieldTransform::Absolute)
+                .with(FieldTransform::DeltaBase)
+                .with(FieldTransform::DeltaPrevious)
+                .with(FieldTransform::Delta2)
+                .with(FieldTransform::Midpoint)
+                .with(FieldTransform::ZigzagVarint)
+                .with(FieldTransform::Bitpack),
+        }
+    }
+}
+
+/// Positional relationship used by generic integer schemas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RelatedFieldMapping {
+    pub field_index: u16,
+    pub related_field_index: u16,
+}
+
+impl RelatedFieldMapping {
+    pub const fn new(field_index: u16, related_field_index: u16) -> Self {
+        Self {
+            field_index,
+            related_field_index,
+        }
+    }
+}
+
 /// One logical field in an Aura schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDescriptor {
@@ -109,6 +209,7 @@ pub struct FieldDescriptor {
     pub role: FieldRole,
     pub nullable: bool,
     pub relation: FieldRelation,
+    pub candidates: TransformCandidates,
 }
 
 /// Logical schema descriptor shared by ingest, Aura0, and Aura1.
@@ -142,6 +243,23 @@ impl SchemaBuilder {
 
     pub fn field(self, name: impl Into<String>, field_type: FieldType, role: FieldRole) -> Self {
         self.field_with_nullability(name, field_type, role, false)
+    }
+
+    pub fn field_with_candidates(
+        self,
+        name: impl Into<String>,
+        field_type: FieldType,
+        role: FieldRole,
+        candidates: TransformCandidates,
+    ) -> Self {
+        self.field_with_relation_and_candidates(
+            name,
+            field_type,
+            role,
+            false,
+            FieldRelation::None,
+            candidates,
+        )
     }
 
     pub fn nullable_field(
@@ -186,12 +304,30 @@ impl SchemaBuilder {
     }
 
     fn field_with_relation(
+        self,
+        name: impl Into<String>,
+        field_type: FieldType,
+        role: FieldRole,
+        nullable: bool,
+        relation: FieldRelation,
+    ) -> Self {
+        let mut candidates = TransformCandidates::default_for_role(role);
+        if matches!(relation, FieldRelation::DeltaFromField(_)) {
+            candidates = candidates.with(FieldTransform::DeltaRelated);
+        }
+        self.field_with_relation_and_candidates(
+            name, field_type, role, nullable, relation, candidates,
+        )
+    }
+
+    fn field_with_relation_and_candidates(
         mut self,
         name: impl Into<String>,
         field_type: FieldType,
         role: FieldRole,
         nullable: bool,
         relation: FieldRelation,
+        candidates: TransformCandidates,
     ) -> Self {
         self.fields.push(FieldDescriptor {
             index: self.fields.len() as u16,
@@ -200,6 +336,7 @@ impl SchemaBuilder {
             role,
             nullable,
             relation,
+            candidates,
         });
         self
     }
@@ -223,6 +360,9 @@ impl SchemaBuilder {
                 if usize::from(related_index) >= self.fields.len() || related_index == field.index {
                     return Err(AuraError::InvalidValue("related field index"));
                 }
+                if !field.candidates.contains(FieldTransform::DeltaRelated) {
+                    return Err(AuraError::InvalidValue("related field candidates"));
+                }
             }
         }
 
@@ -232,6 +372,44 @@ impl SchemaBuilder {
             fields: self.fields,
         })
     }
+}
+
+pub fn generic_i64_schema(
+    name: &str,
+    value_field_count: u16,
+    related_fields: &[RelatedFieldMapping],
+) -> Result<SchemaDescriptor> {
+    let total_field_count = value_field_count
+        .checked_add(1)
+        .ok_or(AuraError::InvalidValue("field count"))?;
+    let mut mapped_fields = BTreeSet::new();
+    for mapping in related_fields {
+        if mapping.field_index == 0
+            || mapping.field_index >= total_field_count
+            || mapping.related_field_index >= total_field_count
+            || mapping.field_index == mapping.related_field_index
+            || !mapped_fields.insert(mapping.field_index)
+        {
+            return Err(AuraError::InvalidValue("related field index"));
+        }
+    }
+    let mut builder =
+        SchemaBuilder::new(name).field("ts", FieldType::TimestampNs, FieldRole::Timestamp);
+    for field_index in 1..total_field_count {
+        let relation = related_fields
+            .iter()
+            .find(|mapping| mapping.field_index == field_index)
+            .map(|mapping| FieldRelation::DeltaFromField(mapping.related_field_index))
+            .unwrap_or(FieldRelation::None);
+        builder = builder.field_with_relation(
+            format!("v{field_index}"),
+            FieldType::I64,
+            FieldRole::Value,
+            false,
+            relation,
+        );
+    }
+    builder.finish()
 }
 
 pub fn book_delta_schema() -> Result<SchemaDescriptor> {
@@ -298,6 +476,7 @@ fn schema_hash(name: &str, fields: &[FieldDescriptor]) -> u32 {
                 .unwrap_or(u16::MAX)
                 .to_le_bytes(),
         );
+        update_hash(&mut hash, &field.candidates.bits().to_le_bytes());
     }
     hash
 }

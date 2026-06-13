@@ -1,4 +1,4 @@
-use crate::schema::{FieldRole, SchemaDescriptor};
+use crate::schema::{FieldRole, FieldTransform, SchemaDescriptor, TransformCandidates};
 use crate::stats::{FieldStats, IngestStats, PhysicalWidth, RelatedFieldStats};
 use crate::{AuraError, Result};
 
@@ -60,7 +60,12 @@ impl Aura0Plan {
                 .field(descriptor.index)
                 .ok_or(AuraError::InvalidValue("field stats"))?;
             let related = stats.related_field(descriptor.index);
-            fields.push(best_aura0_plan(descriptor.role, field, related));
+            fields.push(best_aura0_plan(
+                descriptor.role,
+                descriptor.candidates,
+                field,
+                related,
+            ));
         }
         Ok(Self { fields })
     }
@@ -108,11 +113,15 @@ impl Aura1Plan {
 
 fn best_aura0_plan(
     role: FieldRole,
+    allowed: TransformCandidates,
     field: &FieldStats,
     related: Option<&RelatedFieldStats>,
 ) -> PhysicalFieldPlan {
     let mut candidates = Vec::new();
-    if role == FieldRole::Timestamp && field.has_implicit_fixed_step() {
+    if role == FieldRole::Timestamp
+        && allowed.contains(FieldTransform::FixedStep)
+        && field.has_implicit_fixed_step()
+    {
         candidates.push(PhysicalFieldPlan {
             field_index: field.field_index,
             encoding: FieldEncoding::ImplicitFixedStep,
@@ -124,21 +133,29 @@ fn best_aura0_plan(
         });
     }
 
-    if let Some(related) = related {
-        candidates.push(PhysicalFieldPlan {
-            field_index: field.field_index,
-            encoding: FieldEncoding::DeltaRelated,
-            width: related.delta_width(),
-            reference_field_index: Some(related.related_field_index),
-            base_value: 0,
-            step: 0,
-            estimated_bytes: related.observed * u64::from(related.delta_width().byte_width()),
-        });
+    if allowed.contains(FieldTransform::DeltaRelated) {
+        if let Some(related) = related {
+            candidates.push(PhysicalFieldPlan {
+                field_index: field.field_index,
+                encoding: FieldEncoding::DeltaRelated,
+                width: related.delta_width(),
+                reference_field_index: Some(related.related_field_index),
+                base_value: 0,
+                step: 0,
+                estimated_bytes: related.observed * u64::from(related.delta_width().byte_width()),
+            });
+        }
     }
 
-    candidates.push(absolute_plan(field));
-    candidates.push(base_delta_plan(field));
-    candidates.push(previous_delta_plan(field));
+    if allowed.contains(FieldTransform::Absolute) {
+        candidates.push(absolute_plan(field));
+    }
+    if allowed.contains(FieldTransform::DeltaBase) {
+        candidates.push(base_delta_plan(field));
+    }
+    if allowed.contains(FieldTransform::DeltaPrevious) {
+        candidates.push(previous_delta_plan(field));
+    }
     candidates
         .into_iter()
         .min_by_key(|plan| (plan.estimated_bytes, encoding_preference(plan.encoding)))

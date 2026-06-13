@@ -8,7 +8,7 @@ use aura_codec::ohlcv::{ohlcv_i64_row, DecimalScales, OhlcvF64, DEFAULT_DECIMAL_
 use aura_codec::records::{
     compile_i64_file, decode_i64_file, encode_ingest_i64_file, I64FileInput,
 };
-use aura_codec::schema::ohlcv_schema;
+use aura_codec::schema::{generic_i64_schema, RelatedFieldMapping};
 use aura_codec::Profile;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -60,7 +60,15 @@ fn main() -> Result<()> {
     }
     rows.sort_by_key(|row| row[0]);
 
-    let schema = ohlcv_schema()?;
+    let schema = generic_i64_schema(
+        "generic_ohlcv_i64_v1",
+        5,
+        &[
+            RelatedFieldMapping::new(2, 1),
+            RelatedFieldMapping::new(3, 1),
+            RelatedFieldMapping::new(4, 1),
+        ],
+    )?;
     let aura = encode_ingest_i64_file(I64FileInput {
         schema,
         rows: rows.clone(),

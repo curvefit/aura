@@ -3,7 +3,9 @@ use crate::chunk::ChunkDescriptor;
 use crate::footer::{CompressionDescriptor, CompressionKind};
 use crate::format::FORMAT_VERSION;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
-use crate::schema::{FieldDescriptor, FieldRelation, FieldRole, FieldType, SchemaDescriptor};
+use crate::schema::{
+    FieldDescriptor, FieldRelation, FieldRole, FieldType, SchemaDescriptor, TransformCandidates,
+};
 use crate::stats::PhysicalWidth;
 use crate::{AuraError, Profile, Result};
 
@@ -467,6 +469,7 @@ fn encode_schema(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Result<()> {
             out,
             field.relation.related_field_index().unwrap_or(u16::MAX),
         );
+        put_u16_le(out, field.candidates.bits());
         put_string(out, &field.name)?;
     }
     Ok(())
@@ -484,6 +487,7 @@ fn decode_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
         let nullable = reader.read_u8()? != 0;
         let relation_kind = reader.read_u8()?;
         let related_field_index = reader.read_u16_le()?;
+        let candidates = TransformCandidates::from_bits(reader.read_u16_le()?)?;
         let name = read_string(reader)?;
         fields.push(FieldDescriptor {
             index,
@@ -492,6 +496,7 @@ fn decode_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
             role,
             nullable,
             relation: FieldRelation::from_codes(relation_kind, related_field_index)?,
+            candidates,
         });
     }
     Ok(SchemaDescriptor {
