@@ -111,20 +111,21 @@ fn best_aura0_plan(
     field: &FieldStats,
     related: Option<&RelatedFieldStats>,
 ) -> PhysicalFieldPlan {
+    let mut candidates = Vec::new();
     if role == FieldRole::Timestamp && field.has_implicit_fixed_step() {
-        return PhysicalFieldPlan {
+        candidates.push(PhysicalFieldPlan {
             field_index: field.field_index,
             encoding: FieldEncoding::ImplicitFixedStep,
             width: PhysicalWidth::Zero,
             reference_field_index: None,
             base_value: field.first_value.unwrap_or(0),
             step: field.fixed_step.unwrap_or(0),
-            estimated_bytes: 16,
-        };
+            estimated_bytes: 0,
+        });
     }
 
     if let Some(related) = related {
-        return PhysicalFieldPlan {
+        candidates.push(PhysicalFieldPlan {
             field_index: field.field_index,
             encoding: FieldEncoding::DeltaRelated,
             width: related.delta_width(),
@@ -132,20 +133,16 @@ fn best_aura0_plan(
             base_value: 0,
             step: 0,
             estimated_bytes: related.observed * u64::from(related.delta_width().byte_width()),
-        };
+        });
     }
 
-    let absolute = absolute_plan(field);
-    let base = base_delta_plan(field);
-    if role == FieldRole::Quantity && base.width < absolute.width {
-        return base;
-    }
-
-    let previous = previous_delta_plan(field);
-    [absolute, base, previous]
+    candidates.push(absolute_plan(field));
+    candidates.push(base_delta_plan(field));
+    candidates.push(previous_delta_plan(field));
+    candidates
         .into_iter()
         .min_by_key(|plan| (plan.estimated_bytes, encoding_preference(plan.encoding)))
-        .unwrap_or(absolute)
+        .unwrap_or_else(|| absolute_plan(field))
 }
 
 fn absolute_plan(field: &FieldStats) -> PhysicalFieldPlan {
@@ -163,7 +160,6 @@ fn absolute_plan(field: &FieldStats) -> PhysicalFieldPlan {
 
 fn previous_delta_plan(field: &FieldStats) -> PhysicalFieldPlan {
     let width = field.delta_width();
-    let first_width = field.absolute_width();
     PhysicalFieldPlan {
         field_index: field.field_index,
         encoding: FieldEncoding::DeltaPrevious,
@@ -171,8 +167,7 @@ fn previous_delta_plan(field: &FieldStats) -> PhysicalFieldPlan {
         reference_field_index: None,
         base_value: field.first_value.unwrap_or(0),
         step: 0,
-        estimated_bytes: u64::from(first_width.byte_width())
-            + field.observed.saturating_sub(1) * u64::from(width.byte_width()),
+        estimated_bytes: field.observed.saturating_sub(1) * u64::from(width.byte_width()),
     }
 }
 
@@ -185,7 +180,7 @@ fn base_delta_plan(field: &FieldStats) -> PhysicalFieldPlan {
         reference_field_index: None,
         base_value: field.base_value(),
         step: 0,
-        estimated_bytes: 8 + field.observed * u64::from(width.byte_width()),
+        estimated_bytes: field.observed * u64::from(width.byte_width()),
     }
 }
 

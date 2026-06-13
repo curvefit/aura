@@ -29,26 +29,26 @@ fn aura0_planner_uses_schema_relationships_and_fixed_step_time() {
         ],
         [
             1_700_000_060_000_000_000,
-            10_003,
-            10_011,
-            9_997,
-            10_004,
+            20_000,
+            20_012,
+            19_995,
+            20_006,
             1_000_007,
         ],
         [
             1_700_000_120_000_000_000,
-            10_001,
-            10_009,
-            9_996,
-            10_002,
+            10_000,
+            10_012,
+            9_995,
+            10_006,
             999_998,
         ],
         [
             1_700_000_180_000_000_000,
-            10_004,
-            10_016,
-            10_000,
-            10_010,
+            20_000,
+            20_012,
+            19_995,
+            20_006,
             1_000_003,
         ],
     ];
@@ -71,8 +71,8 @@ fn aura0_planner_uses_schema_relationships_and_fixed_step_time() {
     assert_eq!(Some(open.index), high_plan.reference_field_index);
     assert_eq!(PhysicalWidth::I8, high_plan.width);
 
-    assert_eq!(FieldEncoding::DeltaBase, volume_plan.encoding);
-    assert_eq!(999_998, volume_plan.base_value);
+    assert_eq!(FieldEncoding::DeltaPrevious, volume_plan.encoding);
+    assert_eq!(1_000_000, volume_plan.base_value);
     assert_eq!(PhysicalWidth::I8, volume_plan.width);
 }
 
@@ -124,4 +124,25 @@ fn aura_footer_preserves_aura0_encoding_parameters() {
             .unwrap()
             .encoding
     );
+}
+
+#[test]
+fn aura0_planner_scores_related_fields_instead_of_forcing_them() {
+    let schema = ohlcv_schema().unwrap();
+    let mut stats = IngestStats::new_for_schema(&schema).unwrap();
+    for row in [
+        [0, 0, 100, 0, 0, 0],
+        [1, 1_000_000, 100, 0, 0, 0],
+        [2, 0, 100, 0, 0, 0],
+        [3, 1_000_000, 100, 0, 0, 0],
+    ] {
+        stats.observe_i64_record(&schema, &row).unwrap();
+    }
+
+    let plan = Aura0Plan::from_schema_stats(&schema, &stats).unwrap();
+    let high_plan = plan.field("high", &schema).unwrap();
+
+    assert_eq!(FieldEncoding::DeltaPrevious, high_plan.encoding);
+    assert_eq!(100, high_plan.base_value);
+    assert!(high_plan.estimated_bytes < 4);
 }
