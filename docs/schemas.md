@@ -15,6 +15,7 @@ field descriptor
   semantic role
   nullable flag
   relationship
+  transform candidates
 ```
 
 `schema_id` is the compact registry key used by the fixed file header. The full
@@ -32,23 +33,31 @@ Starter schema constructors exist for:
 book_delta_v1
 tick_v1
 ohlcv_v1
+generic_i64_schema
 ```
 
-`ohlcv_v1` is intentionally a simple six-field integer schema:
+`generic_i64_schema` is the dumb positional path. It treats field `0` as the
+timestamp by convention, then creates `v1..vN` as generic `i64` values. The
+schema does not need to know that `v1..v5` are open, high, low, close, and
+volume. It only says which positional values are allowed to reference other
+positional values.
 
 ```text
-0 ts_open  timestamp
-1 open     price_anchor
-2 high     price delta_from_field 1
-3 low      price delta_from_field 1
-4 close    price delta_from_field 1
-5 volume   quantity
+0 ts  timestamp
+1 v1  value
+2 v2  value delta_from_field 1
+3 v3  value delta_from_field 1
+4 v4  value delta_from_field 1
+5 v5  value
 ```
 
-The relationship metadata lets Aura0 test encodings such as `high - open`,
-`low - open`, and `close - open` instead of only testing previous-value deltas.
-Timestamps can also be proven implicit when every row advances by the same fixed
-step, such as one-minute OHLCV bars.
+The relationship metadata lets Aura0 test encodings such as `v2 - v1`, `v3 -
+v1`, and `v4 - v1` instead of only testing previous-value deltas. Fields without
+relationships can still test self transforms such as previous-value deltas,
+base deltas, midpoint deltas, delta-of-delta statistics, varints, and bit widths
+when their candidate flags allow those calculations. Timestamps can also be
+proven implicit when every row advances by the same fixed step, such as
+one-minute bars.
 
 The intended plug-in pattern is:
 
@@ -60,8 +69,8 @@ seal footer
 compile to .aura0 or .aura1
 ```
 
-Aura0 planners currently compile these field encodings into field-program
-instructions:
+Schemas declare candidate transforms. Aura0 currently compiles this implemented
+subset into field-program instructions:
 
 ```text
 absolute
@@ -70,6 +79,12 @@ delta_base
 delta_related
 implicit_fixed_step
 ```
+
+The schema may also allow candidate families that are tracked as stats before
+the physical writer grows an emitted representation, such as midpoint,
+delta-of-delta, rough fixed steps, zigzag varints, and bitpacking. Declaring a
+candidate is permission to test it; the planner still chooses empirically from
+the supported reversible encodings.
 
 The `.aura` footer may keep the candidate plan and estimated bytes for audit.
 The compiled `.aura0` or `.aura1` footer stores the smaller decode instruction:

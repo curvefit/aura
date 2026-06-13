@@ -44,15 +44,16 @@ only when their flags are set, encoded with `constant width`.
 
 ## Example
 
-An OHLCV-like integer schema can compile to these instructions:
+An OHLCV-like positional integer schema can compile to these instructions
+without naming OHLCV in the schema:
 
 ```text
-ts_open  op=fixed_step     width=zero  const=i64  base,step
-open     op=delta_previous width=i16   const=i64  base
-high     op=delta_related  width=i16   aux=1
-low      op=delta_related  width=i16   aux=1
-close    op=delta_related  width=i16   aux=1
-volume   op=delta_base     width=i32   const=i64  base
+ts  op=fixed_step     width=zero  const=i64  base,step
+v1  op=delta_previous width=i16   const=i64  base
+v2  op=delta_related  width=i16   aux=1
+v3  op=delta_related  width=i16   aux=1
+v4  op=delta_related  width=i16   aux=1
+v5  op=delta_base     width=i32   const=i64  base
 ```
 
 The file no longer needs to keep min/max ranges or candidate scoring tables in
@@ -78,4 +79,5 @@ schema-declared related-field deltas
 
 The planner scores candidates from those facts and picks the smallest reversible
 instruction. Schema relationships make related deltas possible, but they are not
-forced; if a previous-value delta is smaller, the planner can choose it.
+forced; if a previous-value delta is smaller and the schema allows it, the
+planner can choose it.
