@@ -125,7 +125,7 @@ pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
     }
     let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
     let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
-    let header_len = usize::from(bytes[5]);
+    let header_len = usize::from(bytes[7]);
     if header_len < HEADER_PREFIX_SIZE || header_len > footer_len_offset {
         return Err(AuraError::UnexpectedEof);
     }

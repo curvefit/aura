@@ -1,3 +1,4 @@
+use aura_codec::format::FORMAT_VERSION;
 use aura_codec::schema::ohlcv_schema;
 use aura_codec::{records, AuraError, FieldEncoding, Profile};
 
@@ -41,10 +42,11 @@ fn ingest_header_stores_parent_mapping_before_body() {
     })
     .unwrap();
 
-    let header_len = usize::from(file[5]);
+    let header_len = usize::from(file[7]);
 
     assert_eq!(b"AURA", &file[..4]);
-    assert_eq!(Profile::Ingest as u8, file[4]);
+    assert_eq!(FORMAT_VERSION.to_le_bytes(), file[4..6]);
+    assert_eq!(Profile::Ingest as u8, file[6]);
     assert_eq!(28, header_len);
     assert_eq!(1_000_000_000i64.to_le_bytes(), file[8..16]);
     assert_eq!(1u16.to_le_bytes(), file[16..18]);
@@ -69,7 +71,7 @@ fn ingest_header_stores_comment_after_parent_mapping() {
     })
     .unwrap();
 
-    let header_len = usize::from(file[5]);
+    let header_len = usize::from(file[7]);
 
     assert_eq!(57, header_len);
     assert_eq!(6, file[20]);

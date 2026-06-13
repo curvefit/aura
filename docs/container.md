@@ -18,9 +18,9 @@ is the total front-header size and is the byte offset where the body starts.
 ```text
 offset  size  field
 0       4     magic          AURA
-4       1     profile        ingest | Aura0 | Aura1
-5       1     header_len     total header bytes before body
-6       2     version        format version
+4       2     version        format version
+6       1     profile        ingest | Aura0 | Aura1
+7       1     header_len     total header bytes before body
 8       8     start_time_ns  file-local time anchor
 16      2     stream_id      external stream dictionary key
 18      2     dictionary_id  external dictionary/version key
@@ -37,8 +37,10 @@ The header is write-once. When the file is sealed, the writer appends the
 footer, writes the footer length, and writes the trailing seal magic. No header
 field needs to be patched.
 
-The magic identifies the Aura container family. The `profile` byte identifies
-which public file level the body and footer use.
+The magic identifies the Aura container family. The version is read immediately
+after magic so future versions can define a different header layout before a
+reader interprets profile-specific fields. The `profile` byte identifies which
+public file level the body and footer use.
 
 The front header intentionally stores compact stream IDs rather than strings or
 full schemas. For market data, `stream_id` can resolve through the external

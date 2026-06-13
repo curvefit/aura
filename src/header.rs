@@ -61,9 +61,9 @@ impl AuraHeader {
             .map_err(|_| AuraError::InvalidValue("header comment length"))?;
         let mut out = Vec::with_capacity(usize::from(header_len));
         out.extend_from_slice(AURA_MAGIC);
+        put_u16_le(&mut out, FORMAT_VERSION);
         put_u8(&mut out, self.profile as u8);
         put_u8(&mut out, header_len);
-        put_u16_le(&mut out, FORMAT_VERSION);
         put_i64_le(&mut out, self.base_time_ns);
         put_u16_le(&mut out, self.stream_id);
         put_u16_le(&mut out, self.dictionary_id);
@@ -81,15 +81,15 @@ impl AuraHeader {
         if magic != AURA_MAGIC {
             return Err(AuraError::InvalidMagic { expected: "AURA" });
         }
+        let version = reader.read_u16_le()?;
+        if version != FORMAT_VERSION {
+            return Err(AuraError::UnsupportedVersion(version));
+        }
         let profile_byte = reader.read_u8()?;
         let profile = Profile::from_byte(profile_byte)?;
         let header_len = reader.read_u8()?;
         if usize::from(header_len) != bytes.len() || bytes.len() < HEADER_PREFIX_SIZE {
             return Err(AuraError::InvalidValue("header length"));
-        }
-        let version = reader.read_u16_le()?;
-        if version != FORMAT_VERSION {
-            return Err(AuraError::UnsupportedVersion(version));
         }
         let base_time_ns = reader.read_i64_le()?;
         let stream_id = reader.read_u16_le()?;
@@ -159,7 +159,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(HEADER_PREFIX_SIZE + 3, encoded.len());
-        assert_eq!((HEADER_PREFIX_SIZE + 3) as u8, encoded[5]);
+        assert_eq!((HEADER_PREFIX_SIZE + 3) as u8, encoded[7]);
         assert_eq!(3, encoded[20]);
         assert_eq!(0, encoded[21]);
         assert_eq!(&[0, 0, 2], &encoded[22..25]);
@@ -177,7 +177,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(HEADER_PREFIX_SIZE + 3 + 12, encoded.len());
-        assert_eq!((HEADER_PREFIX_SIZE + 3 + 12) as u8, encoded[5]);
+        assert_eq!((HEADER_PREFIX_SIZE + 3 + 12) as u8, encoded[7]);
         assert_eq!(3, encoded[20]);
         assert_eq!(12, encoded[21]);
         assert_eq!(&[0, 0, 2], &encoded[22..25]);
@@ -188,12 +188,12 @@ mod tests {
     }
 
     #[test]
-    fn header_prefix_uses_family_magic_then_profile_and_length() {
+    fn header_prefix_reads_version_before_profile_and_length() {
         let encoded = AuraHeader::new(Profile::Aura0).encode().unwrap();
 
         assert_eq!(b"AURA", &encoded[..4]);
-        assert_eq!(Profile::Aura0 as u8, encoded[4]);
-        assert_eq!(HEADER_PREFIX_SIZE as u8, encoded[5]);
-        assert_eq!(FORMAT_VERSION.to_le_bytes(), encoded[6..8]);
+        assert_eq!(FORMAT_VERSION.to_le_bytes(), encoded[4..6]);
+        assert_eq!(Profile::Aura0 as u8, encoded[6]);
+        assert_eq!(HEADER_PREFIX_SIZE as u8, encoded[7]);
     }
 }
