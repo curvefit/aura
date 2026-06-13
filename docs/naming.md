@@ -32,5 +32,8 @@ AURA + 1  Aura0 compact physical file
 AURA + 2  Aura1 replay physical file
 ```
 
+Complete files end with a four-byte little-endian footer length followed by the
+eight-byte seal magic `sealed:)`. The seal is a file trailer, not a header field.
+
 There is no `.aura2`. Additional replay layouts belong in `.aura1` header/footer
 metadata, not in new public extensions.

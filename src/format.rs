@@ -5,6 +5,7 @@ pub const AURA_MAGIC: &[u8; 4] = b"AURA";
 pub const INGEST_MAGIC: &[u8; 4] = b"AURA";
 pub const AURA0_MAGIC: &[u8; 4] = b"AUR0";
 pub const AURA1_MAGIC: &[u8; 4] = b"AUR1";
+pub const SEAL_MAGIC: &[u8; 8] = b"sealed:)";
 pub const FORMAT_VERSION: u16 = 1;
 
 pub fn profile_extension(profile: Profile) -> &'static str {

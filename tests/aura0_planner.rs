@@ -113,7 +113,12 @@ fn aura_footer_preserves_aura0_encoding_parameters() {
         .with_aura0_plan(plan);
     let decoded = AuraFooter::decode(&footer.encode().unwrap()).unwrap();
 
-    assert_eq!(footer, decoded);
+    assert_eq!(footer.schema.fields, decoded.schema.fields);
+    assert_eq!(footer.stats, decoded.stats);
+    assert_eq!(footer.compression, decoded.compression);
+    assert_eq!(footer.aura0_plan, decoded.aura0_plan);
+    assert_eq!(footer.aura1_plan, decoded.aura1_plan);
+    assert_eq!(footer.chunks, decoded.chunks);
     assert_eq!(
         FieldEncoding::ImplicitFixedStep,
         decoded

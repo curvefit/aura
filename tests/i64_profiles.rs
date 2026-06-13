@@ -1,5 +1,5 @@
 use aura_codec::schema::ohlcv_schema;
-use aura_codec::{records, FieldEncoding, Profile};
+use aura_codec::{records, AuraError, FieldEncoding, Profile};
 
 fn sample_ohlcv_rows() -> Vec<Vec<i64>> {
     vec![
@@ -7,6 +7,15 @@ fn sample_ohlcv_rows() -> Vec<Vec<i64>> {
         vec![61_000_000_000, 20_000, 20_100, 19_900, 20_050, 525],
         vec![121_000_000_000, 10_000, 10_100, 9_900, 10_050, 510],
     ]
+}
+
+fn read_u32_le(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes.try_into().unwrap())
+}
+
+fn trailer_footer_len(file: &[u8]) -> u32 {
+    let seal_offset = file.len() - 8;
+    read_u32_le(&file[seal_offset - 4..seal_offset])
 }
 
 #[test]
@@ -24,10 +33,13 @@ fn ingest_i64_file_round_trips_rows_and_footer_plans() {
     let decoded = records::decode_i64_file(&file).unwrap();
 
     assert_eq!(Profile::Ingest, decoded.header.profile);
-    assert!(decoded.header.is_sealed());
+    assert_eq!(b"sealed:)", &file[file.len() - 8..]);
+    let footer_end = decoded.header.footer_offset as usize + trailer_footer_len(&file) as usize;
+    assert_eq!(file.len() - 12, footer_end);
     assert_eq!(1, decoded.header.stream_id);
     assert_eq!(7, decoded.header.dictionary_id);
     assert_eq!(1_000_000_000, decoded.header.base_time_ns);
+    assert_eq!(0, decoded.header.schema_hash);
     assert_eq!(rows, decoded.rows);
     let footer = decoded.ingest_footer.as_ref().unwrap();
     assert_eq!(3, footer.stats.record_count);
@@ -40,6 +52,29 @@ fn ingest_i64_file_round_trips_rows_and_footer_plans() {
     assert_eq!(
         FieldEncoding::DeltaRelated,
         plan.field("high", &schema).unwrap().encoding
+    );
+}
+
+#[test]
+fn i64_file_trailer_stores_footer_length_before_seal() {
+    let schema = ohlcv_schema().unwrap();
+    let rows = sample_ohlcv_rows();
+    let file = records::encode_ingest_i64_file(records::I64FileInput {
+        schema,
+        rows,
+        stream_id: 1,
+        dictionary_id: 7,
+    })
+    .unwrap();
+
+    let seal_offset = file.len() - 8;
+    let footer_len_offset = seal_offset - 4;
+    let decoded = records::decode_i64_file(&file).unwrap();
+
+    assert_eq!(b"sealed:)", &file[seal_offset..]);
+    assert_eq!(
+        (footer_len_offset - decoded.header.footer_offset as usize) as u32,
+        read_u32_le(&file[footer_len_offset..seal_offset])
     );
 }
 
@@ -70,7 +105,7 @@ fn compiled_i64_profiles_round_trip_ingest_rows() {
     assert_eq!(rows, decoded_aura0.rows);
     assert_eq!(rows, decoded_aura1.rows);
     assert!(aura0.len() < ingest.len());
-    assert!(decoded_aura0.header.footer_len < 256);
+    assert!(trailer_footer_len(&aura0) < 256);
 }
 
 #[test]
@@ -92,5 +127,26 @@ fn compiled_footer_omits_ingest_stats_and_uses_field_programs() {
     assert_eq!(rows.len() as u64, footer.record_count);
     assert_eq!(6, footer.program.fields.len());
     assert!(footer.program.encoded_len().unwrap() <= 48);
-    assert!(decoded.header.footer_len < 256);
+    assert!(trailer_footer_len(&aura0) < 256);
+}
+
+#[test]
+fn i64_file_decode_requires_trailing_seal_magic() {
+    let schema = ohlcv_schema().unwrap();
+    let rows = sample_ohlcv_rows();
+    let mut file = records::encode_ingest_i64_file(records::I64FileInput {
+        schema,
+        rows,
+        stream_id: 1,
+        dictionary_id: 7,
+    })
+    .unwrap();
+    file.truncate(file.len() - 8);
+
+    assert_eq!(
+        Err(AuraError::InvalidMagic {
+            expected: "sealed:)"
+        }),
+        records::decode_i64_file(&file)
+    );
 }

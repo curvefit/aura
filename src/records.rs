@@ -1,5 +1,6 @@
-use crate::bytes::{put_i64_le, put_u16_le, put_u64_le, ByteReader};
+use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, ByteReader};
 use crate::footer::AuraFooter;
+use crate::format::SEAL_MAGIC;
 use crate::header::{AuraHeader, HEADER_SIZE};
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding};
 use crate::program::{CompiledFooter, DecodeProgram};
@@ -49,7 +50,7 @@ pub fn encode_ingest_i64_file(input: I64FileInput) -> Result<Vec<u8>> {
         input.stream_id,
         input.dictionary_id,
         base_time_ns,
-        u64::from(input.schema.schema_id),
+        0,
         body,
         footer,
     )
@@ -104,26 +105,35 @@ pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>
         decoded.header.stream_id,
         decoded.header.dictionary_id,
         decoded.header.base_time_ns,
-        decoded.header.schema_hash,
+        0,
         body,
         compiled_footer,
     )
 }
 
 pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
-    if bytes.len() < HEADER_SIZE {
+    if bytes.len() < HEADER_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
         return Err(AuraError::UnexpectedEof);
     }
+    let seal_offset = bytes.len() - SEAL_MAGIC.len();
+    if &bytes[seal_offset..] != SEAL_MAGIC {
+        return Err(AuraError::InvalidMagic {
+            expected: "sealed:)",
+        });
+    }
+    let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
+    let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
     let header = AuraHeader::decode(&bytes[..HEADER_SIZE])?;
     let footer_offset = usize::try_from(header.footer_offset)
         .map_err(|_| AuraError::InvalidValue("footer offset"))?;
-    let footer_len =
-        usize::try_from(header.footer_len).map_err(|_| AuraError::InvalidValue("footer length"))?;
     let footer_end = footer_offset
         .checked_add(footer_len)
         .ok_or(AuraError::UnexpectedEof)?;
-    if footer_offset < HEADER_SIZE || footer_end > bytes.len() {
+    if footer_offset < HEADER_SIZE || footer_end > footer_len_offset {
         return Err(AuraError::UnexpectedEof);
+    }
+    if footer_end < footer_len_offset {
+        return Err(AuraError::TrailingBytes(footer_len_offset - footer_end));
     }
     let body = &bytes[HEADER_SIZE..footer_offset];
     match header.profile {
@@ -178,6 +188,21 @@ pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
     }
 }
 
+const FOOTER_LEN_SIZE: usize = 4;
+
+fn read_trailer_footer_len(bytes: &[u8], offset: usize) -> Result<usize> {
+    let end = offset
+        .checked_add(FOOTER_LEN_SIZE)
+        .ok_or(AuraError::UnexpectedEof)?;
+    let footer_len_bytes = bytes.get(offset..end).ok_or(AuraError::UnexpectedEof)?;
+    Ok(u32::from_le_bytes([
+        footer_len_bytes[0],
+        footer_len_bytes[1],
+        footer_len_bytes[2],
+        footer_len_bytes[3],
+    ]) as usize)
+}
+
 impl DecodedI64File {
     fn aura0_plan(&self) -> Result<Aura0Plan> {
         if let Some(footer) = &self.ingest_footer {
@@ -223,15 +248,19 @@ fn encode_file(
         .ok_or(AuraError::InvalidValue("footer offset"))?;
     let footer_len =
         u32::try_from(footer_bytes.len()).map_err(|_| AuraError::InvalidValue("footer length"))?;
-    let header = AuraHeader::new(profile, footer.schema.schema_id)
+    let header = AuraHeader::new(profile)
         .with_stream(stream_id, dictionary_id, base_time_ns)
         .with_schema_hash(schema_hash)
-        .with_footer(footer_offset as u64, footer_len);
+        .with_footer_offset(footer_offset as u64);
 
-    let mut out = Vec::with_capacity(HEADER_SIZE + body.len() + footer_bytes.len());
+    let mut out = Vec::with_capacity(
+        HEADER_SIZE + body.len() + footer_bytes.len() + FOOTER_LEN_SIZE + SEAL_MAGIC.len(),
+    );
     out.extend_from_slice(&header.encode());
     out.extend_from_slice(&body);
     out.extend_from_slice(&footer_bytes);
+    put_u32_le(&mut out, footer_len);
+    out.extend_from_slice(SEAL_MAGIC);
     Ok(out)
 }
 
@@ -250,15 +279,19 @@ fn encode_compiled_file(
         .ok_or(AuraError::InvalidValue("footer offset"))?;
     let footer_len =
         u32::try_from(footer_bytes.len()).map_err(|_| AuraError::InvalidValue("footer length"))?;
-    let header = AuraHeader::new(profile, footer.schema.schema_id)
+    let header = AuraHeader::new(profile)
         .with_stream(stream_id, dictionary_id, base_time_ns)
         .with_schema_hash(schema_hash)
-        .with_footer(footer_offset as u64, footer_len);
+        .with_footer_offset(footer_offset as u64);
 
-    let mut out = Vec::with_capacity(HEADER_SIZE + body.len() + footer_bytes.len());
+    let mut out = Vec::with_capacity(
+        HEADER_SIZE + body.len() + footer_bytes.len() + FOOTER_LEN_SIZE + SEAL_MAGIC.len(),
+    );
     out.extend_from_slice(&header.encode());
     out.extend_from_slice(&body);
     out.extend_from_slice(&footer_bytes);
+    put_u32_le(&mut out, footer_len);
+    out.extend_from_slice(SEAL_MAGIC);
     Ok(out)
 }
 

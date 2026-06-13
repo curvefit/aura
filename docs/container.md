@@ -6,6 +6,8 @@ Aura files use one container shape across all public levels:
 Header
 Body
 Footer
+FooterLen
+Seal
 ```
 
 ## Header
@@ -17,29 +19,29 @@ magic           AURA
 profile         ingest | Aura0 | Aura1
 header_len      fixed header size
 version         format version
-schema_id       logical schema registry key
-flags           sealed/open state
+reserved        zero
+reserved        zero
 base_time_ns    file-local time anchor
 stream_id       external stream dictionary key
 dictionary_id   external dictionary/version key
-schema_hash     resolved schema guardrail, zero if unavailable
+schema_hash     embedded schema guardrail, zero if unavailable
 footer_offset   zero while open, patched when sealed
-footer_len      zero while open, patched when sealed
+reserved        zero
 reserved
 ```
 
 Open writers use zero footer pointers. When the file is sealed, the writer
-appends the footer and patches the header pointer.
+appends the footer, patches the header pointer, writes the footer length, and
+writes the trailing seal magic.
 
 The magic identifies the Aura container family. The `profile` byte identifies
 which public file level the body and footer use.
 
-The fixed header intentionally stores compact registry IDs rather than strings
-or variable schemas. For market data, `stream_id` can resolve through the
-external dictionary to the venue, market type, exchange symbol, base, quote,
-contract type, tick size, and quantity step. `schema_id` is the fast parser
-lookup. `schema_hash` lets a reader reject a stale registry entry if the schema
-ID resolves to different fields than the file was written with.
+The fixed header intentionally stores compact stream IDs rather than strings or
+variable schemas. For market data, `stream_id` can resolve through the external
+dictionary to the venue, market type, exchange symbol, base, quote, contract
+type, tick size, and quantity step. Schema identity lives in the footer schema
+block; `schema_hash` is only a guardrail for checking that embedded schema copy.
 
 ## Body
 
@@ -62,7 +64,7 @@ body. Ingest and compiled files intentionally use different footer payloads.
 An `.aura` ingest footer keeps the calculation evidence used while sealing:
 
 ```text
-schema descriptor
+schema block
 ingest stats
 compression descriptor
 Aura0 physical plan
@@ -80,15 +82,22 @@ compression descriptor
 profile
 record_count
 block_capacity
-schema descriptor
+schema block
 decode program
 chunk table
 ```
 
-The schema descriptor is the self-describing archive copy of the raw logical
-schema. A reader should use the header `schema_id` for fast-path parser lookup
-when its registry is available, then use the footer schema as the durable source
-of truth for unknown schemas, validation, and conversion.
+The schema block is a length-prefixed, self-describing archive copy of the
+logical field layout:
+
+```text
+schema_len       u32 little-endian
+schema_encoding  schema_len bytes
+```
+
+The schema encoding does not store a schema ID or schema name. A reader uses the
+footer schema block as the durable source of truth for unknown schemas,
+validation, and conversion.
 
 The compiled decode program is a field-index ordered list of small instructions.
 Each field starts with a `u16` code:
@@ -112,3 +121,18 @@ step`.
 The footer is what makes conversion deterministic. A converter can read the
 header, jump to the footer, run the field program, and then process chunks
 without re-reading source payloads to discover ranges or group shapes.
+
+## Footer length and seal
+
+The last twelve bytes of a complete file store the footer length followed by the
+seal:
+
+```text
+footer_len  u32 little-endian
+sealed:)
+```
+
+The seal is the final eight bytes. `footer_len` is stored immediately before the
+seal and is not part of the footer itself. A reader can reject a file whose last
+eight bytes do not match the seal magic, then use the preceding length to find
+the footer.

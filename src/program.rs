@@ -3,9 +3,7 @@ use crate::chunk::ChunkDescriptor;
 use crate::footer::{CompressionDescriptor, CompressionKind};
 use crate::format::FORMAT_VERSION;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
-use crate::schema::{
-    FieldDescriptor, FieldRelation, FieldRole, FieldType, SchemaDescriptor, TransformCandidates,
-};
+use crate::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
 use crate::stats::PhysicalWidth;
 use crate::{AuraError, Profile, Result};
 
@@ -367,7 +365,7 @@ impl CompiledFooter {
         put_u8(&mut out, self.profile as u8);
         put_u64_le(&mut out, self.record_count);
         put_u16_le(&mut out, self.block_capacity);
-        encode_schema(&self.schema, &mut out)?;
+        encode_schema_block(&self.schema, &mut out)?;
         self.program.encode_to(&mut out)?;
         encode_chunks(&self.chunks, &mut out)?;
         Ok(out)
@@ -392,7 +390,7 @@ impl CompiledFooter {
         }
         let record_count = reader.read_u64_le()?;
         let block_capacity = reader.read_u16_le()?;
-        let schema = decode_schema(&mut reader)?;
+        let schema = decode_schema_block(&mut reader)?;
         let program = DecodeProgram::decode_from(&mut reader)?;
         let chunks = decode_chunks(&mut reader)?;
         reader.finish()?;
@@ -455,57 +453,6 @@ fn read_const(reader: &mut ByteReader<'_>, width: PhysicalWidth) -> Result<i64> 
     }
 }
 
-fn encode_schema(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Result<()> {
-    put_u32_le(out, schema.schema_id);
-    put_string(out, &schema.name)?;
-    put_u16_len(out, schema.fields.len(), "schema field count")?;
-    for field in &schema.fields {
-        put_u16_le(out, field.index);
-        put_u8(out, field.field_type as u8);
-        put_u8(out, field.role as u8);
-        put_u8(out, field.nullable as u8);
-        put_u8(out, field.relation.kind_code());
-        put_u16_le(
-            out,
-            field.relation.related_field_index().unwrap_or(u16::MAX),
-        );
-        put_u16_le(out, field.candidates.bits());
-        put_string(out, &field.name)?;
-    }
-    Ok(())
-}
-
-fn decode_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
-    let schema_id = reader.read_u32_le()?;
-    let name = read_string(reader)?;
-    let field_count = reader.read_u16_le()? as usize;
-    let mut fields = Vec::with_capacity(field_count);
-    for _ in 0..field_count {
-        let index = reader.read_u16_le()?;
-        let field_type = FieldType::from_code(reader.read_u8()?)?;
-        let role = FieldRole::from_code(reader.read_u8()?)?;
-        let nullable = reader.read_u8()? != 0;
-        let relation_kind = reader.read_u8()?;
-        let related_field_index = reader.read_u16_le()?;
-        let candidates = TransformCandidates::from_bits(reader.read_u16_le()?)?;
-        let name = read_string(reader)?;
-        fields.push(FieldDescriptor {
-            index,
-            name,
-            field_type,
-            role,
-            nullable,
-            relation: FieldRelation::from_codes(relation_kind, related_field_index)?,
-            candidates,
-        });
-    }
-    Ok(SchemaDescriptor {
-        schema_id,
-        name,
-        fields,
-    })
-}
-
 fn encode_chunks(chunks: &[ChunkDescriptor], out: &mut Vec<u8>) -> Result<()> {
     put_u32_len(out, chunks.len(), "chunk count")?;
     for chunk in chunks {
@@ -543,20 +490,6 @@ fn decode_chunks(reader: &mut ByteReader<'_>) -> Result<Vec<ChunkDescriptor>> {
         });
     }
     Ok(chunks)
-}
-
-fn put_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
-    put_u16_len(out, value.len(), "string length")?;
-    out.extend_from_slice(value.as_bytes());
-    Ok(())
-}
-
-fn read_string(reader: &mut ByteReader<'_>) -> Result<String> {
-    let len = reader.read_u16_le()? as usize;
-    let bytes = reader.read_exact(len)?;
-    std::str::from_utf8(bytes)
-        .map(|value| value.to_owned())
-        .map_err(|_| AuraError::InvalidValue("utf8 string"))
 }
 
 fn put_u16_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> {

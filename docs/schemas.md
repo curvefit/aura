@@ -3,10 +3,34 @@
 Aura schemas describe logical records. They are separate from physical layout.
 
 ```text
-schema descriptor
-  name
-  schema_id
-  fields[]
+schema block
+  schema_len       u32 little-endian
+  schema_encoding  schema_len bytes
+```
+
+The footer schema block does not store a schema ID or schema name. The footer
+schema encoding is the archive copy that keeps a file readable without the
+external registry.
+
+Schema encoding type `0` is the compact parent-vector form for positional
+generic i64 records:
+
+```text
+descriptor_type  u8 = 0
+slot_count       u8
+parent_slots     slot_count bytes
+```
+
+Slot `0` is the timestamp by convention. Slots `1..N` are generic `i64` values.
+Each parent byte is one-based: `0` means no parent, and `N` means the parent is
+slot `N - 1`.
+
+Schema encoding type `1` is the full field-descriptor fallback for richer
+schemas:
+
+```text
+descriptor_type  u8 = 1
+field_count      u16 little-endian
 
 field descriptor
   index
@@ -17,11 +41,6 @@ field descriptor
   relationship
   transform candidates
 ```
-
-`schema_id` is the compact registry key used by the fixed file header. The full
-schema descriptor is still written into the footer so a file remains readable
-without the external registry and so registry lookups can be checked against the
-embedded schema.
 
 Collectors should write normalized `.aura` ingest values using generous integer
 types. The schema tells Aura what those values mean; ingest stats tell Aura how
@@ -34,6 +53,7 @@ book_delta_v1
 tick_v1
 ohlcv_v1
 generic_i64_schema
+generic_i64_parent_schema
 ```
 
 `generic_i64_schema` is the dumb positional path. It treats field `0` as the
@@ -58,6 +78,30 @@ base deltas, midpoint deltas, delta-of-delta statistics, varints, and bit widths
 when their candidate flags allow those calculations. Timestamps can also be
 proven implicit when every row advances by the same fixed step, such as
 one-minute bars.
+
+`generic_i64_parent_schema` is the compact parent-vector path for dynamic
+OHLCV-like records. The vector includes the timestamp slot. Each byte is
+one-based: `0` means no parent, and `N` means the parent is slot `N - 1`.
+
+```text
+slots:
+0 ts
+1 open
+2 high
+3 low
+4 close
+5 volume
+6 taker_buy
+7 taker_sell
+
+parents:
+0 0 2 2 2 0 6 6
+```
+
+This says high, low, and close may delta from open; taker buy and taker sell may
+delta from volume. The codec still chooses the actual physical encoding from
+stats. The parent vector is only relationship evidence, not a command to force
+a related delta.
 
 The intended plug-in pattern is:
 

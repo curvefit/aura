@@ -2,9 +2,7 @@ use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, put_u8, ByteR
 use crate::chunk::ChunkDescriptor;
 use crate::format::FORMAT_VERSION;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
-use crate::schema::{
-    FieldDescriptor, FieldRelation, FieldRole, FieldType, SchemaDescriptor, TransformCandidates,
-};
+use crate::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
 use crate::stats::{
     FieldStats, FieldStatsSummary, IngestStats, PhysicalWidth, RelatedFieldStats,
     RunHistogramEntry, ShapeStats,
@@ -101,7 +99,7 @@ impl AuraFooter {
         put_u16_le(&mut out, FORMAT_VERSION);
         put_u8(&mut out, self.compression.kind as u8);
         put_u8(&mut out, self.compression.level);
-        encode_schema(&self.schema, &mut out)?;
+        encode_schema_block(&self.schema, &mut out)?;
         encode_stats(&self.stats, &mut out)?;
         encode_plans(self, &mut out)?;
         encode_chunks(&self.chunks, &mut out)?;
@@ -121,7 +119,7 @@ impl AuraFooter {
             kind: CompressionKind::from_code(reader.read_u8()?)?,
             level: reader.read_u8()?,
         };
-        let schema = decode_schema(&mut reader)?;
+        let schema = decode_schema_block(&mut reader)?;
         let stats = decode_stats(&mut reader)?;
         let (aura0_plan, aura1_plan) = decode_plans(&mut reader)?;
         let chunks = decode_chunks(&mut reader)?;
@@ -136,57 +134,6 @@ impl AuraFooter {
             chunks,
         })
     }
-}
-
-fn encode_schema(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Result<()> {
-    put_u32_le(out, schema.schema_id);
-    put_string(out, &schema.name)?;
-    put_u16_len(out, schema.fields.len(), "schema field count")?;
-    for field in &schema.fields {
-        put_u16_le(out, field.index);
-        put_u8(out, field.field_type as u8);
-        put_u8(out, field.role as u8);
-        put_u8(out, field.nullable as u8);
-        put_u8(out, field.relation.kind_code());
-        put_u16_le(
-            out,
-            field.relation.related_field_index().unwrap_or(u16::MAX),
-        );
-        put_u16_le(out, field.candidates.bits());
-        put_string(out, &field.name)?;
-    }
-    Ok(())
-}
-
-fn decode_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
-    let schema_id = reader.read_u32_le()?;
-    let name = read_string(reader)?;
-    let field_count = reader.read_u16_le()? as usize;
-    let mut fields = Vec::with_capacity(field_count);
-    for _ in 0..field_count {
-        let index = reader.read_u16_le()?;
-        let field_type = FieldType::from_code(reader.read_u8()?)?;
-        let role = FieldRole::from_code(reader.read_u8()?)?;
-        let nullable = reader.read_u8()? != 0;
-        let relation_kind = reader.read_u8()?;
-        let related_field_index = reader.read_u16_le()?;
-        let candidates = TransformCandidates::from_bits(reader.read_u16_le()?)?;
-        let name = read_string(reader)?;
-        fields.push(FieldDescriptor {
-            index,
-            name,
-            field_type,
-            role,
-            nullable,
-            relation: FieldRelation::from_codes(relation_kind, related_field_index)?,
-            candidates,
-        });
-    }
-    Ok(SchemaDescriptor {
-        schema_id,
-        name,
-        fields,
-    })
 }
 
 fn encode_stats(stats: &IngestStats, out: &mut Vec<u8>) -> Result<()> {
@@ -415,20 +362,6 @@ fn decode_chunks(reader: &mut ByteReader<'_>) -> Result<Vec<ChunkDescriptor>> {
     Ok(chunks)
 }
 
-fn put_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
-    put_u16_len(out, value.len(), "string length")?;
-    out.extend_from_slice(value.as_bytes());
-    Ok(())
-}
-
-fn read_string(reader: &mut ByteReader<'_>) -> Result<String> {
-    let len = reader.read_u16_le()? as usize;
-    let bytes = reader.read_exact(len)?;
-    std::str::from_utf8(bytes)
-        .map(|value| value.to_owned())
-        .map_err(|_| AuraError::InvalidValue("utf8 string"))
-}
-
 fn put_u16_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> {
     let len = u16::try_from(len).map_err(|_| AuraError::InvalidValue(name))?;
     put_u16_le(out, len);
@@ -477,6 +410,11 @@ mod tests {
         let encoded = footer.encode().unwrap();
         let decoded = AuraFooter::decode(&encoded).unwrap();
 
-        assert_eq!(footer, decoded);
+        assert_eq!(footer.schema.fields, decoded.schema.fields);
+        assert_eq!(footer.stats, decoded.stats);
+        assert_eq!(footer.compression, decoded.compression);
+        assert_eq!(footer.aura0_plan, decoded.aura0_plan);
+        assert_eq!(footer.aura1_plan, decoded.aura1_plan);
+        assert_eq!(footer.chunks, decoded.chunks);
     }
 }

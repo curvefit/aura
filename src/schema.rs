@@ -1,6 +1,11 @@
 use std::collections::BTreeSet;
 
+use crate::bytes::{put_u16_le, put_u32_le, put_u8, ByteReader};
 use crate::{AuraError, Result};
+
+const SCHEMA_ENCODING_PARENT_VECTOR: u8 = 0;
+const SCHEMA_ENCODING_FULL_FIELDS: u8 = 1;
+const DECODED_SCHEMA_NAME: &str = "schema";
 
 /// Logical field type recorded by an Aura schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -410,6 +415,188 @@ pub fn generic_i64_schema(
         );
     }
     builder.finish()
+}
+
+/// Build a positional i64 schema from one-based parent bytes.
+///
+/// `parent_slots[0]` describes the timestamp slot. Every later slot is a
+/// generic `i64` value. A parent byte of `0` means no related-field delta
+/// candidate; a parent byte of `N` means the slot may delta from slot `N - 1`.
+pub fn generic_i64_parent_schema(name: &str, parent_slots: &[u8]) -> Result<SchemaDescriptor> {
+    if parent_slots.is_empty() || parent_slots.len() > u16::MAX as usize {
+        return Err(AuraError::InvalidValue("parent slot count"));
+    }
+    let mut mappings = Vec::new();
+    for (field_index, parent_slot) in parent_slots.iter().copied().enumerate() {
+        if parent_slot == 0 {
+            continue;
+        }
+        let parent_index = usize::from(parent_slot - 1);
+        if parent_index >= field_index {
+            return Err(AuraError::InvalidValue("parent slot"));
+        }
+        mappings.push(RelatedFieldMapping::new(
+            field_index as u16,
+            parent_index as u16,
+        ));
+    }
+    generic_i64_schema(name, parent_slots.len() as u16 - 1, &mappings)
+}
+
+pub(crate) fn encode_schema_block(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Result<()> {
+    let mut schema_encoding = Vec::new();
+    if let Some(parent_slots) = parent_slots_for_generic_i64_schema(schema) {
+        put_u8(&mut schema_encoding, SCHEMA_ENCODING_PARENT_VECTOR);
+        put_u8(&mut schema_encoding, parent_slots.len() as u8);
+        schema_encoding.extend_from_slice(&parent_slots);
+    } else {
+        encode_full_field_schema(schema, &mut schema_encoding)?;
+    }
+
+    put_u32_len(out, schema_encoding.len(), "schema length")?;
+    out.extend_from_slice(&schema_encoding);
+    Ok(())
+}
+
+pub(crate) fn decode_schema_block(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
+    let schema_len = reader.read_u32_le()? as usize;
+    let schema_bytes = reader.read_exact(schema_len)?;
+    let mut schema_reader = ByteReader::new(schema_bytes);
+    let schema = match schema_reader.read_u8()? {
+        SCHEMA_ENCODING_PARENT_VECTOR => decode_parent_vector_schema(&mut schema_reader)?,
+        SCHEMA_ENCODING_FULL_FIELDS => decode_full_field_schema(&mut schema_reader)?,
+        _ => return Err(AuraError::InvalidValue("schema encoding")),
+    };
+    schema_reader.finish()?;
+    Ok(schema)
+}
+
+fn parent_slots_for_generic_i64_schema(schema: &SchemaDescriptor) -> Option<Vec<u8>> {
+    if schema.fields.is_empty() || schema.fields.len() > u8::MAX as usize {
+        return None;
+    }
+
+    let mut parent_slots = Vec::with_capacity(schema.fields.len());
+    for (index, field) in schema.fields.iter().enumerate() {
+        if field.index != index as u16 || field.nullable {
+            return None;
+        }
+        if index == 0 {
+            if field.name != "ts"
+                || field.field_type != FieldType::TimestampNs
+                || field.role != FieldRole::Timestamp
+                || field.relation != FieldRelation::None
+            {
+                return None;
+            }
+            parent_slots.push(0);
+            continue;
+        }
+
+        if field.name != format!("v{index}")
+            || field.field_type != FieldType::I64
+            || field.role != FieldRole::Value
+        {
+            return None;
+        }
+
+        let parent_slot = match field.relation {
+            FieldRelation::None => 0,
+            FieldRelation::DeltaFromField(parent_index) => {
+                if parent_index as usize >= index {
+                    return None;
+                }
+                u8::try_from(parent_index + 1).ok()?
+            }
+        };
+        parent_slots.push(parent_slot);
+    }
+
+    Some(parent_slots)
+}
+
+fn decode_parent_vector_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
+    let slot_count = reader.read_u8()? as usize;
+    let parent_slots = reader.read_exact(slot_count)?;
+    generic_i64_parent_schema(DECODED_SCHEMA_NAME, parent_slots)
+}
+
+fn encode_full_field_schema(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Result<()> {
+    put_u8(out, SCHEMA_ENCODING_FULL_FIELDS);
+    put_u16_len(out, schema.fields.len(), "schema field count")?;
+    for field in &schema.fields {
+        put_u16_le(out, field.index);
+        put_u8(out, field.field_type as u8);
+        put_u8(out, field.role as u8);
+        put_u8(out, field.nullable as u8);
+        put_u8(out, field.relation.kind_code());
+        put_u16_le(
+            out,
+            field.relation.related_field_index().unwrap_or(u16::MAX),
+        );
+        put_u16_le(out, field.candidates.bits());
+        put_string(out, &field.name)?;
+    }
+    Ok(())
+}
+
+fn decode_full_field_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
+    let field_count = reader.read_u16_le()? as usize;
+    let mut fields = Vec::with_capacity(field_count);
+    for _ in 0..field_count {
+        let index = reader.read_u16_le()?;
+        let field_type = FieldType::from_code(reader.read_u8()?)?;
+        let role = FieldRole::from_code(reader.read_u8()?)?;
+        let nullable = reader.read_u8()? != 0;
+        let relation_kind = reader.read_u8()?;
+        let related_field_index = reader.read_u16_le()?;
+        let candidates = TransformCandidates::from_bits(reader.read_u16_le()?)?;
+        let name = read_string(reader)?;
+        fields.push(FieldDescriptor {
+            index,
+            name,
+            field_type,
+            role,
+            nullable,
+            relation: FieldRelation::from_codes(relation_kind, related_field_index)?,
+            candidates,
+        });
+    }
+    Ok(schema_from_fields(DECODED_SCHEMA_NAME, fields))
+}
+
+fn schema_from_fields(name: &str, fields: Vec<FieldDescriptor>) -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: schema_hash(name, &fields),
+        name: name.to_owned(),
+        fields,
+    }
+}
+
+fn put_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
+    put_u16_len(out, value.len(), "string length")?;
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn read_string(reader: &mut ByteReader<'_>) -> Result<String> {
+    let len = reader.read_u16_le()? as usize;
+    let bytes = reader.read_exact(len)?;
+    std::str::from_utf8(bytes)
+        .map(|value| value.to_owned())
+        .map_err(|_| AuraError::InvalidValue("utf8 string"))
+}
+
+fn put_u16_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> {
+    let len = u16::try_from(len).map_err(|_| AuraError::InvalidValue(name))?;
+    put_u16_le(out, len);
+    Ok(())
+}
+
+fn put_u32_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> {
+    let len = u32::try_from(len).map_err(|_| AuraError::InvalidValue(name))?;
+    put_u32_le(out, len);
+    Ok(())
 }
 
 pub fn book_delta_schema() -> Result<SchemaDescriptor> {
