@@ -54,7 +54,9 @@ are file-level facts recorded in the footer.
 ## Footer
 
 The footer stores the facts readers and converters need before replaying the
-body:
+body. Ingest and compiled files intentionally use different footer payloads.
+
+An `.aura` ingest footer keeps the calculation evidence used while sealing:
 
 ```text
 schema descriptor
@@ -65,27 +67,45 @@ Aura1 physical plan
 chunk table
 ```
 
+A compiled `.aura0` or `.aura1` footer stores only the selected decode program
+and replay metadata, not the ingest stats:
+
+```text
+magic AURP
+version
+compression descriptor
+profile
+record_count
+block_capacity
+schema descriptor
+decode program
+chunk table
+```
+
 The schema descriptor is the self-describing archive copy of the raw logical
 schema. A reader should use the header `schema_id` for fast-path parser lookup
 when its registry is available, then use the footer schema as the durable source
 of truth for unknown schemas, validation, and conversion.
 
-Aura0 field plans are footer-visible. A field plan records:
+The compiled decode program is a field-index ordered list of small instructions.
+Each field starts with a `u16` code:
 
 ```text
-field_index
-encoding
-width
-reference_field_index
-base_value
-step
-estimated_bytes
+bits 0..4    op: absolute | delta_base | delta_previous | delta_related | fixed_step
+bits 5..7    stored value width: zero | i8 | i16 | i32 | i64
+bits 8..10   constant width: zero | i8 | i16 | i32 | i64
+bits 11..13  aux: inline related field index, or 7 for extended aux
+bit 14       has base constant
+bit 15       has step constant
 ```
 
-That is enough to represent base deltas for stable values, related-field deltas
-for schemas such as OHLCV, and implicit fixed-step timestamps where the per-row
-timestamp is reconstructed from `base_value + row_index * step`.
+Optional extras follow only when the code asks for them: an extended `u16`
+reference field, a base constant, and a step constant. That keeps common fields
+to two bytes of instruction data while still representing base deltas,
+previous-value deltas, related-field deltas, and implicit fixed-step timestamps
+where the per-row timestamp is reconstructed from `base_value + row_index *
+step`.
 
 The footer is what makes conversion deterministic. A converter can read the
-header, jump to the footer, select the compiled physical plan, and then process
-chunks without re-reading source payloads to discover ranges or group shapes.
+header, jump to the footer, run the field program, and then process chunks
+without re-reading source payloads to discover ranges or group shapes.

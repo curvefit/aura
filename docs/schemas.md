@@ -60,7 +60,8 @@ seal footer
 compile to .aura0 or .aura1
 ```
 
-Aura0 planners currently represent these field encodings in the footer:
+Aura0 planners currently compile these field encodings into field-program
+instructions:
 
 ```text
 absolute
@@ -70,8 +71,9 @@ delta_related
 implicit_fixed_step
 ```
 
-Each chosen field plan stores the selected width, optional related field, base
-value, fixed step, and estimated encoded bytes.
+The `.aura` footer may keep the candidate plan and estimated bytes for audit.
+The compiled `.aura0` or `.aura1` footer stores the smaller decode instruction:
+operation code, value width, optional related field, and optional constants.
 
 During `.aura` ingest, each integer column keeps the calculation facts needed to
 score more Aura0 candidates later:
@@ -91,7 +93,8 @@ related-field delta ranges
 ```
 
 These calculations are column-local except related-field deltas, which are driven
-by the schema relationship metadata.
+by the schema relationship metadata. They are inputs to a seal-time planner, not
+state that every compiled file must retain.
 
 Snapshot-style schemas are expected to be separate logical schemas or explicit
 record kinds. They should not be forced into the delta schema just because both

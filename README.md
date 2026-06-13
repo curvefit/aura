@@ -9,8 +9,9 @@ The public model is intentionally generic:
 - `.aura` stores normalized logical facts with generous integer fields and
   footer optimization stats when available,
 - a schema defines what a record means and what stats should be tracked,
-- `.aura0` is the compact compiled level,
-- `.aura1` is the replay-optimized compiled level,
+- `.aura0` is the compact compiled level with code-only decode instructions,
+- `.aura1` is the replay-optimized compiled level with code-only decode
+  instructions,
 - `.aura`, `.aura0`, and `.aura1` can round-trip through the same logical event
   stream even when a derived `.aura` has to recompute footer stats.
 
@@ -19,8 +20,8 @@ The public model is intentionally generic:
 | File | Level | Purpose |
 |---:|---|---|
 | `.aura` | Intermediate | Normalized facts plus seal-time optimization stats when known. |
-| `.aura0` | Aura0 | Compact cold encoding compiled from ingest stats. |
-| `.aura1` | Aura1 | Replay-optimized fixed/block encoding compiled from ingest stats. |
+| `.aura0` | Aura0 | Compact cold encoding compiled from ingest stats into per-field instructions. |
+| `.aura1` | Aura1 | Replay-optimized fixed/block encoding compiled from ingest stats into per-field instructions. |
 
 The levels trade disk for parsing speed. Live collectors normally write `.aura`
 first because it is the easiest place to collect footer stats, but `.aura` is
@@ -46,6 +47,7 @@ payload samples, or production capture logic.
 
 - [Format levels](docs/tiers.md) explains ingest, Aura0, and Aura1.
 - [Aura container](docs/container.md) explains the header/body/footer shape.
+- [Field programs](docs/field-programs.md) explains compact decode instructions.
 - [Schemas](docs/schemas.md) explains logical schema construction.
 - [Chunked storage](docs/chunking.md) explains independent compression chunks.
 - [Compression policy](docs/compression.md) explains why chunks beat whole-file streams.

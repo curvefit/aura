@@ -19,7 +19,8 @@ smallest or fastest replay shape.
 
 ## `.aura0`: compact
 
-`.aura0` is compiled from `.aura` stats for cold storage.
+`.aura0` is compiled from `.aura` stats for cold storage. The compiled footer
+stores the resulting decode program, not the full stats table.
 
 - integer widths are selected from observed ranges and deltas,
 - signed deltas use zigzag-compatible planning,
@@ -31,7 +32,9 @@ logical stream.
 
 ## `.aura1`: replay
 
-`.aura1` is compiled from `.aura` stats for fast replay.
+`.aura1` is compiled from `.aura` stats for fast replay. The compiled footer
+uses the same field-program idea, but the body favors fixed or block-friendly
+records over maximum compression.
 
 - excessive `i64` fields are shrunk when stats prove a smaller width is safe,
 - records use fixed-width headers and slots,
