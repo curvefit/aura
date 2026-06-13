@@ -1,5 +1,5 @@
 use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, put_u8, ByteReader};
-use crate::format::{AURA0_MAGIC, AURA1_MAGIC, FORMAT_VERSION, INGEST_MAGIC};
+use crate::format::{AURA_MAGIC, FORMAT_VERSION};
 use crate::{AuraError, Profile, Result};
 
 pub const HEADER_SIZE: usize = 56;
@@ -64,10 +64,10 @@ impl AuraHeader {
 
     pub fn encode(self) -> [u8; HEADER_SIZE] {
         let mut out = Vec::with_capacity(HEADER_SIZE);
-        out.extend_from_slice(magic_for_profile(self.profile));
-        put_u16_le(&mut out, FORMAT_VERSION);
+        out.extend_from_slice(AURA_MAGIC);
         put_u8(&mut out, self.profile as u8);
         put_u8(&mut out, HEADER_SIZE as u8);
+        put_u16_le(&mut out, FORMAT_VERSION);
         put_u32_le(&mut out, self.schema_id);
         put_u32_le(&mut out, self.flags);
         put_i64_le(&mut out, self.base_time_ns);
@@ -87,18 +87,18 @@ impl AuraHeader {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut reader = ByteReader::new(bytes);
         let magic = reader.read_exact(4)?;
-        let profile = profile_from_magic(magic)?;
-        let version = reader.read_u16_le()?;
-        if version != FORMAT_VERSION {
-            return Err(AuraError::UnsupportedVersion(version));
+        if magic != AURA_MAGIC {
+            return Err(AuraError::InvalidMagic { expected: "AURA" });
         }
         let profile_byte = reader.read_u8()?;
-        if Profile::from_byte(profile_byte)? != profile {
-            return Err(AuraError::InvalidValue("profile magic mismatch"));
-        }
+        let profile = Profile::from_byte(profile_byte)?;
         let header_len = reader.read_u8()?;
         if usize::from(header_len) != HEADER_SIZE {
             return Err(AuraError::InvalidValue("header length"));
+        }
+        let version = reader.read_u16_le()?;
+        if version != FORMAT_VERSION {
+            return Err(AuraError::UnsupportedVersion(version));
         }
         let schema_id = reader.read_u32_le()?;
         let flags = reader.read_u32_le()?;
@@ -122,26 +122,6 @@ impl AuraHeader {
             footer_offset,
             footer_len,
         })
-    }
-}
-
-pub const fn magic_for_profile(profile: Profile) -> &'static [u8; 4] {
-    match profile {
-        Profile::Ingest => INGEST_MAGIC,
-        Profile::Aura0 => AURA0_MAGIC,
-        Profile::Aura1 => AURA1_MAGIC,
-    }
-}
-
-pub fn profile_from_magic(magic: &[u8]) -> Result<Profile> {
-    if magic == INGEST_MAGIC {
-        Ok(Profile::Ingest)
-    } else if magic == AURA0_MAGIC {
-        Ok(Profile::Aura0)
-    } else if magic == AURA1_MAGIC {
-        Ok(Profile::Aura1)
-    } else {
-        Err(AuraError::InvalidMagic { expected: "AURA" })
     }
 }
 
@@ -177,13 +157,17 @@ mod tests {
             .encode();
 
         assert_eq!(56, HEADER_SIZE);
-        assert_eq!(HEADER_SIZE as u8, encoded[7]);
+        assert_eq!(HEADER_SIZE as u8, encoded[5]);
+        assert_eq!(11u32.to_le_bytes(), encoded[8..12]);
     }
 
     #[test]
-    fn magic_maps_to_public_profiles() {
-        assert_eq!(Profile::Ingest, profile_from_magic(b"AURA").unwrap());
-        assert_eq!(Profile::Aura0, profile_from_magic(b"AUR0").unwrap());
-        assert_eq!(Profile::Aura1, profile_from_magic(b"AUR1").unwrap());
+    fn header_prefix_uses_family_magic_then_profile_and_length() {
+        let encoded = AuraHeader::new(Profile::Aura0, 11).encode();
+
+        assert_eq!(b"AURA", &encoded[..4]);
+        assert_eq!(Profile::Aura0 as u8, encoded[4]);
+        assert_eq!(HEADER_SIZE as u8, encoded[5]);
+        assert_eq!(FORMAT_VERSION.to_le_bytes(), encoded[6..8]);
     }
 }

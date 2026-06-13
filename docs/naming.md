@@ -23,12 +23,13 @@ or hot-layout variants into the extension.
 .aura1  may be uncompressed or chunk-compressed based on the replay profile
 ```
 
-Magic values identify the public level:
+The container magic identifies the Aura file family. The next byte identifies
+the public level:
 
 ```text
-AURA  ingest container
-AUR0  Aura0 compact physical file
-AUR1  Aura1 replay physical file
+AURA + 0  ingest container
+AURA + 1  Aura0 compact physical file
+AURA + 2  Aura1 replay physical file
 ```
 
 There is no `.aura2`. Additional replay layouts belong in `.aura1` header/footer

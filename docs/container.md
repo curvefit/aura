@@ -13,10 +13,10 @@ Footer
 The header is fixed-width and appears at byte zero.
 
 ```text
-magic           AURA | AUR0 | AUR1
-version         format version
+magic           AURA
 profile         ingest | Aura0 | Aura1
 header_len      fixed header size
+version         format version
 schema_id       logical schema registry key
 flags           sealed/open state
 base_time_ns    file-local time anchor
@@ -30,6 +30,9 @@ reserved
 
 Open writers use zero footer pointers. When the file is sealed, the writer
 appends the footer and patches the header pointer.
+
+The magic identifies the Aura container family. The `profile` byte identifies
+which public file level the body and footer use.
 
 The fixed header intentionally stores compact registry IDs rather than strings
 or variable schemas. For market data, `stream_id` can resolve through the

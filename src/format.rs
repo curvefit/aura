@@ -1,6 +1,7 @@
 use crate::Profile;
 
 pub const AURA_NAME: &str = "Aura";
+pub const AURA_MAGIC: &[u8; 4] = b"AURA";
 pub const INGEST_MAGIC: &[u8; 4] = b"AURA";
 pub const AURA0_MAGIC: &[u8; 4] = b"AUR0";
 pub const AURA1_MAGIC: &[u8; 4] = b"AUR1";
