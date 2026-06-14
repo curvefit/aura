@@ -286,6 +286,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "parquet",
+ "serde_json",
 ]
 
 [[package]]

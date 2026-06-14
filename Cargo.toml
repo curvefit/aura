@@ -22,3 +22,8 @@ path = "src/bin/parquet_ohlcv.rs"
 anyhow = "1"
 arrow = { version = "54", features = ["prettyprint"] }
 parquet = { version = "54", features = ["zstd"] }
+serde_json = "1"
+
+[[bin]]
+name = "aura-json-i64"
+path = "src/bin/json_i64_rows.rs"
