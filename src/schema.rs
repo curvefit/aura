@@ -176,9 +176,15 @@ impl TransformCandidates {
                 .with(FieldTransform::DeltaPrevious)
                 .with(FieldTransform::FixedStep)
                 .with(FieldTransform::RoughStep),
-            FieldRole::Identifier | FieldRole::Side | FieldRole::Flag => {
-                Self::empty().with(FieldTransform::Absolute)
-            }
+            FieldRole::Identifier => Self::empty()
+                .with(FieldTransform::Absolute)
+                .with(FieldTransform::DeltaBase)
+                .with(FieldTransform::DeltaPrevious)
+                .with(FieldTransform::Bitpack),
+            FieldRole::Side | FieldRole::Flag => Self::empty()
+                .with(FieldTransform::Absolute)
+                .with(FieldTransform::DeltaBase)
+                .with(FieldTransform::Bitpack),
             _ => Self::empty()
                 .with(FieldTransform::Absolute)
                 .with(FieldTransform::DeltaBase)

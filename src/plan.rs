@@ -112,7 +112,7 @@ impl Aura0Plan {
     ) -> Result<Self> {
         let mut plan = Self::from_schema_stats(schema, stats)?;
         apply_candle_shape_candidates(schema, rows, &mut plan);
-        apply_residual_candidates(rows, &mut plan);
+        apply_residual_candidates(schema, rows, &mut plan);
         Ok(plan)
     }
 
@@ -672,15 +672,22 @@ fn bitpacked_related_offset_plan_from_values(
     })
 }
 
-fn apply_residual_candidates(rows: &[Vec<i64>], plan: &mut Aura0Plan) {
+fn apply_residual_candidates(schema: &SchemaDescriptor, rows: &[Vec<i64>], plan: &mut Aura0Plan) {
     let field_count = rows.first().map(|row| row.len()).unwrap_or(0);
     if field_count == 0 {
         return;
     }
+    let semantic_roles = uses_semantic_roles(schema);
     let protected_targets = candle_protected_fields(plan);
     let pending_references = candle_pending_fields(plan);
     for target_index in 0..field_count {
         if protected_targets.contains(&(target_index as u16)) {
+            continue;
+        }
+        let Some(target_field) = schema.fields.get(target_index) else {
+            continue;
+        };
+        if !residual_target_allowed(target_field.role, semantic_roles) {
             continue;
         }
         let Some(target_values) = column_values(rows, target_index as u16) else {
@@ -695,6 +702,9 @@ fn apply_residual_candidates(rows: &[Vec<i64>], plan: &mut Aura0Plan) {
             if pending_references.contains(&(quantity_index as u16)) {
                 continue;
             }
+            if !product_quantity_allowed(schema, quantity_index, semantic_roles) {
+                continue;
+            }
             let Some(quantity_values) = column_values(rows, quantity_index as u16) else {
                 continue;
             };
@@ -703,6 +713,9 @@ fn apply_residual_candidates(rows: &[Vec<i64>], plan: &mut Aura0Plan) {
                     continue;
                 }
                 if pending_references.contains(&(price_index as u16)) {
+                    continue;
+                }
+                if !product_price_allowed(schema, price_index, semantic_roles) {
                     continue;
                 }
                 let Some(price_values) = column_values(rows, price_index as u16) else {
@@ -727,6 +740,9 @@ fn apply_residual_candidates(rows: &[Vec<i64>], plan: &mut Aura0Plan) {
             if pending_references.contains(&(total_value_index as u16)) {
                 continue;
             }
+            if !proportional_value_allowed(schema, total_value_index, semantic_roles) {
+                continue;
+            }
             let Some(total_values) = column_values(rows, total_value_index as u16) else {
                 continue;
             };
@@ -735,6 +751,9 @@ fn apply_residual_candidates(rows: &[Vec<i64>], plan: &mut Aura0Plan) {
                     continue;
                 }
                 if pending_references.contains(&(child_quantity_index as u16)) {
+                    continue;
+                }
+                if !proportional_quantity_allowed(schema, child_quantity_index, semantic_roles) {
                     continue;
                 }
                 let Some(child_quantity_values) = column_values(rows, child_quantity_index as u16)
@@ -748,6 +767,10 @@ fn apply_residual_candidates(rows: &[Vec<i64>], plan: &mut Aura0Plan) {
                         continue;
                     }
                     if pending_references.contains(&(total_quantity_index as u16)) {
+                        continue;
+                    }
+                    if !proportional_quantity_allowed(schema, total_quantity_index, semantic_roles)
+                    {
                         continue;
                     }
                     let Some(total_quantity_values) =
@@ -774,6 +797,76 @@ fn apply_residual_candidates(rows: &[Vec<i64>], plan: &mut Aura0Plan) {
             replace_plan_fields(plan, vec![best]);
         }
     }
+}
+
+fn uses_semantic_roles(schema: &SchemaDescriptor) -> bool {
+    schema
+        .fields
+        .iter()
+        .any(|field| !matches!(field.role, FieldRole::Timestamp | FieldRole::Value))
+}
+
+fn residual_target_allowed(role: FieldRole, semantic_roles: bool) -> bool {
+    if !semantic_roles {
+        return true;
+    }
+    matches!(role, FieldRole::Quantity | FieldRole::Value)
+}
+
+fn product_quantity_allowed(
+    schema: &SchemaDescriptor,
+    field_index: usize,
+    semantic_roles: bool,
+) -> bool {
+    if !semantic_roles {
+        return true;
+    }
+    schema
+        .fields
+        .get(field_index)
+        .is_some_and(|field| field.role == FieldRole::Quantity)
+}
+
+fn product_price_allowed(
+    schema: &SchemaDescriptor,
+    field_index: usize,
+    semantic_roles: bool,
+) -> bool {
+    if !semantic_roles {
+        return true;
+    }
+    schema
+        .fields
+        .get(field_index)
+        .is_some_and(|field| matches!(field.role, FieldRole::Price | FieldRole::PriceAnchor))
+}
+
+fn proportional_value_allowed(
+    schema: &SchemaDescriptor,
+    field_index: usize,
+    semantic_roles: bool,
+) -> bool {
+    if !semantic_roles {
+        return true;
+    }
+    schema
+        .fields
+        .get(field_index)
+        .is_some_and(|field| field.role == FieldRole::Value)
+}
+
+fn proportional_quantity_allowed(
+    schema: &SchemaDescriptor,
+    field_index: usize,
+    semantic_roles: bool,
+) -> bool {
+    if !semantic_roles {
+        return true;
+    }
+    schema
+        .fields
+        .get(field_index)
+        .is_some_and(|field| field.role == FieldRole::Quantity)
 }
 
 fn candle_protected_fields(plan: &Aura0Plan) -> Vec<u16> {

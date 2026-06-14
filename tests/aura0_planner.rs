@@ -1,6 +1,8 @@
 use aura_codec::footer::{AuraFooter, CompressionDescriptor};
 use aura_codec::plan::{Aura0Plan, FieldEncoding};
-use aura_codec::schema::{generic_i64_parent_schema, ohlcv_schema, FieldRelation};
+use aura_codec::schema::{
+    generic_i64_parent_schema, ohlcv_schema, FieldRelation, FieldType, SchemaBuilder,
+};
 use aura_codec::stats::PhysicalWidth;
 use aura_codec::{FieldRole, IngestStats};
 
@@ -256,4 +258,86 @@ fn aura0_planner_uses_biased_bitpacked_previous_deltas() {
     assert_eq!(1_000, field.step);
     assert_eq!(8, field.bit_width);
     assert_eq!(130, field.estimated_bytes);
+}
+
+#[test]
+fn aura0_planner_delta_packs_numeric_identifier_roles() {
+    let schema = SchemaBuilder::new("bybit_spot_tick_v1")
+        .field("ts_event", FieldType::TimestampNs, FieldRole::Timestamp)
+        .field("exec_id", FieldType::I64, FieldRole::Identifier)
+        .field("seq", FieldType::I64, FieldRole::Sequence)
+        .field("price", FieldType::I64, FieldRole::Price)
+        .field("size", FieldType::I64, FieldRole::Quantity)
+        .field("side", FieldType::I8, FieldRole::Side)
+        .finish()
+        .unwrap();
+    let mut stats = IngestStats::new_for_schema(&schema).unwrap();
+    for idx in 0..64 {
+        stats
+            .observe_i64_record(
+                &schema,
+                &[
+                    1_700_000_000_000_000_000 + i64::from(idx) * 1_000_000,
+                    2_290_000_001_158_834_000 + i64::from(idx),
+                    109_538_440_000 + i64::from(idx / 4),
+                    637_000 + i64::from(idx % 3),
+                    1 + i64::from(idx % 31),
+                    if idx % 2 == 0 { 1 } else { -1 },
+                ],
+            )
+            .unwrap();
+    }
+
+    let plan = Aura0Plan::from_schema_rows_stats(&schema, &stats, &[]).unwrap();
+    let exec_id = plan.field("exec_id", &schema).unwrap();
+
+    assert_eq!(
+        FieldEncoding::BitpackedDeltaPreviousOffset,
+        exec_id.encoding
+    );
+    assert_eq!(2_290_000_001_158_834_000, exec_id.base_value);
+    assert_eq!(1, exec_id.step);
+    assert_eq!(0, exec_id.bit_width);
+    assert_eq!(0, exec_id.estimated_bytes);
+}
+
+#[test]
+fn aura0_planner_keeps_side_and_flags_out_of_residual_search() {
+    let schema = SchemaBuilder::new("bybit_tick_flags_v1")
+        .field("ts_event", FieldType::TimestampNs, FieldRole::Timestamp)
+        .field("seq", FieldType::I64, FieldRole::Sequence)
+        .field("price", FieldType::I64, FieldRole::Price)
+        .field("size", FieldType::I64, FieldRole::Quantity)
+        .field("side", FieldType::I8, FieldRole::Side)
+        .field("is_block", FieldType::I8, FieldRole::Flag)
+        .field("is_rpi", FieldType::I8, FieldRole::Flag)
+        .finish()
+        .unwrap();
+    let mut stats = IngestStats::new_for_schema(&schema).unwrap();
+    let mut rows = Vec::new();
+    for idx in 0..128 {
+        let row = vec![
+            1_700_000_000_000_000_000 + i64::from(idx % 17) * 1_000_000,
+            599_456_860_000 + i64::from(idx / 3),
+            637_000 + i64::from(idx % 5),
+            1 + i64::from(idx % 19),
+            if idx % 2 == 0 { 1 } else { -1 },
+            0,
+            if idx % 13 == 0 { 1 } else { 0 },
+        ];
+        stats.observe_i64_record(&schema, &row).unwrap();
+        rows.push(row);
+    }
+
+    let plan = Aura0Plan::from_schema_rows_stats(&schema, &stats, &rows).unwrap();
+    let side = plan.field("side", &schema).unwrap();
+    let is_block = plan.field("is_block", &schema).unwrap();
+    let is_rpi = plan.field("is_rpi", &schema).unwrap();
+
+    assert_eq!(FieldEncoding::BitpackedDeltaBase, side.encoding);
+    assert_eq!(FieldEncoding::BitpackedDeltaBase, is_block.encoding);
+    assert_eq!(FieldEncoding::BitpackedDeltaBase, is_rpi.encoding);
+    assert_eq!(2, side.bit_width);
+    assert_eq!(0, is_block.bit_width);
+    assert_eq!(1, is_rpi.bit_width);
 }
