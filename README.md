@@ -12,9 +12,7 @@ The public model is intentionally generic:
   field mappings,
 - `.aura0` is the compact compiled level with code-only decode instructions,
 - `.aura1` is the replay-optimized compiled level with code-only decode
-  instructions,
-- `.aura`, `.aura0`, and `.aura1` can round-trip through the same logical event
-  stream even when a derived `.aura` has to recompute footer stats.
+  instructions.
 
 ## Format Levels
 
@@ -24,10 +22,10 @@ The public model is intentionally generic:
 | `.aura0` | Aura0 | Compact cold encoding compiled from ingest stats into per-field instructions. |
 | `.aura1` | Aura1 | Replay-optimized fixed/block encoding compiled from ingest stats into per-field instructions. |
 
-The levels trade disk for parsing speed. Live collectors normally write `.aura`
-first because it is the easiest place to collect footer stats, but `.aura` is
-not a one-way source format: a converter can replay `.aura0` or `.aura1` back
-into normalized `.aura` records and recompute any missing footer calculations.
+The levels trade disk for parsing speed. Live collectors write stamped `.aura`
+first because that is where footer stats and physical plans are collected.
+Compiled `.aura0` and `.aura1` files follow those stamped plans; they are not
+used as optimization sources for each other.
 
 ## Repository Scope
 

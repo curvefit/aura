@@ -338,7 +338,7 @@ fn compiled_aura0_uses_candle_and_residual_footer_programs() {
 }
 
 #[test]
-fn compiled_aura0_can_compile_back_to_aura1() {
+fn compiled_profiles_do_not_recompile_without_stamped_ingest_plans() {
     let schema = aura_codec::generic_i64_parent_schema(
         "aura0_to_aura1",
         &[255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8],
@@ -378,12 +378,16 @@ fn compiled_aura0_can_compile_back_to_aura1() {
     })
     .unwrap();
     let aura0 = records::compile_i64_file(&ingest, Profile::Aura0).unwrap();
+    let aura1 = records::compile_i64_file(&ingest, Profile::Aura1).unwrap();
 
-    let aura1 = records::compile_i64_file(&aura0, Profile::Aura1).unwrap();
-    let decoded = records::decode_i64_file(&aura1).unwrap();
-
-    assert_eq!(Profile::Aura1, decoded.header.profile);
-    assert_eq!(rows, decoded.rows);
+    assert_eq!(
+        Err(AuraError::InvalidValue("stamped ingest source")),
+        records::compile_i64_file(&aura0, Profile::Aura1)
+    );
+    assert_eq!(
+        Err(AuraError::InvalidValue("stamped ingest source")),
+        records::compile_i64_file(&aura1, Profile::Aura0)
+    );
 }
 
 #[test]

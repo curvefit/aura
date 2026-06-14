@@ -8,7 +8,6 @@ const SCHEMA_ENCODING_PARENT_VECTOR: u8 = 0;
 const SCHEMA_ENCODING_FULL_FIELDS: u8 = 1;
 const DECODED_SCHEMA_NAME: &str = "schema";
 pub(crate) const SCHEMA_MAP_TIME_SLOT: u8 = u8::MAX;
-pub const AURA_SCHEMA_EXTENSION: &str = "auraschema";
 
 /// Logical field type recorded by an Aura schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -234,35 +233,52 @@ impl SchemaDescriptor {
     }
 }
 
-/// Ingest-time `.auraschema` relationship definition for front-header metadata.
+/// Code-defined reusable schema definition for generic positional i64 ingest.
 ///
-/// This source file helps writers build self-describing Aura files; readers do
-/// not need the external `.auraschema` after the header/footer have been sealed.
+/// Source adapters can keep one of these beside their mapper code, then pass the
+/// schema and comment into the generic Aura writer. The emitted Aura file remains
+/// self-describing through its header mapping and stamped footer schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuraSchemaDefinition {
-    pub comment: String,
-    pub schema_mapping: Vec<u8>,
+pub struct I64SchemaDefinition {
+    schema: SchemaDescriptor,
+    header_comment: String,
+    parent_slots: Vec<u8>,
 }
 
-impl AuraSchemaDefinition {
-    pub fn parse(input: &str) -> Result<Self> {
-        let lines = significant_auraschema_lines(input);
-        if lines.len() < 2 {
-            return Err(AuraError::InvalidValue("auraschema"));
-        }
-
-        let comment = parse_quoted_auraschema_comment(&lines[0])?;
-        let schema_mapping = parse_auraschema_mapping(&lines[1..])?;
-        validate_auraschema_header_size(schema_mapping.len(), comment.len())?;
+impl I64SchemaDefinition {
+    pub fn new(name: &str, header_comment: impl Into<String>, parent_slots: &[u8]) -> Result<Self> {
+        let header_comment = header_comment.into();
+        validate_i64_schema_definition_header(parent_slots.len(), header_comment.len())?;
+        let schema = generic_i64_parent_schema(name, parent_slots)?;
 
         Ok(Self {
-            comment,
-            schema_mapping,
+            schema,
+            header_comment,
+            parent_slots: parent_slots.to_vec(),
         })
     }
 
-    pub fn generic_i64_schema(&self, name: &str) -> Result<SchemaDescriptor> {
-        generic_i64_parent_schema(name, &self.schema_mapping)
+    pub fn from_field_names(name: &str, field_names: &[&str], parent_slots: &[u8]) -> Result<Self> {
+        if field_names.len() != parent_slots.len() {
+            return Err(AuraError::InvalidValue("schema field names"));
+        }
+        Self::new(name, field_names.join(","), parent_slots)
+    }
+
+    pub const fn schema(&self) -> &SchemaDescriptor {
+        &self.schema
+    }
+
+    pub fn into_schema(self) -> SchemaDescriptor {
+        self.schema
+    }
+
+    pub fn header_comment(&self) -> &str {
+        &self.header_comment
+    }
+
+    pub fn parent_slots(&self) -> &[u8] {
+        &self.parent_slots
     }
 }
 
@@ -489,118 +505,15 @@ pub fn generic_i64_parent_schema(name: &str, parent_slots: &[u8]) -> Result<Sche
     generic_i64_schema(name, parent_slots.len() as u16 - 1, &mappings)
 }
 
-fn significant_auraschema_lines(input: &str) -> Vec<String> {
-    input
-        .lines()
-        .filter_map(|line| {
-            let stripped = strip_auraschema_comment(line).trim();
-            (!stripped.is_empty()).then(|| stripped.to_owned())
-        })
-        .collect()
-}
-
-fn strip_auraschema_comment(line: &str) -> &str {
-    let mut in_quote = false;
-    let mut escaped = false;
-    let mut iter = line.char_indices().peekable();
-    while let Some((index, ch)) = iter.next() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' if in_quote => escaped = true,
-            '"' => in_quote = !in_quote,
-            '/' if !in_quote && iter.peek().is_some_and(|(_, next)| *next == '/') => {
-                return &line[..index];
-            }
-            _ => {}
-        }
+fn validate_i64_schema_definition_header(schema_len: usize, comment_len: usize) -> Result<()> {
+    if schema_len == 0 || schema_len > u8::MAX as usize {
+        return Err(AuraError::InvalidValue("schema mapping"));
     }
-    line
-}
-
-fn parse_quoted_auraschema_comment(line: &str) -> Result<String> {
-    if !line.starts_with('"') || !line.ends_with('"') || line.len() < 2 {
-        return Err(AuraError::InvalidValue("auraschema comment"));
-    }
-
-    let mut out = String::new();
-    let mut escaped = false;
-    for ch in line[1..line.len() - 1].chars() {
-        if escaped {
-            match ch {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                _ => return Err(AuraError::InvalidValue("auraschema comment")),
-            }
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Err(AuraError::InvalidValue("auraschema comment")),
-            _ => out.push(ch),
-        }
-    }
-    if escaped {
-        return Err(AuraError::InvalidValue("auraschema comment"));
-    }
-    Ok(out)
-}
-
-fn parse_auraschema_mapping(lines: &[String]) -> Result<Vec<u8>> {
-    let mut mapping = Vec::new();
-    for line in lines {
-        for token in line.split(|ch: char| ch == ',' || ch.is_whitespace()) {
-            if token.is_empty() {
-                continue;
-            }
-            let value = token
-                .parse::<u16>()
-                .map_err(|_| AuraError::InvalidValue("auraschema mapping"))?;
-            let value =
-                u8::try_from(value).map_err(|_| AuraError::InvalidValue("auraschema mapping"))?;
-            mapping.push(value);
-        }
-    }
-    validate_auraschema_mapping(&mapping)?;
-    Ok(mapping)
-}
-
-fn validate_auraschema_mapping(mapping: &[u8]) -> Result<()> {
-    if mapping.is_empty() || mapping.len() > u8::MAX as usize {
-        return Err(AuraError::InvalidValue("auraschema mapping"));
-    }
-    if mapping[0] != SCHEMA_MAP_TIME_SLOT {
-        return Err(AuraError::InvalidValue("auraschema time slot"));
-    }
-    for (slot_index, byte) in mapping.iter().copied().enumerate() {
-        if byte == SCHEMA_MAP_TIME_SLOT {
-            if slot_index != 0 {
-                return Err(AuraError::InvalidValue("auraschema time slot"));
-            }
-            continue;
-        }
-        if byte == 0 {
-            continue;
-        }
-        let parent_index = usize::from(byte - 1);
-        if parent_index >= slot_index {
-            return Err(AuraError::InvalidValue("auraschema parent"));
-        }
-    }
-    Ok(())
-}
-
-fn validate_auraschema_header_size(schema_len: usize, comment_len: usize) -> Result<()> {
     if comment_len > u8::MAX as usize {
-        return Err(AuraError::InvalidValue("auraschema comment"));
+        return Err(AuraError::InvalidValue("schema comment"));
     }
     if HEADER_PREFIX_SIZE + schema_len + comment_len > u8::MAX as usize {
-        return Err(AuraError::InvalidValue("auraschema header"));
+        return Err(AuraError::InvalidValue("schema header"));
     }
     Ok(())
 }

@@ -67,6 +67,9 @@ pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>
         return Err(AuraError::InvalidValue("target profile"));
     }
     let decoded = decode_i64_file(bytes)?;
+    if decoded.header.profile != Profile::Ingest {
+        return Err(AuraError::InvalidValue("stamped ingest source"));
+    }
     let body = match target_profile {
         Profile::Ingest => unreachable!(),
         Profile::Aura0 => {
@@ -74,7 +77,7 @@ pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>
             encode_aura0_body(&decoded.rows, &plan)?
         }
         Profile::Aura1 => {
-            let plan = decoded.aura1_plan_for_compile()?;
+            let plan = decoded.aura1_plan()?;
             encode_aura1_body(&decoded.rows, &plan)?
         }
     };
@@ -93,7 +96,7 @@ pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>
             )?
         }
         Profile::Aura1 => {
-            let plan = decoded.aura1_plan_for_compile()?;
+            let plan = decoded.aura1_plan()?;
             let block_capacity = plan.block_capacity;
             let program = DecodeProgram::from_aura1_plan(&plan, decoded.schema.fields.len())?;
             CompiledFooter::new(
@@ -223,24 +226,13 @@ impl DecodedI64File {
             .to_aura0_plan()
     }
 
-    fn aura1_plan_for_compile(&self) -> Result<Aura1Plan> {
-        if let Some(footer) = &self.ingest_footer {
-            return footer
-                .aura1_plan
-                .clone()
-                .ok_or(AuraError::InvalidValue("aura1 plan"));
-        }
-        let block_capacity = self
-            .compiled_footer
+    fn aura1_plan(&self) -> Result<Aura1Plan> {
+        self.ingest_footer
             .as_ref()
-            .map(|footer| footer.block_capacity)
-            .unwrap_or(1)
-            .max(1);
-        let mut stats = IngestStats::new_for_schema(&self.schema)?;
-        for row in &self.rows {
-            stats.observe_i64_record(&self.schema, row)?;
-        }
-        Ok(Aura1Plan::from_stats(&stats, block_capacity))
+            .ok_or(AuraError::InvalidValue("ingest footer"))?
+            .aura1_plan
+            .clone()
+            .ok_or(AuraError::InvalidValue("aura1 plan"))
     }
 }
 

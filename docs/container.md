@@ -127,9 +127,9 @@ deltas, implicit fixed-step timestamps, constant offsets, candle wick residuals,
 and product/proportional residuals.
 
 Aura0 bodies are columnar by decode-program order. Aura1 bodies are row-major
-fixed-width replay data. Converting Aura0 to Aura1 decodes logical rows from the
-Aura0 field program, then emits a fresh Aura1 fixed-width program from those
-rows.
+fixed-width replay data. Both are emitted from the stamped `.aura` footer plans;
+compiled files are decode artifacts, not inputs for choosing another profile's
+plan.
 
 The footer is what makes conversion deterministic. A converter can read the
 trailer to locate the footer, run the field program, and then process chunks
