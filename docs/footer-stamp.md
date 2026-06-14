@@ -84,9 +84,10 @@ For hot `.aura1` fixed-width slots, `decode_arg` uses the integer width code:
 5 i128
 ```
 
-Timestamp slots are logical `i64` time values, but candle data can stamp them as
-`fixed_step` with base and step constants in the aux table. The front header
-schema map remains the source of parent relationships and repeated child shape:
+Timestamp slots are logical `i64` time values, but fixed-interval data can stamp
+them as `fixed_step` with base and step constants in the aux table. The front
+header schema map remains the source of parent relationships and repeated child
+shape:
 
 ```text
 255 primary timestamp
@@ -130,58 +131,46 @@ stream entry:
   aux_id      u8   255 means no aux
 ```
 
-Common stream representations:
+Generic stream instructions:
 
 ```text
-fixed_i8/i16/i32/i64/i128
-fixed_u8/u16/u32/u64/u128
-zigzag_varint
-unsigned_varint
-zigzag_bitpack
-unsigned_bitpack
-block_min_bitpack
-sparse_zigzag_varint
-sparse_unsigned_varint
+fixed_step       base + row_index * step
+base_bitpack     base + packed_unsigned * storage_unit
+prev_delta       previous + packed_delta * storage_unit
+block_local      body is divided into blocks, each with its own stream mode
+patched_bitpack  low-width body plus exception indexes/high bits
+rle              run lengths over a value stream
+bitplane_rle     each bit plane is stored as runs
+dictionary       dictionary entries plus bitpacked codes
+uuid_const_mask  fixed 128-bit mask/value plus packed variable bits
 ```
 
-Group entries describe multi-slot transforms. The compact candle-shape group is
-four bytes and requires consecutive OHLC slots and consecutive streams:
+Generic group instructions describe multi-slot structure without naming a
+market-data domain:
 
 ```text
-group_op      u8  CANDLE_SHAPE
-first_slot    u8  open slot; high, low, close follow
-first_stream  u8  open_delta stream; body, upper, lower follow
-aux_id        u8  base_open
+group            event slots written once, repeated slots written per child
+partition_runs   contiguous runs of a partition slot, with optional fixed order
+presence_map     packed presence/enum bits for a set of slots
+derived_stream   output slot reconstructed from input slots plus one stream
 ```
 
-Decode:
+A `derived_stream` is intentionally generic. Its operation can express common
+curvefit shapes without hardcoding the source schema:
 
 ```text
-open  = previous_close + open_delta
-close = open + body
-high  = max(open, close) + upper_wick
-low   = min(open, close) - lower_wick
-```
-
-For Binance BTCUSDT klines, a stamped Aura0 footer can express:
-
-```text
-open_time       fixed_step(base_ts, 60000)
-open..close     group_member(CANDLE_SHAPE)
-volume          stream(block_min_bitpack)
-close_time      derived_offset(open_time, 59999)
-quote_volume    stream(block_min_bitpack)
-trades          stream(block_min_bitpack)
-taker_buy_base  derived_subtract(volume, sell_base_stream)
-taker_buy_quote derived_subtract(quote_volume, sell_quote_stream)
+add_residual              output = input + residual_stream
+subtract_residual         output = input - residual_stream
+max_plus_residual         output = max(input_a, input_b) + residual_stream
+min_minus_residual        output = min(input_a, input_b) - residual_stream
+first_offset_then_delta   first value from partition base, then local deltas
 ```
 
 ## Grouping
 
-Timestamp grouping is separate from physical chunking. For websocket-style
-orderbook updates, many logical events can share one timestamp. The footer
-should stamp the chosen timestamp grouping strategy, such as fixed power-of-two
-group capacity, because that is part of decoding the body.
+Timestamp grouping is separate from physical chunking. For repeated child data,
+many logical rows can share one event. The footer should stamp the chosen
+grouping strategy because it is part of decoding the body.
 
 Physical chunks are optional and only needed for seeking, compression blocks,
 parallel decode, or corruption isolation. `chunk_count` and a chunk table should
@@ -198,9 +187,12 @@ shapes:
 ```
 
 The compiled decode program already supports fixed steps, signed bitpacked
-deltas, unsigned offset bitpacks, candle wick residuals, product residuals, and
-proportional residuals. It is still a field-program footer rather than the target
-slot-tail footer above.
+deltas, unsigned offset bitpacks, min/max residuals, product residuals, and
+proportional residuals. `src/instructions.rs` defines a generic byte-aligned
+stream/group instruction plan that can stamp curvefit shapes without
+domain-specific operation names. The main `.aura0` writer still uses the
+field-program footer; it needs to converge on the generic instruction plan for
+the fitted layouts to be emitted by the production writer.
 
 That should converge toward one small stamped slot table footer shared across
 profiles, interpreted by the header `version` and `profile`.

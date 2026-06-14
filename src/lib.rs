@@ -14,6 +14,7 @@ pub mod footer;
 pub mod format;
 pub mod grouped;
 pub mod header;
+pub mod instructions;
 pub mod ohlcv;
 pub mod plan;
 pub mod program;
@@ -30,6 +31,10 @@ pub mod warm;
 pub use error::{AuraError, Result};
 pub use footer::{AuraFooter, CompressionDescriptor, CompressionKind};
 pub use header::{AuraHeader, HEADER_PREFIX_SIZE};
+pub use instructions::{
+    DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
+    GenericStreamOp,
+};
 pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 pub use schema::{
     generic_i64_parent_schema, schema_parent_mapping, FieldDescriptor, FieldRelation, FieldRole,
