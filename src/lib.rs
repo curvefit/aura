@@ -13,6 +13,7 @@ pub mod convert;
 pub mod error;
 pub mod footer;
 pub mod format;
+pub mod generic_planner;
 pub mod grouped;
 pub mod header;
 pub mod instructions;
@@ -32,6 +33,10 @@ pub mod warm;
 pub use body::{decode_generic_stream_body, encode_generic_stream_body, GenericStreamBodyValue};
 pub use error::{AuraError, Result};
 pub use footer::{AuraFooter, CompressionDescriptor, CompressionKind};
+pub use generic_planner::{
+    decode_generic_i64_rows, encode_generic_i64_rows, plan_generic_i64_rows,
+    plan_uuid_const_mask_stream, GenericEncodedI64Rows, GenericEncodedStream,
+};
 pub use header::{AuraHeader, HEADER_PREFIX_SIZE};
 pub use instructions::{
     DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
