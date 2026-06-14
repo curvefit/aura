@@ -5,6 +5,7 @@
 //! files or fast replay `.aura1` files.
 
 pub mod bitpack;
+pub mod body;
 pub mod bytes;
 pub mod chunk;
 pub mod cold;
@@ -28,6 +29,7 @@ pub mod ultra;
 pub mod varint;
 pub mod warm;
 
+pub use body::{decode_generic_stream_body, encode_generic_stream_body, GenericStreamBodyValue};
 pub use error::{AuraError, Result};
 pub use footer::{AuraFooter, CompressionDescriptor, CompressionKind};
 pub use header::{AuraHeader, HEADER_PREFIX_SIZE};

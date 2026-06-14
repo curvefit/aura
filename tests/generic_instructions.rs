@@ -1,6 +1,6 @@
-use aura_codec::instructions::{
-    DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
-    GenericStreamOp,
+use aura_codec::{
+    decode_generic_stream_body, encode_generic_stream_body, DerivedOp, GenericGroupInstruction,
+    GenericInstructionPlan, GenericStreamBodyValue, GenericStreamInstruction, GenericStreamOp,
 };
 
 #[test]
@@ -138,4 +138,146 @@ fn generic_instruction_plan_rejects_invalid_uuid_mask_shape() {
     };
 
     assert!(plan.encode().is_err());
+}
+
+#[test]
+fn generic_stream_body_round_trips_core_i64_ops() {
+    assert_i64_body_round_trip(
+        GenericStreamOp::FixedStep { base: 100, step: 5 },
+        &[100, 105, 110, 115],
+    );
+    assert_i64_body_round_trip(
+        GenericStreamOp::BaseBitpack {
+            base: 10,
+            unit: 5,
+            bit_width: 3,
+        },
+        &[10, 15, 20, 25],
+    );
+    assert_i64_body_round_trip(
+        GenericStreamOp::PrevDelta {
+            base: 100,
+            unit: 10,
+            bit_width: 3,
+        },
+        &[100, 110, 130, 120, 140],
+    );
+    assert_i64_body_round_trip(
+        GenericStreamOp::Rle {
+            base: 0,
+            unit: 1,
+            bit_width: 3,
+            run_count: 3,
+        },
+        &[2, 2, 2, 5, 5, 1],
+    );
+    assert_i64_body_round_trip(
+        GenericStreamOp::PatchedBitpack {
+            base: 0,
+            unit: 1,
+            low_width: 2,
+            high_width: 2,
+            exception_count: 2,
+        },
+        &[0, 1, 2, 3, 4, 7],
+    );
+    assert_i64_body_round_trip(
+        GenericStreamOp::BitplaneRle {
+            base: 0,
+            unit: 1,
+            bit_width: 3,
+        },
+        &[0, 1, 1, 3, 7, 7, 0],
+    );
+    assert_i64_body_round_trip(
+        GenericStreamOp::Dictionary {
+            unit: 10,
+            entry_count: 3,
+            code_width: 2,
+        },
+        &[10, 20, 10, 30, 20],
+    );
+    assert_i64_body_round_trip(
+        GenericStreamOp::BlockLocal {
+            block_size: 4,
+            mode_count: 2,
+        },
+        &[100, 101, 102, 103, 8_000, 8_000, 8_004, 8_008],
+    );
+}
+
+#[test]
+fn generic_uuid_const_mask_body_round_trips_u128_values() {
+    let instruction = GenericStreamInstruction {
+        stream_id: 0,
+        target_slot: Some(0),
+        op: GenericStreamOp::UuidConstMask {
+            constant_bits: 6,
+            variable_bits: 122,
+        },
+    };
+    let constant_prefix = 0b101010u128 << 122;
+    let values = vec![
+        constant_prefix | 1,
+        constant_prefix | 2,
+        constant_prefix | 3,
+        constant_prefix | (1u128 << 80) | 9,
+    ];
+
+    let encoded =
+        encode_generic_stream_body(&instruction, &GenericStreamBodyValue::U128(values.clone()))
+            .unwrap();
+    let decoded = decode_generic_stream_body(&instruction, &encoded, values.len()).unwrap();
+
+    assert_eq!(GenericStreamBodyValue::U128(values), decoded);
+}
+
+#[test]
+fn generic_stream_body_rejects_mismatched_instruction() {
+    let instruction = GenericStreamInstruction {
+        stream_id: 0,
+        target_slot: Some(0),
+        op: GenericStreamOp::BaseBitpack {
+            base: 10,
+            unit: 5,
+            bit_width: 2,
+        },
+    };
+
+    let result =
+        encode_generic_stream_body(&instruction, &GenericStreamBodyValue::I64(vec![10, 12]));
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn generic_bitplane_rle_rejects_values_outside_stamped_width() {
+    let instruction = GenericStreamInstruction {
+        stream_id: 0,
+        target_slot: Some(0),
+        op: GenericStreamOp::BitplaneRle {
+            base: 0,
+            unit: 1,
+            bit_width: 2,
+        },
+    };
+
+    let result =
+        encode_generic_stream_body(&instruction, &GenericStreamBodyValue::I64(vec![0, 1, 2, 4]));
+
+    assert!(result.is_err());
+}
+
+fn assert_i64_body_round_trip(op: GenericStreamOp, values: &[i64]) {
+    let instruction = GenericStreamInstruction {
+        stream_id: 0,
+        target_slot: Some(0),
+        op,
+    };
+    let encoded =
+        encode_generic_stream_body(&instruction, &GenericStreamBodyValue::I64(values.to_vec()))
+            .unwrap();
+    let decoded = decode_generic_stream_body(&instruction, &encoded, values.len()).unwrap();
+
+    assert_eq!(GenericStreamBodyValue::I64(values.to_vec()), decoded);
 }

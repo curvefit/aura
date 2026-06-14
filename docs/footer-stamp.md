@@ -145,6 +145,47 @@ dictionary       dictionary entries plus bitpacked codes
 uuid_const_mask  fixed 128-bit mask/value plus packed variable bits
 ```
 
+The generic body codec is deterministic from the stamped stream instruction:
+
+```text
+fixed_step
+  body: empty
+
+base_bitpack
+  body: packed_unsigned[value_count] using bit_width
+
+prev_delta
+  body: packed_signed[value_count - 1] using bit_width
+  row 0 is the stamped base
+
+patched_bitpack
+  body: packed low bits[value_count]
+        packed exception indexes[exception_count]
+        packed exception high bits[exception_count]
+
+rle
+  body: packed run values[run_count]
+        varint run lengths[run_count]
+
+bitplane_rle
+  body per bit plane: start_bit u8, run_count u32, varint run lengths
+
+dictionary
+  body: signed-varint dictionary entries[entry_count]
+        packed dictionary codes[value_count]
+
+uuid_const_mask
+  body: constant_mask u128, constant_value u128, packed variable bits
+
+block_local
+  body: one local mode header plus local stream body per fixed-size block
+```
+
+`block_local` modes are generic body-local choices (`fixed_step`,
+`base_bitpack`, `patched_bitpack`, or `rle`) derived by the writer from that
+block only. The footer instruction provides `block_size` and the expected block
+count; the local body header provides only the constants needed for that block.
+
 Generic group instructions describe multi-slot structure without naming a
 market-data domain:
 
