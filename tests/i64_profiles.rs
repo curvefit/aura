@@ -29,6 +29,12 @@ fn trailer_footer_start(file: &[u8]) -> usize {
     footer_len_offset - trailer_footer_len(file) as usize
 }
 
+fn trailer_footer_bytes(file: &[u8]) -> &[u8] {
+    let footer_start = trailer_footer_start(file);
+    let footer_end = file.len() - 12;
+    &file[footer_start..footer_end]
+}
+
 #[test]
 fn ingest_header_stores_parent_mapping_before_body() {
     let schema = ohlcv_schema().unwrap();
@@ -211,7 +217,7 @@ fn compiled_aura0_uses_bitpacked_delta_body() {
         .compiled_footer
         .as_ref()
         .unwrap()
-        .program
+        .aura0_program
         .to_aura0_plan()
         .unwrap();
 
@@ -261,7 +267,7 @@ fn compiled_aura0_round_trips_derived_and_biased_bitpacked_fields() {
         .compiled_footer
         .as_ref()
         .unwrap()
-        .program
+        .aura0_program
         .to_aura0_plan()
         .unwrap();
 
@@ -310,7 +316,7 @@ fn compiled_aura0_uses_candle_and_residual_footer_programs() {
         .compiled_footer
         .as_ref()
         .unwrap()
-        .program
+        .aura0_program
         .to_aura0_plan()
         .unwrap();
 
@@ -338,7 +344,7 @@ fn compiled_aura0_uses_candle_and_residual_footer_programs() {
 }
 
 #[test]
-fn compiled_profiles_do_not_recompile_without_stamped_ingest_plans() {
+fn compiled_profiles_share_stamp_and_convert_without_replanning() {
     let schema = aura_codec::generic_i64_parent_schema(
         "aura0_to_aura1",
         &[255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8],
@@ -379,15 +385,17 @@ fn compiled_profiles_do_not_recompile_without_stamped_ingest_plans() {
     .unwrap();
     let aura0 = records::compile_i64_file(&ingest, Profile::Aura0).unwrap();
     let aura1 = records::compile_i64_file(&ingest, Profile::Aura1).unwrap();
+    assert_eq!(trailer_footer_bytes(&aura0), trailer_footer_bytes(&aura1));
 
+    let aura1_from_aura0 = records::compile_i64_file(&aura0, Profile::Aura1).unwrap();
     assert_eq!(
-        Err(AuraError::InvalidValue("stamped ingest source")),
-        records::compile_i64_file(&aura0, Profile::Aura1)
+        trailer_footer_bytes(&aura0),
+        trailer_footer_bytes(&aura1_from_aura0)
     );
-    assert_eq!(
-        Err(AuraError::InvalidValue("stamped ingest source")),
-        records::compile_i64_file(&aura1, Profile::Aura0)
-    );
+    let decoded = records::decode_i64_file(&aura1_from_aura0).unwrap();
+
+    assert_eq!(Profile::Aura1, decoded.header.profile);
+    assert_eq!(rows, decoded.rows);
 }
 
 #[test]
@@ -408,9 +416,10 @@ fn compiled_footer_omits_ingest_stats_and_uses_field_programs() {
     let footer = decoded.compiled_footer.as_ref().unwrap();
 
     assert_eq!(rows.len() as u64, footer.record_count);
-    assert_eq!(6, footer.program.fields.len());
-    assert!(footer.program.encoded_len().unwrap() <= 80);
-    assert!(trailer_footer_len(&aura0) < 256);
+    assert_eq!(6, footer.aura0_program.fields.len());
+    assert_eq!(6, footer.aura1_program.fields.len());
+    assert!(footer.aura0_program.encoded_len().unwrap() <= 80);
+    assert!(trailer_footer_len(&aura0) < 320);
 }
 
 #[test]

@@ -5,7 +5,7 @@ use crate::format::FORMAT_VERSION;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 use crate::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
 use crate::stats::PhysicalWidth;
-use crate::{AuraError, Profile, Result};
+use crate::{AuraError, Result};
 
 pub const COMPILED_FOOTER_MAGIC: &[u8; 4] = b"AURP";
 pub const FIELD_AUX_EXTENDED: u8 = 7;
@@ -457,33 +457,30 @@ impl DecodeProgram {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledFooter {
-    pub profile: Profile,
     pub schema: SchemaDescriptor,
     pub compression: CompressionDescriptor,
     pub record_count: u64,
     pub block_capacity: u16,
-    pub program: DecodeProgram,
+    pub aura0_program: DecodeProgram,
+    pub aura1_program: DecodeProgram,
     pub chunks: Vec<ChunkDescriptor>,
 }
 
 impl CompiledFooter {
     pub fn new(
-        profile: Profile,
         schema: SchemaDescriptor,
         record_count: u64,
         block_capacity: u16,
-        program: DecodeProgram,
+        aura0_program: DecodeProgram,
+        aura1_program: DecodeProgram,
     ) -> Result<Self> {
-        if profile == Profile::Ingest {
-            return Err(AuraError::InvalidValue("compiled footer profile"));
-        }
         Ok(Self {
-            profile,
             schema,
             compression: CompressionDescriptor::none(),
             record_count,
             block_capacity,
-            program,
+            aura0_program,
+            aura1_program,
             chunks: Vec::new(),
         })
     }
@@ -494,11 +491,11 @@ impl CompiledFooter {
         put_u16_le(&mut out, FORMAT_VERSION);
         put_u8(&mut out, self.compression.kind as u8);
         put_u8(&mut out, self.compression.level);
-        put_u8(&mut out, self.profile as u8);
         put_u64_le(&mut out, self.record_count);
         put_u16_le(&mut out, self.block_capacity);
         encode_schema_block(&self.schema, &mut out)?;
-        self.program.encode_to(&mut out)?;
+        self.aura0_program.encode_to(&mut out)?;
+        self.aura1_program.encode_to(&mut out)?;
         encode_chunks(&self.chunks, &mut out)?;
         Ok(out)
     }
@@ -516,23 +513,20 @@ impl CompiledFooter {
             kind: CompressionKind::from_code(reader.read_u8()?)?,
             level: reader.read_u8()?,
         };
-        let profile = Profile::from_byte(reader.read_u8()?)?;
-        if profile == Profile::Ingest {
-            return Err(AuraError::InvalidValue("compiled footer profile"));
-        }
         let record_count = reader.read_u64_le()?;
         let block_capacity = reader.read_u16_le()?;
         let schema = decode_schema_block(&mut reader)?;
-        let program = DecodeProgram::decode_from(&mut reader)?;
+        let aura0_program = DecodeProgram::decode_from(&mut reader)?;
+        let aura1_program = DecodeProgram::decode_from(&mut reader)?;
         let chunks = decode_chunks(&mut reader)?;
         reader.finish()?;
         Ok(Self {
-            profile,
             schema,
             compression,
             record_count,
             block_capacity,
-            program,
+            aura0_program,
+            aura1_program,
             chunks,
         })
     }

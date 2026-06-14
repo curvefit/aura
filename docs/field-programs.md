@@ -121,5 +121,5 @@ product residual is smaller and reversible, the planner can choose it.
 Aura0 decoding is columnar, so some fields are delayed until their dependencies
 exist. The decoder resolves previous-field pairs first, then related offsets,
 product residuals, proportional residuals, and candle wick offsets. Aura1 uses
-its own stamped fixed-width field program from `.aura`; it is not derived by
-replanning an Aura0 file.
+its own stamped fixed-width field program from the same compiled footer; it is
+not derived by replanning an Aura0 file.

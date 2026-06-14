@@ -67,9 +67,6 @@ pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>
         return Err(AuraError::InvalidValue("target profile"));
     }
     let decoded = decode_i64_file(bytes)?;
-    if decoded.header.profile != Profile::Ingest {
-        return Err(AuraError::InvalidValue("stamped ingest source"));
-    }
     let body = match target_profile {
         Profile::Ingest => unreachable!(),
         Profile::Aura0 => {
@@ -82,32 +79,7 @@ pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>
         }
     };
 
-    let compiled_footer = match target_profile {
-        Profile::Ingest => unreachable!(),
-        Profile::Aura0 => {
-            let plan = decoded.aura0_plan()?;
-            let program = DecodeProgram::from_aura0_plan(&plan, decoded.schema.fields.len())?;
-            CompiledFooter::new(
-                target_profile,
-                decoded.schema.clone(),
-                decoded.rows.len() as u64,
-                1,
-                program,
-            )?
-        }
-        Profile::Aura1 => {
-            let plan = decoded.aura1_plan()?;
-            let block_capacity = plan.block_capacity;
-            let program = DecodeProgram::from_aura1_plan(&plan, decoded.schema.fields.len())?;
-            CompiledFooter::new(
-                target_profile,
-                decoded.schema.clone(),
-                decoded.rows.len() as u64,
-                block_capacity,
-                program,
-            )?
-        }
-    };
+    let compiled_footer = decoded.compiled_footer_for_compile()?;
 
     encode_compiled_file(
         target_profile,
@@ -159,7 +131,7 @@ pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
         }
         Profile::Aura0 => {
             let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-            let plan = footer.program.to_aura0_plan()?;
+            let plan = footer.aura0_program.to_aura0_plan()?;
             let rows = decode_aura0_body(
                 body,
                 &plan,
@@ -177,7 +149,7 @@ pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
         }
         Profile::Aura1 => {
             let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-            let plan = footer.program.to_aura1_plan(footer.block_capacity)?;
+            let plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
             let rows = decode_aura1_body(
                 body,
                 &plan,
@@ -222,17 +194,39 @@ impl DecodedI64File {
         self.compiled_footer
             .as_ref()
             .ok_or(AuraError::InvalidValue("compiled footer"))?
-            .program
+            .aura0_program
             .to_aura0_plan()
     }
 
     fn aura1_plan(&self) -> Result<Aura1Plan> {
-        self.ingest_footer
+        if let Some(footer) = &self.ingest_footer {
+            return footer
+                .aura1_plan
+                .clone()
+                .ok_or(AuraError::InvalidValue("aura1 plan"));
+        }
+        let footer = self
+            .compiled_footer
             .as_ref()
-            .ok_or(AuraError::InvalidValue("ingest footer"))?
-            .aura1_plan
-            .clone()
-            .ok_or(AuraError::InvalidValue("aura1 plan"))
+            .ok_or(AuraError::InvalidValue("compiled footer"))?;
+        footer.aura1_program.to_aura1_plan(footer.block_capacity)
+    }
+
+    fn compiled_footer_for_compile(&self) -> Result<CompiledFooter> {
+        if let Some(footer) = &self.compiled_footer {
+            return Ok(footer.clone());
+        }
+        let aura0_plan = self.aura0_plan()?;
+        let aura1_plan = self.aura1_plan()?;
+        let block_capacity = aura1_plan.block_capacity;
+        let field_count = self.schema.fields.len();
+        CompiledFooter::new(
+            self.schema.clone(),
+            self.rows.len() as u64,
+            block_capacity,
+            DecodeProgram::from_aura0_plan(&aura0_plan, field_count)?,
+            DecodeProgram::from_aura1_plan(&aura1_plan, field_count)?,
+        )
     }
 }
 

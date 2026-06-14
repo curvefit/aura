@@ -80,18 +80,17 @@ Aura1 physical plan
 chunk table
 ```
 
-A compiled `.aura0` or `.aura1` footer stores only the selected decode program
+A compiled `.aura0` or `.aura1` footer stores both compiled profile programs
 and replay metadata, not the ingest stats:
 
 ```text
 magic AURP
 version
-compression descriptor
-profile
 record_count
 block_capacity
 schema block
-decode program
+aura0 decode program
+aura1 decode program
 chunk table
 ```
 
@@ -127,9 +126,9 @@ deltas, implicit fixed-step timestamps, constant offsets, candle wick residuals,
 and product/proportional residuals.
 
 Aura0 bodies are columnar by decode-program order. Aura1 bodies are row-major
-fixed-width replay data. Both are emitted from the stamped `.aura` footer plans;
-compiled files are decode artifacts, not inputs for choosing another profile's
-plan.
+fixed-width replay data. Both use the same compiled footer bytes; converting
+between compiled profiles changes the body and front profile byte, then copies
+the footer unchanged.
 
 The footer is what makes conversion deterministic. A converter can read the
 trailer to locate the footer, run the field program, and then process chunks
