@@ -25,6 +25,17 @@ pub enum ProgramOp {
     DeltaPrevious = 2,
     DeltaRelated = 3,
     FixedStep = 4,
+    BitpackedDeltaPrevious = 5,
+    BitpackedDeltaBase = 6,
+    BitpackedDeltaRelated = 7,
+    DerivedOffset = 8,
+    BitpackedDeltaRelatedOffset = 9,
+    BitpackedDeltaPreviousOffset = 10,
+    BitpackedDeltaPreviousFieldOffset = 11,
+    BitpackedCandleMaxOffset = 12,
+    BitpackedCandleMinOffset = 13,
+    BitpackedProductResidual = 14,
+    BitpackedProportionalResidual = 15,
 }
 
 impl ProgramOp {
@@ -35,6 +46,17 @@ impl ProgramOp {
             2 => Ok(Self::DeltaPrevious),
             3 => Ok(Self::DeltaRelated),
             4 => Ok(Self::FixedStep),
+            5 => Ok(Self::BitpackedDeltaPrevious),
+            6 => Ok(Self::BitpackedDeltaBase),
+            7 => Ok(Self::BitpackedDeltaRelated),
+            8 => Ok(Self::DerivedOffset),
+            9 => Ok(Self::BitpackedDeltaRelatedOffset),
+            10 => Ok(Self::BitpackedDeltaPreviousOffset),
+            11 => Ok(Self::BitpackedDeltaPreviousFieldOffset),
+            12 => Ok(Self::BitpackedCandleMaxOffset),
+            13 => Ok(Self::BitpackedCandleMinOffset),
+            14 => Ok(Self::BitpackedProductResidual),
+            15 => Ok(Self::BitpackedProportionalResidual),
             _ => Err(AuraError::InvalidValue("program op")),
         }
     }
@@ -46,6 +68,19 @@ impl ProgramOp {
             Self::DeltaPrevious => FieldEncoding::DeltaPrevious,
             Self::DeltaRelated => FieldEncoding::DeltaRelated,
             Self::FixedStep => FieldEncoding::ImplicitFixedStep,
+            Self::BitpackedDeltaPrevious => FieldEncoding::BitpackedDeltaPrevious,
+            Self::BitpackedDeltaBase => FieldEncoding::BitpackedDeltaBase,
+            Self::BitpackedDeltaRelated => FieldEncoding::BitpackedDeltaRelated,
+            Self::DerivedOffset => FieldEncoding::DerivedOffset,
+            Self::BitpackedDeltaRelatedOffset => FieldEncoding::BitpackedDeltaRelatedOffset,
+            Self::BitpackedDeltaPreviousOffset => FieldEncoding::BitpackedDeltaPreviousOffset,
+            Self::BitpackedDeltaPreviousFieldOffset => {
+                FieldEncoding::BitpackedDeltaPreviousFieldOffset
+            }
+            Self::BitpackedCandleMaxOffset => FieldEncoding::BitpackedCandleMaxOffset,
+            Self::BitpackedCandleMinOffset => FieldEncoding::BitpackedCandleMinOffset,
+            Self::BitpackedProductResidual => FieldEncoding::BitpackedProductResidual,
+            Self::BitpackedProportionalResidual => FieldEncoding::BitpackedProportionalResidual,
         }
     }
 }
@@ -121,6 +156,7 @@ pub struct FieldProgram {
     pub reference_field_index: Option<u16>,
     pub base_value: Option<i64>,
     pub step: Option<i64>,
+    pub bit_width: Option<u8>,
 }
 
 impl FieldProgram {
@@ -131,15 +167,66 @@ impl FieldProgram {
             FieldEncoding::DeltaPrevious => ProgramOp::DeltaPrevious,
             FieldEncoding::DeltaRelated => ProgramOp::DeltaRelated,
             FieldEncoding::TimestampStep | FieldEncoding::ImplicitFixedStep => ProgramOp::FixedStep,
+            FieldEncoding::BitpackedDeltaPrevious => ProgramOp::BitpackedDeltaPrevious,
+            FieldEncoding::BitpackedDeltaBase => ProgramOp::BitpackedDeltaBase,
+            FieldEncoding::BitpackedDeltaRelated => ProgramOp::BitpackedDeltaRelated,
+            FieldEncoding::DerivedOffset => ProgramOp::DerivedOffset,
+            FieldEncoding::BitpackedDeltaRelatedOffset => ProgramOp::BitpackedDeltaRelatedOffset,
+            FieldEncoding::BitpackedDeltaPreviousOffset => ProgramOp::BitpackedDeltaPreviousOffset,
+            FieldEncoding::BitpackedDeltaPreviousFieldOffset => {
+                ProgramOp::BitpackedDeltaPreviousFieldOffset
+            }
+            FieldEncoding::BitpackedCandleMaxOffset => ProgramOp::BitpackedCandleMaxOffset,
+            FieldEncoding::BitpackedCandleMinOffset => ProgramOp::BitpackedCandleMinOffset,
+            FieldEncoding::BitpackedProductResidual => ProgramOp::BitpackedProductResidual,
+            FieldEncoding::BitpackedProportionalResidual => {
+                ProgramOp::BitpackedProportionalResidual
+            }
         };
         let has_base = matches!(
             op,
-            ProgramOp::DeltaBase | ProgramOp::DeltaPrevious | ProgramOp::FixedStep
+            ProgramOp::DeltaBase
+                | ProgramOp::DeltaPrevious
+                | ProgramOp::FixedStep
+                | ProgramOp::BitpackedDeltaPrevious
+                | ProgramOp::BitpackedDeltaBase
+                | ProgramOp::DerivedOffset
+                | ProgramOp::BitpackedDeltaRelatedOffset
+                | ProgramOp::BitpackedDeltaPreviousOffset
+                | ProgramOp::BitpackedDeltaPreviousFieldOffset
+                | ProgramOp::BitpackedCandleMaxOffset
+                | ProgramOp::BitpackedCandleMinOffset
+                | ProgramOp::BitpackedProductResidual
+                | ProgramOp::BitpackedProportionalResidual
         );
-        let has_step = matches!(op, ProgramOp::FixedStep);
-        let reference_field_index = field
-            .reference_field_index
-            .filter(|_| op == ProgramOp::DeltaRelated);
+        let has_step = matches!(
+            op,
+            ProgramOp::FixedStep
+                | ProgramOp::BitpackedDeltaPreviousOffset
+                | ProgramOp::BitpackedDeltaPreviousFieldOffset
+                | ProgramOp::BitpackedCandleMaxOffset
+                | ProgramOp::BitpackedCandleMinOffset
+                | ProgramOp::BitpackedProductResidual
+                | ProgramOp::BitpackedProportionalResidual
+        );
+        let is_bitpacked = is_bitpacked_op(op);
+        if is_bitpacked && field.bit_width > 64 {
+            return Err(AuraError::InvalidValue("bit width"));
+        }
+        let reference_field_index = field.reference_field_index.filter(|_| {
+            matches!(
+                op,
+                ProgramOp::DeltaRelated
+                    | ProgramOp::BitpackedDeltaRelated
+                    | ProgramOp::DerivedOffset
+                    | ProgramOp::BitpackedDeltaRelatedOffset
+                    | ProgramOp::BitpackedDeltaPreviousFieldOffset
+                    | ProgramOp::BitpackedCandleMaxOffset
+                    | ProgramOp::BitpackedCandleMinOffset
+                    | ProgramOp::BitpackedProductResidual
+                    | ProgramOp::BitpackedProportionalResidual
+            )
+        });
         let aux = reference_field_index
             .and_then(|index| u8::try_from(index).ok())
             .filter(|index| *index < FIELD_AUX_EXTENDED)
@@ -158,6 +245,7 @@ impl FieldProgram {
             reference_field_index,
             base_value: has_base.then_some(field.base_value),
             step: has_step.then_some(field.step),
+            bit_width: is_bitpacked.then_some(field.bit_width),
         })
     }
 
@@ -167,6 +255,7 @@ impl FieldProgram {
             field_index,
             encoding: op.to_encoding(),
             width: self.code.width()?,
+            bit_width: self.bit_width.unwrap_or(0),
             reference_field_index: self.reference_field_index,
             base_value: self.base_value.unwrap_or(0),
             step: self.step.unwrap_or(0),
@@ -204,6 +293,12 @@ impl FieldProgram {
                 self.code.const_width()?,
             )?;
         }
+        if is_bitpacked_op(self.code.op()?) {
+            put_u8(
+                out,
+                self.bit_width.ok_or(AuraError::InvalidValue("bit width"))?,
+            );
+        }
         Ok(())
     }
 
@@ -218,7 +313,18 @@ impl FieldProgram {
         let code = FieldCode::from_raw(reader.read_u16_le()?)?;
         let reference_field_index = if code.aux() == FIELD_AUX_EXTENDED {
             Some(reader.read_u16_le()?)
-        } else if code.op()? == ProgramOp::DeltaRelated {
+        } else if matches!(
+            code.op()?,
+            ProgramOp::DeltaRelated
+                | ProgramOp::BitpackedDeltaRelated
+                | ProgramOp::DerivedOffset
+                | ProgramOp::BitpackedDeltaRelatedOffset
+                | ProgramOp::BitpackedDeltaPreviousFieldOffset
+                | ProgramOp::BitpackedCandleMaxOffset
+                | ProgramOp::BitpackedCandleMinOffset
+                | ProgramOp::BitpackedProductResidual
+                | ProgramOp::BitpackedProportionalResidual
+        ) {
             Some(u16::from(code.aux()))
         } else {
             None
@@ -233,17 +339,43 @@ impl FieldProgram {
         } else {
             None
         };
+        let bit_width = if is_bitpacked_op(code.op()?) {
+            let bit_width = reader.read_u8()?;
+            if bit_width > 64 {
+                return Err(AuraError::InvalidValue("bit width"));
+            }
+            Some(bit_width)
+        } else {
+            None
+        };
         Ok(Self {
             code,
             reference_field_index,
             base_value,
             step,
+            bit_width,
         })
     }
 
     pub fn encoded_len(self) -> Result<usize> {
         Ok(self.encode()?.len())
     }
+}
+
+const fn is_bitpacked_op(op: ProgramOp) -> bool {
+    matches!(
+        op,
+        ProgramOp::BitpackedDeltaPrevious
+            | ProgramOp::BitpackedDeltaBase
+            | ProgramOp::BitpackedDeltaRelated
+            | ProgramOp::BitpackedDeltaRelatedOffset
+            | ProgramOp::BitpackedDeltaPreviousOffset
+            | ProgramOp::BitpackedDeltaPreviousFieldOffset
+            | ProgramOp::BitpackedCandleMaxOffset
+            | ProgramOp::BitpackedCandleMinOffset
+            | ProgramOp::BitpackedProductResidual
+            | ProgramOp::BitpackedProportionalResidual
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

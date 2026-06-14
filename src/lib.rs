@@ -4,6 +4,7 @@
 //! physical layouts separate so one canonical stream can become compact `.aura0`
 //! files or fast replay `.aura1` files.
 
+pub mod bitpack;
 pub mod bytes;
 pub mod chunk;
 pub mod cold;

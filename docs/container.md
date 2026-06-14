@@ -111,7 +111,7 @@ The compiled decode program is a field-index ordered list of small instructions.
 Each field starts with a `u16` code:
 
 ```text
-bits 0..4    op: absolute | delta_base | delta_previous | delta_related | fixed_step
+bits 0..4    op: 5-bit ProgramOp code; see docs/field-programs.md
 bits 5..7    stored value width: zero | i8 | i16 | i32 | i64 | i128
 bits 8..10   constant width: zero | i8 | i16 | i32 | i64 | i128
 bits 11..13  aux: inline related field index, or 7 for extended aux
@@ -120,11 +120,16 @@ bit 15       has step constant
 ```
 
 Optional extras follow only when the code asks for them: an extended `u16`
-reference field, a base constant, and a step constant. That keeps common fields
-to two bytes of instruction data while still representing base deltas,
-previous-value deltas, related-field deltas, and implicit fixed-step timestamps
-where the per-row timestamp is reconstructed from `base_value + row_index *
-step`.
+reference field, a base constant, a step constant, and one bit-width byte for
+bitpacked streams. That keeps common fields to two bytes of instruction data
+while still representing base deltas, previous-value deltas, related-field
+deltas, implicit fixed-step timestamps, constant offsets, candle wick residuals,
+and product/proportional residuals.
+
+Aura0 bodies are columnar by decode-program order. Aura1 bodies are row-major
+fixed-width replay data. Converting Aura0 to Aura1 decodes logical rows from the
+Aura0 field program, then emits a fresh Aura1 fixed-width program from those
+rows.
 
 The footer is what makes conversion deterministic. A converter can read the
 trailer to locate the footer, run the field program, and then process chunks

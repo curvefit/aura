@@ -179,13 +179,24 @@ delta_previous
 delta_base
 delta_related
 implicit_fixed_step
+bitpacked_delta_previous
+bitpacked_delta_base
+bitpacked_delta_related
+derived_offset
+bitpacked_delta_related_offset
+bitpacked_delta_previous_offset
+bitpacked_delta_previous_field_offset
+bitpacked_candle_max_offset
+bitpacked_candle_min_offset
+bitpacked_product_residual
+bitpacked_proportional_residual
 ```
 
 The schema may also allow candidate families that are tracked as stats before
 the physical writer grows an emitted representation, such as midpoint,
-delta-of-delta, rough fixed steps, zigzag varints, and bitpacking. Declaring a
-candidate is permission to test it; the planner still chooses empirically from
-the supported reversible encodings.
+delta-of-delta, rough fixed steps, zigzag varints, and exception tables.
+Declaring a candidate is permission to test it; the planner still chooses
+empirically from the supported reversible encodings.
 
 The `.aura` footer may keep the candidate plan and estimated bytes for audit.
 The compiled `.aura0` or `.aura1` footer stores the smaller decode instruction:
@@ -206,11 +217,15 @@ gap counts from missed expected steps
 zigzag varint byte estimates
 signed bit widths for bitpacking
 related-field delta ranges
+candle open/close/high/low residual ranges when relationships imply a shape
+product residual ranges such as quote = quantity * price / divisor
+proportional residual ranges such as child_quote = quote * child_qty / qty
 ```
 
-These calculations are column-local except related-field deltas, which are driven
-by the schema relationship metadata. They are inputs to a seal-time planner, not
-state that every compiled file must retain.
+These calculations are mostly column-local. Related-field, candle-shape, product,
+and proportional residuals are row scans driven by schema/order evidence. They
+are inputs to a seal-time planner, not state that every compiled file must
+retain.
 
 Snapshot-style schemas are expected to be separate logical schemas or explicit
 record kinds. They should not be forced into the delta schema just because both

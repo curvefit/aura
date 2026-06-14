@@ -193,5 +193,10 @@ shapes:
 .aura0/.aura1 AURP compiled footer with a decode program
 ```
 
+The compiled decode program already supports fixed steps, signed bitpacked
+deltas, unsigned offset bitpacks, candle wick residuals, product residuals, and
+proportional residuals. It is still a field-program footer rather than the target
+slot-tail footer above.
+
 That should converge toward one small stamped slot table footer shared across
 profiles, interpreted by the header `version` and `profile`.

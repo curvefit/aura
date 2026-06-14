@@ -93,11 +93,11 @@ fn generic_i64_schema_drives_compiled_field_choices_without_ohlcv_names() {
         plan.field("ts", &schema).unwrap().encoding
     );
     assert_eq!(
-        FieldEncoding::DeltaRelated,
+        FieldEncoding::DerivedOffset,
         plan.field("v2", &schema).unwrap().encoding
     );
     assert_eq!(
-        FieldEncoding::DeltaPrevious,
+        FieldEncoding::BitpackedDeltaPrevious,
         plan.field("v5", &schema).unwrap().encoding
     );
 
@@ -189,11 +189,11 @@ fn generic_i64_parent_schema_drives_dynamic_aura0_related_deltas() {
         .unwrap();
 
     assert_eq!(
-        FieldEncoding::DeltaRelated,
+        FieldEncoding::DerivedOffset,
         plan.field("v2", &schema).unwrap().encoding
     );
     assert_eq!(
-        FieldEncoding::DeltaRelated,
+        FieldEncoding::DerivedOffset,
         plan.field("v6", &schema).unwrap().encoding
     );
     let aura0 = records::compile_i64_file(&ingest, Profile::Aura0).unwrap();

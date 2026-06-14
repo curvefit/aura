@@ -126,7 +126,7 @@ fn ingest_i64_file_round_trips_rows_and_footer_plans() {
         plan.field("ts_open", &schema).unwrap().encoding
     );
     assert_eq!(
-        FieldEncoding::DeltaRelated,
+        FieldEncoding::DerivedOffset,
         plan.field("high", &schema).unwrap().encoding
     );
 }
@@ -187,6 +187,206 @@ fn compiled_i64_profiles_round_trip_ingest_rows() {
 }
 
 #[test]
+fn compiled_aura0_uses_bitpacked_delta_body() {
+    let schema = ohlcv_schema().unwrap();
+    let rows: Vec<Vec<i64>> = (0..130)
+        .map(|idx| {
+            let ts = 1_000_000_000 + i64::from(idx) * 60_000_000_000;
+            let open = 10_000 + i64::from(idx % 2);
+            vec![ts, open, open + 1, open - 1, open, 500 + i64::from(idx % 2)]
+        })
+        .collect();
+    let ingest = records::encode_ingest_i64_file(records::I64FileInput {
+        schema: schema.clone(),
+        rows: rows.clone(),
+        stream_id: 2,
+        dictionary_id: 9,
+        header_comment: None,
+    })
+    .unwrap();
+
+    let aura0 = records::compile_i64_file(&ingest, Profile::Aura0).unwrap();
+    let decoded = records::decode_i64_file(&aura0).unwrap();
+    let plan = decoded
+        .compiled_footer
+        .as_ref()
+        .unwrap()
+        .program
+        .to_aura0_plan()
+        .unwrap();
+
+    assert_eq!(rows, decoded.rows);
+    assert_eq!(
+        FieldEncoding::BitpackedDeltaBase,
+        plan.field("open", &schema).unwrap().encoding
+    );
+    assert_eq!(
+        FieldEncoding::DerivedOffset,
+        plan.field("high", &schema).unwrap().encoding
+    );
+    assert!(aura0.len() < ingest.len() / 4);
+}
+
+#[test]
+fn compiled_aura0_round_trips_derived_and_biased_bitpacked_fields() {
+    let schema =
+        aura_codec::generic_i64_parent_schema("derived_and_biased", &[255, 0, 2, 0]).unwrap();
+    let mut previous = 10_000;
+    let mut rows = Vec::new();
+    for idx in 0..130 {
+        if idx > 0 {
+            previous += 1_000 + i64::from(idx - 1);
+        }
+        let parent = if idx % 2 == 0 { 1_000_000 } else { 2_000_000 };
+        let related_delta = -130 + i64::from(idx);
+        rows.push(vec![
+            i64::from(idx),
+            parent,
+            parent + related_delta,
+            previous,
+        ]);
+    }
+    let ingest = records::encode_ingest_i64_file(records::I64FileInput {
+        schema: schema.clone(),
+        rows: rows.clone(),
+        stream_id: 2,
+        dictionary_id: 9,
+        header_comment: None,
+    })
+    .unwrap();
+
+    let aura0 = records::compile_i64_file(&ingest, Profile::Aura0).unwrap();
+    let decoded = records::decode_i64_file(&aura0).unwrap();
+    let plan = decoded
+        .compiled_footer
+        .as_ref()
+        .unwrap()
+        .program
+        .to_aura0_plan()
+        .unwrap();
+
+    assert_eq!(rows, decoded.rows);
+    assert_eq!(
+        FieldEncoding::BitpackedDeltaRelatedOffset,
+        plan.field("v2", &schema).unwrap().encoding
+    );
+    assert_eq!(
+        FieldEncoding::BitpackedDeltaPreviousOffset,
+        plan.field("v3", &schema).unwrap().encoding
+    );
+}
+
+#[test]
+fn compiled_aura0_uses_candle_and_residual_footer_programs() {
+    let schema =
+        aura_codec::generic_i64_parent_schema("btc_like", &[255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8])
+            .unwrap();
+    let rows = vec![
+        vec![
+            0, 10_000, 10_050, 9_970, 10_020, 1_000, 59_999, 10_000_000, 10, 400, 4_000_000,
+        ],
+        vec![
+            60_000, 10_025, 10_100, 9_990, 10_080, 1_200, 119_999, 12_036_000, 12, 500, 5_015_000,
+        ],
+        vec![
+            120_000, 10_070, 10_090, 10_000, 10_010, 900, 179_999, 9_054_000, 9, 300, 3_018_000,
+        ],
+        vec![
+            180_000, 10_015, 10_040, 9_960, 9_980, 1_500, 239_999, 15_022_500, 15, 700, 7_010_500,
+        ],
+    ];
+    let ingest = records::encode_ingest_i64_file(records::I64FileInput {
+        schema: schema.clone(),
+        rows: rows.clone(),
+        stream_id: 2,
+        dictionary_id: 9,
+        header_comment: None,
+    })
+    .unwrap();
+
+    let aura0 = records::compile_i64_file(&ingest, Profile::Aura0).unwrap();
+    let decoded = records::decode_i64_file(&aura0).unwrap();
+    let plan = decoded
+        .compiled_footer
+        .as_ref()
+        .unwrap()
+        .program
+        .to_aura0_plan()
+        .unwrap();
+
+    assert_eq!(rows, decoded.rows);
+    assert_eq!(
+        FieldEncoding::BitpackedDeltaPreviousFieldOffset,
+        plan.field("v1", &schema).unwrap().encoding
+    );
+    assert_eq!(
+        FieldEncoding::BitpackedCandleMaxOffset,
+        plan.field("v2", &schema).unwrap().encoding
+    );
+    assert_eq!(
+        FieldEncoding::BitpackedCandleMinOffset,
+        plan.field("v3", &schema).unwrap().encoding
+    );
+    assert_eq!(
+        FieldEncoding::BitpackedProductResidual,
+        plan.field("v7", &schema).unwrap().encoding
+    );
+    assert_eq!(
+        FieldEncoding::BitpackedProportionalResidual,
+        plan.field("v10", &schema).unwrap().encoding
+    );
+}
+
+#[test]
+fn compiled_aura0_can_compile_back_to_aura1() {
+    let schema = aura_codec::generic_i64_parent_schema(
+        "aura0_to_aura1",
+        &[255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8],
+    )
+    .unwrap();
+    let rows: Vec<Vec<i64>> = (0..32)
+        .map(|idx| {
+            let open = 10_000 + i64::from(idx % 5) * 10;
+            let close = open + i64::from(idx % 7) - 3;
+            let high = open.max(close) + i64::from(idx % 4);
+            let low = open.min(close) - i64::from(idx % 3);
+            let volume = 1_000 + i64::from(idx * 10);
+            let quote = volume * low + i64::from(idx % 11);
+            let taker_base = volume / 3;
+            let taker_quote = quote * taker_base / volume + i64::from(idx % 13);
+            vec![
+                i64::from(idx) * 60_000,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                i64::from(idx) * 60_000 + 59_999,
+                quote,
+                i64::from(idx),
+                taker_base,
+                taker_quote,
+            ]
+        })
+        .collect();
+    let ingest = records::encode_ingest_i64_file(records::I64FileInput {
+        schema,
+        rows: rows.clone(),
+        stream_id: 2,
+        dictionary_id: 9,
+        header_comment: None,
+    })
+    .unwrap();
+    let aura0 = records::compile_i64_file(&ingest, Profile::Aura0).unwrap();
+
+    let aura1 = records::compile_i64_file(&aura0, Profile::Aura1).unwrap();
+    let decoded = records::decode_i64_file(&aura1).unwrap();
+
+    assert_eq!(Profile::Aura1, decoded.header.profile);
+    assert_eq!(rows, decoded.rows);
+}
+
+#[test]
 fn compiled_footer_omits_ingest_stats_and_uses_field_programs() {
     let schema = ohlcv_schema().unwrap();
     let rows = sample_ohlcv_rows();
@@ -205,7 +405,7 @@ fn compiled_footer_omits_ingest_stats_and_uses_field_programs() {
 
     assert_eq!(rows.len() as u64, footer.record_count);
     assert_eq!(6, footer.program.fields.len());
-    assert!(footer.program.encoded_len().unwrap() <= 48);
+    assert!(footer.program.encoded_len().unwrap() <= 80);
     assert!(trailer_footer_len(&aura0) < 256);
 }
 

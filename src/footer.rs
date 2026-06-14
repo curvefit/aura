@@ -295,6 +295,7 @@ fn encode_plan_field(field: PhysicalFieldPlan, out: &mut Vec<u8>) {
     put_u16_le(out, field.field_index);
     put_u8(out, field.encoding as u8);
     put_u8(out, field.width.code());
+    put_u8(out, field.bit_width);
     put_u16_le(out, field.reference_field_index.unwrap_or(u16::MAX));
     put_i64_le(out, field.base_value);
     put_i64_le(out, field.step);
@@ -311,6 +312,7 @@ fn decode_plan_fields(
             field_index: reader.read_u16_le()?,
             encoding: FieldEncoding::from_code(reader.read_u8()?)?,
             width: PhysicalWidth::from_code(reader.read_u8()?)?,
+            bit_width: reader.read_u8()?,
             reference_field_index: match reader.read_u16_le()? {
                 u16::MAX => None,
                 index => Some(index),
