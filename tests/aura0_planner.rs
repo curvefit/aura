@@ -309,8 +309,8 @@ fn aura0_planner_keeps_side_and_flags_out_of_residual_search() {
         .field("price", FieldType::I64, FieldRole::Price)
         .field("size", FieldType::I64, FieldRole::Quantity)
         .field("side", FieldType::I8, FieldRole::Side)
-        .field("is_block", FieldType::I8, FieldRole::Flag)
-        .field("is_rpi", FieldType::I8, FieldRole::Flag)
+        .field("flag_a", FieldType::I8, FieldRole::Flag)
+        .field("flag_b", FieldType::I8, FieldRole::Flag)
         .finish()
         .unwrap();
     let mut stats = IngestStats::new_for_schema(&schema).unwrap();
@@ -331,13 +331,13 @@ fn aura0_planner_keeps_side_and_flags_out_of_residual_search() {
 
     let plan = Aura0Plan::from_schema_rows_stats(&schema, &stats, &rows).unwrap();
     let side = plan.field("side", &schema).unwrap();
-    let is_block = plan.field("is_block", &schema).unwrap();
-    let is_rpi = plan.field("is_rpi", &schema).unwrap();
+    let flag_a = plan.field("flag_a", &schema).unwrap();
+    let flag_b = plan.field("flag_b", &schema).unwrap();
 
     assert_eq!(FieldEncoding::BitpackedDeltaBase, side.encoding);
-    assert_eq!(FieldEncoding::BitpackedDeltaBase, is_block.encoding);
-    assert_eq!(FieldEncoding::BitpackedDeltaBase, is_rpi.encoding);
+    assert_eq!(FieldEncoding::BitpackedDeltaBase, flag_a.encoding);
+    assert_eq!(FieldEncoding::BitpackedDeltaBase, flag_b.encoding);
     assert_eq!(2, side.bit_width);
-    assert_eq!(0, is_block.bit_width);
-    assert_eq!(1, is_rpi.bit_width);
+    assert_eq!(0, flag_a.bit_width);
+    assert_eq!(1, flag_b.bit_width);
 }

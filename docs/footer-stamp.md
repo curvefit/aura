@@ -86,10 +86,14 @@ For hot `.aura1` fixed-width slots, `decode_arg` uses the integer width code:
 
 Timestamp slots are logical `i64` time values, but candle data can stamp them as
 `fixed_step` with base and step constants in the aux table. The front header
-schema map remains the source of parent relationships:
+schema map remains the source of parent relationships and repeated child shape:
 
 ```text
-255 primary timestamp | 0 no parent | 1..254 parent slot + 1
+255 primary timestamp
+0 event/root slot
+1..127 event slot, parent = value - 1
+128 repeated child root slot
+129..254 repeated child slot, parent = value - 129
 ```
 
 Scale is fixed-width and placed before any variable data so a parser can read it

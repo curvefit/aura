@@ -60,9 +60,11 @@ pub struct FieldStats {
     pub min_delta: i64,
     pub max_delta: i64,
     pub max_abs_delta: u64,
+    pub delta_valid: bool,
     pub min_delta2: i64,
     pub max_delta2: i64,
     pub max_abs_delta2: u64,
+    pub delta2_valid: bool,
     pub monotonic_non_decreasing: bool,
     pub first_value: Option<i64>,
     pub fixed_step: Option<i64>,
@@ -122,10 +124,12 @@ pub struct FieldStatsSummary {
     pub min: i64,
     pub max: i64,
     pub max_abs_delta: u64,
+    pub delta_valid: bool,
     pub monotonic_non_decreasing: bool,
     pub first_value: Option<i64>,
     pub fixed_step: Option<i64>,
     pub fixed_step_valid: bool,
+    pub delta2_valid: bool,
 }
 
 impl PartialEq for FieldStats {
@@ -135,10 +139,12 @@ impl PartialEq for FieldStats {
             && self.min == other.min
             && self.max == other.max
             && self.max_abs_delta == other.max_abs_delta
+            && self.delta_valid == other.delta_valid
             && self.monotonic_non_decreasing == other.monotonic_non_decreasing
             && self.first_value == other.first_value
             && self.fixed_step == other.fixed_step
             && self.fixed_step_valid == other.fixed_step_valid
+            && self.delta2_valid == other.delta2_valid
     }
 }
 
@@ -153,9 +159,11 @@ impl FieldStats {
             min_delta: 0,
             max_delta: 0,
             max_abs_delta: 0,
+            delta_valid: true,
             min_delta2: 0,
             max_delta2: 0,
             max_abs_delta2: 0,
+            delta2_valid: true,
             monotonic_non_decreasing: true,
             first_value: None,
             fixed_step: None,
@@ -174,8 +182,12 @@ impl FieldStats {
             self.min = value;
             self.max = value;
             self.first_value = Some(value);
-            self.previous_delta_zigzag_varint_bytes += u64::from(zigzag_varint_len(value));
-            self.delta2_zigzag_varint_bytes += u64::from(zigzag_varint_len(value));
+            self.previous_delta_zigzag_varint_bytes = self
+                .previous_delta_zigzag_varint_bytes
+                .saturating_add(u64::from(zigzag_varint_len(value)));
+            self.delta2_zigzag_varint_bytes = self
+                .delta2_zigzag_varint_bytes
+                .saturating_add(u64::from(zigzag_varint_len(value)));
         } else {
             self.min = self.min.min(value);
             self.max = self.max.max(value);
@@ -183,46 +195,67 @@ impl FieldStats {
         self.absolute_zigzag_varint_bytes += u64::from(zigzag_varint_len(value));
 
         if let Some(previous) = self.previous {
-            let step = value - previous;
-            if self.first_delta.is_none() {
-                self.first_delta = Some(step);
-                self.min_delta = step;
-                self.max_delta = step;
-                self.rough_step = Some(RoughStepStats::new(step));
-                self.delta2_zigzag_varint_bytes += u64::from(zigzag_varint_len(step));
-            } else {
-                self.min_delta = self.min_delta.min(step);
-                self.max_delta = self.max_delta.max(step);
-                if let Some(rough_step) = &mut self.rough_step {
-                    rough_step.observe_delta(step);
-                }
-            }
-
-            self.previous_delta_zigzag_varint_bytes += u64::from(zigzag_varint_len(step));
-
-            if let Some(previous_delta) = self.previous_delta {
-                let delta2 = step - previous_delta;
-                if self.observed == 2 {
-                    self.min_delta2 = delta2;
-                    self.max_delta2 = delta2;
+            let raw_step = i128::from(value) - i128::from(previous);
+            self.max_abs_delta = self.max_abs_delta.max(raw_step.unsigned_abs() as u64);
+            if let Ok(step) = i64::try_from(raw_step) {
+                if self.first_delta.is_none() {
+                    self.first_delta = Some(step);
+                    self.min_delta = step;
+                    self.max_delta = step;
+                    self.rough_step = Some(RoughStepStats::new(step));
+                    self.delta2_zigzag_varint_bytes = self
+                        .delta2_zigzag_varint_bytes
+                        .saturating_add(u64::from(zigzag_varint_len(step)));
                 } else {
-                    self.min_delta2 = self.min_delta2.min(delta2);
-                    self.max_delta2 = self.max_delta2.max(delta2);
+                    self.min_delta = self.min_delta.min(step);
+                    self.max_delta = self.max_delta.max(step);
+                    if let Some(rough_step) = &mut self.rough_step {
+                        rough_step.observe_delta(step);
+                    }
                 }
-                self.max_abs_delta2 = self.max_abs_delta2.max(delta2.unsigned_abs());
-                self.delta2_zigzag_varint_bytes += u64::from(zigzag_varint_len(delta2));
-            }
 
-            self.max_abs_delta = self.max_abs_delta.max(abs_delta(previous, value));
+                self.previous_delta_zigzag_varint_bytes = self
+                    .previous_delta_zigzag_varint_bytes
+                    .saturating_add(u64::from(zigzag_varint_len(step)));
+
+                if let Some(previous_delta) = self.previous_delta {
+                    if let Some(delta2) = step.checked_sub(previous_delta) {
+                        if self.observed == 2 {
+                            self.min_delta2 = delta2;
+                            self.max_delta2 = delta2;
+                        } else {
+                            self.min_delta2 = self.min_delta2.min(delta2);
+                            self.max_delta2 = self.max_delta2.max(delta2);
+                        }
+                        self.max_abs_delta2 = self.max_abs_delta2.max(delta2.unsigned_abs());
+                        self.delta2_zigzag_varint_bytes = self
+                            .delta2_zigzag_varint_bytes
+                            .saturating_add(u64::from(zigzag_varint_len(delta2)));
+                    } else {
+                        self.delta2_valid = false;
+                        self.delta2_zigzag_varint_bytes = u64::MAX;
+                    }
+                }
+
+                if self.delta_valid {
+                    if self.observed == 1 {
+                        self.fixed_step = Some(step);
+                    } else if self.fixed_step != Some(step) {
+                        self.fixed_step_valid = false;
+                    }
+                }
+                self.previous_delta = Some(step);
+            } else {
+                self.delta_valid = false;
+                self.delta2_valid = false;
+                self.fixed_step_valid = false;
+                self.previous_delta = None;
+                self.previous_delta_zigzag_varint_bytes = u64::MAX;
+                self.delta2_zigzag_varint_bytes = u64::MAX;
+            }
             if value < previous {
                 self.monotonic_non_decreasing = false;
             }
-            if self.observed == 1 {
-                self.fixed_step = Some(step);
-            } else if self.fixed_step != Some(step) {
-                self.fixed_step_valid = false;
-            }
-            self.previous_delta = Some(step);
         }
 
         self.previous = Some(value);
@@ -236,6 +269,7 @@ impl FieldStats {
             min: summary.min,
             max: summary.max,
             max_abs_delta: summary.max_abs_delta,
+            delta_valid: summary.delta_valid,
             monotonic_non_decreasing: summary.monotonic_non_decreasing,
             first_value: summary.first_value,
             fixed_step: summary.fixed_step,
@@ -246,6 +280,7 @@ impl FieldStats {
             min_delta2: 0,
             max_delta2: 0,
             max_abs_delta2: 0,
+            delta2_valid: summary.delta2_valid,
             rough_step: None,
             absolute_zigzag_varint_bytes: 0,
             previous_delta_zigzag_varint_bytes: 0,
@@ -305,6 +340,7 @@ pub struct RelatedFieldStats {
     pub min_delta: i64,
     pub max_delta: i64,
     pub max_abs_delta: u64,
+    pub delta_valid: bool,
 }
 
 impl RelatedFieldStats {
@@ -316,19 +352,24 @@ impl RelatedFieldStats {
             min_delta: 0,
             max_delta: 0,
             max_abs_delta: 0,
+            delta_valid: true,
         }
     }
 
     pub fn observe(&mut self, value: i64, related_value: i64) {
-        let delta = value - related_value;
-        if self.observed == 0 {
-            self.min_delta = delta;
-            self.max_delta = delta;
+        let raw_delta = i128::from(value) - i128::from(related_value);
+        self.max_abs_delta = self.max_abs_delta.max(raw_delta.unsigned_abs() as u64);
+        if let Ok(delta) = i64::try_from(raw_delta) {
+            if self.observed == 0 {
+                self.min_delta = delta;
+                self.max_delta = delta;
+            } else {
+                self.min_delta = self.min_delta.min(delta);
+                self.max_delta = self.max_delta.max(delta);
+            }
         } else {
-            self.min_delta = self.min_delta.min(delta);
-            self.max_delta = self.max_delta.max(delta);
+            self.delta_valid = false;
         }
-        self.max_abs_delta = self.max_abs_delta.max(delta.unsigned_abs());
         self.observed += 1;
     }
 

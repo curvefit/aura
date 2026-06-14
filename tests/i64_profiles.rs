@@ -1,5 +1,5 @@
 use aura_codec::format::FORMAT_VERSION;
-use aura_codec::schema::ohlcv_schema;
+use aura_codec::schema::{generic_i64_parent_schema, ohlcv_schema};
 use aura_codec::{records, AuraError, FieldEncoding, Profile};
 
 fn sample_ohlcv_rows() -> Vec<Vec<i64>> {
@@ -280,6 +280,24 @@ fn compiled_aura0_round_trips_derived_and_biased_bitpacked_fields() {
         FieldEncoding::BitpackedDeltaPreviousOffset,
         plan.field("v3", &schema).unwrap().encoding
     );
+}
+
+#[test]
+fn compiled_aura0_round_trips_full_i64_span_without_delta_overflow() {
+    let schema = generic_i64_parent_schema("wide_value_v1", &[255, 0]).unwrap();
+    let rows = vec![vec![1_000, i64::MIN], vec![1_001, i64::MAX], vec![1_002, 0]];
+
+    let ingest = records::encode_ingest_i64_file(records::I64FileInput {
+        schema,
+        rows: rows.clone(),
+        stream_id: 0,
+        dictionary_id: 0,
+        header_comment: None,
+    })
+    .unwrap();
+    let aura0 = records::compile_i64_file(&ingest, Profile::Aura0).unwrap();
+
+    assert_eq!(rows, records::decode_i64_file(&aura0).unwrap().rows);
 }
 
 #[test]

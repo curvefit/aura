@@ -11,11 +11,22 @@ schema_map    schema_len bytes
 comment_utf8  comment_len bytes
 ```
 
-Each byte is self-describing: `255` marks the primary timestamp slot, `0` means
-no parent, and `1..254` means the parent is slot `value - 1`. This header
-mapping is a quick file-shape preview and body-start metadata. It is not the
-full schema. `comment_utf8` is optional human-readable text, usually CSV-style
-labels; `comment_len = 0` means no comment.
+Each byte is self-describing:
+
+```text
+255       primary timestamp slot
+0         event/root slot with no parent
+1..127    event slot, parent = value - 1
+128       repeated child root slot with no parent
+129..254  repeated child slot, parent = value - 129
+```
+
+This keeps one byte per logical slot while still telling a dumb writer which
+fields are one-per-event and which fields repeat inside an event, such as
+orderbook levels. The mapping is a quick file-shape preview and body-start
+metadata. It is not the full footer program. `comment_utf8` is optional
+human-readable text, usually CSV-style labels; `comment_len = 0` means no
+comment.
 
 ```text
 schema block
@@ -37,7 +48,8 @@ parent_slots     slot_count bytes
 ```
 
 Slot `0` is the timestamp slot and is marked `255`. Slots `1..N` are generic
-`i64` values. This uses the same byte convention as the front header.
+`i64` values. This uses the same byte convention as the front header, including
+the repeated child range.
 
 Schema encoding type `1` is the full field-descriptor fallback for richer
 schemas:
@@ -51,6 +63,7 @@ field descriptor
   name
   field type
   semantic role
+  field scope
   nullable flag
   relationship
   transform candidates
@@ -82,8 +95,8 @@ slot  field         role        common Aura0 result
 2     price         price       previous-offset bitpack
 3     size          quantity    base-offset bitpack
 4     side          side        base-offset bitpack
-5     is_block      flag        zero-width or one-bit base-offset bitpack
-6     is_rpi        flag        zero-width or one-bit base-offset bitpack
+5     flag_a        flag        zero-width or one-bit base-offset bitpack
+6     flag_b        flag        zero-width or one-bit base-offset bitpack
 ```
 
 The front header mapping for this shape is intentionally plain:
@@ -140,9 +153,9 @@ proven implicit when every row advances by the same fixed step, such as
 one-minute bars.
 
 `generic_i64_parent_schema` is the compact parent-vector path for dynamic
-OHLCV-like records. The vector includes the timestamp slot. Each byte is
-self-describing: `255` means primary timestamp, `0` means no parent, and
-`1..254` means the parent is slot `value - 1`.
+OHLCV-like records and repeated child records. The vector includes the
+timestamp slot. Each byte is self-describing with the same header map convention
+listed above.
 
 ```text
 slots:
@@ -163,6 +176,29 @@ This says high, low, and close may delta from open; taker buy and taker sell may
 delta from volume. The codec still chooses the actual physical encoding from
 stats. The parent vector is only relationship evidence, not a command to force
 a related delta.
+
+For an orderbook update stream flattened into level rows:
+
+```text
+slots:
+0 ts_event
+1 sequence_final
+2 sequence_primary
+3 side
+4 price
+5 qty1
+6 qty2
+7 delete_flag
+
+parents:
+255 0 0 128 128 128 128 128
+```
+
+Slots `0..2` are event-level fields. Slots `3..7` are repeated child fields.
+That is enough for a schema-driven writer to group contiguous rows with the same
+event fields, write the event fields once, and write the repeated child fields
+per level. The stamped footer still decides exact storage units, widths,
+bitpacking, varints, and sparse/presence streams.
 
 The intended module pattern is:
 

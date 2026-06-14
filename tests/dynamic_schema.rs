@@ -1,5 +1,5 @@
 use aura_codec::schema::{
-    generic_i64_parent_schema, generic_i64_schema, FieldRelation, FieldTransform,
+    generic_i64_parent_schema, generic_i64_schema, FieldRelation, FieldScope, FieldTransform,
     RelatedFieldMapping,
 };
 use aura_codec::{records, AuraError, FieldEncoding, Profile};
@@ -131,6 +131,46 @@ fn generic_i64_parent_schema_maps_time_and_parent_bytes() {
     assert_eq!(FieldRelation::None, schema.fields[5].relation);
     assert_eq!(FieldRelation::DeltaFromField(5), schema.fields[6].relation);
     assert_eq!(FieldRelation::DeltaFromField(5), schema.fields[7].relation);
+}
+
+#[test]
+fn generic_i64_parent_schema_maps_repeated_child_scope() {
+    let schema = generic_i64_parent_schema(
+        "dynamic_book_delta_v1",
+        &[255, 0, 0, 128, 128, 128, 128, 128],
+    )
+    .unwrap();
+
+    assert_eq!(FieldScope::Event, schema.fields[0].scope);
+    assert_eq!(FieldScope::Event, schema.fields[1].scope);
+    assert_eq!(FieldScope::Event, schema.fields[2].scope);
+    assert_eq!(FieldScope::Repeated, schema.fields[3].scope);
+    assert_eq!(FieldScope::Repeated, schema.fields[7].scope);
+    assert_eq!(FieldRelation::None, schema.fields[3].relation);
+}
+
+#[test]
+fn generic_i64_writer_preserves_scoped_parent_map_in_header() {
+    let parent_slots = vec![255, 0, 0, 128, 128, 128, 128, 128];
+    let schema = generic_i64_parent_schema("dynamic_book_delta_v1", &parent_slots).unwrap();
+    let rows = vec![
+        vec![1_000, 10, 20, 1, 0, 100_000, 5, 0],
+        vec![1_000, 10, 20, 1, 0, 100_010, 0, 1],
+        vec![1_001, 11, 21, 1, 1, 100_020, 8, 0],
+    ];
+
+    let ingest = records::encode_ingest_i64_file(records::I64FileInput {
+        schema,
+        rows,
+        stream_id: 42,
+        dictionary_id: 7,
+        header_comment: None,
+    })
+    .unwrap();
+    let decoded = records::decode_i64_file(&ingest).unwrap();
+
+    assert_eq!(parent_slots, decoded.header.schema_mapping);
+    assert_eq!(FieldScope::Repeated, decoded.schema.fields[3].scope);
 }
 
 #[test]

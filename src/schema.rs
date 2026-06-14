@@ -8,6 +8,9 @@ const SCHEMA_ENCODING_PARENT_VECTOR: u8 = 0;
 const SCHEMA_ENCODING_FULL_FIELDS: u8 = 1;
 const DECODED_SCHEMA_NAME: &str = "schema";
 pub(crate) const SCHEMA_MAP_TIME_SLOT: u8 = u8::MAX;
+pub(crate) const SCHEMA_MAP_REPEATED_ROOT_SLOT: u8 = 128;
+pub(crate) const SCHEMA_MAP_REPEATED_PARENT_BASE: u8 = 129;
+pub(crate) const SCHEMA_MAP_EVENT_PARENT_MAX: u8 = 127;
 
 /// Logical field type recorded by an Aura schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -71,6 +74,26 @@ impl FieldRole {
             9 => Ok(Self::Flag),
             10 => Ok(Self::PriceAnchor),
             _ => Err(AuraError::InvalidValue("field role")),
+        }
+    }
+}
+
+/// Positional scope encoded by the compact front-header schema map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum FieldScope {
+    /// One value per logical event/record.
+    Event = 0,
+    /// Repeated child value inside a logical event, such as an orderbook level.
+    Repeated = 1,
+}
+
+impl FieldScope {
+    pub fn from_code(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Event),
+            1 => Ok(Self::Repeated),
+            _ => Err(AuraError::InvalidValue("field scope")),
         }
     }
 }
@@ -220,9 +243,19 @@ pub struct FieldDescriptor {
     pub name: String,
     pub field_type: FieldType,
     pub role: FieldRole,
+    pub scope: FieldScope,
     pub nullable: bool,
     pub relation: FieldRelation,
     pub candidates: TransformCandidates,
+}
+
+/// Decoded meaning of one compact front-header schema-map byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaMapEntry {
+    pub field_index: u16,
+    pub scope: FieldScope,
+    pub is_timestamp: bool,
+    pub relation: FieldRelation,
 }
 
 /// Logical schema descriptor shared by ingest, Aura0, and Aura1.
@@ -318,6 +351,7 @@ impl SchemaBuilder {
             name,
             field_type,
             role,
+            FieldScope::Event,
             false,
             FieldRelation::None,
             candidates,
@@ -350,6 +384,46 @@ impl SchemaBuilder {
             name,
             field_type,
             role,
+            FieldScope::Event,
+            false,
+            FieldRelation::DeltaFromField(related_index),
+        )
+    }
+
+    pub fn repeated_field(
+        self,
+        name: impl Into<String>,
+        field_type: FieldType,
+        role: FieldRole,
+    ) -> Self {
+        self.field_with_relation(
+            name,
+            field_type,
+            role,
+            FieldScope::Repeated,
+            false,
+            FieldRelation::None,
+        )
+    }
+
+    pub fn repeated_field_related_to(
+        self,
+        name: impl Into<String>,
+        field_type: FieldType,
+        role: FieldRole,
+        related_field_name: &str,
+    ) -> Self {
+        let related_index = self
+            .fields
+            .iter()
+            .find(|field| field.name == related_field_name)
+            .map(|field| field.index)
+            .unwrap_or(u16::MAX);
+        self.field_with_relation(
+            name,
+            field_type,
+            role,
+            FieldScope::Repeated,
             false,
             FieldRelation::DeltaFromField(related_index),
         )
@@ -362,7 +436,14 @@ impl SchemaBuilder {
         role: FieldRole,
         nullable: bool,
     ) -> Self {
-        self.field_with_relation(name, field_type, role, nullable, FieldRelation::None)
+        self.field_with_relation(
+            name,
+            field_type,
+            role,
+            FieldScope::Event,
+            nullable,
+            FieldRelation::None,
+        )
     }
 
     fn field_with_relation(
@@ -370,6 +451,7 @@ impl SchemaBuilder {
         name: impl Into<String>,
         field_type: FieldType,
         role: FieldRole,
+        scope: FieldScope,
         nullable: bool,
         relation: FieldRelation,
     ) -> Self {
@@ -378,7 +460,7 @@ impl SchemaBuilder {
             candidates = candidates.with(FieldTransform::DeltaRelated);
         }
         self.field_with_relation_and_candidates(
-            name, field_type, role, nullable, relation, candidates,
+            name, field_type, role, scope, nullable, relation, candidates,
         )
     }
 
@@ -387,6 +469,7 @@ impl SchemaBuilder {
         name: impl Into<String>,
         field_type: FieldType,
         role: FieldRole,
+        scope: FieldScope,
         nullable: bool,
         relation: FieldRelation,
         candidates: TransformCandidates,
@@ -396,6 +479,7 @@ impl SchemaBuilder {
             name: name.into(),
             field_type,
             role,
+            scope,
             nullable,
             relation,
             candidates,
@@ -417,6 +501,9 @@ impl SchemaBuilder {
             }
             if matches!(field.relation, FieldRelation::DeltaFromField(u16::MAX)) {
                 return Err(AuraError::InvalidValue("related field name"));
+            }
+            if field.role == FieldRole::Timestamp && field.scope != FieldScope::Event {
+                return Err(AuraError::InvalidValue("timestamp scope"));
             }
             if let FieldRelation::DeltaFromField(related_index) = field.relation {
                 if usize::from(related_index) >= self.fields.len() || related_index == field.index {
@@ -467,6 +554,7 @@ pub fn generic_i64_schema(
             format!("v{field_index}"),
             FieldType::I64,
             FieldRole::Value,
+            FieldScope::Event,
             false,
             relation,
         );
@@ -478,37 +566,141 @@ pub fn generic_i64_schema(
 ///
 /// `parent_slots[0]` describes the timestamp slot. Every later slot is a
 /// generic `i64` value. A parent byte of `255` marks the timestamp slot, `0`
-/// means no related-field delta candidate, and `1..254` means the slot may
-/// delta from slot `value - 1`.
+/// means an event/root slot, `1..127` means an event slot that may delta from
+/// slot `value - 1`, `128` means a repeated child root slot, and `129..254`
+/// means a repeated child slot that may delta from slot `value - 129`.
 pub fn generic_i64_parent_schema(name: &str, parent_slots: &[u8]) -> Result<SchemaDescriptor> {
+    let entries = decode_schema_map(parent_slots)?;
+    if entries.len() > u16::MAX as usize {
+        return Err(AuraError::InvalidValue("parent slot count"));
+    }
+
+    let mut builder = SchemaBuilder::new(name);
+    for entry in entries {
+        if entry.is_timestamp {
+            builder = builder.field("ts", FieldType::TimestampNs, FieldRole::Timestamp);
+            continue;
+        }
+
+        builder = builder.field_with_relation(
+            format!("v{}", entry.field_index),
+            FieldType::I64,
+            FieldRole::Value,
+            entry.scope,
+            false,
+            entry.relation,
+        );
+    }
+    builder.finish()
+}
+
+pub fn decode_schema_map(parent_slots: &[u8]) -> Result<Vec<SchemaMapEntry>> {
     if parent_slots.is_empty() || parent_slots.len() > u16::MAX as usize {
         return Err(AuraError::InvalidValue("parent slot count"));
     }
-    let mut mappings = Vec::new();
+    let mut entries = Vec::with_capacity(parent_slots.len());
     let mut time_slot = None;
     for (field_index, parent_slot) in parent_slots.iter().copied().enumerate() {
-        if parent_slot == SCHEMA_MAP_TIME_SLOT {
-            if time_slot.replace(field_index).is_some() || field_index != 0 {
-                return Err(AuraError::InvalidValue("time slot"));
+        let field_index_u16 =
+            u16::try_from(field_index).map_err(|_| AuraError::InvalidValue("field index"))?;
+        let entry = match parent_slot {
+            SCHEMA_MAP_TIME_SLOT => {
+                if time_slot.replace(field_index).is_some() || field_index != 0 {
+                    return Err(AuraError::InvalidValue("time slot"));
+                }
+                SchemaMapEntry {
+                    field_index: field_index_u16,
+                    scope: FieldScope::Event,
+                    is_timestamp: true,
+                    relation: FieldRelation::None,
+                }
             }
-            continue;
-        }
-        if parent_slot == 0 {
-            continue;
-        }
-        let parent_index = usize::from(parent_slot - 1);
-        if parent_index >= field_index {
-            return Err(AuraError::InvalidValue("parent slot"));
-        }
-        mappings.push(RelatedFieldMapping::new(
-            field_index as u16,
-            parent_index as u16,
-        ));
+            0 => SchemaMapEntry {
+                field_index: field_index_u16,
+                scope: FieldScope::Event,
+                is_timestamp: false,
+                relation: FieldRelation::None,
+            },
+            1..=SCHEMA_MAP_EVENT_PARENT_MAX => {
+                let parent_index = u16::from(parent_slot - 1);
+                if usize::from(parent_index) >= field_index {
+                    return Err(AuraError::InvalidValue("parent slot"));
+                }
+                SchemaMapEntry {
+                    field_index: field_index_u16,
+                    scope: FieldScope::Event,
+                    is_timestamp: false,
+                    relation: FieldRelation::DeltaFromField(parent_index),
+                }
+            }
+            SCHEMA_MAP_REPEATED_ROOT_SLOT => SchemaMapEntry {
+                field_index: field_index_u16,
+                scope: FieldScope::Repeated,
+                is_timestamp: false,
+                relation: FieldRelation::None,
+            },
+            SCHEMA_MAP_REPEATED_PARENT_BASE..=254 => {
+                let parent_index = u16::from(parent_slot - SCHEMA_MAP_REPEATED_PARENT_BASE);
+                if usize::from(parent_index) >= field_index {
+                    return Err(AuraError::InvalidValue("parent slot"));
+                }
+                SchemaMapEntry {
+                    field_index: field_index_u16,
+                    scope: FieldScope::Repeated,
+                    is_timestamp: false,
+                    relation: FieldRelation::DeltaFromField(parent_index),
+                }
+            }
+        };
+        entries.push(entry);
     }
     if time_slot != Some(0) {
         return Err(AuraError::InvalidValue("time slot"));
     }
-    generic_i64_schema(name, parent_slots.len() as u16 - 1, &mappings)
+    Ok(entries)
+}
+
+pub fn schema_parent_mapping(schema: &SchemaDescriptor) -> Result<Vec<u8>> {
+    let mut mapping = Vec::with_capacity(schema.fields.len());
+    for (position, field) in schema.fields.iter().enumerate() {
+        if usize::from(field.index) != position {
+            return Err(AuraError::InvalidValue("schema field index"));
+        }
+        let parent = match (field.role, field.scope, field.relation) {
+            (FieldRole::Timestamp, FieldScope::Event, FieldRelation::None) => SCHEMA_MAP_TIME_SLOT,
+            (FieldRole::Timestamp, _, _) => {
+                return Err(AuraError::InvalidValue("schema time mapping"));
+            }
+            (_, FieldScope::Event, FieldRelation::None) => 0,
+            (_, FieldScope::Event, FieldRelation::DeltaFromField(parent_index)) => {
+                if parent_index >= field.index {
+                    return Err(AuraError::InvalidValue("schema parent mapping"));
+                }
+                let parent_slot = parent_index
+                    .checked_add(1)
+                    .ok_or(AuraError::InvalidValue("schema parent mapping"))?;
+                if parent_slot > u16::from(SCHEMA_MAP_EVENT_PARENT_MAX) {
+                    return Err(AuraError::InvalidValue("schema parent mapping"));
+                }
+                parent_slot as u8
+            }
+            (_, FieldScope::Repeated, FieldRelation::None) => SCHEMA_MAP_REPEATED_ROOT_SLOT,
+            (_, FieldScope::Repeated, FieldRelation::DeltaFromField(parent_index)) => {
+                if parent_index >= field.index {
+                    return Err(AuraError::InvalidValue("schema parent mapping"));
+                }
+                let parent_slot = parent_index
+                    .checked_add(u16::from(SCHEMA_MAP_REPEATED_PARENT_BASE))
+                    .ok_or(AuraError::InvalidValue("schema parent mapping"))?;
+                if parent_slot >= u16::from(SCHEMA_MAP_TIME_SLOT) {
+                    return Err(AuraError::InvalidValue("schema parent mapping"));
+                }
+                parent_slot as u8
+            }
+        };
+        mapping.push(parent);
+    }
+    Ok(mapping)
 }
 
 fn validate_i64_schema_definition_header(schema_len: usize, comment_len: usize) -> Result<()> {
@@ -566,6 +758,7 @@ fn parent_slots_for_generic_i64_schema(schema: &SchemaDescriptor) -> Option<Vec<
             if field.name != "ts"
                 || field.field_type != FieldType::TimestampNs
                 || field.role != FieldRole::Timestamp
+                || field.scope != FieldScope::Event
                 || field.relation != FieldRelation::None
             {
                 return None;
@@ -580,17 +773,7 @@ fn parent_slots_for_generic_i64_schema(schema: &SchemaDescriptor) -> Option<Vec<
         {
             return None;
         }
-
-        let parent_slot = match field.relation {
-            FieldRelation::None => 0,
-            FieldRelation::DeltaFromField(parent_index) => {
-                if parent_index as usize >= index {
-                    return None;
-                }
-                u8::try_from(parent_index + 1).ok()?
-            }
-        };
-        parent_slots.push(parent_slot);
+        parent_slots.push(schema_parent_mapping(schema).ok()?.get(index).copied()?);
     }
 
     Some(parent_slots)
@@ -609,6 +792,7 @@ fn encode_full_field_schema(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Res
         put_u16_le(out, field.index);
         put_u8(out, field.field_type as u8);
         put_u8(out, field.role as u8);
+        put_u8(out, field.scope as u8);
         put_u8(out, field.nullable as u8);
         put_u8(out, field.relation.kind_code());
         put_u16_le(
@@ -628,6 +812,7 @@ fn decode_full_field_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescrip
         let index = reader.read_u16_le()?;
         let field_type = FieldType::from_code(reader.read_u8()?)?;
         let role = FieldRole::from_code(reader.read_u8()?)?;
+        let scope = FieldScope::from_code(reader.read_u8()?)?;
         let nullable = reader.read_u8()? != 0;
         let relation_kind = reader.read_u8()?;
         let related_field_index = reader.read_u16_le()?;
@@ -638,6 +823,7 @@ fn decode_full_field_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescrip
             name,
             field_type,
             role,
+            scope,
             nullable,
             relation: FieldRelation::from_codes(relation_kind, related_field_index)?,
             candidates,
@@ -732,6 +918,7 @@ fn schema_hash(name: &str, fields: &[FieldDescriptor]) -> u32 {
             &[
                 field.field_type as u8,
                 field.role as u8,
+                field.scope as u8,
                 field.nullable as u8,
                 field.relation.kind_code(),
             ],

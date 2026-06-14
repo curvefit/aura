@@ -19,6 +19,7 @@ pub mod plan;
 pub mod program;
 pub mod records;
 pub mod schema;
+pub mod scoped;
 pub mod stats;
 pub mod synthetic;
 pub mod types;
@@ -31,9 +32,9 @@ pub use footer::{AuraFooter, CompressionDescriptor, CompressionKind};
 pub use header::{AuraHeader, HEADER_PREFIX_SIZE};
 pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 pub use schema::{
-    generic_i64_parent_schema, FieldDescriptor, FieldRelation, FieldRole, FieldTransform,
-    FieldType, I64SchemaDefinition, RelatedFieldMapping, SchemaBuilder, SchemaDescriptor,
-    TransformCandidates,
+    generic_i64_parent_schema, schema_parent_mapping, FieldDescriptor, FieldRelation, FieldRole,
+    FieldScope, FieldTransform, FieldType, I64SchemaDefinition, RelatedFieldMapping, SchemaBuilder,
+    SchemaDescriptor, TransformCandidates,
 };
 pub use stats::{FieldStats, IngestStats, PhysicalWidth, RunHistogramEntry, ShapeStats};
 pub use types::{BookEvent, BookId, LevelChange, Profile};

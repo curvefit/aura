@@ -183,22 +183,25 @@ fn best_aura0_plan(
 
     if allowed.contains(FieldTransform::DeltaRelated) {
         if let Some(related) = related {
-            if related.min_delta == related.max_delta {
+            if related.delta_valid && related.min_delta == related.max_delta {
                 candidates.push(derived_offset_plan(field.field_index, related));
             }
-            candidates.push(PhysicalFieldPlan {
-                field_index: field.field_index,
-                encoding: FieldEncoding::DeltaRelated,
-                width: related.delta_width(),
-                bit_width: 0,
-                reference_field_index: Some(related.related_field_index),
-                base_value: 0,
-                step: 0,
-                estimated_bytes: related.observed * u64::from(related.delta_width().byte_width()),
-            });
-            candidates.push(bitpacked_related_plan(field.field_index, related));
-            if let Some(plan) = bitpacked_related_offset_plan(field.field_index, related) {
-                candidates.push(plan);
+            if related.delta_valid {
+                candidates.push(PhysicalFieldPlan {
+                    field_index: field.field_index,
+                    encoding: FieldEncoding::DeltaRelated,
+                    width: related.delta_width(),
+                    bit_width: 0,
+                    reference_field_index: Some(related.related_field_index),
+                    base_value: 0,
+                    step: 0,
+                    estimated_bytes: related.observed
+                        * u64::from(related.delta_width().byte_width()),
+                });
+                candidates.push(bitpacked_related_plan(field.field_index, related));
+                if let Some(plan) = bitpacked_related_offset_plan(field.field_index, related) {
+                    candidates.push(plan);
+                }
             }
         }
     }
@@ -207,12 +210,14 @@ fn best_aura0_plan(
         candidates.push(absolute_plan(field));
     }
     if allowed.contains(FieldTransform::DeltaBase) {
-        candidates.push(base_delta_plan(field));
+        if field.max_abs_base_delta() <= i64::MAX as u64 {
+            candidates.push(base_delta_plan(field));
+        }
         if let Some(plan) = bitpacked_base_delta_plan(field) {
             candidates.push(plan);
         }
     }
-    if allowed.contains(FieldTransform::DeltaPrevious) {
+    if allowed.contains(FieldTransform::DeltaPrevious) && field.delta_valid {
         candidates.push(previous_delta_plan(field));
         candidates.push(bitpacked_previous_delta_plan(field));
         if let Some(plan) = bitpacked_previous_delta_offset_plan(field) {

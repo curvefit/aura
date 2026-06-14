@@ -151,7 +151,10 @@ fn encode_stats(stats: &IngestStats, out: &mut Vec<u8>) -> Result<()> {
         put_u8(out, field.fixed_step.is_some() as u8);
         put_i64_le(out, field.fixed_step.unwrap_or(0));
         put_u8(out, field.fixed_step_valid as u8);
-        put_u8(out, 0);
+        put_u8(
+            out,
+            (field.delta_valid as u8) | ((field.delta2_valid as u8) << 1),
+        );
     }
     put_u16_len(out, stats.related_fields.len(), "related stats count")?;
     for related in &stats.related_fields {
@@ -161,6 +164,7 @@ fn encode_stats(stats: &IngestStats, out: &mut Vec<u8>) -> Result<()> {
         put_i64_le(out, related.min_delta);
         put_i64_le(out, related.max_delta);
         put_u64_le(out, related.max_abs_delta);
+        put_u8(out, related.delta_valid as u8);
     }
     put_u32_le(out, stats.shape.max_records_per_timestamp);
     put_u32_len(
@@ -199,17 +203,19 @@ fn decode_stats(reader: &mut ByteReader<'_>) -> Result<IngestStats> {
             None
         };
         let fixed_step_valid = reader.read_u8()? != 0;
-        let _reserved = reader.read_u8()?;
+        let flags = reader.read_u8()?;
         fields.push(FieldStats::from_summary(FieldStatsSummary {
             field_index,
             observed,
             min,
             max,
             max_abs_delta,
+            delta_valid: flags & 1 != 0,
             monotonic_non_decreasing,
             first_value,
             fixed_step,
             fixed_step_valid,
+            delta2_valid: flags & 2 != 0,
         }));
     }
     let related_count = reader.read_u16_le()? as usize;
@@ -222,6 +228,7 @@ fn decode_stats(reader: &mut ByteReader<'_>) -> Result<IngestStats> {
             min_delta: reader.read_i64_le()?,
             max_delta: reader.read_i64_le()?,
             max_abs_delta: reader.read_u64_le()?,
+            delta_valid: reader.read_u8()? != 0,
         });
     }
     let max_records_per_timestamp = reader.read_u32_le()?;

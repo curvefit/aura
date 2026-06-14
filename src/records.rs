@@ -8,7 +8,7 @@ use crate::format::SEAL_MAGIC;
 use crate::header::{AuraHeader, HEADER_PREFIX_SIZE};
 use crate::plan::{unpack_ref_divisor, unpack_two_refs, Aura0Plan, Aura1Plan, FieldEncoding};
 use crate::program::{CompiledFooter, DecodeProgram};
-use crate::schema::{FieldRelation, FieldRole, SchemaDescriptor, SCHEMA_MAP_TIME_SLOT};
+use crate::schema::{schema_parent_mapping, SchemaDescriptor};
 use crate::stats::IngestStats;
 use crate::{AuraError, PhysicalWidth, Profile, Result};
 
@@ -286,33 +286,6 @@ fn encode_compiled_file(
     put_u32_le(&mut out, footer_len);
     out.extend_from_slice(SEAL_MAGIC);
     Ok(out)
-}
-
-fn schema_parent_mapping(schema: &SchemaDescriptor) -> Result<Vec<u8>> {
-    let mut mapping = Vec::with_capacity(schema.fields.len());
-    for (position, field) in schema.fields.iter().enumerate() {
-        if usize::from(field.index) != position {
-            return Err(AuraError::InvalidValue("schema field index"));
-        }
-        let parent = match (field.role, field.relation) {
-            (FieldRole::Timestamp, FieldRelation::None) => SCHEMA_MAP_TIME_SLOT,
-            (FieldRole::Timestamp, FieldRelation::DeltaFromField(_)) => {
-                return Err(AuraError::InvalidValue("schema time mapping"));
-            }
-            (_, FieldRelation::None) => 0,
-            (_, FieldRelation::DeltaFromField(parent_index)) => {
-                let parent_slot = parent_index
-                    .checked_add(1)
-                    .ok_or(AuraError::InvalidValue("schema parent mapping"))?;
-                if parent_slot >= u16::from(SCHEMA_MAP_TIME_SLOT) {
-                    return Err(AuraError::InvalidValue("schema parent mapping"));
-                }
-                parent_slot as u8
-            }
-        };
-        mapping.push(parent);
-    }
-    Ok(mapping)
 }
 
 fn encode_raw_body(field_count: usize, rows: &[Vec<i64>]) -> Result<Vec<u8>> {
