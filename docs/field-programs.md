@@ -118,6 +118,25 @@ instruction. Schema relationships make related deltas possible, but they are not
 forced; if a previous-value delta, constant offset, candle-shape residual, or
 product residual is smaller and reversible, the planner can choose it.
 
+When a full typed schema is available, residual search is role-gated. Product
+residuals are only searched with quantity and price-like operands, and
+proportional residuals are only searched across value/quantity fields. Side,
+flag, sequence, timestamp, and identifier fields stay on direct/base/previous
+encodings. Generic positional i64 schemas keep the broad empirical search
+because every non-time slot is only known as a generic value.
+
+For trade ticks this usually compiles to:
+
+```text
+ts_event_ns  op=bitpack_prev_offset  bits=N  base=first_ts  step=min_dt
+seq          op=bitpack_prev_offset  bits=N  base=first_seq step=min_dseq
+exec_id      op=bitpack_prev_offset  bits=N  when numeric and monotonic
+price        op=bitpack_prev_offset  bits=N  base=first_px  step=min_dpx
+size         op=bitpack_base         bits=N  base=min_size
+side         op=bitpack_base         bits=1..2
+flags        op=bitpack_base         bits=0..1
+```
+
 Aura0 decoding is columnar, so some fields are delayed until their dependencies
 exist. The decoder resolves previous-field pairs first, then related offsets,
 product residuals, proportional residuals, and candle wick offsets. Aura1 uses

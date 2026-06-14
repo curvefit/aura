@@ -70,6 +70,52 @@ generic_i64_schema
 generic_i64_parent_schema
 ```
 
+## Tick Data
+
+Trade ticks usually do not need same-row parent relationships. Their compact
+shape comes from row-local deltas and small enums:
+
+```text
+slot  field         role        common Aura0 result
+0     ts_event_ns   timestamp   previous-offset bitpack, or grouping later
+1     seq           sequence    previous-offset bitpack
+2     price         price       previous-offset bitpack
+3     size          quantity    base-offset bitpack
+4     side          side        base-offset bitpack
+5     is_block      flag        zero-width or one-bit base-offset bitpack
+6     is_rpi        flag        zero-width or one-bit base-offset bitpack
+```
+
+The front header mapping for this shape is intentionally plain:
+
+```text
+[255, 0, 0, 0, 0]
+```
+
+or, with flags:
+
+```text
+[255, 0, 0, 0, 0, 0, 0]
+```
+
+This says only that slot `0` is time and the other slots are roots. The useful
+tick transforms are previous-row and base transforms, so no fake parent link is
+needed.
+
+Bybit spot trades expose a numeric `execId`, which can be modeled as an
+`Identifier` and compressed with previous/base bitpacking when it is monotonic.
+Bybit derivatives expose UUID `execId` values; those are not losslessly
+representable by the current generic i64 writer. For those streams, `seq` is the
+compact int64 ordering key today. A future UUID/fixed-bytes or dictionary field
+family should carry the derivative `execId` when trade-id preservation is
+required.
+
+Typed field roles matter. `Identifier` fields may use base/previous delta
+bitpacking when numeric. `Side` and `Flag` fields may use base bitpacking, but
+they are not candidates for product or proportional residual transforms. That
+keeps the schema reader simple: arithmetic residuals are reserved for measurable
+quantity/value fields, while enums stay enum-like.
+
 `generic_i64_schema` is the dumb positional path. It treats field `0` as the
 timestamp by convention, then creates `v1..vN` as generic `i64` values. The
 schema does not need to know that `v1..v5` are open, high, low, close, and
