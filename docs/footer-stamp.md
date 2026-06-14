@@ -231,9 +231,19 @@ The compiled decode program already supports fixed steps, signed bitpacked
 deltas, unsigned offset bitpacks, min/max residuals, product residuals, and
 proportional residuals. `src/instructions.rs` defines a generic byte-aligned
 stream/group instruction plan that can stamp curvefit shapes without
-domain-specific operation names. The main `.aura0` writer still uses the
-field-program footer; it needs to converge on the generic instruction plan for
-the fitted layouts to be emitted by the production writer.
+domain-specific operation names.
+
+`src/generic_planner.rs` now derives executable generic stream/group plans from
+the schema header hints and observed rows. It can plan and round-trip fixed
+steps, base/previous bitpacking, patched bitpacking, RLE, bitplane RLE,
+dictionary streams, block-local streams, UUID constant masks, candle-shape
+derived streams, and repeated-slot grouping. The planner uses relationships and
+scope bytes, not field names.
+
+The remaining gap is container integration: the main `.aura0` writer still uses
+the field-program footer. It needs to converge on the generic instruction plan
+so these fitted layouts are emitted by the production writer and carried by the
+shared stamped footer.
 
 That should converge toward one small stamped slot table footer shared across
 profiles, interpreted by the header `version` and `profile`.

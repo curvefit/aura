@@ -152,6 +152,56 @@ when their candidate flags allow those calculations. Timestamps can also be
 proven implicit when every row advances by the same fixed step, such as
 one-minute bars.
 
+## Generic planner
+
+`src/generic_planner.rs` is the executable bridge between dumb header hints and
+stamped generic instructions. It does not inspect field names or market-data
+schema names. It uses only:
+
+```text
+slot position
+timestamp marker
+parent relationship
+event/repeated scope
+observed values collected during ingest
+```
+
+From that, it can stamp and execute these generic choices:
+
+```text
+fixed_step
+base_bitpack
+prev_delta
+patched_bitpack
+rle
+bitplane_rle
+dictionary
+block_local
+uuid_const_mask
+group
+partition_runs
+derived_stream
+```
+
+For OHLC-like data, the parent map is enough for the planner to discover the
+shape without a named OHLCV mode:
+
+```text
+open   first value, then delta from previous close
+close  open + residual
+high   max(open, close) + residual
+low    min(open, close) - residual
+```
+
+For repeated child streams, the `128..254` scope bytes are enough to stamp a
+generic group instruction and, when each group has the same child partition
+order, a `partition_runs` instruction. This is the generic version of fixed
+side/orderbook-level ordering; it is not named as orderbook behavior.
+
+If a future transform cannot be derived from those hints plus observed values,
+the schema header needs a generic hint, not a domain-specific one. The current
+minimum generic hint set is still parent relationship plus event/repeated scope.
+
 `generic_i64_parent_schema` is the compact parent-vector path for dynamic
 OHLCV-like records and repeated child records. The vector includes the
 timestamp slot. Each byte is self-describing with the same header map convention
