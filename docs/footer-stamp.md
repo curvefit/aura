@@ -194,6 +194,8 @@ group            event slots written once, repeated slots written per child
 partition_runs   contiguous runs of a partition slot, with optional fixed order
 presence_map     packed presence/enum bits for a set of slots
 derived_stream   output slot reconstructed from input slots plus one stream
+sparse_stream    nonzero values for one slot, selected by a presence_map bit
+presence_value   constant nonzero value selected by a presence_map bit
 ```
 
 A `derived_stream` is intentionally generic. Its operation can express common
@@ -206,6 +208,12 @@ max_plus_residual         output = max(input_a, input_b) + residual_stream
 min_minus_residual        output = min(input_a, input_b) - residual_stream
 first_offset_then_delta   first value from partition base, then local deltas
 ```
+
+`presence_map`, `sparse_stream`, and `presence_value` let the footer describe
+zero-heavy slots without domain names. The writer may pack one presence mask for
+multiple slots, store only nonzero values for sparse numeric slots, and derive
+boolean-like slots directly from a presence bit. These are selected only when
+the measured stamped body is smaller than direct slot streams.
 
 ## Grouping
 
@@ -236,9 +244,11 @@ domain-specific operation names.
 `src/generic_planner.rs` now derives executable generic stream/group plans from
 the schema header hints and observed rows. It can plan and round-trip fixed
 steps, base/previous bitpacking, patched bitpacking, RLE, bitplane RLE,
-dictionary streams, block-local streams, UUID constant masks, candle-shape
-derived streams, and repeated-slot grouping. The planner uses relationships and
-scope bytes, not field names.
+dictionary streams, block-local streams, UUID constant masks, sparse presence
+streams, candle-shape derived streams, and repeated-slot grouping. Parent
+relationships are scored as transform candidates, not forced deltas; if the
+residual stream is larger than a direct stream, the writer keeps the direct
+stream. The planner uses relationships and scope bytes, not field names.
 
 The `.aura` ingest footer now stamps a generic Aura0 plan alongside the legacy
 field program candidates. `.aura -> .aura0` conversion follows that stamped
