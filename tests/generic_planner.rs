@@ -206,6 +206,51 @@ fn generic_planner_uses_sparse_presence_for_zero_heavy_repeated_slots() {
 }
 
 #[test]
+fn generic_planner_selects_sparse_set_by_total_saved_bytes() {
+    let schema =
+        generic_i64_parent_schema("parented_repeated", &[255, 0, 0, 128, 132, 133, 133]).unwrap();
+    let rows = (0..128)
+        .flat_map(|event| {
+            (0..4).map(move |level| {
+                let row_index = event * 4 + level;
+                let slot_a = if row_index % 3 == 0 {
+                    9_000_000_000_000 + i64::from(row_index) * 17
+                } else {
+                    0
+                };
+                let slot_b = if row_index % 5 == 0 {
+                    8_000_000_000_000 + i64::from(row_index) * 19
+                } else {
+                    0
+                };
+                vec![
+                    1_000_000 + i64::from(event),
+                    10_000 + i64::from(event),
+                    20_000 + i64::from(event / 2),
+                    i64::from(level >= 2),
+                    100_000 + i64::from(row_index),
+                    slot_a,
+                    slot_b,
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+
+    assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::PresenceMap {
+                slots,
+                ..
+            } if slots.as_slice() == [5, 6]
+        )
+    }));
+}
+
+#[test]
 fn generic_planner_uses_partition_runs_and_segmented_child_deltas() {
     let schema =
         generic_i64_parent_schema("parented_repeated", &[255, 0, 0, 128, 132, 133, 133, 133])
@@ -281,6 +326,89 @@ fn generic_planner_uses_partition_runs_and_segmented_child_deltas() {
         .streams
         .iter()
         .any(|stream| matches!(stream.target_slot, Some(1 | 3 | 4))));
+}
+
+#[test]
+fn generic_planner_uses_fixed_partition_order_with_variable_run_counts() {
+    let schema = generic_i64_parent_schema("parented_repeated", &[255, 0, 0, 128, 132]).unwrap();
+    let rows = (0..16)
+        .flat_map(|event| {
+            let first_len = 1 + usize::from(event % 3 == 0);
+            let second_len = 2 + usize::from(event % 4 == 0);
+            [(0, first_len), (1, second_len)]
+                .into_iter()
+                .flat_map(move |(partition, run_len)| {
+                    (0..run_len).map(move |level| {
+                        let base = 1_000_000 + i64::from(event) * 100;
+                        let first = if partition == 0 { base } else { base + 10_000 };
+                        vec![
+                            1_000 + i64::from(event),
+                            10_000 + i64::from(event / 2),
+                            20_000 + i64::from(event / 3),
+                            partition,
+                            first + i64::try_from(level).unwrap(),
+                        ]
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+
+    let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+
+    assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::PartitionRunLengths {
+                partition_slot: 3,
+                fixed_order: true,
+                event_count_stream_id: None,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn generic_planner_uses_prev_varint_for_skewed_previous_deltas() {
+    let schema = generic_i64_parent_schema("skewed", &[255, 0]).unwrap();
+    let rows = (0..12)
+        .scan(1_000_000i64, |value, index| {
+            if index == 6 {
+                *value += 1_000_000;
+            } else {
+                *value += i64::from(index % 3);
+            }
+            Some(vec![i64::from(index), *value])
+        })
+        .collect::<Vec<_>>();
+
+    let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+
+    assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
+    assert!(encoded.plan.streams.iter().any(|stream| {
+        stream.target_slot == Some(1) && matches!(stream.op, GenericStreamOp::PrevVarint { .. })
+    }));
+}
+
+#[test]
+fn generic_planner_uses_packed_dictionary_for_repeated_wide_values() {
+    let schema = generic_i64_parent_schema("wide_repeats", &[255]).unwrap();
+    let buckets = [0, 1_000_000_000_000, 17, 999_999_999_937];
+    let rows = (0..15)
+        .map(|index| {
+            let bucket = buckets[[0, 3, 1, 2, 3, 0, 2, 1, 3, 2, 0, 1, 2, 3, 0][index]];
+            vec![9_000_000_000_000 + bucket]
+        })
+        .collect::<Vec<_>>();
+
+    let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+
+    assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
+    assert!(encoded.plan.streams.iter().any(|stream| {
+        stream.target_slot == Some(0)
+            && matches!(stream.op, GenericStreamOp::PackedDictionary { .. })
+    }));
 }
 
 #[test]

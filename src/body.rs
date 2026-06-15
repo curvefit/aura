@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::bitpack::{
-    bitpacked_byte_len, pack_signed_values, pack_unsigned_values, unpack_signed_values,
-    unpack_unsigned_values, unsigned_bitpack_width,
+    bitpacked_byte_len, pack_signed_values, pack_unsigned_values, signed_bitpack_width_for_range,
+    unpack_signed_values, unpack_unsigned_values, unsigned_bitpack_width,
 };
 use crate::bytes::{put_i64_le, put_u32_le, put_u8, ByteReader};
 use crate::instructions::{GenericStreamInstruction, GenericStreamOp};
@@ -60,6 +60,7 @@ fn encode_i64_op(op: &GenericStreamOp, values: &[i64]) -> Result<Vec<u8>> {
             unit,
             bit_width,
         } => encode_prev_delta(base, unit, bit_width, values),
+        GenericStreamOp::PrevVarint { base, unit } => encode_prev_varint(base, unit, values),
         GenericStreamOp::BlockLocal {
             block_size,
             mode_count,
@@ -87,6 +88,13 @@ fn encode_i64_op(op: &GenericStreamOp, values: &[i64]) -> Result<Vec<u8>> {
             entry_count,
             code_width,
         } => encode_dictionary(unit, entry_count, code_width, values),
+        GenericStreamOp::PackedDictionary {
+            base,
+            unit,
+            entry_count,
+            entry_width,
+            code_width,
+        } => encode_packed_dictionary(base, unit, entry_count, entry_width, code_width, values),
         GenericStreamOp::UuidConstMask { .. } => Err(AuraError::InvalidValue("body type")),
     }
 }
@@ -108,6 +116,9 @@ fn decode_i64_op(
             unit,
             bit_width,
         } => decode_prev_delta(base, unit, bit_width, reader, value_count),
+        GenericStreamOp::PrevVarint { base, unit } => {
+            decode_prev_varint(base, unit, reader, value_count)
+        }
         GenericStreamOp::BlockLocal {
             block_size,
             mode_count,
@@ -143,6 +154,21 @@ fn decode_i64_op(
             entry_count,
             code_width,
         } => decode_dictionary(unit, entry_count, code_width, reader, value_count),
+        GenericStreamOp::PackedDictionary {
+            base,
+            unit,
+            entry_count,
+            entry_width,
+            code_width,
+        } => decode_packed_dictionary(
+            base,
+            unit,
+            entry_count,
+            entry_width,
+            code_width,
+            reader,
+            value_count,
+        ),
         GenericStreamOp::UuidConstMask { .. } => Err(AuraError::InvalidValue("body type")),
     }
 }
@@ -215,6 +241,43 @@ fn decode_prev_delta(
         let previous = *values
             .last()
             .ok_or(AuraError::InvalidValue("previous delta body"))?;
+        values.push(reconstruct_signed_delta(previous, unit, delta)?);
+    }
+    Ok(values)
+}
+
+fn encode_prev_varint(base: i64, unit: i64, values: &[i64]) -> Result<Vec<u8>> {
+    validate_unit(unit)?;
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    if values[0] != base {
+        return Err(AuraError::InvalidValue("previous varint base"));
+    }
+    let mut out = Vec::new();
+    for pair in values.windows(2) {
+        varint::encode_i64(scaled_signed_delta(pair[1], pair[0], unit)?, &mut out);
+    }
+    Ok(out)
+}
+
+fn decode_prev_varint(
+    base: i64,
+    unit: i64,
+    reader: &mut ByteReader<'_>,
+    value_count: usize,
+) -> Result<Vec<i64>> {
+    validate_unit(unit)?;
+    if value_count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut values = Vec::with_capacity(value_count);
+    values.push(base);
+    for _ in 1..value_count {
+        let delta = varint::decode_i64(reader)?;
+        let previous = *values
+            .last()
+            .ok_or(AuraError::InvalidValue("previous varint body"))?;
         values.push(reconstruct_signed_delta(previous, unit, delta)?);
     }
     Ok(values)
@@ -494,6 +557,73 @@ fn decode_dictionary(
         .collect()
 }
 
+fn encode_packed_dictionary(
+    base: i64,
+    unit: i64,
+    entry_count: u32,
+    entry_width: u8,
+    code_width: u8,
+    values: &[i64],
+) -> Result<Vec<u8>> {
+    let scaled_values = values
+        .iter()
+        .map(|value| scaled_unsigned_offset(*value, base, unit))
+        .collect::<Result<Vec<_>>>()?;
+    let mut entries = scaled_values.clone();
+    entries.sort_unstable();
+    entries.dedup();
+    if entries.len() != entry_count as usize {
+        return Err(AuraError::InvalidValue("dictionary entry count"));
+    }
+    for entry in &entries {
+        ensure_unsigned_width(*entry, entry_width, "dictionary entry")?;
+    }
+    let entry_indexes = entries
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (*value, index as u64))
+        .collect::<BTreeMap<_, _>>();
+    let codes = scaled_values
+        .iter()
+        .map(|value| {
+            entry_indexes
+                .get(value)
+                .copied()
+                .ok_or(AuraError::InvalidValue("dictionary code"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut out = pack_unsigned_values(&entries, entry_width)?;
+    out.extend(pack_unsigned_values(&codes, code_width)?);
+    Ok(out)
+}
+
+fn decode_packed_dictionary(
+    base: i64,
+    unit: i64,
+    entry_count: u32,
+    entry_width: u8,
+    code_width: u8,
+    reader: &mut ByteReader<'_>,
+    value_count: usize,
+) -> Result<Vec<i64>> {
+    let entry_count = entry_count as usize;
+    let entries = read_bitpacked_unsigned(reader, entry_width, entry_count)?;
+    let codes = read_bitpacked_unsigned(reader, code_width, value_count)?;
+    codes
+        .into_iter()
+        .map(|code| {
+            let entry = *entries
+                .get(
+                    usize::try_from(code)
+                        .map_err(|_| AuraError::InvalidValue("dictionary code"))?,
+                )
+                .ok_or(AuraError::InvalidValue("dictionary code"))?;
+            reconstruct_unsigned_offset(base, unit, entry)
+        })
+        .collect()
+}
+
 fn encode_block_local(block_size: u16, mode_count: u32, values: &[i64]) -> Result<Vec<u8>> {
     let block_size = usize::from(block_size);
     if block_size == 0 {
@@ -542,6 +672,9 @@ fn decode_block_local(
 
 fn choose_local_op(values: &[i64]) -> Result<GenericStreamOp> {
     let mut candidates = vec![derive_fixed_step(values)?, derive_base_bitpack(values)?];
+    if let Some(op) = derive_prev_delta(values)? {
+        candidates.push(op);
+    }
     candidates.push(derive_patched_bitpack(values)?);
     candidates.push(derive_rle(values)?);
     candidates
@@ -600,6 +733,31 @@ fn derive_base_bitpack(values: &[i64]) -> Result<GenericStreamOp> {
         unit,
         bit_width: unsigned_bitpack_width(max_scaled),
     })
+}
+
+fn derive_prev_delta(values: &[i64]) -> Result<Option<GenericStreamOp>> {
+    let Some(base) = values.first().copied() else {
+        return Ok(None);
+    };
+    if values.len() <= 1 {
+        return Ok(None);
+    }
+    let mut deltas = Vec::with_capacity(values.len().saturating_sub(1));
+    for pair in values.windows(2) {
+        let delta = match pair[1].checked_sub(pair[0]) {
+            Some(delta) => delta,
+            None => return Ok(None),
+        };
+        deltas.push(delta);
+    }
+    let unit = signed_gcd_unit(&deltas);
+    let scaled = deltas.iter().map(|delta| *delta / unit).collect::<Vec<_>>();
+    let (min, max) = min_max_i64(&scaled).ok_or(AuraError::InvalidValue("previous delta"))?;
+    Ok(Some(GenericStreamOp::PrevDelta {
+        base,
+        unit,
+        bit_width: signed_bitpack_width_for_range(min, max),
+    }))
 }
 
 fn derive_patched_bitpack(values: &[i64]) -> Result<GenericStreamOp> {
@@ -690,6 +848,16 @@ fn encode_local_op_header(op: &GenericStreamOp, out: &mut Vec<u8>) -> Result<()>
             put_i64_le(out, unit);
             put_u8(out, bit_width);
         }
+        GenericStreamOp::PrevDelta {
+            base,
+            unit,
+            bit_width,
+        } => {
+            put_u8(out, 2);
+            put_i64_le(out, base);
+            put_i64_le(out, unit);
+            put_u8(out, bit_width);
+        }
         GenericStreamOp::PatchedBitpack {
             base,
             unit,
@@ -732,6 +900,11 @@ fn decode_local_op_header(reader: &mut ByteReader<'_>) -> Result<GenericStreamOp
             unit: reader.read_i64_le()?,
             bit_width: reader.read_u8()?,
         }),
+        2 => Ok(GenericStreamOp::PrevDelta {
+            base: reader.read_i64_le()?,
+            unit: reader.read_i64_le()?,
+            bit_width: reader.read_u8()?,
+        }),
         4 => Ok(GenericStreamOp::PatchedBitpack {
             base: reader.read_i64_le()?,
             unit: reader.read_i64_le()?,
@@ -753,6 +926,7 @@ fn local_op_header_len(op: &GenericStreamOp) -> usize {
     match op {
         GenericStreamOp::FixedStep { .. } => 17,
         GenericStreamOp::BaseBitpack { .. } => 18,
+        GenericStreamOp::PrevDelta { .. } => 18,
         GenericStreamOp::PatchedBitpack { .. } => 23,
         GenericStreamOp::Rle { .. } => 22,
         _ => usize::MAX,
@@ -967,6 +1141,27 @@ fn gcd_unit(values: &[u64]) -> u64 {
 fn storage_unit(values: &[u64]) -> i64 {
     let unit = gcd_unit(values);
     i64::try_from(unit).unwrap_or(1)
+}
+
+fn signed_gcd_unit(values: &[i64]) -> i64 {
+    let mut out = 0u64;
+    for value in values.iter().copied().filter(|value| *value != 0) {
+        let value = value.unsigned_abs();
+        out = if out == 0 { value } else { gcd(out, value) };
+    }
+    i64::try_from(out).unwrap_or(1).max(1)
+}
+
+fn min_max_i64(values: &[i64]) -> Option<(i64, i64)> {
+    let mut iter = values.iter().copied();
+    let first = iter.next()?;
+    let mut min = first;
+    let mut max = first;
+    for value in iter {
+        min = min.min(value);
+        max = max.max(value);
+    }
+    Some((min, max))
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {

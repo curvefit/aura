@@ -257,6 +257,10 @@ fn generic_stream_body_round_trips_core_i64_ops() {
         &[100, 110, 130, 120, 140],
     );
     assert_i64_body_round_trip(
+        GenericStreamOp::PrevVarint { base: 100, unit: 1 },
+        &[100, 101, 103, 102, 106, 107],
+    );
+    assert_i64_body_round_trip(
         GenericStreamOp::Rle {
             base: 0,
             unit: 1,
@@ -287,6 +291,16 @@ fn generic_stream_body_round_trips_core_i64_ops() {
         GenericStreamOp::Dictionary {
             unit: 10,
             entry_count: 3,
+            code_width: 2,
+        },
+        &[10, 20, 10, 30, 20],
+    );
+    assert_i64_body_round_trip(
+        GenericStreamOp::PackedDictionary {
+            base: 10,
+            unit: 10,
+            entry_count: 3,
+            entry_width: 2,
             code_width: 2,
         },
         &[10, 20, 10, 30, 20],
@@ -371,6 +385,29 @@ fn generic_block_local_falls_back_when_fixed_step_probe_overflows() {
         },
         &[i64::MIN, i64::MAX, i64::MAX - 1, i64::MIN + 1],
     );
+}
+
+#[test]
+fn generic_block_local_can_use_previous_delta_local_mode() {
+    let instruction = GenericStreamInstruction {
+        stream_id: 0,
+        target_slot: Some(0),
+        op: GenericStreamOp::BlockLocal {
+            block_size: 8,
+            mode_count: 1,
+        },
+    };
+    let values = vec![
+        1_000_000, 1_000_003, 1_000_004, 1_000_010, 1_000_012, 1_000_015, 1_000_016, 1_000_020,
+    ];
+
+    let encoded =
+        encode_generic_stream_body(&instruction, &GenericStreamBodyValue::I64(values.clone()))
+            .unwrap();
+    let decoded = decode_generic_stream_body(&instruction, &encoded, values.len()).unwrap();
+
+    assert_eq!(Some(&2), encoded.first());
+    assert_eq!(GenericStreamBodyValue::I64(values), decoded);
 }
 
 fn assert_i64_body_round_trip(op: GenericStreamOp, values: &[i64]) {

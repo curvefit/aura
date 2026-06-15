@@ -1407,11 +1407,7 @@ fn add_sparse_presence_hints(
     let mut best: Option<SparseSetCandidate> = None;
     for candidate in &candidates {
         let candidate = sparse_set_candidate(rows, vec![candidate.clone()])?;
-        if candidate.sparse_size < candidate.direct_size
-            && best
-                .as_ref()
-                .is_none_or(|current| candidate.sparse_size < current.sparse_size)
-        {
+        if sparse_candidate_better(&candidate, best.as_ref()) {
             best = Some(candidate);
         }
     }
@@ -1419,11 +1415,7 @@ fn add_sparse_presence_hints(
     for candidate in candidates {
         selected.push(candidate);
         let candidate = sparse_set_candidate(rows, selected.clone())?;
-        if candidate.sparse_size < candidate.direct_size
-            && best
-                .as_ref()
-                .is_none_or(|current| candidate.sparse_size < current.sparse_size)
-        {
+        if sparse_candidate_better(&candidate, best.as_ref()) {
             best = Some(candidate);
         }
     }
@@ -1589,6 +1581,21 @@ fn sparse_set_candidate(
         slots,
         direct_size,
         sparse_size,
+    })
+}
+
+fn sparse_candidate_better(
+    candidate: &SparseSetCandidate,
+    current: Option<&SparseSetCandidate>,
+) -> bool {
+    if candidate.sparse_size >= candidate.direct_size {
+        return false;
+    }
+    let saved = candidate.direct_size - candidate.sparse_size;
+    current.is_none_or(|current| {
+        let current_saved = current.direct_size.saturating_sub(current.sparse_size);
+        saved > current_saved
+            || (saved == current_saved && candidate.sparse_size < current.sparse_size)
     })
 }
 
@@ -1795,10 +1802,16 @@ fn choose_i64_op(values: &[i64]) -> Result<GenericStreamOp> {
     if let Some(op) = derive_prev_delta(values)? {
         candidates.push(op);
     }
+    if let Some(op) = derive_prev_varint(values)? {
+        candidates.push(op);
+    }
     candidates.push(derive_patched_bitpack(values)?);
     candidates.push(derive_rle(values)?);
     candidates.push(derive_bitplane_rle(values)?);
     if let Some(op) = derive_dictionary(values)? {
+        candidates.push(op);
+    }
+    if let Some(op) = derive_packed_dictionary(values)? {
         candidates.push(op);
     }
     for block_size in [16usize, 64, 256, 512, 1024, 2048] {
@@ -1848,12 +1861,14 @@ fn op_preference(op: &GenericStreamOp) -> u8 {
         GenericStreamOp::FixedStep { .. } => 0,
         GenericStreamOp::BaseBitpack { .. } => 1,
         GenericStreamOp::PrevDelta { .. } => 2,
-        GenericStreamOp::PatchedBitpack { .. } => 3,
-        GenericStreamOp::Rle { .. } => 4,
-        GenericStreamOp::BitplaneRle { .. } => 5,
-        GenericStreamOp::Dictionary { .. } => 6,
-        GenericStreamOp::BlockLocal { .. } => 7,
-        GenericStreamOp::UuidConstMask { .. } => 8,
+        GenericStreamOp::PrevVarint { .. } => 3,
+        GenericStreamOp::PatchedBitpack { .. } => 4,
+        GenericStreamOp::Rle { .. } => 5,
+        GenericStreamOp::BitplaneRle { .. } => 6,
+        GenericStreamOp::PackedDictionary { .. } => 7,
+        GenericStreamOp::Dictionary { .. } => 8,
+        GenericStreamOp::BlockLocal { .. } => 9,
+        GenericStreamOp::UuidConstMask { .. } => 10,
     }
 }
 
@@ -1917,6 +1932,26 @@ fn derive_prev_delta(values: &[i64]) -> Result<Option<GenericStreamOp>> {
         base,
         unit,
         bit_width: signed_bitpack_width_for_range(min, max),
+    }))
+}
+
+fn derive_prev_varint(values: &[i64]) -> Result<Option<GenericStreamOp>> {
+    let Some(base) = values.first().copied() else {
+        return Ok(None);
+    };
+    if values.len() <= 1 {
+        return Ok(None);
+    }
+    let mut deltas = Vec::with_capacity(values.len().saturating_sub(1));
+    for pair in values.windows(2) {
+        let Ok(delta) = checked_delta(pair[1], pair[0]) else {
+            return Ok(None);
+        };
+        deltas.push(delta);
+    }
+    Ok(Some(GenericStreamOp::PrevVarint {
+        base,
+        unit: signed_gcd_unit(&deltas),
     }))
 }
 
@@ -2017,6 +2052,35 @@ fn derive_dictionary(values: &[i64]) -> Result<Option<GenericStreamOp>> {
         unit,
         entry_count: u32::try_from(entries.len())
             .map_err(|_| AuraError::InvalidValue("dictionary entry count"))?,
+        code_width: unsigned_bitpack_width(max_code),
+    }))
+}
+
+fn derive_packed_dictionary(values: &[i64]) -> Result<Option<GenericStreamOp>> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let base = values.iter().copied().min().unwrap_or(0);
+    let residuals = unsigned_offsets(values, base)?;
+    let unit = storage_unit(&residuals);
+    let scaled_values = residuals
+        .iter()
+        .map(|value| value / unit as u64)
+        .collect::<Vec<_>>();
+    let mut entries = scaled_values;
+    entries.sort_unstable();
+    entries.dedup();
+    if entries.len() == values.len() {
+        return Ok(None);
+    }
+    let max_entry = entries.iter().copied().max().unwrap_or(0);
+    let max_code = entries.len().saturating_sub(1) as u64;
+    Ok(Some(GenericStreamOp::PackedDictionary {
+        base,
+        unit,
+        entry_count: u32::try_from(entries.len())
+            .map_err(|_| AuraError::InvalidValue("dictionary entry count"))?,
+        entry_width: unsigned_bitpack_width(max_entry),
         code_width: unsigned_bitpack_width(max_code),
     }))
 }

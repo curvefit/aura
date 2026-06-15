@@ -216,6 +216,10 @@ pub enum GenericStreamOp {
         unit: i64,
         bit_width: u8,
     },
+    PrevVarint {
+        base: i64,
+        unit: i64,
+    },
     BlockLocal {
         block_size: u16,
         mode_count: u32,
@@ -241,6 +245,13 @@ pub enum GenericStreamOp {
     Dictionary {
         unit: i64,
         entry_count: u32,
+        code_width: u8,
+    },
+    PackedDictionary {
+        base: i64,
+        unit: i64,
+        entry_count: u32,
+        entry_width: u8,
         code_width: u8,
     },
     UuidConstMask {
@@ -277,6 +288,11 @@ impl GenericStreamOp {
                 put_i64_le(out, base);
                 put_i64_le(out, unit);
                 put_u8(out, bit_width);
+            }
+            Self::PrevVarint { base, unit } => {
+                put_u8(out, 9);
+                put_i64_le(out, base);
+                put_i64_le(out, unit);
             }
             Self::BlockLocal {
                 block_size,
@@ -332,6 +348,20 @@ impl GenericStreamOp {
                 put_u32_le(out, entry_count);
                 put_u8(out, code_width);
             }
+            Self::PackedDictionary {
+                base,
+                unit,
+                entry_count,
+                entry_width,
+                code_width,
+            } => {
+                put_u8(out, 10);
+                put_i64_le(out, base);
+                put_i64_le(out, unit);
+                put_u32_le(out, entry_count);
+                put_u8(out, entry_width);
+                put_u8(out, code_width);
+            }
             Self::UuidConstMask {
                 constant_bits,
                 variable_bits,
@@ -360,6 +390,10 @@ impl GenericStreamOp {
                 unit: reader.read_i64_le()?,
                 bit_width: reader.read_u8()?,
             },
+            9 => Self::PrevVarint {
+                base: reader.read_i64_le()?,
+                unit: reader.read_i64_le()?,
+            },
             3 => Self::BlockLocal {
                 block_size: reader.read_u16_le()?,
                 mode_count: reader.read_u32_le()?,
@@ -387,6 +421,13 @@ impl GenericStreamOp {
                 entry_count: reader.read_u32_le()?,
                 code_width: reader.read_u8()?,
             },
+            10 => Self::PackedDictionary {
+                base: reader.read_i64_le()?,
+                unit: reader.read_i64_le()?,
+                entry_count: reader.read_u32_le()?,
+                entry_width: reader.read_u8()?,
+                code_width: reader.read_u8()?,
+            },
             8 => Self::UuidConstMask {
                 constant_bits: reader.read_u8()?,
                 variable_bits: reader.read_u8()?,
@@ -412,6 +453,7 @@ impl GenericStreamOp {
             | Self::BitplaneRle {
                 unit, bit_width, ..
             } => validate_unit_width(unit, bit_width),
+            Self::PrevVarint { unit, .. } => validate_unit(unit),
             Self::BlockLocal { block_size, .. } => {
                 if block_size == 0 {
                     Err(AuraError::InvalidValue("block size"))
@@ -435,6 +477,22 @@ impl GenericStreamOp {
                 code_width,
             } => {
                 validate_unit(unit)?;
+                validate_bit_width(code_width)?;
+                if entry_count == 0 {
+                    Err(AuraError::InvalidValue("dictionary entry count"))
+                } else {
+                    Ok(())
+                }
+            }
+            Self::PackedDictionary {
+                unit,
+                entry_count,
+                entry_width,
+                code_width,
+                ..
+            } => {
+                validate_unit(unit)?;
+                validate_bit_width(entry_width)?;
                 validate_bit_width(code_width)?;
                 if entry_count == 0 {
                     Err(AuraError::InvalidValue("dictionary entry count"))
