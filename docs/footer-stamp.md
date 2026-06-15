@@ -137,11 +137,13 @@ Generic stream instructions:
 fixed_step       base + row_index * step
 base_bitpack     base + packed_unsigned * storage_unit
 prev_delta       previous + packed_delta * storage_unit
+prev_varint      previous + zigzag-varint delta * storage_unit
 block_local      body is divided into blocks, each with its own stream mode
 patched_bitpack  low-width body plus exception indexes/high bits
 rle              run lengths over a value stream
 bitplane_rle     each bit plane is stored as runs
 dictionary       dictionary entries plus bitpacked codes
+packed_dictionary bitpacked dictionary entries plus bitpacked codes
 uuid_const_mask  fixed 128-bit mask/value plus packed variable bits
 ```
 
@@ -156,6 +158,10 @@ base_bitpack
 
 prev_delta
   body: packed_signed[value_count - 1] using bit_width
+  row 0 is the stamped base
+
+prev_varint
+  body: zigzag-varint scaled_delta[value_count - 1]
   row 0 is the stamped base
 
 patched_bitpack
@@ -174,6 +180,10 @@ dictionary
   body: signed-varint dictionary entries[entry_count]
         packed dictionary codes[value_count]
 
+packed_dictionary
+  body: packed dictionary entries[entry_count] using entry_width
+        packed dictionary codes[value_count] using code_width
+
 uuid_const_mask
   body: constant_mask u128, constant_value u128, packed variable bits
 
@@ -182,9 +192,10 @@ block_local
 ```
 
 `block_local` modes are generic body-local choices (`fixed_step`,
-`base_bitpack`, `patched_bitpack`, or `rle`) derived by the writer from that
-block only. The footer instruction provides `block_size` and the expected block
-count; the local body header provides only the constants needed for that block.
+`base_bitpack`, `prev_delta`, `patched_bitpack`, or `rle`) derived by the
+writer from that block only. The footer instruction provides `block_size` and
+the expected block count; the local body header provides only the constants
+needed for that block.
 
 Generic group instructions describe multi-slot structure without naming a
 market-data domain:
@@ -225,7 +236,9 @@ partition-local bases, first value per run, and deltas inside each run.
 zero-heavy slots without domain names. The writer may pack one presence mask for
 multiple slots, store only nonzero values for sparse numeric slots, and derive
 boolean-like slots directly from a presence bit. These are selected only when
-the measured stamped body is smaller than direct slot streams.
+the measured stamped body is smaller than direct slot streams. Sparse groups are
+chosen by total bytes saved, not by smallest absolute sparse body, so a larger
+multi-slot presence map can win when it removes more direct streams.
 
 ## Grouping
 
@@ -255,13 +268,14 @@ domain-specific operation names.
 
 `src/generic_planner.rs` now derives executable generic stream/group plans from
 the schema header hints and observed rows. It can plan and round-trip fixed
-steps, base/previous bitpacking, patched bitpacking, RLE, bitplane RLE,
-dictionary streams, block-local streams, UUID constant masks, sparse presence
-streams, candle-shape derived streams, partition run lengths, grouped
-event-value streams, segmented child deltas, and repeated-slot grouping. Parent
-relationships are scored as transform candidates, not forced deltas; if a
-candidate body is larger than a direct stream, the writer keeps the direct
-stream. The planner uses relationships and scope bytes, not field names.
+steps, base/previous bitpacking, previous zigzag-varints, patched bitpacking,
+RLE, bitplane RLE, dictionary streams, packed dictionary streams, block-local
+streams, UUID constant masks, sparse presence streams, candle-shape derived
+streams, partition run lengths, grouped event-value streams, segmented child
+deltas, and repeated-slot grouping. Parent relationships are scored as
+transform candidates, not forced deltas; if a candidate body is larger than a
+direct stream, the writer keeps the direct stream. The planner uses
+relationships and scope bytes, not field names.
 
 The `.aura` ingest footer now stamps a generic Aura0 plan alongside the legacy
 field program candidates. `.aura -> .aura0` conversion follows that stamped

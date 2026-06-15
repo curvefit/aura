@@ -251,8 +251,15 @@ slots `5..7` are children of slot `4`. That is enough for a schema-driven
 writer to group contiguous rows with the same event fields, write event fields
 once, encode partition run counts, reset price deltas inside each partition run,
 and use sparse/presence streams for zero-heavy child fields. The stamped footer
-still decides exact storage units, widths, bitpacking, varints, and whether each
-candidate actually wins.
+still decides exact storage units, widths, bitpacking, varints, packed
+dictionaries, and whether each candidate actually wins.
+
+On the Grimoire Bybit 15-minute fixture, that same header map stamps a generic
+footer with partition run lengths, grouped event-value streams, segmented price
+deltas, a multi-slot presence map, sparse nonzero quantity streams, packed
+dictionaries for those quantity values, and a presence-derived flag. There is no
+orderbook-specific opcode; the footer only says what to do with repeated groups,
+presence bits, dictionaries, and streams.
 
 The intended module pattern is:
 
