@@ -101,6 +101,24 @@ impl GenericInstructionPlan {
                     }
                     ensure_stream_ref(&stream_ids, *stream_id)?;
                 }
+                GenericGroupInstruction::SparseStream {
+                    parent_group_id,
+                    presence_group_id,
+                    stream_id,
+                    ..
+                } => {
+                    ensure_group_ref(&group_ids, *parent_group_id)?;
+                    ensure_group_ref(&group_ids, *presence_group_id)?;
+                    ensure_stream_ref(&stream_ids, *stream_id)?;
+                }
+                GenericGroupInstruction::PresenceValue {
+                    parent_group_id,
+                    presence_group_id,
+                    ..
+                } => {
+                    ensure_group_ref(&group_ids, *parent_group_id)?;
+                    ensure_group_ref(&group_ids, *presence_group_id)?;
+                }
                 GenericGroupInstruction::Group { .. } => {}
             }
         }
@@ -452,6 +470,22 @@ pub enum GenericGroupInstruction {
         input_slots: Vec<u16>,
         stream_id: u16,
     },
+    SparseStream {
+        group_id: u16,
+        parent_group_id: u16,
+        presence_group_id: u16,
+        output_slot: u16,
+        presence_index: u16,
+        stream_id: u16,
+    },
+    PresenceValue {
+        group_id: u16,
+        parent_group_id: u16,
+        presence_group_id: u16,
+        output_slot: u16,
+        presence_index: u16,
+        value: i64,
+    },
 }
 
 impl GenericGroupInstruction {
@@ -460,7 +494,9 @@ impl GenericGroupInstruction {
             Self::Group { group_id, .. }
             | Self::PartitionRuns { group_id, .. }
             | Self::PresenceMap { group_id, .. }
-            | Self::DerivedStream { group_id, .. } => group_id,
+            | Self::DerivedStream { group_id, .. }
+            | Self::SparseStream { group_id, .. }
+            | Self::PresenceValue { group_id, .. } => group_id,
         }
     }
 
@@ -519,6 +555,38 @@ impl GenericGroupInstruction {
                 put_u16_vec(out, input_slots, "input slots")?;
                 put_u16_le(out, *stream_id);
             }
+            Self::SparseStream {
+                group_id,
+                parent_group_id,
+                presence_group_id,
+                output_slot,
+                presence_index,
+                stream_id,
+            } => {
+                put_u8(out, 4);
+                put_u16_le(out, *group_id);
+                put_u16_le(out, *parent_group_id);
+                put_u16_le(out, *presence_group_id);
+                put_u16_le(out, *output_slot);
+                put_u16_le(out, *presence_index);
+                put_u16_le(out, *stream_id);
+            }
+            Self::PresenceValue {
+                group_id,
+                parent_group_id,
+                presence_group_id,
+                output_slot,
+                presence_index,
+                value,
+            } => {
+                put_u8(out, 5);
+                put_u16_le(out, *group_id);
+                put_u16_le(out, *parent_group_id);
+                put_u16_le(out, *presence_group_id);
+                put_u16_le(out, *output_slot);
+                put_u16_le(out, *presence_index);
+                put_i64_le(out, *value);
+            }
         }
         Ok(())
     }
@@ -555,6 +623,22 @@ impl GenericGroupInstruction {
                 input_slots: read_u16_vec(reader)?,
                 stream_id: reader.read_u16_le()?,
             },
+            4 => Self::SparseStream {
+                group_id: reader.read_u16_le()?,
+                parent_group_id: reader.read_u16_le()?,
+                presence_group_id: reader.read_u16_le()?,
+                output_slot: reader.read_u16_le()?,
+                presence_index: reader.read_u16_le()?,
+                stream_id: reader.read_u16_le()?,
+            },
+            5 => Self::PresenceValue {
+                group_id: reader.read_u16_le()?,
+                parent_group_id: reader.read_u16_le()?,
+                presence_group_id: reader.read_u16_le()?,
+                output_slot: reader.read_u16_le()?,
+                presence_index: reader.read_u16_le()?,
+                value: reader.read_i64_le()?,
+            },
             _ => return Err(AuraError::InvalidValue("group instruction op")),
         };
         group.validate()?;
@@ -582,6 +666,7 @@ impl GenericGroupInstruction {
                     return Err(AuraError::InvalidValue("input slots"));
                 }
             }
+            Self::SparseStream { .. } | Self::PresenceValue { .. } => {}
             Self::PartitionRuns { .. } => {}
         }
         Ok(())

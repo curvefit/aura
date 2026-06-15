@@ -41,6 +41,7 @@ struct PlannerState {
     planned_slots: BTreeSet<u16>,
     next_stream_id: u16,
     next_group_id: u16,
+    repeated_group_id: Option<u16>,
 }
 
 impl PlannerState {
@@ -51,6 +52,7 @@ impl PlannerState {
             planned_slots: BTreeSet::new(),
             next_stream_id: 0,
             next_group_id: 0,
+            repeated_group_id: None,
         }
     }
 
@@ -236,6 +238,71 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
         }
     }
 
+    let presence_maps =
+        presence_maps_by_group(&encoded.plan, &stream_values, encoded.record_count)?;
+    for group in &encoded.plan.groups {
+        match group {
+            GenericGroupInstruction::SparseStream {
+                presence_group_id,
+                output_slot,
+                presence_index,
+                stream_id,
+                ..
+            } => {
+                let output_slot = usize::from(*output_slot);
+                if output_slot >= encoded.field_count {
+                    return Err(AuraError::InvalidValue("target slot"));
+                }
+                let masks = presence_maps
+                    .get(presence_group_id)
+                    .ok_or(AuraError::InvalidValue("presence map reference"))?;
+                let values = stream_values
+                    .get(stream_id)
+                    .ok_or(AuraError::InvalidValue("stream body"))?;
+                let mut value_index = 0usize;
+                for row_index in 0..encoded.record_count {
+                    if presence_bit_set(masks[row_index], *presence_index)? {
+                        rows[row_index][output_slot] = *values
+                            .get(value_index)
+                            .ok_or(AuraError::InvalidValue("sparse stream body"))?;
+                        value_index += 1;
+                    } else {
+                        rows[row_index][output_slot] = 0;
+                    }
+                    filled[row_index][output_slot] = true;
+                }
+                if value_index != values.len() {
+                    return Err(AuraError::InvalidValue("sparse stream body"));
+                }
+            }
+            GenericGroupInstruction::PresenceValue {
+                presence_group_id,
+                output_slot,
+                presence_index,
+                value,
+                ..
+            } => {
+                let output_slot = usize::from(*output_slot);
+                if output_slot >= encoded.field_count {
+                    return Err(AuraError::InvalidValue("target slot"));
+                }
+                let masks = presence_maps
+                    .get(presence_group_id)
+                    .ok_or(AuraError::InvalidValue("presence map reference"))?;
+                for row_index in 0..encoded.record_count {
+                    rows[row_index][output_slot] =
+                        if presence_bit_set(masks[row_index], *presence_index)? {
+                            *value
+                        } else {
+                            0
+                        };
+                    filled[row_index][output_slot] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
     let derived = encoded
         .plan
         .groups
@@ -340,6 +407,53 @@ fn stream_values_for_instruction(
             .collect();
     }
 
+    if let Some(slots) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::PresenceMap {
+            slots, stream_id, ..
+        } if *stream_id == instruction.stream_id => Some(slots),
+        _ => None,
+    }) {
+        return rows
+            .iter()
+            .map(|row| {
+                slots
+                    .iter()
+                    .enumerate()
+                    .try_fold(0i64, |mask, (index, slot)| {
+                        if row[usize::from(*slot)] == 0 {
+                            Ok(mask)
+                        } else {
+                            let bit = 1i64
+                                .checked_shl(
+                                    u32::try_from(index)
+                                        .map_err(|_| AuraError::InvalidValue("presence bit"))?,
+                                )
+                                .ok_or(AuraError::InvalidValue("presence bit"))?;
+                            Ok(mask | bit)
+                        }
+                    })
+            })
+            .collect();
+    }
+
+    if let Some(output_slot) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::SparseStream {
+            output_slot,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some(*output_slot),
+        _ => None,
+    }) {
+        let values = rows
+            .iter()
+            .filter_map(|row| {
+                let value = row[usize::from(output_slot)];
+                (value != 0).then_some(value)
+            })
+            .collect::<Vec<_>>();
+        return Ok(values);
+    }
+
     if let Some(parent_group_id) = plan.groups.iter().find_map(|group| match group {
         GenericGroupInstruction::PartitionRuns {
             parent_group_id,
@@ -418,11 +532,52 @@ fn group_event_slots(plan: &GenericInstructionPlan, group_id: u16) -> Result<Vec
         .ok_or(AuraError::InvalidValue("group instruction reference"))
 }
 
+fn presence_maps_by_group(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+) -> Result<BTreeMap<u16, Vec<i64>>> {
+    let mut out = BTreeMap::new();
+    for group in &plan.groups {
+        let GenericGroupInstruction::PresenceMap {
+            group_id,
+            slots,
+            stream_id,
+            ..
+        } = group
+        else {
+            continue;
+        };
+        if slots.len() > 62 {
+            return Err(AuraError::InvalidValue("presence slots"));
+        }
+        let values = stream_values
+            .get(stream_id)
+            .ok_or(AuraError::InvalidValue("presence stream body"))?;
+        if values.len() != record_count {
+            return Err(AuraError::InvalidValue("presence stream body"));
+        }
+        out.insert(*group_id, values.clone());
+    }
+    Ok(out)
+}
+
+fn presence_bit_set(mask: i64, index: u16) -> Result<bool> {
+    if index >= 62 || mask < 0 {
+        return Err(AuraError::InvalidValue("presence bit"));
+    }
+    let bit = 1i64
+        .checked_shl(u32::from(index))
+        .ok_or(AuraError::InvalidValue("presence bit"))?;
+    Ok(mask & bit != 0)
+}
+
 fn plan_i64_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<PlannedI64Rows> {
     validate_rows(schema, rows)?;
     let mut state = PlannerState::new();
     add_group_hints(schema, rows, &mut state)?;
     add_candle_shape_hints(schema, rows, &mut state)?;
+    add_sparse_presence_hints(schema, rows, &mut state)?;
 
     for field in &schema.fields {
         if state.planned_slots.contains(&field.index) {
@@ -437,12 +592,19 @@ fn plan_i64_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<Planned
                     .zip(parent_values)
                     .map(|(value, parent)| checked_delta(*value, parent))
                     .collect::<Result<Vec<_>>>()?;
-                state.add_derived(
-                    field.index,
-                    DerivedOp::AddResidual,
-                    vec![parent_slot],
-                    residuals,
-                )?;
+                let direct_size = encoded_i64_len(&values)?;
+                let residual_size = encoded_i64_len(&residuals)?;
+                if residual_size < direct_size {
+                    state.add_derived(
+                        field.index,
+                        DerivedOp::AddResidual,
+                        vec![parent_slot],
+                        residuals,
+                    )?;
+                } else {
+                    state.add_stream(Some(field.index), values)?;
+                    state.planned_slots.insert(field.index);
+                }
             }
             FieldRelation::None => {
                 state.add_stream(Some(field.index), values)?;
@@ -485,6 +647,7 @@ fn add_group_hints(
         event_slots: event_slots.clone(),
         repeated_slots: repeated_slots.clone(),
     });
+    state.repeated_group_id = Some(group_id);
 
     if let Some(partition_slot) = fixed_order_partition_slot(rows, &event_slots, &repeated_slots)? {
         let counts = event_group_lengths(rows, &event_slots)?;
@@ -504,6 +667,219 @@ fn add_group_hints(
     }
 
     Ok(())
+}
+
+fn add_sparse_presence_hints(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<i64>],
+    state: &mut PlannerState,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let Some(parent_group_id) = state.repeated_group_id else {
+        return Ok(());
+    };
+    let mut candidates = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Repeated)
+        .filter(|field| !state.planned_slots.contains(&field.index))
+        .filter_map(|field| sparse_candidate(field.index, rows).transpose())
+        .collect::<Result<Vec<_>>>()?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    candidates.sort_by_key(|candidate| {
+        std::cmp::Reverse(candidate.direct_size.saturating_sub(candidate.nonzero_size))
+    });
+    let mut best: Option<SparseSetCandidate> = None;
+    for candidate in &candidates {
+        let candidate = sparse_set_candidate(rows, vec![candidate.clone()])?;
+        if candidate.sparse_size < candidate.direct_size
+            && best
+                .as_ref()
+                .is_none_or(|current| candidate.sparse_size < current.sparse_size)
+        {
+            best = Some(candidate);
+        }
+    }
+    let mut selected = Vec::new();
+    for candidate in candidates {
+        selected.push(candidate);
+        let candidate = sparse_set_candidate(rows, selected.clone())?;
+        if candidate.sparse_size < candidate.direct_size
+            && best
+                .as_ref()
+                .is_none_or(|current| candidate.sparse_size < current.sparse_size)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    let Some(best) = best else {
+        return Ok(());
+    };
+    let presence_values = rows
+        .iter()
+        .map(|row| {
+            best.slots
+                .iter()
+                .enumerate()
+                .try_fold(0i64, |mask, (index, slot)| {
+                    if row[usize::from(slot.field_index)] == 0 {
+                        Ok(mask)
+                    } else {
+                        let bit = 1i64
+                            .checked_shl(
+                                u32::try_from(index)
+                                    .map_err(|_| AuraError::InvalidValue("presence bit"))?,
+                            )
+                            .ok_or(AuraError::InvalidValue("presence bit"))?;
+                        Ok(mask | bit)
+                    }
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let presence_stream_id = state.add_stream(None, presence_values)?;
+    let presence_group_id = state.next_group_id;
+    state.next_group_id = state
+        .next_group_id
+        .checked_add(1)
+        .ok_or(AuraError::InvalidValue("group id"))?;
+    let presence_slots = best
+        .slots
+        .iter()
+        .map(|slot| slot.field_index)
+        .collect::<Vec<_>>();
+    state.groups.push(GenericGroupInstruction::PresenceMap {
+        group_id: presence_group_id,
+        parent_group_id,
+        slots: presence_slots,
+        stream_id: presence_stream_id,
+    });
+
+    for (presence_index, slot) in best.slots.into_iter().enumerate() {
+        let group_id = state.next_group_id;
+        state.next_group_id = state
+            .next_group_id
+            .checked_add(1)
+            .ok_or(AuraError::InvalidValue("group id"))?;
+        if let Some(value) = slot.presence_value {
+            state.groups.push(GenericGroupInstruction::PresenceValue {
+                group_id,
+                parent_group_id,
+                presence_group_id,
+                output_slot: slot.field_index,
+                presence_index: u16::try_from(presence_index)
+                    .map_err(|_| AuraError::InvalidValue("presence index"))?,
+                value,
+            });
+        } else {
+            let values = rows
+                .iter()
+                .filter_map(|row| {
+                    let value = row[usize::from(slot.field_index)];
+                    (value != 0).then_some(value)
+                })
+                .collect::<Vec<_>>();
+            let stream_id = state.add_stream(None, values)?;
+            state.groups.push(GenericGroupInstruction::SparseStream {
+                group_id,
+                parent_group_id,
+                presence_group_id,
+                output_slot: slot.field_index,
+                presence_index: u16::try_from(presence_index)
+                    .map_err(|_| AuraError::InvalidValue("presence index"))?,
+                stream_id,
+            });
+        }
+        state.planned_slots.insert(slot.field_index);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct SparseSlotCandidate {
+    field_index: u16,
+    direct_size: usize,
+    nonzero_size: usize,
+    presence_value: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct SparseSetCandidate {
+    slots: Vec<SparseSlotCandidate>,
+    direct_size: usize,
+    sparse_size: usize,
+}
+
+fn sparse_candidate(field_index: u16, rows: &[Vec<i64>]) -> Result<Option<SparseSlotCandidate>> {
+    let values = column_values(rows, field_index)?;
+    let nonzero_values = values
+        .iter()
+        .copied()
+        .filter(|value| *value != 0)
+        .collect::<Vec<_>>();
+    if nonzero_values.is_empty() || nonzero_values.len() == values.len() {
+        return Ok(None);
+    }
+    let direct_size = encoded_i64_len(&values)?;
+    let presence_value = nonzero_values
+        .first()
+        .copied()
+        .filter(|first| nonzero_values.iter().all(|value| value == first));
+    let nonzero_size = if presence_value.is_some() {
+        0
+    } else {
+        encoded_i64_len(&nonzero_values)?
+    };
+    Ok(Some(SparseSlotCandidate {
+        field_index,
+        direct_size,
+        nonzero_size,
+        presence_value,
+    }))
+}
+
+fn sparse_set_candidate(
+    rows: &[Vec<i64>],
+    slots: Vec<SparseSlotCandidate>,
+) -> Result<SparseSetCandidate> {
+    if slots.len() > 62 {
+        return Err(AuraError::InvalidValue("presence slots"));
+    }
+    let presence_values = rows
+        .iter()
+        .map(|row| {
+            slots
+                .iter()
+                .enumerate()
+                .try_fold(0i64, |mask, (index, slot)| {
+                    if row[usize::from(slot.field_index)] == 0 {
+                        Ok(mask)
+                    } else {
+                        let bit = 1i64
+                            .checked_shl(
+                                u32::try_from(index)
+                                    .map_err(|_| AuraError::InvalidValue("presence bit"))?,
+                            )
+                            .ok_or(AuraError::InvalidValue("presence bit"))?;
+                        Ok(mask | bit)
+                    }
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let direct_size = slots.iter().map(|slot| slot.direct_size).sum();
+    let sparse_size = encoded_i64_len(&presence_values)?
+        + slots.iter().map(|slot| slot.nonzero_size).sum::<usize>();
+    Ok(SparseSetCandidate {
+        slots,
+        direct_size,
+        sparse_size,
+    })
 }
 
 fn add_candle_shape_hints(

@@ -70,6 +70,15 @@ fn generic_instruction_plan_round_trips_grouped_curvefit_shape() {
                     run_count: 50_344,
                 },
             },
+            GenericStreamInstruction {
+                stream_id: 7,
+                target_slot: None,
+                op: GenericStreamOp::Dictionary {
+                    unit: 1,
+                    entry_count: 32,
+                    code_width: 5,
+                },
+            },
         ],
         groups: vec![
             GenericGroupInstruction::Group {
@@ -113,6 +122,22 @@ fn generic_instruction_plan_round_trips_grouped_curvefit_shape() {
                 op: DerivedOp::MinMinusResidual,
                 input_slots: vec![1, 2],
                 stream_id: 1,
+            },
+            GenericGroupInstruction::SparseStream {
+                group_id: 6,
+                parent_group_id: 0,
+                presence_group_id: 2,
+                output_slot: 5,
+                presence_index: 0,
+                stream_id: 7,
+            },
+            GenericGroupInstruction::PresenceValue {
+                group_id: 7,
+                parent_group_id: 0,
+                presence_group_id: 2,
+                output_slot: 7,
+                presence_index: 2,
+                value: 1,
             },
         ],
     };

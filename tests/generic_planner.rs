@@ -136,6 +136,76 @@ fn generic_planner_emits_group_hints_for_repeated_slots() {
 }
 
 #[test]
+fn generic_planner_uses_sparse_presence_for_zero_heavy_repeated_slots() {
+    let schema =
+        generic_i64_parent_schema("parented_repeated", &[255, 0, 0, 128, 132, 133, 133, 133])
+            .unwrap();
+    let rows = (0..256)
+        .flat_map(|event| {
+            (0..8).map(move |level| {
+                let row_index = event * 8 + level;
+                let side = i64::from(level >= 4);
+                let price = 100_000 + i64::from(event * 10 + level);
+                let present = row_index % 17 == 0;
+                let qty1 = if present {
+                    1_000_000 + i64::from(row_index * 37)
+                } else {
+                    0
+                };
+                let qty2 = if present {
+                    5_000_000 + i64::from(row_index * 41)
+                } else {
+                    0
+                };
+                let delete_flag = i64::from(present);
+                vec![
+                    1_000_000 + i64::from(event),
+                    10_000 + i64::from(event),
+                    20_000 + i64::from(event / 2),
+                    side,
+                    price,
+                    qty1,
+                    qty2,
+                    delete_flag,
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+
+    assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::PresenceMap {
+                slots,
+                ..
+            } if slots.iter().any(|slot| matches!(slot, 5 | 6))
+        )
+    }));
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::SparseStream {
+                output_slot: 5 | 6,
+                ..
+            }
+        )
+    }));
+    assert!(!encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::DerivedStream {
+                output_slot: 4,
+                input_slots,
+                ..
+            } if input_slots.as_slice() == [3]
+        )
+    }));
+}
+
+#[test]
 fn uuid_const_mask_is_planned_and_executable() {
     let prefix = 0xabcdu128 << 112;
     let values = vec![
