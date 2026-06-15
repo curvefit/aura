@@ -83,6 +83,43 @@ impl GenericInstructionPlan {
                     ensure_group_ref(&group_ids, *parent_group_id)?;
                     ensure_stream_ref(&stream_ids, *count_stream_id)?;
                 }
+                GenericGroupInstruction::PartitionRunLengths {
+                    parent_group_id,
+                    value_stream_id,
+                    count_stream_id,
+                    event_count_stream_id,
+                    fixed_order: _,
+                    ..
+                } => {
+                    ensure_group_ref(&group_ids, *parent_group_id)?;
+                    ensure_stream_ref(&stream_ids, *value_stream_id)?;
+                    ensure_stream_ref(&stream_ids, *count_stream_id)?;
+                    if let Some(event_count_stream_id) = event_count_stream_id {
+                        ensure_stream_ref(&stream_ids, *event_count_stream_id)?;
+                    }
+                }
+                GenericGroupInstruction::SegmentedDeltaStream {
+                    parent_group_id,
+                    base_stream_id,
+                    first_stream_id,
+                    delta_stream_id,
+                    ..
+                } => {
+                    ensure_group_ref(&group_ids, *parent_group_id)?;
+                    if let Some(base_stream_id) = base_stream_id {
+                        ensure_stream_ref(&stream_ids, *base_stream_id)?;
+                    }
+                    ensure_stream_ref(&stream_ids, *first_stream_id)?;
+                    ensure_stream_ref(&stream_ids, *delta_stream_id)?;
+                }
+                GenericGroupInstruction::GroupValueStream {
+                    parent_group_id,
+                    stream_id,
+                    ..
+                } => {
+                    ensure_group_ref(&group_ids, *parent_group_id)?;
+                    ensure_stream_ref(&stream_ids, *stream_id)?;
+                }
                 GenericGroupInstruction::PresenceMap {
                     parent_group_id,
                     stream_id,
@@ -456,6 +493,29 @@ pub enum GenericGroupInstruction {
         count_stream_id: u16,
         fixed_order: bool,
     },
+    PartitionRunLengths {
+        group_id: u16,
+        parent_group_id: u16,
+        partition_slot: u16,
+        fixed_order: bool,
+        value_stream_id: u16,
+        count_stream_id: u16,
+        event_count_stream_id: Option<u16>,
+    },
+    SegmentedDeltaStream {
+        group_id: u16,
+        parent_group_id: u16,
+        output_slot: u16,
+        base_stream_id: Option<u16>,
+        first_stream_id: u16,
+        delta_stream_id: u16,
+    },
+    GroupValueStream {
+        group_id: u16,
+        parent_group_id: u16,
+        output_slot: u16,
+        stream_id: u16,
+    },
     PresenceMap {
         group_id: u16,
         parent_group_id: u16,
@@ -493,6 +553,9 @@ impl GenericGroupInstruction {
         match *self {
             Self::Group { group_id, .. }
             | Self::PartitionRuns { group_id, .. }
+            | Self::PartitionRunLengths { group_id, .. }
+            | Self::SegmentedDeltaStream { group_id, .. }
+            | Self::GroupValueStream { group_id, .. }
             | Self::PresenceMap { group_id, .. }
             | Self::DerivedStream { group_id, .. }
             | Self::SparseStream { group_id, .. }
@@ -526,6 +589,52 @@ impl GenericGroupInstruction {
                 put_u16_le(out, *partition_slot);
                 put_u16_le(out, *count_stream_id);
                 put_u8(out, u8::from(*fixed_order));
+            }
+            Self::PartitionRunLengths {
+                group_id,
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id,
+                count_stream_id,
+                event_count_stream_id,
+            } => {
+                put_u8(out, 6);
+                put_u16_le(out, *group_id);
+                put_u16_le(out, *parent_group_id);
+                put_u16_le(out, *partition_slot);
+                put_u8(out, u8::from(*fixed_order));
+                put_u16_le(out, *value_stream_id);
+                put_u16_le(out, *count_stream_id);
+                put_u16_le(out, encode_optional_slot(*event_count_stream_id)?);
+            }
+            Self::SegmentedDeltaStream {
+                group_id,
+                parent_group_id,
+                output_slot,
+                base_stream_id,
+                first_stream_id,
+                delta_stream_id,
+            } => {
+                put_u8(out, 7);
+                put_u16_le(out, *group_id);
+                put_u16_le(out, *parent_group_id);
+                put_u16_le(out, *output_slot);
+                put_u16_le(out, encode_optional_slot(*base_stream_id)?);
+                put_u16_le(out, *first_stream_id);
+                put_u16_le(out, *delta_stream_id);
+            }
+            Self::GroupValueStream {
+                group_id,
+                parent_group_id,
+                output_slot,
+                stream_id,
+            } => {
+                put_u8(out, 8);
+                put_u16_le(out, *group_id);
+                put_u16_le(out, *parent_group_id);
+                put_u16_le(out, *output_slot);
+                put_u16_le(out, *stream_id);
             }
             Self::PresenceMap {
                 group_id,
@@ -639,6 +748,33 @@ impl GenericGroupInstruction {
                 presence_index: reader.read_u16_le()?,
                 value: reader.read_i64_le()?,
             },
+            6 => Self::PartitionRunLengths {
+                group_id: reader.read_u16_le()?,
+                parent_group_id: reader.read_u16_le()?,
+                partition_slot: reader.read_u16_le()?,
+                fixed_order: match reader.read_u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(AuraError::InvalidValue("partition order flag")),
+                },
+                value_stream_id: reader.read_u16_le()?,
+                count_stream_id: reader.read_u16_le()?,
+                event_count_stream_id: decode_optional_slot(reader.read_u16_le()?),
+            },
+            7 => Self::SegmentedDeltaStream {
+                group_id: reader.read_u16_le()?,
+                parent_group_id: reader.read_u16_le()?,
+                output_slot: reader.read_u16_le()?,
+                base_stream_id: decode_optional_slot(reader.read_u16_le()?),
+                first_stream_id: reader.read_u16_le()?,
+                delta_stream_id: reader.read_u16_le()?,
+            },
+            8 => Self::GroupValueStream {
+                group_id: reader.read_u16_le()?,
+                parent_group_id: reader.read_u16_le()?,
+                output_slot: reader.read_u16_le()?,
+                stream_id: reader.read_u16_le()?,
+            },
             _ => return Err(AuraError::InvalidValue("group instruction op")),
         };
         group.validate()?;
@@ -668,6 +804,9 @@ impl GenericGroupInstruction {
             }
             Self::SparseStream { .. } | Self::PresenceValue { .. } => {}
             Self::PartitionRuns { .. } => {}
+            Self::PartitionRunLengths { .. }
+            | Self::SegmentedDeltaStream { .. }
+            | Self::GroupValueStream { .. } => {}
         }
         Ok(())
     }

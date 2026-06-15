@@ -44,6 +44,37 @@ struct PlannerState {
     repeated_group_id: Option<u16>,
 }
 
+#[derive(Debug, Clone)]
+struct PartitionRunPlan {
+    group_id: u16,
+    partition_slot: u16,
+    fixed_order_len: Option<usize>,
+    has_event_run_counts: bool,
+    runs: Vec<PartitionRun>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PartitionRun {
+    start: usize,
+    end: usize,
+    value: i64,
+}
+
+#[derive(Debug)]
+struct PartitionRunCandidate {
+    partition_slot: u16,
+    fixed_order_values: Option<Vec<i64>>,
+    event_run_counts: Vec<i64>,
+    runs: Vec<PartitionRun>,
+}
+
+struct SegmentedDeltaCandidate {
+    output_slot: u16,
+    base_values: Option<Vec<i64>>,
+    first_values: Vec<i64>,
+    delta_values: Vec<i64>,
+}
+
 impl PlannerState {
     fn new() -> Self {
         Self {
@@ -237,6 +268,31 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
             filled[row_index][slot] = true;
         }
     }
+
+    let partition_runs = materialize_partition_run_lengths(
+        &encoded.plan,
+        &stream_values,
+        encoded.record_count,
+        encoded.field_count,
+        &mut rows,
+        &mut filled,
+    )?;
+    materialize_group_value_streams(
+        &encoded.plan,
+        &stream_values,
+        &partition_runs,
+        encoded.field_count,
+        &mut rows,
+        &mut filled,
+    )?;
+    materialize_segmented_delta_streams(
+        &encoded.plan,
+        &stream_values,
+        &partition_runs,
+        encoded.field_count,
+        &mut rows,
+        &mut filled,
+    )?;
 
     let presence_maps =
         presence_maps_by_group(&encoded.plan, &stream_values, encoded.record_count)?;
@@ -454,6 +510,171 @@ fn stream_values_for_instruction(
         return Ok(values);
     }
 
+    if let Some((parent_group_id, partition_slot, fixed_order, stream_kind)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id,
+                count_stream_id,
+                event_count_stream_id: _,
+                ..
+            } if *value_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 0u8))
+            }
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id: _,
+                count_stream_id,
+                event_count_stream_id: _,
+                ..
+            } if *count_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 1u8))
+            }
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id: _,
+                count_stream_id: _,
+                event_count_stream_id: Some(event_count_stream_id),
+                ..
+            } if *event_count_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 2u8))
+            }
+            _ => None,
+        })
+    {
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        return match stream_kind {
+            0 if fixed_order => fixed_partition_run_order(rows, &event_slots, partition_slot)?
+                .ok_or(AuraError::InvalidValue("fixed partition order")),
+            0 => Ok(partition_run_ranges(rows, &event_slots, partition_slot)?
+                .into_iter()
+                .map(|run| run.value)
+                .collect()),
+            1 => partition_run_ranges(rows, &event_slots, partition_slot)?
+                .into_iter()
+                .map(|run| {
+                    i64::try_from(run.end - run.start)
+                        .map_err(|_| AuraError::InvalidValue("run length"))
+                })
+                .collect(),
+            2 => partition_run_event_counts(rows, &event_slots, partition_slot),
+            _ => Err(AuraError::InvalidValue("partition stream")),
+        };
+    }
+
+    if let Some((parent_group_id, output_slot, stream_kind, has_base_stream)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id,
+                first_stream_id,
+                delta_stream_id,
+                ..
+            } if base_stream_id == &Some(instruction.stream_id) => {
+                Some((*parent_group_id, *output_slot, 0u8, true))
+            }
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id,
+                first_stream_id,
+                delta_stream_id: _,
+                ..
+            } if *first_stream_id == instruction.stream_id => Some((
+                *parent_group_id,
+                *output_slot,
+                1u8,
+                base_stream_id.is_some(),
+            )),
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id: _,
+                first_stream_id: _,
+                delta_stream_id,
+                ..
+            } if *delta_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *output_slot, 2u8, false))
+            }
+            _ => None,
+        })
+    {
+        let runs = partition_runs_for_group(plan, rows, parent_group_id)?;
+        return match stream_kind {
+            0 => Ok(partition_value_bases(rows, &runs, output_slot)?
+                .into_values()
+                .collect()),
+            1 => {
+                let output_slot = usize::from(output_slot);
+                if has_base_stream {
+                    let bases = partition_value_bases(
+                        rows,
+                        &runs,
+                        u16::try_from(output_slot)
+                            .map_err(|_| AuraError::InvalidValue("target slot"))?,
+                    )?;
+                    runs.iter()
+                        .map(|run| {
+                            let base = bases
+                                .get(&run.value)
+                                .copied()
+                                .ok_or(AuraError::InvalidValue("partition base"))?;
+                            checked_delta(rows[run.start][output_slot], base)
+                        })
+                        .collect()
+                } else {
+                    Ok(runs
+                        .iter()
+                        .map(|run| rows[run.start][output_slot])
+                        .collect())
+                }
+            }
+            2 => {
+                let mut deltas = Vec::with_capacity(rows.len().saturating_sub(runs.len()));
+                let output_slot = usize::from(output_slot);
+                for run in runs {
+                    for row_index in run.start + 1..run.end {
+                        deltas.push(checked_delta(
+                            rows[row_index][output_slot],
+                            rows[row_index - 1][output_slot],
+                        )?);
+                    }
+                }
+                Ok(deltas)
+            }
+            _ => Err(AuraError::InvalidValue("segmented stream")),
+        };
+    }
+
+    if let Some((parent_group_id, output_slot)) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::GroupValueStream {
+            parent_group_id,
+            output_slot,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some((*parent_group_id, *output_slot)),
+        _ => None,
+    }) {
+        let parent_group_id = partition_parent_group_id(plan, parent_group_id)?;
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        return event_group_ranges(rows, &event_slots)?
+            .into_iter()
+            .map(|(start, _)| {
+                rows.get(start)
+                    .and_then(|row| row.get(usize::from(output_slot)))
+                    .copied()
+                    .ok_or(AuraError::InvalidValue("group value stream"))
+            })
+            .collect();
+    }
+
     if let Some(parent_group_id) = plan.groups.iter().find_map(|group| match group {
         GenericGroupInstruction::PartitionRuns {
             parent_group_id,
@@ -532,6 +753,42 @@ fn group_event_slots(plan: &GenericInstructionPlan, group_id: u16) -> Result<Vec
         .ok_or(AuraError::InvalidValue("group instruction reference"))
 }
 
+fn partition_runs_for_group(
+    plan: &GenericInstructionPlan,
+    rows: &[Vec<i64>],
+    group_id: u16,
+) -> Result<Vec<PartitionRun>> {
+    let (parent_group_id, partition_slot) = plan
+        .groups
+        .iter()
+        .find_map(|group| match group {
+            GenericGroupInstruction::PartitionRunLengths {
+                group_id: candidate,
+                parent_group_id,
+                partition_slot,
+                ..
+            } if *candidate == group_id => Some((*parent_group_id, *partition_slot)),
+            _ => None,
+        })
+        .ok_or(AuraError::InvalidValue("partition run reference"))?;
+    let event_slots = group_event_slots(plan, parent_group_id)?;
+    partition_run_ranges(rows, &event_slots, partition_slot)
+}
+
+fn partition_parent_group_id(plan: &GenericInstructionPlan, group_id: u16) -> Result<u16> {
+    plan.groups
+        .iter()
+        .find_map(|group| match group {
+            GenericGroupInstruction::PartitionRunLengths {
+                group_id: candidate,
+                parent_group_id,
+                ..
+            } if *candidate == group_id => Some(*parent_group_id),
+            _ => None,
+        })
+        .ok_or(AuraError::InvalidValue("partition run reference"))
+}
+
 fn presence_maps_by_group(
     plan: &GenericInstructionPlan,
     stream_values: &BTreeMap<u16, Vec<i64>>,
@@ -572,10 +829,310 @@ fn presence_bit_set(mask: i64, index: u16) -> Result<bool> {
     Ok(mask & bit != 0)
 }
 
+fn materialize_partition_run_lengths(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+    field_count: usize,
+    rows: &mut [Vec<i64>],
+    filled: &mut [Vec<bool>],
+) -> Result<BTreeMap<u16, Vec<PartitionRun>>> {
+    let mut out = BTreeMap::new();
+    for group in &plan.groups {
+        let GenericGroupInstruction::PartitionRunLengths {
+            group_id,
+            partition_slot,
+            fixed_order,
+            value_stream_id,
+            count_stream_id,
+            ..
+        } = group
+        else {
+            continue;
+        };
+        let partition_slot = usize::from(*partition_slot);
+        if partition_slot >= field_count {
+            return Err(AuraError::InvalidValue("partition slot"));
+        }
+        let values = stream_values
+            .get(value_stream_id)
+            .ok_or(AuraError::InvalidValue("partition value stream"))?;
+        let counts = stream_values
+            .get(count_stream_id)
+            .ok_or(AuraError::InvalidValue("partition count stream"))?;
+        if *fixed_order {
+            if !counts.is_empty() && values.is_empty() {
+                return Err(AuraError::InvalidValue("fixed partition order"));
+            }
+        } else if values.len() != counts.len() {
+            return Err(AuraError::InvalidValue("partition stream length"));
+        }
+
+        let mut row_index = 0usize;
+        let mut runs = Vec::with_capacity(counts.len());
+        for (run_index, count) in counts.iter().copied().enumerate() {
+            if count <= 0 {
+                return Err(AuraError::InvalidValue("partition run length"));
+            }
+            let count = usize::try_from(count)
+                .map_err(|_| AuraError::InvalidValue("partition run length"))?;
+            let end = row_index
+                .checked_add(count)
+                .ok_or(AuraError::InvalidValue("partition run length"))?;
+            if end > record_count {
+                return Err(AuraError::InvalidValue("partition run length"));
+            }
+            let value = if *fixed_order {
+                values[run_index % values.len()]
+            } else {
+                values[run_index]
+            };
+            for row in row_index..end {
+                rows[row][partition_slot] = value;
+                filled[row][partition_slot] = true;
+            }
+            runs.push(PartitionRun {
+                start: row_index,
+                end,
+                value,
+            });
+            row_index = end;
+        }
+        if row_index != record_count {
+            return Err(AuraError::InvalidValue("partition run length"));
+        }
+        out.insert(*group_id, runs);
+    }
+    Ok(out)
+}
+
+fn materialize_group_value_streams(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    partition_runs: &BTreeMap<u16, Vec<PartitionRun>>,
+    field_count: usize,
+    rows: &mut [Vec<i64>],
+    filled: &mut [Vec<bool>],
+) -> Result<()> {
+    for group in &plan.groups {
+        let GenericGroupInstruction::GroupValueStream {
+            parent_group_id,
+            output_slot,
+            stream_id,
+            ..
+        } = group
+        else {
+            continue;
+        };
+        let output_slot = usize::from(*output_slot);
+        if output_slot >= field_count {
+            return Err(AuraError::InvalidValue("target slot"));
+        }
+        let event_ranges = event_ranges_from_partition_runs(
+            plan,
+            stream_values,
+            partition_runs,
+            *parent_group_id,
+        )?;
+        let values = stream_values
+            .get(stream_id)
+            .ok_or(AuraError::InvalidValue("group value stream"))?;
+        if values.len() != event_ranges.len() {
+            return Err(AuraError::InvalidValue("group value stream"));
+        }
+        for ((start, end), value) in event_ranges.into_iter().zip(values.iter().copied()) {
+            for row_index in start..end {
+                rows[row_index][output_slot] = value;
+                filled[row_index][output_slot] = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn materialize_segmented_delta_streams(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    partition_runs: &BTreeMap<u16, Vec<PartitionRun>>,
+    field_count: usize,
+    rows: &mut [Vec<i64>],
+    filled: &mut [Vec<bool>],
+) -> Result<()> {
+    for group in &plan.groups {
+        let GenericGroupInstruction::SegmentedDeltaStream {
+            parent_group_id,
+            output_slot,
+            base_stream_id,
+            first_stream_id,
+            delta_stream_id,
+            ..
+        } = group
+        else {
+            continue;
+        };
+        let output_slot = usize::from(*output_slot);
+        if output_slot >= field_count {
+            return Err(AuraError::InvalidValue("target slot"));
+        }
+        let runs = partition_runs
+            .get(parent_group_id)
+            .ok_or(AuraError::InvalidValue("partition run reference"))?;
+        let first_values = stream_values
+            .get(first_stream_id)
+            .ok_or(AuraError::InvalidValue("segmented first stream"))?;
+        let delta_values = stream_values
+            .get(delta_stream_id)
+            .ok_or(AuraError::InvalidValue("segmented delta stream"))?;
+        if first_values.len() != runs.len() {
+            return Err(AuraError::InvalidValue("segmented first stream"));
+        }
+        let base_by_partition = if let Some(base_stream_id) = base_stream_id {
+            let base_values = stream_values
+                .get(base_stream_id)
+                .ok_or(AuraError::InvalidValue("segmented base stream"))?;
+            let partition_values = partition_values_from_runs(runs);
+            if base_values.len() != partition_values.len() {
+                return Err(AuraError::InvalidValue("segmented base stream"));
+            }
+            Some(
+                partition_values
+                    .into_iter()
+                    .zip(base_values.iter().copied())
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        } else {
+            None
+        };
+        let mut delta_index = 0usize;
+        for (run, first_value) in runs.iter().zip(first_values.iter().copied()) {
+            if run.start >= run.end || run.end > rows.len() {
+                return Err(AuraError::InvalidValue("partition run"));
+            }
+            let mut value = if let Some(base_by_partition) = &base_by_partition {
+                let base = base_by_partition
+                    .get(&run.value)
+                    .copied()
+                    .ok_or(AuraError::InvalidValue("segmented base stream"))?;
+                checked_sum(base, first_value)?
+            } else {
+                first_value
+            };
+            rows[run.start][output_slot] = value;
+            filled[run.start][output_slot] = true;
+            for row_index in run.start + 1..run.end {
+                let delta = *delta_values
+                    .get(delta_index)
+                    .ok_or(AuraError::InvalidValue("segmented delta stream"))?;
+                value = checked_sum(value, delta)?;
+                rows[row_index][output_slot] = value;
+                filled[row_index][output_slot] = true;
+                delta_index += 1;
+            }
+        }
+        if delta_index != delta_values.len() {
+            return Err(AuraError::InvalidValue("segmented delta stream"));
+        }
+    }
+    Ok(())
+}
+
+fn partition_values_from_runs(runs: &[PartitionRun]) -> Vec<i64> {
+    let mut values = runs.iter().map(|run| run.value).collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn event_ranges_from_partition_runs(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    partition_runs: &BTreeMap<u16, Vec<PartitionRun>>,
+    group_id: u16,
+) -> Result<Vec<(usize, usize)>> {
+    let (fixed_order, value_stream_id, event_count_stream_id) = plan
+        .groups
+        .iter()
+        .find_map(|group| match group {
+            GenericGroupInstruction::PartitionRunLengths {
+                group_id: candidate,
+                fixed_order,
+                value_stream_id,
+                event_count_stream_id,
+                ..
+            } if *candidate == group_id => {
+                Some((*fixed_order, *value_stream_id, *event_count_stream_id))
+            }
+            _ => None,
+        })
+        .ok_or(AuraError::InvalidValue("partition run reference"))?;
+    let runs = partition_runs
+        .get(&group_id)
+        .ok_or(AuraError::InvalidValue("partition run reference"))?;
+    let run_counts = if fixed_order {
+        let order_len = stream_values
+            .get(&value_stream_id)
+            .ok_or(AuraError::InvalidValue("partition value stream"))?
+            .len();
+        if order_len == 0 {
+            return Ok(Vec::new());
+        }
+        if runs.len() % order_len != 0 {
+            return Err(AuraError::InvalidValue("partition run length"));
+        }
+        vec![order_len; runs.len() / order_len]
+    } else {
+        let event_count_stream_id =
+            event_count_stream_id.ok_or(AuraError::InvalidValue("partition event count stream"))?;
+        stream_values
+            .get(&event_count_stream_id)
+            .ok_or(AuraError::InvalidValue("partition event count stream"))?
+            .iter()
+            .map(|count| {
+                if *count <= 0 {
+                    return Err(AuraError::InvalidValue("partition event count stream"));
+                }
+                usize::try_from(*count)
+                    .map_err(|_| AuraError::InvalidValue("partition event count stream"))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    if run_counts.iter().sum::<usize>() != runs.len() {
+        return Err(AuraError::InvalidValue("partition event count stream"));
+    }
+    let mut run_index = 0usize;
+    run_counts
+        .into_iter()
+        .map(|chunk| {
+            let end_index = run_index
+                .checked_add(chunk)
+                .ok_or(AuraError::InvalidValue("partition run length"))?;
+            if end_index > runs.len() {
+                return Err(AuraError::InvalidValue("partition run length"));
+            }
+            let chunk = &runs[run_index..end_index];
+            run_index = end_index;
+            let first = chunk
+                .first()
+                .ok_or(AuraError::InvalidValue("partition run length"))?;
+            let last = chunk
+                .last()
+                .ok_or(AuraError::InvalidValue("partition run length"))?;
+            for pair in chunk.windows(2) {
+                if pair[0].end != pair[1].start {
+                    return Err(AuraError::InvalidValue("partition run length"));
+                }
+            }
+            Ok((first.start, last.end))
+        })
+        .collect()
+}
+
 fn plan_i64_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<PlannedI64Rows> {
     validate_rows(schema, rows)?;
     let mut state = PlannerState::new();
-    add_group_hints(schema, rows, &mut state)?;
+    let partition_runs = add_group_hints(schema, rows, &mut state)?;
+    add_group_value_hints(schema, rows, &mut state, partition_runs.as_ref())?;
+    add_segmented_delta_hints(schema, rows, &mut state, partition_runs.as_ref())?;
     add_candle_shape_hints(schema, rows, &mut state)?;
     add_sparse_presence_hints(schema, rows, &mut state)?;
 
@@ -620,7 +1177,7 @@ fn add_group_hints(
     schema: &SchemaDescriptor,
     rows: &[Vec<i64>],
     state: &mut PlannerState,
-) -> Result<()> {
+) -> Result<Option<PartitionRunPlan>> {
     let event_slots = schema
         .fields
         .iter()
@@ -634,7 +1191,7 @@ fn add_group_hints(
         .map(|field| field.index)
         .collect::<Vec<_>>();
     if repeated_slots.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let group_id = state.next_group_id;
@@ -648,6 +1205,7 @@ fn add_group_hints(
         repeated_slots: repeated_slots.clone(),
     });
     state.repeated_group_id = Some(group_id);
+    let parent_group_id = group_id;
 
     if let Some(partition_slot) = fixed_order_partition_slot(rows, &event_slots, &repeated_slots)? {
         let counts = event_group_lengths(rows, &event_slots)?;
@@ -666,6 +1224,158 @@ fn add_group_hints(
         });
     }
 
+    let Some(candidate) = partition_run_candidate(schema, rows, &event_slots, &repeated_slots)?
+    else {
+        return Ok(None);
+    };
+    let value_stream_values = if let Some(values) = &candidate.fixed_order_values {
+        values.clone()
+    } else {
+        candidate.runs.iter().map(|run| run.value).collect()
+    };
+    let count_stream_values = candidate
+        .runs
+        .iter()
+        .map(|run| {
+            i64::try_from(run.end - run.start).map_err(|_| AuraError::InvalidValue("run length"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let value_stream_id = state.add_stream(None, value_stream_values)?;
+    let count_stream_id = state.add_stream(None, count_stream_values)?;
+    let event_count_stream_id = if candidate.fixed_order_values.is_none() {
+        Some(state.add_stream(None, candidate.event_run_counts.clone())?)
+    } else {
+        None
+    };
+    let group_id = state.next_group_id;
+    state.next_group_id = state
+        .next_group_id
+        .checked_add(1)
+        .ok_or(AuraError::InvalidValue("group id"))?;
+    let fixed_order = candidate.fixed_order_values.is_some();
+    state
+        .groups
+        .push(GenericGroupInstruction::PartitionRunLengths {
+            group_id,
+            parent_group_id,
+            partition_slot: candidate.partition_slot,
+            fixed_order,
+            value_stream_id,
+            count_stream_id,
+            event_count_stream_id,
+        });
+    state.planned_slots.insert(candidate.partition_slot);
+
+    Ok(Some(PartitionRunPlan {
+        group_id,
+        partition_slot: candidate.partition_slot,
+        fixed_order_len: candidate.fixed_order_values.as_ref().map(Vec::len),
+        has_event_run_counts: event_count_stream_id.is_some(),
+        runs: candidate.runs,
+    }))
+}
+
+fn add_group_value_hints(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<i64>],
+    state: &mut PlannerState,
+    partition_run_plan: Option<&PartitionRunPlan>,
+) -> Result<()> {
+    let Some(partition_run_plan) = partition_run_plan else {
+        return Ok(());
+    };
+    if !partition_run_plan.has_event_run_counts
+        && !partition_run_plan
+            .fixed_order_len
+            .is_some_and(|len| len > 0 && partition_run_plan.runs.len() % len == 0)
+    {
+        return Ok(());
+    }
+    let event_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Event)
+        .map(|field| field.index)
+        .collect::<Vec<_>>();
+    let event_ranges = event_group_ranges(rows, &event_slots)?;
+    if event_ranges.is_empty() {
+        return Ok(());
+    }
+    for field in &schema.fields {
+        if field.scope != FieldScope::Event || state.planned_slots.contains(&field.index) {
+            continue;
+        }
+        let values = event_ranges
+            .iter()
+            .map(|(start, _)| rows[*start][usize::from(field.index)])
+            .collect::<Vec<_>>();
+        let direct_values = column_values(rows, field.index)?;
+        if encoded_i64_len(&values)? >= encoded_i64_len(&direct_values)? {
+            continue;
+        }
+        let stream_id = state.add_stream(None, values)?;
+        let group_id = state.next_group_id;
+        state.next_group_id = state
+            .next_group_id
+            .checked_add(1)
+            .ok_or(AuraError::InvalidValue("group id"))?;
+        state
+            .groups
+            .push(GenericGroupInstruction::GroupValueStream {
+                group_id,
+                parent_group_id: partition_run_plan.group_id,
+                output_slot: field.index,
+                stream_id,
+            });
+        state.planned_slots.insert(field.index);
+    }
+    Ok(())
+}
+
+fn add_segmented_delta_hints(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<i64>],
+    state: &mut PlannerState,
+    partition_run_plan: Option<&PartitionRunPlan>,
+) -> Result<()> {
+    let Some(partition_run_plan) = partition_run_plan else {
+        return Ok(());
+    };
+    for field in &schema.fields {
+        if field.scope != FieldScope::Repeated || state.planned_slots.contains(&field.index) {
+            continue;
+        }
+        if field.relation.related_field_index() != Some(partition_run_plan.partition_slot) {
+            continue;
+        }
+        let Some(candidate) =
+            segmented_delta_candidate(rows, &partition_run_plan.runs, field.index)?
+        else {
+            continue;
+        };
+        let base_stream_id = candidate
+            .base_values
+            .map(|values| state.add_stream(None, values))
+            .transpose()?;
+        let first_stream_id = state.add_stream(None, candidate.first_values)?;
+        let delta_stream_id = state.add_stream(None, candidate.delta_values)?;
+        let group_id = state.next_group_id;
+        state.next_group_id = state
+            .next_group_id
+            .checked_add(1)
+            .ok_or(AuraError::InvalidValue("group id"))?;
+        state
+            .groups
+            .push(GenericGroupInstruction::SegmentedDeltaStream {
+                group_id,
+                parent_group_id: partition_run_plan.group_id,
+                output_slot: candidate.output_slot,
+                base_stream_id,
+                first_stream_id,
+                delta_stream_id,
+            });
+        state.planned_slots.insert(candidate.output_slot);
+    }
     Ok(())
 }
 
@@ -1309,6 +2019,256 @@ fn derive_dictionary(values: &[i64]) -> Result<Option<GenericStreamOp>> {
             .map_err(|_| AuraError::InvalidValue("dictionary entry count"))?,
         code_width: unsigned_bitpack_width(max_code),
     }))
+}
+
+fn partition_run_candidate(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<i64>],
+    event_slots: &[u16],
+    repeated_slots: &[u16],
+) -> Result<Option<PartitionRunCandidate>> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut best = None;
+    for partition_slot in repeated_slots {
+        let child_slots = schema
+            .fields
+            .iter()
+            .filter(|field| field.scope == FieldScope::Repeated)
+            .filter(|field| field.relation.related_field_index() == Some(*partition_slot))
+            .map(|field| field.index)
+            .collect::<Vec<_>>();
+        if child_slots.is_empty() {
+            continue;
+        }
+        let runs = partition_run_ranges(rows, event_slots, *partition_slot)?;
+        if runs.len() >= rows.len() {
+            continue;
+        }
+        let mut unique_values = runs.iter().map(|run| run.value).collect::<Vec<_>>();
+        unique_values.sort_unstable();
+        unique_values.dedup();
+        if unique_values.len() < 2 || unique_values.len() > 16 {
+            continue;
+        }
+        if !child_slots.iter().any(|slot| {
+            segmented_delta_candidate(rows, &runs, *slot)
+                .map(|candidate| candidate.is_some())
+                .unwrap_or(false)
+        }) {
+            continue;
+        }
+        let fixed_order_values = fixed_partition_run_order(rows, event_slots, *partition_slot)?;
+        let event_run_counts = partition_run_event_counts(rows, event_slots, *partition_slot)?;
+        let score = rows.len().saturating_sub(runs.len())
+            + fixed_order_values
+                .as_ref()
+                .map_or(0, |values| runs.len().saturating_sub(values.len()));
+        let candidate = PartitionRunCandidate {
+            partition_slot: *partition_slot,
+            fixed_order_values,
+            event_run_counts,
+            runs,
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _): &(usize, PartitionRunCandidate)| score > *best_score)
+        {
+            best = Some((score, candidate));
+        }
+    }
+    Ok(best.map(|(_, candidate)| candidate))
+}
+
+fn segmented_delta_candidate(
+    rows: &[Vec<i64>],
+    runs: &[PartitionRun],
+    output_slot: u16,
+) -> Result<Option<SegmentedDeltaCandidate>> {
+    if rows.is_empty() || runs.is_empty() {
+        return Ok(None);
+    }
+    let values = column_values(rows, output_slot)?;
+    let mut first_values = Vec::with_capacity(runs.len());
+    let mut delta_values = Vec::with_capacity(rows.len().saturating_sub(runs.len()));
+    let output_slot_index = usize::from(output_slot);
+    for run in runs {
+        if run.start >= run.end || run.end > rows.len() {
+            return Err(AuraError::InvalidValue("partition run"));
+        }
+        first_values.push(rows[run.start][output_slot_index]);
+        for row_index in run.start + 1..run.end {
+            delta_values.push(checked_delta(
+                rows[row_index][output_slot_index],
+                rows[row_index - 1][output_slot_index],
+            )?);
+        }
+    }
+    let absolute_bytes = encoded_i64_len(&first_values)? + encoded_i64_len(&delta_values)?;
+    let bases = partition_value_bases(rows, runs, output_slot)?;
+    let base_values = bases.values().copied().collect::<Vec<_>>();
+    let residual_first_values = runs
+        .iter()
+        .map(|run| {
+            let base = bases
+                .get(&run.value)
+                .copied()
+                .ok_or(AuraError::InvalidValue("partition base"))?;
+            checked_delta(rows[run.start][output_slot_index], base)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let partition_base_bytes = encoded_i64_len(&base_values)?
+        + encoded_i64_len(&residual_first_values)?
+        + encoded_i64_len(&delta_values)?;
+    let (base_values, first_values, estimated_bytes) = if partition_base_bytes < absolute_bytes {
+        (
+            Some(base_values),
+            residual_first_values,
+            partition_base_bytes,
+        )
+    } else {
+        (None, first_values, absolute_bytes)
+    };
+    if estimated_bytes >= encoded_i64_len(&values)? {
+        return Ok(None);
+    }
+    Ok(Some(SegmentedDeltaCandidate {
+        output_slot,
+        base_values,
+        first_values,
+        delta_values,
+    }))
+}
+
+fn partition_value_bases(
+    rows: &[Vec<i64>],
+    runs: &[PartitionRun],
+    output_slot: u16,
+) -> Result<BTreeMap<i64, i64>> {
+    let output_slot = usize::from(output_slot);
+    let mut bases: BTreeMap<i64, i64> = BTreeMap::new();
+    for run in runs {
+        if run.start >= run.end || run.end > rows.len() {
+            return Err(AuraError::InvalidValue("partition run"));
+        }
+        for row in rows.iter().take(run.end).skip(run.start) {
+            let value = row[output_slot];
+            bases
+                .entry(run.value)
+                .and_modify(|base| *base = (*base).min(value))
+                .or_insert(value);
+        }
+    }
+    Ok(bases)
+}
+
+fn partition_run_ranges(
+    rows: &[Vec<i64>],
+    event_slots: &[u16],
+    partition_slot: u16,
+) -> Result<Vec<PartitionRun>> {
+    let mut runs = Vec::new();
+    let partition_slot = usize::from(partition_slot);
+    for (group_start, group_end) in event_group_ranges(rows, event_slots)? {
+        if group_start >= group_end {
+            continue;
+        }
+        let mut run_start = group_start;
+        let mut value = *rows[group_start]
+            .get(partition_slot)
+            .ok_or(AuraError::InvalidValue("partition slot"))?;
+        for (row_index, row) in rows
+            .iter()
+            .enumerate()
+            .take(group_end)
+            .skip(group_start + 1)
+        {
+            let next = *row
+                .get(partition_slot)
+                .ok_or(AuraError::InvalidValue("partition slot"))?;
+            if next != value {
+                runs.push(PartitionRun {
+                    start: run_start,
+                    end: row_index,
+                    value,
+                });
+                run_start = row_index;
+                value = next;
+            }
+        }
+        runs.push(PartitionRun {
+            start: run_start,
+            end: group_end,
+            value,
+        });
+    }
+    Ok(runs)
+}
+
+fn partition_run_event_counts(
+    rows: &[Vec<i64>],
+    event_slots: &[u16],
+    partition_slot: u16,
+) -> Result<Vec<i64>> {
+    let partition_slot = usize::from(partition_slot);
+    event_group_ranges(rows, event_slots)?
+        .into_iter()
+        .map(|(group_start, group_end)| {
+            if group_start >= group_end {
+                return Ok(0);
+            }
+            let mut count = 1usize;
+            let mut value = rows[group_start][partition_slot];
+            for row in rows.iter().take(group_end).skip(group_start + 1) {
+                let next = row[partition_slot];
+                if next != value {
+                    value = next;
+                    count += 1;
+                }
+            }
+            i64::try_from(count).map_err(|_| AuraError::InvalidValue("partition event count"))
+        })
+        .collect()
+}
+
+fn fixed_partition_run_order(
+    rows: &[Vec<i64>],
+    event_slots: &[u16],
+    partition_slot: u16,
+) -> Result<Option<Vec<i64>>> {
+    let groups = event_group_ranges(rows, event_slots)?;
+    if groups.len() < 2 {
+        return Ok(None);
+    }
+    let partition_slot = usize::from(partition_slot);
+    let mut fixed_order: Option<Vec<i64>> = None;
+    for (group_start, group_end) in groups {
+        let mut order = Vec::new();
+        if group_start >= group_end {
+            continue;
+        }
+        let mut value = rows[group_start][partition_slot];
+        order.push(value);
+        for row in rows.iter().take(group_end).skip(group_start + 1) {
+            let next = row[partition_slot];
+            if next != value {
+                value = next;
+                order.push(value);
+            }
+        }
+        if order.is_empty() {
+            return Ok(None);
+        }
+        if let Some(existing) = &fixed_order {
+            if existing != &order {
+                return Ok(None);
+            }
+        } else {
+            fixed_order = Some(order);
+        }
+    }
+    Ok(fixed_order)
 }
 
 fn fixed_order_partition_slot(

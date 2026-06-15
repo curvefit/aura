@@ -79,6 +79,52 @@ fn generic_instruction_plan_round_trips_grouped_curvefit_shape() {
                     code_width: 5,
                 },
             },
+            GenericStreamInstruction {
+                stream_id: 8,
+                target_slot: None,
+                op: GenericStreamOp::Rle {
+                    base: 0,
+                    unit: 1,
+                    bit_width: 1,
+                    run_count: 24,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 9,
+                target_slot: None,
+                op: GenericStreamOp::BaseBitpack {
+                    base: 100_000,
+                    unit: 10,
+                    bit_width: 12,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 10,
+                target_slot: None,
+                op: GenericStreamOp::Dictionary {
+                    unit: 10,
+                    entry_count: 3,
+                    code_width: 2,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 11,
+                target_slot: None,
+                op: GenericStreamOp::BaseBitpack {
+                    base: 100_000,
+                    unit: 10,
+                    bit_width: 12,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 12,
+                target_slot: None,
+                op: GenericStreamOp::PrevDelta {
+                    base: 1_773_693_720_000_000_000,
+                    unit: 1_000_000,
+                    bit_width: 12,
+                },
+            },
         ],
         groups: vec![
             GenericGroupInstruction::Group {
@@ -92,6 +138,29 @@ fn generic_instruction_plan_round_trips_grouped_curvefit_shape() {
                 partition_slot: 3,
                 count_stream_id: 6,
                 fixed_order: true,
+            },
+            GenericGroupInstruction::PartitionRunLengths {
+                group_id: 8,
+                parent_group_id: 0,
+                partition_slot: 3,
+                fixed_order: true,
+                value_stream_id: 8,
+                count_stream_id: 6,
+                event_count_stream_id: None,
+            },
+            GenericGroupInstruction::SegmentedDeltaStream {
+                group_id: 9,
+                parent_group_id: 8,
+                output_slot: 4,
+                base_stream_id: Some(11),
+                first_stream_id: 9,
+                delta_stream_id: 10,
+            },
+            GenericGroupInstruction::GroupValueStream {
+                group_id: 10,
+                parent_group_id: 8,
+                output_slot: 0,
+                stream_id: 12,
             },
             GenericGroupInstruction::PresenceMap {
                 group_id: 2,

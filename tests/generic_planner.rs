@@ -206,6 +206,84 @@ fn generic_planner_uses_sparse_presence_for_zero_heavy_repeated_slots() {
 }
 
 #[test]
+fn generic_planner_uses_partition_runs_and_segmented_child_deltas() {
+    let schema =
+        generic_i64_parent_schema("parented_repeated", &[255, 0, 0, 128, 132, 133, 133, 133])
+            .unwrap();
+    let rows = (0..96)
+        .flat_map(|event| {
+            let run_sizes = [
+                2 + usize::from(event % 3 == 0),
+                3 + usize::from(event % 4 == 0),
+            ];
+            run_sizes
+                .into_iter()
+                .enumerate()
+                .flat_map(move |(partition, run_len)| {
+                    (0..run_len).map(move |level| {
+                        let base_price = 2_000_000 + i64::from(event) * 10;
+                        let first_price = if partition == 0 {
+                            base_price - 100
+                        } else {
+                            base_price + 8_000_000 + 100
+                        };
+                        let price = first_price + i64::try_from(level).unwrap() * 5;
+                        let has_qty = (event + level as u16 + partition as u16).is_multiple_of(11);
+                        vec![
+                            1_000_000 + i64::from(event / 2),
+                            10_000 + i64::from(event),
+                            20_000 + i64::from(event / 3),
+                            partition as i64,
+                            price,
+                            if has_qty { 1_000 + i64::from(event) } else { 0 },
+                            if has_qty {
+                                2_000 + i64::from(level as u16)
+                            } else {
+                                0
+                            },
+                            i64::from(has_qty),
+                        ]
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+
+    let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+
+    assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::PartitionRunLengths {
+                partition_slot: 3,
+                ..
+            }
+        )
+    }));
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::SegmentedDeltaStream {
+                output_slot: 4,
+                base_stream_id: Some(_),
+                ..
+            }
+        )
+    }));
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::GroupValueStream { output_slot: 1, .. }
+        )
+    }));
+    assert!(!encoded
+        .plan
+        .streams
+        .iter()
+        .any(|stream| matches!(stream.target_slot, Some(1 | 3 | 4))));
+}
+
+#[test]
 fn uuid_const_mask_is_planned_and_executable() {
     let prefix = 0xabcdu128 << 112;
     let values = vec![
