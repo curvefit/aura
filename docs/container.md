@@ -46,10 +46,13 @@ The front header intentionally stores compact stream IDs rather than strings or
 full schemas. For market data, `stream_id` can resolve through the external
 dictionary to the venue, market type, exchange symbol, base, quote, contract
 type, tick size, and quantity step. `schema_map` is a small time/parent mapping
-so the file shape is visible at the front: `255` marks the primary timestamp
-slot, `0` means no parent, and `1..254` means parent slot `value - 1`.
-`comment_utf8` is optional human-facing text, such as CSV-style field labels.
-The stamped footer schema remains the authoritative schema copy.
+so the file shape is visible at the front. Each logical slot uses one byte:
+`255` marks the primary timestamp slot, `0` marks an event/root slot with no
+parent, `1..127` marks an event slot with parent `value - 1`, `128` marks a
+repeated child root slot, and `129..254` marks a repeated child slot with
+parent `value - 129`. `comment_utf8` is optional human-facing text, such as
+CSV-style field labels. The stamped footer schema remains the authoritative
+schema copy.
 
 ## Body
 
