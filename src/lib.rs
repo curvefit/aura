@@ -34,7 +34,8 @@ pub use body::{decode_generic_stream_body, encode_generic_stream_body, GenericSt
 pub use error::{AuraError, Result};
 pub use footer::{AuraFooter, CompressionDescriptor, CompressionKind};
 pub use generic_planner::{
-    decode_generic_i64_rows, encode_generic_i64_rows, plan_generic_i64_rows,
+    decode_generic_i64_rows, decode_generic_i64_rows_body, encode_generic_i64_rows,
+    encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan, plan_generic_i64_rows,
     plan_uuid_const_mask_stream, GenericEncodedI64Rows, GenericEncodedStream,
 };
 pub use header::{AuraHeader, HEADER_PREFIX_SIZE};

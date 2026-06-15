@@ -268,6 +268,17 @@ fn generic_bitplane_rle_rejects_values_outside_stamped_width() {
     assert!(result.is_err());
 }
 
+#[test]
+fn generic_block_local_falls_back_when_fixed_step_probe_overflows() {
+    assert_i64_body_round_trip(
+        GenericStreamOp::BlockLocal {
+            block_size: 2,
+            mode_count: 2,
+        },
+        &[i64::MIN, i64::MAX, i64::MAX - 1, i64::MIN + 1],
+    );
+}
+
 fn assert_i64_body_round_trip(op: GenericStreamOp, values: &[i64]) {
     let instruction = GenericStreamInstruction {
         stream_id: 0,

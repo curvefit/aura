@@ -1,6 +1,7 @@
 use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, put_u8, ByteReader};
 use crate::chunk::ChunkDescriptor;
 use crate::format::FORMAT_VERSION;
+use crate::instructions::GenericInstructionPlan;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 use crate::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
 use crate::stats::{
@@ -58,6 +59,7 @@ pub struct AuraFooter {
     pub compression: CompressionDescriptor,
     pub aura0_plan: Option<Aura0Plan>,
     pub aura1_plan: Option<Aura1Plan>,
+    pub generic_aura0_plan: Option<GenericInstructionPlan>,
     pub chunks: Vec<ChunkDescriptor>,
 }
 
@@ -69,6 +71,7 @@ impl AuraFooter {
             compression: CompressionDescriptor::none(),
             aura0_plan: None,
             aura1_plan: None,
+            generic_aura0_plan: None,
             chunks: Vec::new(),
         }
     }
@@ -85,6 +88,11 @@ impl AuraFooter {
 
     pub fn with_aura1_plan(mut self, plan: Aura1Plan) -> Self {
         self.aura1_plan = Some(plan);
+        self
+    }
+
+    pub fn with_generic_aura0_plan(mut self, plan: GenericInstructionPlan) -> Self {
+        self.generic_aura0_plan = Some(plan);
         self
     }
 
@@ -121,7 +129,7 @@ impl AuraFooter {
         };
         let schema = decode_schema_block(&mut reader)?;
         let stats = decode_stats(&mut reader)?;
-        let (aura0_plan, aura1_plan) = decode_plans(&mut reader)?;
+        let (aura0_plan, aura1_plan, generic_aura0_plan) = decode_plans(&mut reader)?;
         let chunks = decode_chunks(&mut reader)?;
         reader.finish()?;
 
@@ -131,6 +139,7 @@ impl AuraFooter {
             compression,
             aura0_plan,
             aura1_plan,
+            generic_aura0_plan,
             chunks,
         })
     }
@@ -252,7 +261,9 @@ fn decode_stats(reader: &mut ByteReader<'_>) -> Result<IngestStats> {
 }
 
 fn encode_plans(footer: &AuraFooter, out: &mut Vec<u8>) -> Result<()> {
-    let plan_count = footer.aura0_plan.is_some() as usize + footer.aura1_plan.is_some() as usize;
+    let plan_count = footer.aura0_plan.is_some() as usize
+        + footer.aura1_plan.is_some() as usize
+        + footer.generic_aura0_plan.is_some() as usize;
     put_u8(out, plan_count as u8);
     if let Some(plan) = &footer.aura0_plan {
         put_u8(out, 0);
@@ -269,13 +280,26 @@ fn encode_plans(footer: &AuraFooter, out: &mut Vec<u8>) -> Result<()> {
             encode_plan_field(*field, out);
         }
     }
+    if let Some(plan) = &footer.generic_aura0_plan {
+        put_u8(out, 2);
+        let bytes = plan.encode()?;
+        put_u32_len(out, bytes.len(), "generic Aura0 plan length")?;
+        out.extend_from_slice(&bytes);
+    }
     Ok(())
 }
 
-fn decode_plans(reader: &mut ByteReader<'_>) -> Result<(Option<Aura0Plan>, Option<Aura1Plan>)> {
+fn decode_plans(
+    reader: &mut ByteReader<'_>,
+) -> Result<(
+    Option<Aura0Plan>,
+    Option<Aura1Plan>,
+    Option<GenericInstructionPlan>,
+)> {
     let plan_count = reader.read_u8()?;
     let mut aura0_plan = None;
     let mut aura1_plan = None;
+    let mut generic_aura0_plan = None;
     for _ in 0..plan_count {
         match reader.read_u8()? {
             0 => {
@@ -292,10 +316,14 @@ fn decode_plans(reader: &mut ByteReader<'_>) -> Result<(Option<Aura0Plan>, Optio
                     fields,
                 });
             }
+            2 => {
+                let len = reader.read_u32_le()? as usize;
+                generic_aura0_plan = Some(GenericInstructionPlan::decode(reader.read_exact(len)?)?);
+            }
             _ => return Err(AuraError::InvalidValue("plan kind")),
         }
     }
-    Ok((aura0_plan, aura1_plan))
+    Ok((aura0_plan, aura1_plan, generic_aura0_plan))
 }
 
 fn encode_plan_field(field: PhysicalFieldPlan, out: &mut Vec<u8>) {
@@ -386,6 +414,7 @@ fn put_u32_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instructions::{GenericStreamInstruction, GenericStreamOp};
     use crate::schema::book_delta_schema;
 
     #[test]
@@ -414,6 +443,17 @@ mod tests {
             .with_compression(CompressionDescriptor::zstd(12))
             .with_aura0_plan(Aura0Plan::from_stats(&stats))
             .with_aura1_plan(Aura1Plan::from_stats(&stats, 4))
+            .with_generic_aura0_plan(GenericInstructionPlan {
+                streams: vec![GenericStreamInstruction {
+                    stream_id: 0,
+                    target_slot: Some(0),
+                    op: GenericStreamOp::FixedStep {
+                        base: 1_000,
+                        step: 0,
+                    },
+                }],
+                groups: Vec::new(),
+            })
             .with_chunks(vec![chunk]);
 
         let encoded = footer.encode().unwrap();
@@ -424,6 +464,7 @@ mod tests {
         assert_eq!(footer.compression, decoded.compression);
         assert_eq!(footer.aura0_plan, decoded.aura0_plan);
         assert_eq!(footer.aura1_plan, decoded.aura1_plan);
+        assert_eq!(footer.generic_aura0_plan, decoded.generic_aura0_plan);
         assert_eq!(footer.chunks, decoded.chunks);
     }
 }

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::bitpack::{signed_bitpack_width_for_range, unsigned_bitpack_width};
 use crate::body::{decode_generic_stream_body, encode_generic_stream_body, GenericStreamBodyValue};
+use crate::bytes::{put_u16_le, put_u32_le, put_u64_le, ByteReader};
 use crate::instructions::{
     DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
     GenericStreamOp,
@@ -32,16 +33,10 @@ pub struct GenericEncodedStream {
 
 struct PlannedI64Rows {
     plan: GenericInstructionPlan,
-    streams: Vec<PlannedI64Stream>,
-}
-
-struct PlannedI64Stream {
-    instruction: GenericStreamInstruction,
-    values: Vec<i64>,
 }
 
 struct PlannerState {
-    streams: Vec<PlannedI64Stream>,
+    streams: Vec<GenericStreamInstruction>,
     groups: Vec<GenericGroupInstruction>,
     planned_slots: BTreeSet<u16>,
     next_stream_id: u16,
@@ -66,13 +61,10 @@ impl PlannerState {
             .checked_add(1)
             .ok_or(AuraError::InvalidValue("stream id"))?;
         let op = choose_i64_op(&values)?;
-        self.streams.push(PlannedI64Stream {
-            instruction: GenericStreamInstruction {
-                stream_id,
-                target_slot,
-                op,
-            },
-            values,
+        self.streams.push(GenericStreamInstruction {
+            stream_id,
+            target_slot,
+            op,
         });
         Ok(stream_id)
     }
@@ -104,18 +96,11 @@ impl PlannerState {
 
     fn finish(self) -> Result<PlannedI64Rows> {
         let plan = GenericInstructionPlan {
-            streams: self
-                .streams
-                .iter()
-                .map(|stream| stream.instruction.clone())
-                .collect(),
+            streams: self.streams,
             groups: self.groups,
         };
         let _encoded = plan.encode()?;
-        Ok(PlannedI64Rows {
-            plan,
-            streams: self.streams,
-        })
+        Ok(PlannedI64Rows { plan })
     }
 }
 
@@ -132,27 +117,80 @@ pub fn encode_generic_i64_rows(
 ) -> Result<GenericEncodedI64Rows> {
     validate_rows(schema, rows)?;
     let planned = plan_i64_rows(schema, rows)?;
-    let streams = planned
+    encode_generic_i64_rows_with_plan(schema, rows, planned.plan)
+}
+
+pub fn encode_generic_i64_rows_with_plan(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<i64>],
+    plan: GenericInstructionPlan,
+) -> Result<GenericEncodedI64Rows> {
+    validate_rows(schema, rows)?;
+    let _encoded_plan = plan.encode()?;
+    let streams = plan
         .streams
         .iter()
-        .map(|stream| {
+        .map(|instruction| {
+            let values = stream_values_for_instruction(schema, rows, &plan, instruction)?;
             let body = encode_generic_stream_body(
-                &stream.instruction,
-                &GenericStreamBodyValue::I64(stream.values.clone()),
+                instruction,
+                &GenericStreamBodyValue::I64(values.clone()),
             )?;
             Ok(GenericEncodedStream {
-                stream_id: stream.instruction.stream_id,
-                value_count: stream.values.len(),
+                stream_id: instruction.stream_id,
+                value_count: values.len(),
                 body,
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
     Ok(GenericEncodedI64Rows {
-        plan: planned.plan,
+        plan,
         streams,
         record_count: rows.len(),
         field_count: schema.fields.len(),
+    })
+}
+
+pub fn encode_generic_i64_rows_body(encoded: &GenericEncodedI64Rows) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    put_u16_len(&mut out, encoded.streams.len(), "generic stream count")?;
+    for stream in &encoded.streams {
+        put_u16_le(&mut out, stream.stream_id);
+        put_u64_le(&mut out, stream.value_count as u64);
+        put_u32_len(&mut out, stream.body.len(), "generic stream body length")?;
+        out.extend_from_slice(&stream.body);
+    }
+    Ok(out)
+}
+
+pub fn decode_generic_i64_rows_body(
+    plan: GenericInstructionPlan,
+    bytes: &[u8],
+    record_count: usize,
+    field_count: usize,
+) -> Result<Vec<Vec<i64>>> {
+    let mut reader = ByteReader::new(bytes);
+    let stream_count = reader.read_u16_le()? as usize;
+    let mut streams = Vec::with_capacity(stream_count);
+    for _ in 0..stream_count {
+        let stream_id = reader.read_u16_le()?;
+        let value_count = usize::try_from(reader.read_u64_le()?)
+            .map_err(|_| AuraError::InvalidValue("stream value count"))?;
+        let body_len = reader.read_u32_le()? as usize;
+        let body = reader.read_exact(body_len)?.to_vec();
+        streams.push(GenericEncodedStream {
+            stream_id,
+            value_count,
+            body,
+        });
+    }
+    reader.finish()?;
+    decode_generic_i64_rows(&GenericEncodedI64Rows {
+        plan,
+        streams,
+        record_count,
+        field_count,
     })
 }
 
@@ -271,6 +309,113 @@ pub fn plan_uuid_const_mask_stream(
     let _body =
         encode_generic_stream_body(&instruction, &GenericStreamBodyValue::U128(values.to_vec()))?;
     Ok(instruction)
+}
+
+fn stream_values_for_instruction(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<i64>],
+    plan: &GenericInstructionPlan,
+    instruction: &GenericStreamInstruction,
+) -> Result<Vec<i64>> {
+    if let Some(slot) = instruction.target_slot {
+        return column_values(rows, slot);
+    }
+
+    if let Some((output_slot, op, input_slots)) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::DerivedStream {
+            output_slot,
+            op,
+            input_slots,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some((*output_slot, *op, input_slots)),
+        _ => None,
+    }) {
+        return rows
+            .iter()
+            .enumerate()
+            .map(|(row_index, _)| {
+                inverse_derive_value(op, input_slots, output_slot, row_index, rows)
+            })
+            .collect();
+    }
+
+    if let Some(parent_group_id) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::PartitionRuns {
+            parent_group_id,
+            count_stream_id,
+            ..
+        } if *count_stream_id == instruction.stream_id => Some(*parent_group_id),
+        _ => None,
+    }) {
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        return event_group_lengths(rows, &event_slots);
+    }
+
+    let _ = schema;
+    Err(AuraError::InvalidValue("generic stream instruction"))
+}
+
+fn inverse_derive_value(
+    op: DerivedOp,
+    input_slots: &[u16],
+    output_slot: u16,
+    row_index: usize,
+    rows: &[Vec<i64>],
+) -> Result<i64> {
+    let output = rows
+        .get(row_index)
+        .and_then(|row| row.get(usize::from(output_slot)))
+        .copied()
+        .ok_or(AuraError::InvalidValue("output slot"))?;
+    match op {
+        DerivedOp::AddResidual => {
+            let base = rows[row_index][usize::from(input_slots[0])];
+            checked_delta(output, base)
+        }
+        DerivedOp::SubtractResidual => {
+            let base = rows[row_index][usize::from(input_slots[0])];
+            checked_delta(base, output)
+        }
+        DerivedOp::MaxPlusResidual => {
+            let base = input_slots
+                .iter()
+                .map(|slot| rows[row_index][usize::from(*slot)])
+                .max()
+                .ok_or(AuraError::InvalidValue("input slots"))?;
+            checked_delta(output, base)
+        }
+        DerivedOp::MinMinusResidual => {
+            let base = input_slots
+                .iter()
+                .map(|slot| rows[row_index][usize::from(*slot)])
+                .min()
+                .ok_or(AuraError::InvalidValue("input slots"))?;
+            checked_delta(base, output)
+        }
+        DerivedOp::FirstOffsetThenDelta => {
+            if row_index == 0 {
+                Ok(output)
+            } else {
+                let base = rows[row_index - 1][usize::from(input_slots[0])];
+                checked_delta(output, base)
+            }
+        }
+    }
+}
+
+fn group_event_slots(plan: &GenericInstructionPlan, group_id: u16) -> Result<Vec<u16>> {
+    plan.groups
+        .iter()
+        .find_map(|group| match group {
+            GenericGroupInstruction::Group {
+                group_id: candidate,
+                event_slots,
+                ..
+            } if *candidate == group_id => Some(event_slots.clone()),
+            _ => None,
+        })
+        .ok_or(AuraError::InvalidValue("group instruction reference"))
 }
 
 fn plan_i64_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<PlannedI64Rows> {
@@ -631,12 +776,18 @@ fn derive_fixed_step(values: &[i64]) -> Result<Option<GenericStreamOp>> {
         return Ok(Some(GenericStreamOp::FixedStep { base: 0, step: 0 }));
     };
     let step = if values.len() > 1 {
-        checked_delta(values[1], base)?
+        match checked_delta(values[1], base) {
+            Ok(step) => step,
+            Err(_) => return Ok(None),
+        }
     } else {
         0
     };
     for (index, value) in values.iter().copied().enumerate() {
-        if value != checked_step_value(base, step, index)? {
+        let Ok(expected) = checked_step_value(base, step, index) else {
+            return Ok(None);
+        };
+        if value != expected {
             return Ok(None);
         }
     }
@@ -646,15 +797,15 @@ fn derive_fixed_step(values: &[i64]) -> Result<Option<GenericStreamOp>> {
 fn derive_base_bitpack(values: &[i64]) -> Result<GenericStreamOp> {
     let base = values.iter().copied().min().unwrap_or(0);
     let residuals = unsigned_offsets(values, base)?;
-    let unit = gcd_unit(&residuals);
+    let unit = storage_unit(&residuals);
     let max_scaled = residuals
         .iter()
-        .map(|value| value / unit)
+        .map(|value| value / unit as u64)
         .max()
         .unwrap_or(0);
     Ok(GenericStreamOp::BaseBitpack {
         base,
-        unit: i64::try_from(unit).map_err(|_| AuraError::InvalidValue("storage unit"))?,
+        unit,
         bit_width: unsigned_bitpack_width(max_scaled),
     })
 }
@@ -666,10 +817,13 @@ fn derive_prev_delta(values: &[i64]) -> Result<Option<GenericStreamOp>> {
     if values.len() <= 1 {
         return Ok(None);
     }
-    let deltas = values
-        .windows(2)
-        .map(|pair| checked_delta(pair[1], pair[0]))
-        .collect::<Result<Vec<_>>>()?;
+    let mut deltas = Vec::with_capacity(values.len().saturating_sub(1));
+    for pair in values.windows(2) {
+        let Ok(delta) = checked_delta(pair[1], pair[0]) else {
+            return Ok(None);
+        };
+        deltas.push(delta);
+    }
     let unit = signed_gcd_unit(&deltas);
     let scaled = deltas.iter().map(|delta| *delta / unit).collect::<Vec<_>>();
     let (min, max) = min_max_i64(&scaled).ok_or(AuraError::InvalidValue("previous delta"))?;
@@ -731,14 +885,14 @@ fn derive_patched_bitpack(values: &[i64]) -> Result<GenericStreamOp> {
 fn derive_rle(values: &[i64]) -> Result<GenericStreamOp> {
     let base = values.iter().copied().min().unwrap_or(0);
     let residuals = unsigned_offsets(values, base)?;
-    let unit = gcd_unit(&residuals);
+    let unit = storage_unit(&residuals);
     let scaled = residuals
         .iter()
-        .map(|value| value / unit)
+        .map(|value| value / unit as u64)
         .collect::<Vec<_>>();
     Ok(GenericStreamOp::Rle {
         base,
-        unit: i64::try_from(unit).map_err(|_| AuraError::InvalidValue("storage unit"))?,
+        unit,
         bit_width: unsigned_bitpack_width(scaled.iter().copied().max().unwrap_or(0)),
         run_count: u32::try_from(run_count(&scaled))
             .map_err(|_| AuraError::InvalidValue("run count"))?,
@@ -748,15 +902,15 @@ fn derive_rle(values: &[i64]) -> Result<GenericStreamOp> {
 fn derive_bitplane_rle(values: &[i64]) -> Result<GenericStreamOp> {
     let base = values.iter().copied().min().unwrap_or(0);
     let residuals = unsigned_offsets(values, base)?;
-    let unit = gcd_unit(&residuals);
+    let unit = storage_unit(&residuals);
     let max_scaled = residuals
         .iter()
-        .map(|value| value / unit)
+        .map(|value| value / unit as u64)
         .max()
         .unwrap_or(0);
     Ok(GenericStreamOp::BitplaneRle {
         base,
-        unit: i64::try_from(unit).map_err(|_| AuraError::InvalidValue("storage unit"))?,
+        unit,
         bit_width: unsigned_bitpack_width(max_scaled),
     })
 }
@@ -1013,6 +1167,11 @@ fn gcd_unit(values: &[u64]) -> u64 {
     out.max(1)
 }
 
+fn storage_unit(values: &[u64]) -> i64 {
+    let unit = gcd_unit(values);
+    i64::try_from(unit).unwrap_or(1)
+}
+
 fn gcd(mut left: u64, mut right: u64) -> u64 {
     while right != 0 {
         let next = left % right;
@@ -1048,4 +1207,16 @@ fn uuid_constant_candidates(values: &[u128]) -> u128 {
         all_zeroes &= !*value;
     }
     all_ones | all_zeroes
+}
+
+fn put_u16_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> {
+    let len = u16::try_from(len).map_err(|_| AuraError::InvalidValue(name))?;
+    put_u16_le(out, len);
+    Ok(())
+}
+
+fn put_u32_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> {
+    let len = u32::try_from(len).map_err(|_| AuraError::InvalidValue(name))?;
+    put_u32_le(out, len);
+    Ok(())
 }

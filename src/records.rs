@@ -5,7 +5,12 @@ use crate::bitpack::{
 use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, ByteReader};
 use crate::footer::AuraFooter;
 use crate::format::SEAL_MAGIC;
+use crate::generic_planner::{
+    decode_generic_i64_rows_body, encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan,
+    plan_generic_i64_rows,
+};
 use crate::header::{AuraHeader, HEADER_PREFIX_SIZE};
+use crate::instructions::GenericInstructionPlan;
 use crate::plan::{unpack_ref_divisor, unpack_two_refs, Aura0Plan, Aura1Plan, FieldEncoding};
 use crate::program::{CompiledFooter, DecodeProgram};
 use crate::schema::{schema_parent_mapping, SchemaDescriptor};
@@ -40,9 +45,11 @@ pub fn encode_ingest_i64_file(input: I64FileInput) -> Result<Vec<u8>> {
 
     let aura0_plan = Aura0Plan::from_schema_rows_stats(&input.schema, &stats, &input.rows)?;
     let aura1_plan = Aura1Plan::from_stats(&stats, 1);
+    let generic_aura0_plan = plan_generic_i64_rows(&input.schema, &input.rows)?;
     let footer = AuraFooter::new(input.schema.clone(), stats)
         .with_aura0_plan(aura0_plan)
-        .with_aura1_plan(aura1_plan);
+        .with_aura1_plan(aura1_plan)
+        .with_generic_aura0_plan(generic_aura0_plan);
     let body = encode_raw_body(input.schema.fields.len(), &input.rows)?;
     let base_time_ns = input
         .rows
@@ -67,19 +74,27 @@ pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>
         return Err(AuraError::InvalidValue("target profile"));
     }
     let decoded = decode_i64_file(bytes)?;
+    let compiled_footer = decoded.compiled_footer_for_compile()?;
     let body = match target_profile {
         Profile::Ingest => unreachable!(),
         Profile::Aura0 => {
-            let plan = decoded.aura0_plan()?;
-            encode_aura0_body(&decoded.rows, &plan)?
+            if let Some(plan) = &compiled_footer.generic_aura0_plan {
+                let encoded = encode_generic_i64_rows_with_plan(
+                    &decoded.schema,
+                    &decoded.rows,
+                    plan.clone(),
+                )?;
+                encode_generic_i64_rows_body(&encoded)?
+            } else {
+                let plan = decoded.aura0_plan()?;
+                encode_aura0_body(&decoded.rows, &plan)?
+            }
         }
         Profile::Aura1 => {
             let plan = decoded.aura1_plan()?;
             encode_aura1_body(&decoded.rows, &plan)?
         }
     };
-
-    let compiled_footer = decoded.compiled_footer_for_compile()?;
 
     encode_compiled_file(
         target_profile,
@@ -131,13 +146,22 @@ pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
         }
         Profile::Aura0 => {
             let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-            let plan = footer.aura0_program.to_aura0_plan()?;
-            let rows = decode_aura0_body(
-                body,
-                &plan,
-                footer.record_count as usize,
-                footer.schema.fields.len(),
-            )?;
+            let rows = if let Some(plan) = footer.generic_aura0_plan.clone() {
+                decode_generic_i64_rows_body(
+                    plan,
+                    body,
+                    footer.record_count as usize,
+                    footer.schema.fields.len(),
+                )?
+            } else {
+                let plan = footer.aura0_program.to_aura0_plan()?;
+                decode_aura0_body(
+                    body,
+                    &plan,
+                    footer.record_count as usize,
+                    footer.schema.fields.len(),
+                )?
+            };
             validate_rows(&footer.schema, &rows)?;
             Ok(DecodedI64File {
                 header,
@@ -212,6 +236,15 @@ impl DecodedI64File {
         footer.aura1_program.to_aura1_plan(footer.block_capacity)
     }
 
+    fn generic_aura0_plan(&self) -> Option<GenericInstructionPlan> {
+        if let Some(footer) = &self.ingest_footer {
+            return footer.generic_aura0_plan.clone();
+        }
+        self.compiled_footer
+            .as_ref()
+            .and_then(|footer| footer.generic_aura0_plan.clone())
+    }
+
     fn compiled_footer_for_compile(&self) -> Result<CompiledFooter> {
         if let Some(footer) = &self.compiled_footer {
             return Ok(footer.clone());
@@ -220,13 +253,17 @@ impl DecodedI64File {
         let aura1_plan = self.aura1_plan()?;
         let block_capacity = aura1_plan.block_capacity;
         let field_count = self.schema.fields.len();
-        CompiledFooter::new(
+        let mut footer = CompiledFooter::new(
             self.schema.clone(),
             self.rows.len() as u64,
             block_capacity,
             DecodeProgram::from_aura0_plan(&aura0_plan, field_count)?,
             DecodeProgram::from_aura1_plan(&aura1_plan, field_count)?,
-        )
+        )?;
+        if let Some(plan) = self.generic_aura0_plan() {
+            footer = footer.with_generic_aura0_plan(plan);
+        }
+        Ok(footer)
     }
 }
 

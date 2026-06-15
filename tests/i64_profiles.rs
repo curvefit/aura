@@ -125,6 +125,7 @@ fn ingest_i64_file_round_trips_rows_and_footer_plans() {
     assert_eq!(rows, decoded.rows);
     let footer = decoded.ingest_footer.as_ref().unwrap();
     assert_eq!(3, footer.stats.record_count);
+    assert!(footer.generic_aura0_plan.is_some());
 
     let plan = footer.aura0_plan.as_ref().unwrap();
     assert_eq!(
@@ -135,6 +136,58 @@ fn ingest_i64_file_round_trips_rows_and_footer_plans() {
         FieldEncoding::DerivedOffset,
         plan.field("high", &schema).unwrap().encoding
     );
+}
+
+#[test]
+fn aura0_conversion_preserves_generic_stamp_from_ingest() {
+    let schema = generic_i64_parent_schema("generic_stamp_flow", &[255, 0, 2, 2, 2, 0]).unwrap();
+    let rows: Vec<Vec<i64>> = (0..64)
+        .map(|idx| {
+            let open = 10_000 + i64::from(idx % 5) * 10;
+            let close = open + i64::from(idx % 7) - 3;
+            let high = open.max(close) + i64::from(idx % 4);
+            let low = open.min(close) - i64::from(idx % 3);
+            vec![
+                i64::from(idx) * 60_000,
+                open,
+                high,
+                low,
+                close,
+                1_000 + i64::from(idx * 10),
+            ]
+        })
+        .collect();
+    let ingest = records::encode_ingest_i64_file(records::I64FileInput {
+        schema,
+        rows: rows.clone(),
+        stream_id: 2,
+        dictionary_id: 9,
+        header_comment: None,
+    })
+    .unwrap();
+    let ingest_decoded = records::decode_i64_file(&ingest).unwrap();
+    let ingest_generic_plan = ingest_decoded
+        .ingest_footer
+        .as_ref()
+        .unwrap()
+        .generic_aura0_plan
+        .clone()
+        .unwrap();
+
+    assert!(!ingest_generic_plan.streams.is_empty());
+
+    let aura0 = records::compile_i64_file(&ingest, Profile::Aura0).unwrap();
+    let aura0_decoded = records::decode_i64_file(&aura0).unwrap();
+    let compiled_generic_plan = aura0_decoded
+        .compiled_footer
+        .as_ref()
+        .unwrap()
+        .generic_aura0_plan
+        .clone()
+        .unwrap();
+
+    assert_eq!(rows, aura0_decoded.rows);
+    assert_eq!(ingest_generic_plan, compiled_generic_plan);
 }
 
 #[test]
@@ -189,7 +242,7 @@ fn compiled_i64_profiles_round_trip_ingest_rows() {
     assert_eq!(rows, decoded_aura0.rows);
     assert_eq!(rows, decoded_aura1.rows);
     assert!(aura0.len() < ingest.len());
-    assert!(trailer_footer_len(&aura0) < 256);
+    assert!(trailer_footer_len(&aura0) < 1024);
 }
 
 #[test]
@@ -436,8 +489,9 @@ fn compiled_footer_omits_ingest_stats_and_uses_field_programs() {
     assert_eq!(rows.len() as u64, footer.record_count);
     assert_eq!(6, footer.aura0_program.fields.len());
     assert_eq!(6, footer.aura1_program.fields.len());
+    assert!(footer.generic_aura0_plan.is_some());
     assert!(footer.aura0_program.encoded_len().unwrap() <= 80);
-    assert!(trailer_footer_len(&aura0) < 320);
+    assert!(trailer_footer_len(&aura0) < 1024);
 }
 
 #[test]

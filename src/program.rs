@@ -2,6 +2,7 @@ use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, put_u8, ByteR
 use crate::chunk::ChunkDescriptor;
 use crate::footer::{CompressionDescriptor, CompressionKind};
 use crate::format::FORMAT_VERSION;
+use crate::instructions::GenericInstructionPlan;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 use crate::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
 use crate::stats::PhysicalWidth;
@@ -463,6 +464,7 @@ pub struct CompiledFooter {
     pub block_capacity: u16,
     pub aura0_program: DecodeProgram,
     pub aura1_program: DecodeProgram,
+    pub generic_aura0_plan: Option<GenericInstructionPlan>,
     pub chunks: Vec<ChunkDescriptor>,
 }
 
@@ -481,8 +483,14 @@ impl CompiledFooter {
             block_capacity,
             aura0_program,
             aura1_program,
+            generic_aura0_plan: None,
             chunks: Vec::new(),
         })
+    }
+
+    pub fn with_generic_aura0_plan(mut self, plan: GenericInstructionPlan) -> Self {
+        self.generic_aura0_plan = Some(plan);
+        self
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -496,6 +504,7 @@ impl CompiledFooter {
         encode_schema_block(&self.schema, &mut out)?;
         self.aura0_program.encode_to(&mut out)?;
         self.aura1_program.encode_to(&mut out)?;
+        encode_generic_plan(&self.generic_aura0_plan, &mut out)?;
         encode_chunks(&self.chunks, &mut out)?;
         Ok(out)
     }
@@ -518,6 +527,7 @@ impl CompiledFooter {
         let schema = decode_schema_block(&mut reader)?;
         let aura0_program = DecodeProgram::decode_from(&mut reader)?;
         let aura1_program = DecodeProgram::decode_from(&mut reader)?;
+        let generic_aura0_plan = decode_generic_plan(&mut reader)?;
         let chunks = decode_chunks(&mut reader)?;
         reader.finish()?;
         Ok(Self {
@@ -527,8 +537,34 @@ impl CompiledFooter {
             block_capacity,
             aura0_program,
             aura1_program,
+            generic_aura0_plan,
             chunks,
         })
+    }
+}
+
+fn encode_generic_plan(plan: &Option<GenericInstructionPlan>, out: &mut Vec<u8>) -> Result<()> {
+    if let Some(plan) = plan {
+        put_u8(out, 1);
+        let bytes = plan.encode()?;
+        put_u32_len(out, bytes.len(), "generic plan length")?;
+        out.extend_from_slice(&bytes);
+    } else {
+        put_u8(out, 0);
+    }
+    Ok(())
+}
+
+fn decode_generic_plan(reader: &mut ByteReader<'_>) -> Result<Option<GenericInstructionPlan>> {
+    match reader.read_u8()? {
+        0 => Ok(None),
+        1 => {
+            let len = reader.read_u32_le()? as usize;
+            Ok(Some(GenericInstructionPlan::decode(
+                reader.read_exact(len)?,
+            )?))
+        }
+        _ => Err(AuraError::InvalidValue("generic plan flag")),
     }
 }
 

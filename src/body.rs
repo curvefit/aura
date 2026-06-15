@@ -562,13 +562,17 @@ fn derive_fixed_step(values: &[i64]) -> Result<GenericStreamOp> {
         .first()
         .ok_or(AuraError::InvalidValue("block local body"))?;
     let step = match values {
-        [first, second, ..] => second
-            .checked_sub(*first)
-            .ok_or(AuraError::InvalidValue("fixed step"))?,
+        [first, second, ..] => match second.checked_sub(*first) {
+            Some(step) => step,
+            None => return derive_base_bitpack(values),
+        },
         _ => 0,
     };
     for (index, value) in values.iter().enumerate() {
-        if *value != fixed_step_value(base, step, index)? {
+        let Ok(expected) = fixed_step_value(base, step, index) else {
+            return derive_base_bitpack(values);
+        };
+        if *value != expected {
             return derive_base_bitpack(values);
         }
     }
@@ -585,15 +589,15 @@ fn derive_base_bitpack(values: &[i64]) -> Result<GenericStreamOp> {
         .map(|value| u64::try_from(i128::from(*value) - i128::from(base)))
         .collect::<core::result::Result<Vec<_>, _>>()
         .map_err(|_| AuraError::InvalidValue("block local residual"))?;
-    let unit = gcd_unit(&residuals);
+    let unit = storage_unit(&residuals);
     let max_scaled = residuals
         .iter()
-        .map(|value| value / unit)
+        .map(|value| value / unit as u64)
         .max()
         .unwrap_or(0);
     Ok(GenericStreamOp::BaseBitpack {
         base,
-        unit: i64::try_from(unit).map_err(|_| AuraError::InvalidValue("storage unit"))?,
+        unit,
         bit_width: unsigned_bitpack_width(max_scaled),
     })
 }
@@ -654,15 +658,15 @@ fn derive_rle(values: &[i64]) -> Result<GenericStreamOp> {
         .map(|value| u64::try_from(i128::from(*value) - i128::from(base)))
         .collect::<core::result::Result<Vec<_>, _>>()
         .map_err(|_| AuraError::InvalidValue("block local residual"))?;
-    let unit = gcd_unit(&residuals);
+    let unit = storage_unit(&residuals);
     let scaled = residuals
         .iter()
-        .map(|value| value / unit)
+        .map(|value| value / unit as u64)
         .collect::<Vec<_>>();
     let max_scaled = scaled.iter().copied().max().unwrap_or(0);
     Ok(GenericStreamOp::Rle {
         base,
-        unit: i64::try_from(unit).map_err(|_| AuraError::InvalidValue("storage unit"))?,
+        unit,
         bit_width: unsigned_bitpack_width(max_scaled),
         run_count: u32::try_from(runs_for(&scaled).len())
             .map_err(|_| AuraError::InvalidValue("run count"))?,
@@ -958,6 +962,11 @@ fn gcd_unit(values: &[u64]) -> u64 {
         out = if out == 0 { value } else { gcd(out, value) };
     }
     out.max(1)
+}
+
+fn storage_unit(values: &[u64]) -> i64 {
+    let unit = gcd_unit(values);
+    i64::try_from(unit).unwrap_or(1)
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {
