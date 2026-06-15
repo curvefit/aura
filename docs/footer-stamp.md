@@ -217,7 +217,7 @@ Physical chunks are optional and only needed for seeking, compression blocks,
 parallel decode, or corruption isolation. `chunk_count` and a chunk table should
 not be required for simple sequential bodies.
 
-## Current implementation gap
+## Current implementation
 
 The current code still uses the legacy twelve-byte trailer and has two footer
 shapes:
@@ -240,10 +240,11 @@ dictionary streams, block-local streams, UUID constant masks, candle-shape
 derived streams, and repeated-slot grouping. The planner uses relationships and
 scope bytes, not field names.
 
-The remaining gap is container integration: the main `.aura0` writer still uses
-the field-program footer. It needs to converge on the generic instruction plan
-so these fitted layouts are emitted by the production writer and carried by the
-shared stamped footer.
+The `.aura` ingest footer now stamps a generic Aura0 plan alongside the legacy
+field program candidates. `.aura -> .aura0` conversion follows that stamped
+generic plan to write the body and stores the same plan in the compiled AURP
+footer. Aura0 decode uses the generic plan when present, so the conversion path
+does not re-optimize after ingest.
 
 That should converge toward one small stamped slot table footer shared across
 profiles, interpreted by the header `version` and `profile`.
