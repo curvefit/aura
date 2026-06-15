@@ -190,12 +190,15 @@ Generic group instructions describe multi-slot structure without naming a
 market-data domain:
 
 ```text
-group            event slots written once, repeated slots written per child
-partition_runs   contiguous runs of a partition slot, with optional fixed order
-presence_map     packed presence/enum bits for a set of slots
-derived_stream   output slot reconstructed from input slots plus one stream
-sparse_stream    nonzero values for one slot, selected by a presence_map bit
-presence_value   constant nonzero value selected by a presence_map bit
+group                  event slots written once, repeated slots written per child
+partition_runs         legacy fixed-order grouping metadata
+partition_run_lengths  partition run values/order, run lengths, optional runs-per-event
+group_value_stream     one event-level value expanded across each repeated group
+segmented_delta_stream child values as first-per-run plus local deltas
+presence_map           packed presence/enum bits for a set of slots
+derived_stream         output slot reconstructed from input slots plus one stream
+sparse_stream          nonzero values for one slot, selected by a presence_map bit
+presence_value         constant nonzero value selected by a presence_map bit
 ```
 
 A `derived_stream` is intentionally generic. Its operation can express common
@@ -208,6 +211,15 @@ max_plus_residual         output = max(input_a, input_b) + residual_stream
 min_minus_residual        output = min(input_a, input_b) - residual_stream
 first_offset_then_delta   first value from partition base, then local deltas
 ```
+
+`partition_run_lengths`, `group_value_stream`, and `segmented_delta_stream`
+cover repeated child layouts without domain names. The partition instruction
+can store one fixed partition order or one partition value per run, plus one
+run length per partition run. If events do not have a fixed number of partition
+runs, it can also store one `runs_per_event` stream so event boundaries remain
+unambiguous. A group value stream then stores event-level slots once per event,
+and a segmented delta stream stores a repeated child slot as optional
+partition-local bases, first value per run, and deltas inside each run.
 
 `presence_map`, `sparse_stream`, and `presence_value` let the footer describe
 zero-heavy slots without domain names. The writer may pack one presence mask for
@@ -245,9 +257,10 @@ domain-specific operation names.
 the schema header hints and observed rows. It can plan and round-trip fixed
 steps, base/previous bitpacking, patched bitpacking, RLE, bitplane RLE,
 dictionary streams, block-local streams, UUID constant masks, sparse presence
-streams, candle-shape derived streams, and repeated-slot grouping. Parent
-relationships are scored as transform candidates, not forced deltas; if the
-residual stream is larger than a direct stream, the writer keeps the direct
+streams, candle-shape derived streams, partition run lengths, grouped
+event-value streams, segmented child deltas, and repeated-slot grouping. Parent
+relationships are scored as transform candidates, not forced deltas; if a
+candidate body is larger than a direct stream, the writer keeps the direct
 stream. The planner uses relationships and scope bytes, not field names.
 
 The `.aura` ingest footer now stamps a generic Aura0 plan alongside the legacy

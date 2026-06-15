@@ -194,9 +194,10 @@ low    min(open, close) - residual
 ```
 
 For repeated child streams, the `128..254` scope bytes are enough to stamp a
-generic group instruction and, when each group has the same child partition
-order, a `partition_runs` instruction. This is the generic version of fixed
-side/orderbook-level ordering; it is not named as orderbook behavior.
+generic group instruction. When one repeated slot partitions the child rows,
+the writer can stamp generic partition run lengths, event-value streams,
+segmented child deltas, and sparse presence streams. This is the generic version
+of side/level ordering; it is not named as orderbook behavior.
 
 If a future transform cannot be derived from those hints plus observed values,
 the schema header needs a generic hint, not a domain-specific one. The current
@@ -241,14 +242,17 @@ slots:
 7 delete_flag
 
 parents:
-255 0 0 128 128 128 128 128
+255 0 0 128 132 133 133 133
 ```
 
 Slots `0..2` are event-level fields. Slots `3..7` are repeated child fields.
-That is enough for a schema-driven writer to group contiguous rows with the same
-event fields, write the event fields once, and write the repeated child fields
-per level. The stamped footer still decides exact storage units, widths,
-bitpacking, varints, and sparse/presence streams.
+Slot `3` is a repeated partition root, slot `4` is a child of slot `3`, and
+slots `5..7` are children of slot `4`. That is enough for a schema-driven
+writer to group contiguous rows with the same event fields, write event fields
+once, encode partition run counts, reset price deltas inside each partition run,
+and use sparse/presence streams for zero-heavy child fields. The stamped footer
+still decides exact storage units, widths, bitpacking, varints, and whether each
+candidate actually wins.
 
 The intended module pattern is:
 
