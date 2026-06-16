@@ -24,7 +24,7 @@ offset  size  field
 8       8     start_time_ns  file-local time anchor
 16      2     stream_id      external stream dictionary key
 18      2     dictionary_id  external dictionary/version key
-20      1     schema_len     time/parent mapping byte count
+20      1     schema_len     compact schema-map byte count
 21      1     comment_len    UTF-8 comment byte count
 22      N     schema_map     time marker and parent bytes
 22+N    M     comment_utf8   optional human-readable field labels
@@ -39,20 +39,38 @@ field needs to be patched.
 
 The magic identifies the Aura container family. The version is read immediately
 after magic so future versions can define a different header layout before a
-reader interprets profile-specific fields. The `profile` byte identifies which
-public file level the body and footer use.
+reader interprets profile-specific fields. The version field starts at byte `4`
+after the four-byte magic and is the escape hatch for future schema-header
+dialects. The `profile` byte identifies which public file level the body and
+footer use.
 
 The front header intentionally stores compact stream IDs rather than strings or
 full schemas. For market data, `stream_id` can resolve through the external
 dictionary to the venue, market type, exchange symbol, base, quote, contract
-type, tick size, and quantity step. `schema_map` is a small time/parent mapping
-so the file shape is visible at the front. Each logical slot uses one byte:
-`255` marks the primary timestamp slot, `0` marks an event/root slot with no
-parent, `1..127` marks an event slot with parent `value - 1`, `128` marks a
-repeated child root slot, and `129..254` marks a repeated child slot with
-parent `value - 129`. `comment_utf8` is optional human-facing text, such as
-CSV-style field labels. The stamped footer schema remains the authoritative
-schema copy.
+type, tick size, and quantity step. `schema_map` is a small relationship and
+grouping map so the file shape is visible at the front:
+
+```text
+0        no parent / root
+1-99     direct parent slot ref, exact physical slot number
+100      timestamp axis / timestamp parent ref
+101-199  derived expression ref, exact expression number
+200      dual-domain wrapper for the next group/node
+201-239  group array: width = byte - 200
+240      reserved
+241      1-bit boolean stream
+242      2-bit enum stream, up to 4 outcomes
+243-253  reserved
+255      opaque / do-not-attempt stream
+```
+
+Timestamp, when present, is expected in physical slot `0`. If `100` is absent,
+the payload is non-time-series data. `200` is scoped to the next group/node, so
+`200 202 0 0` means a dual-domain repeated array with two fields per element,
+such as bid/ask `(price, size)` levels. Constants, scales, residuals, and
+physical coding choices remain in the footer/body. `comment_utf8` is optional
+human-facing text, such as CSV-style field labels. The stamped footer schema
+remains the authoritative schema copy.
 
 ## Body
 

@@ -84,13 +84,14 @@ volume op=bitpack_base        bits=N      const=i64  base
 For a Binance kline-style schema, the same row scan can also choose:
 
 ```text
-quote_volume     op=product_residual       ref=volume step=(close, divisor)
-taker_buy_quote  op=proportional_resid     ref=quote_volume step=(taker_buy_base, volume)
+quote_volume     op=product_residual  ref=volume         aux=mean_floor(high, low)
+taker_buy_quote  op=product_residual  ref=taker_buy_base aux=mean_floor(high, low)
 ```
 
 These are still generic field programs. The planner derives them from integer
 relationships and only keeps them when their bitpacked residual stream is
-smaller than the existing candidate.
+smaller than the existing candidate. Scale constants and residual streams are
+footer/body facts, not compact schema-header bytes.
 
 The file no longer needs to keep min/max ranges or candidate scoring tables in
 the compiled footer. Those were ingest-time evidence. A reader only needs the

@@ -1,8 +1,7 @@
 # Schemas
 
 Aura schemas describe logical records. They are separate from physical layout.
-
-Every file repeats a compact time/parent mapping in the front header:
+Every file repeats a compact schema map in the front header:
 
 ```text
 schema_len    u8
@@ -11,22 +10,99 @@ schema_map    schema_len bytes
 comment_utf8  comment_len bytes
 ```
 
-Each byte is self-describing:
+The current compact schema dialect is intentionally small and human-readable:
 
 ```text
-255       primary timestamp slot
-0         event/root slot with no parent
-1..127    event slot, parent = value - 1
-128       repeated child root slot with no parent
-129..254  repeated child slot, parent = value - 129
+0        no parent / root
+1-99     direct parent slot ref, exact physical slot number
+100      timestamp axis / timestamp parent ref
+101-199  derived expression ref, exact expression number
+200      dual-domain wrapper for the next group/node
+201-239  group array: width = byte - 200
+240      reserved
+241      1-bit boolean stream
+242      2-bit enum stream, up to 4 outcomes
+243-253  reserved
+255      opaque / do-not-attempt stream
 ```
 
-This keeps one byte per logical slot while still telling a dumb writer which
-fields are one-per-event and which fields repeat inside an event, such as
-orderbook levels. The mapping is a quick file-shape preview and body-start
-metadata. It is not the full footer program. `comment_utf8` is optional
-human-readable text, usually CSV-style labels; `comment_len = 0` means no
-comment.
+Timestamp, when present, is expected in physical slot `0`. If `100` is absent,
+the payload is non-time-series data, such as a single snapshot. The byte `100`
+may also be reused by another field as a timestamp parent, for example
+`close_time -> 100`. Parent refs `1-99` refer to exact physical slots, so `1`
+means slot `1`, not `slot 0`.
+
+The group bytes create structure without adding one header slot per repeated
+value. `200` wraps only the next group/node, and `202` means an array whose
+repeated element has two fields. For example, `200 202 0 0` describes a
+dual-domain repeated array such as bid/ask levels with `(price, size)`.
+Derived expression refs `101-199` point to an expression table carried by the
+stamped schema/footer or by a future header dialect. The compact map stores the
+reference, not the full expression program.
+
+The mapping is a quick file-shape preview and body-start metadata. It is not the
+full footer program. Constants, decimal scales, residual values, bit widths,
+varint/bitpack choices, and compression choices live in the footer/body.
+`comment_utf8` is optional human-readable text, usually CSV-style labels;
+`comment_len = 0` means no comment.
+
+### Sample compact headers
+
+Binance kline:
+
+```text
+schema:
+timestamp, open, high, low, close, volume,
+close_time, quote_volume, trade_count,
+taker_buy_base, taker_buy_quote, ignored
+
+aura:
+100 0 101 102 1 0 100 103 0 5 104 0
+
+E1 = max(slot 1/open, slot 4/close)
+E2 = min(slot 1/open, slot 4/close)
+E3 = product(mean_floor(slot 2/high, slot 3/low), slot 5/volume)
+E4 = product(mean_floor(slot 2/high, slot 3/low), slot 9/taker_buy_base)
+```
+
+Binance depth snapshot:
+
+```text
+schema:
+lastUpdateId, bids[][price, qty], asks[][price, qty]
+
+aura:
+0 200 202 0 0
+```
+
+Binance diff-depth update:
+
+```text
+schema:
+event_time, event_type, symbol, first_update_id, final_update_id,
+bids[][price, qty], asks[][price, qty]
+
+aura:
+100 0 0 0 3 200 202 0 0
+```
+
+Bybit perp trade tick:
+
+```text
+schema:
+timestamp, symbol, side, size, price, tickDirection,
+trdMatchID, grossValue, homeNotional, foreignNotional, flag
+
+aura:
+100 0 241 0 0 242 255 10 3 101 0
+
+E1 = product(slot 4/price, slot 3/size)
+```
+
+In the Bybit trade example, `grossValue` is parented to `foreignNotional`,
+`homeNotional` is parented to `size`, and the UUID-like `trdMatchID` is marked
+opaque. Any constant scale between gross value and notional is a footer/body
+fact, not a compact-header calculation.
 
 ```text
 schema block
@@ -38,18 +114,17 @@ The footer schema block does not store a schema ID or schema name. The footer
 schema encoding is the archive copy that keeps a file readable without the
 external registry and is the authoritative stamped schema.
 
-Schema encoding type `0` is the compact parent-vector form for positional
-generic i64 records:
+Schema encoding type `0` is the compact schema-map form for positional generic
+i64 records:
 
 ```text
 descriptor_type  u8 = 0
-slot_count       u8
-parent_slots     slot_count bytes
+schema_map_len   u8
+schema_map       schema_map_len bytes
 ```
 
-Slot `0` is the timestamp slot and is marked `255`. Slots `1..N` are generic
-`i64` values. This uses the same byte convention as the front header, including
-the repeated child range.
+Slot `0` is the timestamp slot when the map starts with `100`. Slots `1..N` are
+generic `i64` values. This uses the same byte convention as the front header.
 
 Schema encoding type `1` is the full field-descriptor fallback for richer
 schemas:
@@ -102,18 +177,18 @@ slot  field         role        common Aura0 result
 The front header mapping for this shape is intentionally plain:
 
 ```text
-[255, 0, 0, 0, 0]
+[100, 0, 0, 0, 241]
 ```
 
 or, with flags:
 
 ```text
-[255, 0, 0, 0, 0, 0, 0]
+[100, 0, 0, 0, 241, 241]
 ```
 
-This says only that slot `0` is time and the other slots are roots. The useful
-tick transforms are previous-row and base transforms, so no fake parent link is
-needed.
+This says slot `0` is time, ordinary numeric slots are roots, and side/flag
+slots are small leaf streams. The useful tick transforms are previous-row and
+base transforms, so no fake parent link is needed.
 
 Bybit spot trades expose a numeric `execId`, which can be modeled as an
 `Identifier` and compressed with previous/base bitpacking when it is monotonic.
@@ -162,7 +237,7 @@ schema names. It uses only:
 slot position
 timestamp marker
 parent relationship
-event/repeated scope
+group and leaf markers
 observed values collected during ingest
 ```
 
@@ -193,20 +268,21 @@ high   max(open, close) + residual
 low    min(open, close) - residual
 ```
 
-For repeated child streams, the `128..254` scope bytes are enough to stamp a
-generic group instruction. When one repeated slot partitions the child rows,
-the writer can stamp generic partition run lengths, event-value streams,
-segmented child deltas, and sparse presence streams. This is the generic version
-of side/level ordering; it is not named as orderbook behavior.
+For repeated child streams, group bytes `201-239` describe the repeated element
+width, and `200` can wrap the next group as a dual-domain partition such as
+bid/ask. The writer can stamp generic partition run lengths, event-value
+streams, segmented child deltas, and sparse presence streams. This is the
+generic version of side/level ordering; it is not named as orderbook behavior.
 
 If a future transform cannot be derived from those hints plus observed values,
 the schema header needs a generic hint, not a domain-specific one. The current
-minimum generic hint set is still parent relationship plus event/repeated scope.
+minimum generic hint set is still parent relationships plus generic group,
+derived-expression, leaf-size, timestamp, and opaque markers.
 
-`generic_i64_parent_schema` is the compact parent-vector path for dynamic
-OHLCV-like records and repeated child records. The vector includes the
-timestamp slot. Each byte is self-describing with the same header map convention
-listed above.
+`generic_i64_parent_schema` is the compact schema-map path for dynamic
+OHLCV-like records and repeated child records. The map includes the timestamp
+slot. Each byte is self-describing with the same header map convention listed
+above.
 
 ```text
 slots:
@@ -219,14 +295,21 @@ slots:
 6 taker_buy
 7 taker_sell
 
-parents:
-255 0 2 2 2 0 6 6
+schema map:
+100 0 101 102 1 0 5 5
 ```
 
-This says high, low, and close may delta from open; taker buy and taker sell may
-delta from volume. The codec still chooses the actual physical encoding from
-stats. The parent vector is only relationship evidence, not a command to force
-a related delta.
+This says slot `0` is the timestamp, close is parented to open, high and low use
+derived expression parents, and taker buy/sell volumes are parented to total
+volume. The expression table can define the candle shape generically:
+
+```text
+E1 = max(slot 1, slot 4)
+E2 = min(slot 1, slot 4)
+```
+
+The codec still chooses the actual physical encoding from stats. The schema map
+is only relationship evidence, not a command to force a related delta.
 
 For an orderbook update stream flattened into level rows:
 
@@ -235,31 +318,31 @@ slots:
 0 ts_event
 1 sequence_final
 2 sequence_primary
-3 side
-4 price
-5 qty1
-6 qty2
-7 delete_flag
+3 price
+4 qty1
+5 qty2
+6 delete_flag
 
-parents:
-255 0 0 128 132 133 133 133
+schema map:
+100 0 0 200 204 0 0 0 241
 ```
 
-Slots `0..2` are event-level fields. Slots `3..7` are repeated child fields.
-Slot `3` is a repeated partition root, slot `4` is a child of slot `3`, and
-slots `5..7` are children of slot `4`. That is enough for a schema-driven
-writer to group contiguous rows with the same event fields, write event fields
-once, encode partition run counts, reset price deltas inside each partition run,
-and use sparse/presence streams for zero-heavy child fields. The stamped footer
-still decides exact storage units, widths, bitpacking, varints, packed
-dictionaries, and whether each candidate actually wins.
+Slots `0..2` are event-level fields. `200 204` wraps one repeated group of four
+level fields in a dual-domain partition, so bid/ask side is structural rather
+than stored per level. The level fields are price, QTY1, improvement
+quantity, and delete flag; delete flag is a 1-bit stream. That is enough for a
+schema-driven writer to group contiguous rows with the same event fields, write
+event fields once, encode partition run counts, reset price deltas inside each
+partition run, and use sparse/presence streams for zero-heavy child fields. The
+stamped footer still decides exact storage units, widths, bitpacking, varints,
+packed dictionaries, and whether each candidate actually wins.
 
-On the Grimoire Bybit 15-minute fixture, that same header map stamps a generic
-footer with partition run lengths, grouped event-value streams, segmented price
-deltas, a multi-slot presence map, sparse nonzero quantity streams, packed
-dictionaries for those quantity values, and a presence-derived flag. There is no
-orderbook-specific opcode; the footer only says what to do with repeated groups,
-presence bits, dictionaries, and streams.
+On the Grimoire Bybit 15-minute fixture, this relationship shape stamps a
+generic footer with partition run lengths, grouped event-value streams,
+segmented price deltas, a multi-slot presence map, sparse nonzero quantity
+streams, packed dictionaries for those quantity values, and a presence-derived
+flag. There is no orderbook-specific opcode; the footer only says what to do
+with repeated groups, presence bits, dictionaries, and streams.
 
 The intended module pattern is:
 
@@ -288,21 +371,22 @@ field_names = [
   "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume",
 ]
 
-parent_slots = [255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8]
+schema_map = [100, 0, 101, 102, 1, 0, 100, 103, 0, 5, 104]
 ```
 
 This produces:
 
 ```text
 comment     = open_time_ms,open,high,low,close,volume,...
-schema_map  = [255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8]
+schema_map  = [100, 0, 101, 102, 1, 0, 100, 103, 0, 5, 104]
 ```
 
 The generic schema-definition helper validates that slot `0` is the primary
-timestamp marker, parent references point backward, the mapping fits in the
-header `schema_len u8`, and the generated comment fits in the header. Source
-adapters still own source-specific mapping, such as JSON array indexes, decimal
-scales, missing-field policy, and venue quirks.
+timestamp marker, parent references point to valid physical slots, derived
+expression refs point to the expression table, the mapping fits in the header
+`schema_len u8`, and the generated comment fits in the header. Source adapters
+still own source-specific mapping, such as JSON array indexes, decimal scales,
+missing-field policy, and venue quirks.
 
 Schemas declare candidate transforms. Aura0 currently compiles this implemented
 subset into field-program instructions:

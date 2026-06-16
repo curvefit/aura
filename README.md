@@ -8,8 +8,8 @@ The public model is intentionally generic:
 
 - `.aura` stores normalized logical facts with generous integer fields and
   footer optimization stats when available,
-- a schema defines positional fields, allowed transform candidates, and related
-  field mappings,
+- a compact v1 schema header defines positional fields, direct/derived parent
+  refs, repeated groups, booleans/enums, timestamps, and opaque streams,
 - `.aura0` is the compact compiled level with code-only decode instructions,
 - `.aura1` is the replay-optimized compiled level with code-only decode
   instructions.

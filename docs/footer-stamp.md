@@ -50,9 +50,11 @@ slot tail:
 ```
 
 `record_count` is the number of logical events in the body. `slot_count` is the
-number of logical slots and must equal the front header `schema_len`. Slot order
-is the logical field identity; field names live in the header comment or the
-external stream dictionary, not in the footer.
+number of logical data slots after interpreting the front schema map. It does
+not have to equal `schema_len`, because schema control bytes such as `200` and
+`201-239` describe grouping structure rather than standalone data slots. Slot
+order is the logical field identity; field names live in the header comment or
+the external stream dictionary, not in the footer.
 
 The slot tail is the Aura1 fast path:
 
@@ -86,16 +88,26 @@ For hot `.aura1` fixed-width slots, `decode_arg` uses the integer width code:
 
 Timestamp slots are logical `i64` time values, but fixed-interval data can stamp
 them as `fixed_step` with base and step constants in the aux table. The front
-header schema map remains the source of parent relationships and repeated child
+header schema map remains the source of parent relationships and repeated group
 shape:
 
 ```text
-255 primary timestamp
-0 event/root slot
-1..127 event slot, parent = value - 1
-128 repeated child root slot
-129..254 repeated child slot, parent = value - 129
+0        no parent / root
+1-99     direct parent slot ref, exact physical slot number
+100      timestamp axis / timestamp parent ref
+101-199  derived expression ref, exact expression number
+200      dual-domain wrapper for the next group/node
+201-239  group array: width = byte - 200
+240      reserved
+241      1-bit boolean stream
+242      2-bit enum stream, up to 4 outcomes
+243-253  reserved
+255      opaque / do-not-attempt stream
 ```
+
+The front map describes relationship shape only. Constants, decimal scales,
+residual streams, bit widths, and physical coding choices are stamped here in
+the footer or stored in the body streams.
 
 Scale is fixed-width and placed before any variable data so a parser can read it
 with one predictable offset:
