@@ -113,12 +113,24 @@ fn schema_map_byte_contract_round_trips_event_and_repeated_slots() {
     assert_eq!(FieldScope::Repeated, repeated_entries[3].scope);
     assert_eq!(FieldRelation::None, repeated_entries[3].relation);
     assert_eq!(FieldScope::Repeated, repeated_entries[4].scope);
-    assert_eq!(FieldRelation::DeltaFromField(3), repeated_entries[4].relation);
-    assert_eq!(FieldRelation::DeltaFromField(4), repeated_entries[5].relation);
-    assert_eq!(FieldRelation::DeltaFromField(4), repeated_entries[6].relation);
+    assert_eq!(
+        FieldRelation::DeltaFromField(3),
+        repeated_entries[4].relation
+    );
+    assert_eq!(
+        FieldRelation::DeltaFromField(4),
+        repeated_entries[5].relation
+    );
+    assert_eq!(
+        FieldRelation::DeltaFromField(4),
+        repeated_entries[6].relation
+    );
 
     let schema = generic_i64_parent_schema("schema_map_repeated_v1", REPEATED_PARENT_MAP).unwrap();
-    assert_eq!(REPEATED_PARENT_MAP, schema_parent_map_from_file(schema, repeated_rows()));
+    assert_eq!(
+        REPEATED_PARENT_MAP,
+        schema_parent_map_from_file(schema, repeated_rows())
+    );
 
     assert!(decode_schema_map(&[]).is_err());
     assert!(decode_schema_map(&[0, 255]).is_err());
@@ -139,7 +151,10 @@ fn schema_parent_map_from_file(
         header_comment: None,
     })
     .unwrap();
-    records::decode_i64_file(&file).unwrap().header.schema_mapping
+    records::decode_i64_file(&file)
+        .unwrap()
+        .header
+        .schema_mapping
 }
 
 #[test]
@@ -171,7 +186,10 @@ fn assert_schema_archive_agreement(
         records::compile_i64_file(&ingest, Profile::Aura1).unwrap(),
     ] {
         let decoded = records::decode_i64_file(&file).unwrap();
-        assert_eq!(decoded.header.schema_mapping.len(), decoded.schema.fields.len());
+        assert_eq!(
+            decoded.header.schema_mapping.len(),
+            decoded.schema.fields.len()
+        );
         assert!(decoded
             .rows
             .iter()

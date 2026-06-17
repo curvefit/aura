@@ -47,30 +47,24 @@ footer use.
 The front header intentionally stores compact stream IDs rather than strings or
 full schemas. For market data, `stream_id` can resolve through the external
 dictionary to the venue, market type, exchange symbol, base, quote, contract
-type, tick size, and quantity step. `schema_map` is a small relationship and
-grouping map so the file shape is visible at the front:
+type, tick size, and quantity step. The current Rust implementation emits this
+compact schema-map dialect:
 
 ```text
-0        no parent / root
-1-99     direct parent slot ref, exact physical slot number
-100      timestamp axis / timestamp parent ref
-101-199  derived expression ref, exact expression number
-200      dual-domain wrapper for the next group/node
-201-239  group array: width = byte - 200
-240      reserved
-241      1-bit boolean stream
-242      2-bit enum stream, up to 4 outcomes
-243-253  reserved
-255      opaque / do-not-attempt stream
+255      timestamp slot; currently required at physical slot 0
+0        event/root slot with no parent
+1-127    event slot parent; parent index = byte - 1
+128      repeated child root slot
+129-254  repeated child parent; parent index = byte - 129
 ```
 
-Timestamp, when present, is expected in physical slot `0`. If `100` is absent,
-the payload is non-time-series data. `200` is scoped to the next group/node, so
-`200 202 0 0` means a dual-domain repeated array with two fields per element,
-such as bid/ask `(price, size)` levels. Constants, scales, residuals, and
-physical coding choices remain in the footer/body. `comment_utf8` is optional
-human-facing text, such as CSV-style field labels. The stamped footer schema
-remains the authoritative schema copy.
+Constants, scales, residuals, and physical coding choices remain in the
+footer/body. `comment_utf8` is optional human-facing text, such as CSV-style
+field labels. The stamped footer schema remains the authoritative schema copy.
+
+The richer target dialect discussed in planning reserves bytes for overflow
+derived references, group array widths, booleans, enums, and opaque streams. It
+is not the current emitted Rust contract.
 
 ## Body
 
@@ -98,6 +92,7 @@ ingest stats
 compression descriptor
 Aura0 physical plan
 Aura1 physical plan
+generic Aura0 instruction plan
 chunk table
 ```
 
@@ -112,6 +107,7 @@ block_capacity
 schema block
 aura0 decode program
 aura1 decode program
+generic Aura0 instruction plan
 chunk table
 ```
 

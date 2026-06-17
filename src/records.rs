@@ -36,6 +36,10 @@ pub struct DecodedI64File {
 }
 
 pub fn encode_ingest_i64_file(input: I64FileInput) -> Result<Vec<u8>> {
+    crate::writer::encode_i64(input)
+}
+
+pub(crate) fn encode_ingest_i64_file_inner(input: I64FileInput) -> Result<Vec<u8>> {
     validate_rows(&input.schema, &input.rows)?;
     let mut stats = IngestStats::new_for_schema(&input.schema)?;
     for row in &input.rows {
@@ -70,10 +74,14 @@ pub fn encode_ingest_i64_file(input: I64FileInput) -> Result<Vec<u8>> {
 }
 
 pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
+    crate::writer::compile_i64(bytes, target_profile)
+}
+
+pub(crate) fn compile_i64_file_inner(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
     if target_profile == Profile::Ingest {
         return Err(AuraError::InvalidValue("target profile"));
     }
-    let decoded = decode_i64_file(bytes)?;
+    let decoded = decode_i64_file_inner(bytes)?;
     let compiled_footer = decoded.compiled_footer_for_compile()?;
     let body = match target_profile {
         Profile::Ingest => unreachable!(),
@@ -108,6 +116,10 @@ pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>
 }
 
 pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
+    crate::reader::decode_i64(bytes)
+}
+
+pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
     if bytes.len() < HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
         return Err(AuraError::UnexpectedEof);
     }
@@ -208,7 +220,7 @@ fn read_trailer_footer_len(bytes: &[u8], offset: usize) -> Result<usize> {
 }
 
 impl DecodedI64File {
-    fn aura0_plan(&self) -> Result<Aura0Plan> {
+    pub(crate) fn aura0_plan(&self) -> Result<Aura0Plan> {
         if let Some(footer) = &self.ingest_footer {
             return footer
                 .aura0_plan
@@ -222,7 +234,7 @@ impl DecodedI64File {
             .to_aura0_plan()
     }
 
-    fn aura1_plan(&self) -> Result<Aura1Plan> {
+    pub(crate) fn aura1_plan(&self) -> Result<Aura1Plan> {
         if let Some(footer) = &self.ingest_footer {
             return footer
                 .aura1_plan
@@ -236,7 +248,7 @@ impl DecodedI64File {
         footer.aura1_program.to_aura1_plan(footer.block_capacity)
     }
 
-    fn generic_aura0_plan(&self) -> Option<GenericInstructionPlan> {
+    pub(crate) fn generic_aura0_plan(&self) -> Option<GenericInstructionPlan> {
         if let Some(footer) = &self.ingest_footer {
             return footer.generic_aura0_plan.clone();
         }
@@ -245,7 +257,7 @@ impl DecodedI64File {
             .and_then(|footer| footer.generic_aura0_plan.clone())
     }
 
-    fn compiled_footer_for_compile(&self) -> Result<CompiledFooter> {
+    pub(crate) fn compiled_footer_for_compile(&self) -> Result<CompiledFooter> {
         if let Some(footer) = &self.compiled_footer {
             return Ok(footer.clone());
         }
@@ -1254,7 +1266,7 @@ fn read_i64_width(reader: &mut ByteReader<'_>, width: PhysicalWidth) -> Result<i
     }
 }
 
-fn validate_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<()> {
+pub(crate) fn validate_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<()> {
     for row in rows {
         if row.len() != schema.fields.len() {
             return Err(AuraError::InvalidValue("record field count"));

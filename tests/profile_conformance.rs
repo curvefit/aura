@@ -124,7 +124,10 @@ fn profile_metadata_survives_compile() {
             ingest_decoded.header.dictionary_id,
             decoded.header.dictionary_id
         );
-        assert_eq!(ingest_decoded.header.base_time_ns, decoded.header.base_time_ns);
+        assert_eq!(
+            ingest_decoded.header.base_time_ns,
+            decoded.header.base_time_ns
+        );
         assert_eq!(
             ingest_decoded.header.schema_mapping,
             decoded.header.schema_mapping

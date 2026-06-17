@@ -5,6 +5,10 @@ logical stream plus seal-time stats and stamped physical plans. `.aura0` and
 `.aura1` are compiled from the same stamped `.aura` into code-only field
 programs.
 
+The Rust crate's intended API boundary is `writer` for sealing/compiling and
+`reader` for decoding. The older `records::*` helpers remain compatibility
+aliases over those facades.
+
 ```text
 .aura  -> .aura0
 .aura  -> .aura1
@@ -36,3 +40,8 @@ the same footer.
 The current crate provides small in-memory helpers for generic integer records
 and OHLCV Parquet input. The production version should stream chunk-by-chunk and
 write temporary output files that are atomically promoted after validation.
+
+Phase 3 does not choose final `.aura0` compression settings. It preserves the
+current Aura0 physical planner, generic instruction planner, and stamped footer
+programs behind the writer-owned API so later optimization phases can tune the
+chosen transforms without changing the reader/writer shape.

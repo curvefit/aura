@@ -20,6 +20,7 @@ pub mod instructions;
 pub mod ohlcv;
 pub mod plan;
 pub mod program;
+pub mod reader;
 pub mod records;
 pub mod schema;
 pub mod scoped;
@@ -29,6 +30,7 @@ pub mod types;
 pub mod ultra;
 pub mod varint;
 pub mod warm;
+pub mod writer;
 
 pub use body::{decode_generic_stream_body, encode_generic_stream_body, GenericStreamBodyValue};
 pub use error::{AuraError, Result};
@@ -44,6 +46,7 @@ pub use instructions::{
     GenericStreamOp,
 };
 pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
+pub use reader::AuraI64Reader;
 pub use schema::{
     generic_i64_parent_schema, schema_parent_mapping, FieldDescriptor, FieldRelation, FieldRole,
     FieldScope, FieldTransform, FieldType, I64SchemaDefinition, RelatedFieldMapping, SchemaBuilder,
@@ -51,3 +54,4 @@ pub use schema::{
 };
 pub use stats::{FieldStats, IngestStats, PhysicalWidth, RunHistogramEntry, ShapeStats};
 pub use types::{BookEvent, BookId, LevelChange, Profile};
+pub use writer::AuraI64Writer;
