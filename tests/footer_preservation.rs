@@ -222,6 +222,17 @@ fn all_variant_generic_plan() -> GenericInstructionPlan {
                     code_width: 2,
                 },
             },
+            GenericStreamInstruction {
+                stream_id: 15,
+                target_slot: None,
+                op: GenericStreamOp::HuffmanDictionary {
+                    base: 10,
+                    unit: 1,
+                    entry_count: 4,
+                    entry_width: 4,
+                    code_lengths: vec![1, 2, 3, 3],
+                },
+            },
         ],
         groups: vec![
             GenericGroupInstruction::Group {

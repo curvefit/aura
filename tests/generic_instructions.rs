@@ -125,6 +125,17 @@ fn generic_instruction_plan_round_trips_grouped_curvefit_shape() {
                     bit_width: 12,
                 },
             },
+            GenericStreamInstruction {
+                stream_id: 13,
+                target_slot: None,
+                op: GenericStreamOp::HuffmanDictionary {
+                    base: 10,
+                    unit: 1,
+                    entry_count: 4,
+                    entry_width: 4,
+                    code_lengths: vec![1, 2, 3, 3],
+                },
+            },
         ],
         groups: vec![
             GenericGroupInstruction::Group {
@@ -380,6 +391,16 @@ fn generic_stream_body_round_trips_core_i64_ops() {
             code_width: 2,
         },
         &[10, 20, 10, 30, 20],
+    );
+    assert_i64_body_round_trip(
+        GenericStreamOp::HuffmanDictionary {
+            base: 10,
+            unit: 10,
+            entry_count: 4,
+            entry_width: 2,
+            code_lengths: vec![1, 2, 3, 3],
+        },
+        &[10, 10, 10, 20, 10, 30, 40, 20, 10],
     );
     assert_i64_body_round_trip(
         GenericStreamOp::BlockLocal {

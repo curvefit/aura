@@ -8,12 +8,23 @@ use aura_codec::{generic_i64_parent_schema, FieldScope};
 #[test]
 fn generic_planner_derives_candle_shape_from_parent_hints() {
     let schema = generic_i64_parent_schema("candles", &[100, 0, 2, 2, 2, 0]).unwrap();
-    let rows = vec![
-        vec![1_000, 100_000, 100_250, 99_900, 100_120, 8_000],
-        vec![2_000, 100_130, 100_400, 100_050, 100_300, 8_100],
-        vec![3_000, 100_290, 100_310, 100_000, 100_050, 8_050],
-        vec![4_000, 100_060, 100_500, 99_990, 100_450, 8_090],
-    ];
+    let rows = (0..128)
+        .scan(100_000i64, |previous_close, index| {
+            let open = *previous_close + i64::from(index % 3) - 1;
+            let close = open + i64::from(index % 5) - 2;
+            let high = open.max(close);
+            let low = open.min(close);
+            *previous_close = close;
+            Some(vec![
+                1_000 + i64::from(index) * 1_000,
+                open,
+                high,
+                low,
+                close,
+                8_000 + i64::from(index % 11),
+            ])
+        })
+        .collect::<Vec<_>>();
 
     let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
     let decoded = decode_generic_i64_rows(&encoded).unwrap();
@@ -94,6 +105,11 @@ fn generic_planner_selects_tick_stream_ops_without_field_names() {
                 stream.op,
                 GenericStreamOp::BaseBitpack { bit_width: 0, .. }
                     | GenericStreamOp::FixedStep { step: 0, .. }
+                    | GenericStreamOp::Dictionary {
+                        entry_count: 1,
+                        code_width: 0,
+                        ..
+                    }
             )
     }));
 }
@@ -109,7 +125,6 @@ fn generic_planner_emits_group_hints_for_repeated_slots() {
     ];
 
     let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
-
     assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
     assert_eq!(FieldScope::Repeated, schema.fields[3].scope);
     assert!(encoded.plan.groups.iter().any(|group| {
@@ -172,7 +187,6 @@ fn generic_planner_uses_sparse_presence_for_zero_heavy_repeated_slots() {
         .collect::<Vec<_>>();
 
     let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
-
     assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
     assert!(encoded.plan.groups.iter().any(|group| {
         matches!(
@@ -236,7 +250,6 @@ fn generic_planner_selects_sparse_set_by_total_saved_bytes() {
         .collect::<Vec<_>>();
 
     let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
-
     assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
     assert!(encoded.plan.groups.iter().any(|group| {
         matches!(
@@ -391,11 +404,20 @@ fn generic_planner_uses_prev_varint_for_skewed_previous_deltas() {
 
 #[test]
 fn generic_planner_uses_packed_dictionary_for_repeated_wide_values() {
-    let schema = generic_i64_parent_schema("wide_repeats", &[100]).unwrap();
-    let buckets = [0, 1_000_000_000_000, 17, 999_999_999_937];
-    let rows = (0..15)
+    let schema = generic_i64_parent_schema("wide_repeats", &[0]).unwrap();
+    let buckets = [
+        0,
+        1_000_000_000_000,
+        17,
+        999_999_999_937,
+        2_000_000_000_003,
+        3_000_000_000_019,
+        4_000_000_000_031,
+        5_000_000_000_041,
+    ];
+    let rows = (0..64)
         .map(|index| {
-            let bucket = buckets[[0, 3, 1, 2, 3, 0, 2, 1, 3, 2, 0, 1, 2, 3, 0][index]];
+            let bucket = buckets[index % buckets.len()];
             vec![9_000_000_000_000 + bucket]
         })
         .collect::<Vec<_>>();
@@ -406,6 +428,53 @@ fn generic_planner_uses_packed_dictionary_for_repeated_wide_values() {
     assert!(encoded.plan.streams.iter().any(|stream| {
         stream.target_slot == Some(0)
             && matches!(stream.op, GenericStreamOp::PackedDictionary { .. })
+    }));
+}
+
+#[test]
+fn generic_planner_uses_huffman_dictionary_for_large_skewed_values() {
+    let schema = generic_i64_parent_schema("large_skewed_repeats", &[0]).unwrap();
+    let buckets = [0, 1_000_000_000_000, 17, 999_999_999_937];
+    let rows = (0..1_024)
+        .map(|index| {
+            let bucket = if index % 97 == 0 {
+                buckets[3]
+            } else if index % 31 == 0 {
+                buckets[2]
+            } else if index % 11 == 0 {
+                buckets[1]
+            } else {
+                buckets[0]
+            };
+            vec![9_000_000_000_000 + bucket]
+        })
+        .collect::<Vec<_>>();
+
+    let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+
+    assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
+    assert!(encoded.plan.streams.iter().any(|stream| {
+        stream.target_slot == Some(0)
+            && matches!(stream.op, GenericStreamOp::HuffmanDictionary { .. })
+    }));
+}
+
+#[test]
+fn generic_planner_avoids_huffman_when_footer_overhead_loses() {
+    let schema = generic_i64_parent_schema("small_skewed_repeats", &[0]).unwrap();
+    let rows = [0, 1_000_000_000_000, 0, 17, 0, 999_999_999_937]
+        .into_iter()
+        .cycle()
+        .take(30)
+        .map(|bucket| vec![9_000_000_000_000 + bucket])
+        .collect::<Vec<_>>();
+
+    let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+
+    assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
+    assert!(!encoded.plan.streams.iter().any(|stream| {
+        stream.target_slot == Some(0)
+            && matches!(stream.op, GenericStreamOp::HuffmanDictionary { .. })
     }));
 }
 

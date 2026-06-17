@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use crate::bitpack::{signed_bitpack_width_for_range, unsigned_bitpack_width};
 use crate::body::{decode_generic_stream_body, encode_generic_stream_body, GenericStreamBodyValue};
@@ -1814,6 +1815,9 @@ fn choose_i64_op(values: &[i64]) -> Result<GenericStreamOp> {
     if let Some(op) = derive_packed_dictionary(values)? {
         candidates.push(op);
     }
+    if let Some(op) = derive_huffman_dictionary(values)? {
+        candidates.push(op);
+    }
     for block_size in [16usize, 64, 256, 512, 1024, 2048] {
         if values.len() >= block_size {
             let mode_count = values.len().div_ceil(block_size);
@@ -1829,7 +1833,7 @@ fn choose_i64_op(values: &[i64]) -> Result<GenericStreamOp> {
     candidates
         .into_iter()
         .map(|op| {
-            let size = encoded_i64_len_with_op(&op, values)?;
+            let size = encoded_i64_score_with_op(&op, values)?;
             Ok((size, op_preference(&op), op))
         })
         .collect::<Result<Vec<_>>>()?
@@ -1856,6 +1860,10 @@ fn encoded_i64_len_with_op(op: &GenericStreamOp, values: &[i64]) -> Result<usize
     )
 }
 
+fn encoded_i64_score_with_op(op: &GenericStreamOp, values: &[i64]) -> Result<usize> {
+    Ok(encoded_i64_len_with_op(op, values)? + op.encoded_len()?)
+}
+
 fn op_preference(op: &GenericStreamOp) -> u8 {
     match op {
         GenericStreamOp::FixedStep { .. } => 0,
@@ -1866,9 +1874,10 @@ fn op_preference(op: &GenericStreamOp) -> u8 {
         GenericStreamOp::Rle { .. } => 5,
         GenericStreamOp::BitplaneRle { .. } => 6,
         GenericStreamOp::PackedDictionary { .. } => 7,
-        GenericStreamOp::Dictionary { .. } => 8,
-        GenericStreamOp::BlockLocal { .. } => 9,
-        GenericStreamOp::UuidConstMask { .. } => 10,
+        GenericStreamOp::HuffmanDictionary { .. } => 8,
+        GenericStreamOp::Dictionary { .. } => 9,
+        GenericStreamOp::BlockLocal { .. } => 10,
+        GenericStreamOp::UuidConstMask { .. } => 11,
     }
 }
 
@@ -2083,6 +2092,152 @@ fn derive_packed_dictionary(values: &[i64]) -> Result<Option<GenericStreamOp>> {
         entry_width: unsigned_bitpack_width(max_entry),
         code_width: unsigned_bitpack_width(max_code),
     }))
+}
+
+fn derive_huffman_dictionary(values: &[i64]) -> Result<Option<GenericStreamOp>> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let base = values.iter().copied().min().unwrap_or(0);
+    let residuals = unsigned_offsets(values, base)?;
+    let unit = storage_unit(&residuals);
+    let scaled_values = residuals
+        .iter()
+        .map(|value| value / unit as u64)
+        .collect::<Vec<_>>();
+    let mut entries = scaled_values.clone();
+    entries.sort_unstable();
+    entries.dedup();
+    if entries.len() <= 1 || entries.len() == values.len() {
+        return Ok(None);
+    }
+
+    let entry_indexes = entries
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (*value, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut frequencies = vec![0u64; entries.len()];
+    for value in &scaled_values {
+        let index = entry_indexes
+            .get(value)
+            .copied()
+            .ok_or(AuraError::InvalidValue("dictionary code"))?;
+        frequencies[index] += 1;
+    }
+    let code_lengths = huffman_code_lengths(&frequencies)?;
+    let max_entry = entries.iter().copied().max().unwrap_or(0);
+    Ok(Some(GenericStreamOp::HuffmanDictionary {
+        base,
+        unit,
+        entry_count: u32::try_from(entries.len())
+            .map_err(|_| AuraError::InvalidValue("dictionary entry count"))?,
+        entry_width: unsigned_bitpack_width(max_entry),
+        code_lengths,
+    }))
+}
+
+#[derive(Debug)]
+struct HuffmanTreeNode {
+    symbol: Option<usize>,
+    left: Option<usize>,
+    right: Option<usize>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct HuffmanHeapNode {
+    frequency: u64,
+    min_symbol: usize,
+    node_index: usize,
+}
+
+impl Ord for HuffmanHeapNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .frequency
+            .cmp(&self.frequency)
+            .then_with(|| other.min_symbol.cmp(&self.min_symbol))
+            .then_with(|| other.node_index.cmp(&self.node_index))
+    }
+}
+
+impl PartialOrd for HuffmanHeapNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn huffman_code_lengths(frequencies: &[u64]) -> Result<Vec<u8>> {
+    if frequencies.is_empty() || frequencies.iter().any(|frequency| *frequency == 0) {
+        return Err(AuraError::InvalidValue("huffman frequencies"));
+    }
+    if frequencies.len() == 1 {
+        return Ok(vec![0]);
+    }
+
+    let mut nodes = Vec::with_capacity(frequencies.len().saturating_mul(2));
+    let mut heap = BinaryHeap::new();
+    for (symbol, frequency) in frequencies.iter().copied().enumerate() {
+        let node_index = nodes.len();
+        nodes.push(HuffmanTreeNode {
+            symbol: Some(symbol),
+            left: None,
+            right: None,
+        });
+        heap.push(HuffmanHeapNode {
+            frequency,
+            min_symbol: symbol,
+            node_index,
+        });
+    }
+
+    while heap.len() > 1 {
+        let left = heap
+            .pop()
+            .ok_or(AuraError::InvalidValue("huffman frequencies"))?;
+        let right = heap
+            .pop()
+            .ok_or(AuraError::InvalidValue("huffman frequencies"))?;
+        let node_index = nodes.len();
+        nodes.push(HuffmanTreeNode {
+            symbol: None,
+            left: Some(left.node_index),
+            right: Some(right.node_index),
+        });
+        heap.push(HuffmanHeapNode {
+            frequency: left.frequency.saturating_add(right.frequency),
+            min_symbol: left.min_symbol.min(right.min_symbol),
+            node_index,
+        });
+    }
+
+    let root = heap
+        .pop()
+        .ok_or(AuraError::InvalidValue("huffman frequencies"))?;
+    let mut lengths = vec![0u8; frequencies.len()];
+    let mut stack = vec![(root.node_index, 0u8)];
+    while let Some((node_index, depth)) = stack.pop() {
+        let node = nodes
+            .get(node_index)
+            .ok_or(AuraError::InvalidValue("huffman tree"))?;
+        if let Some(symbol) = node.symbol {
+            lengths[symbol] = depth;
+            continue;
+        }
+        let next_depth = depth
+            .checked_add(1)
+            .ok_or(AuraError::InvalidValue("huffman code lengths"))?;
+        if next_depth > 64 {
+            return Err(AuraError::InvalidValue("huffman code lengths"));
+        }
+        if let Some(right) = node.right {
+            stack.push((right, next_depth));
+        }
+        if let Some(left) = node.left {
+            stack.push((left, next_depth));
+        }
+    }
+    Ok(lengths)
 }
 
 fn partition_run_candidate(
@@ -2619,4 +2774,37 @@ fn put_u32_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> 
     let len = u32::try_from(len).map_err(|_| AuraError::InvalidValue(name))?;
     put_u32_le(out, len);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_score_counts_huffman_footer_bytes() {
+        let values = [10, 10, 10, 20, 10, 30, 40, 20, 10];
+        let packed = GenericStreamOp::PackedDictionary {
+            base: 10,
+            unit: 10,
+            entry_count: 4,
+            entry_width: 2,
+            code_width: 2,
+        };
+        let huffman = GenericStreamOp::HuffmanDictionary {
+            base: 10,
+            unit: 10,
+            entry_count: 4,
+            entry_width: 2,
+            code_lengths: vec![1, 2, 3, 3],
+        };
+
+        assert!(
+            encoded_i64_len_with_op(&huffman, &values).unwrap()
+                < encoded_i64_len_with_op(&packed, &values).unwrap()
+        );
+        assert!(
+            encoded_i64_score_with_op(&packed, &values).unwrap()
+                < encoded_i64_score_with_op(&huffman, &values).unwrap()
+        );
+    }
 }

@@ -254,6 +254,13 @@ pub enum GenericStreamOp {
         entry_width: u8,
         code_width: u8,
     },
+    HuffmanDictionary {
+        base: i64,
+        unit: i64,
+        entry_count: u32,
+        entry_width: u8,
+        code_lengths: Vec<u8>,
+    },
     UuidConstMask {
         constant_bits: u8,
         variable_bits: u8,
@@ -362,6 +369,22 @@ impl GenericStreamOp {
                 put_u8(out, entry_width);
                 put_u8(out, code_width);
             }
+            Self::HuffmanDictionary {
+                base,
+                unit,
+                entry_count,
+                entry_width,
+                ref code_lengths,
+            } => {
+                put_u8(out, 11);
+                put_i64_le(out, base);
+                put_i64_le(out, unit);
+                put_u32_le(out, entry_count);
+                put_u8(out, entry_width);
+                for code_length in code_lengths {
+                    put_u8(out, *code_length);
+                }
+            }
             Self::UuidConstMask {
                 constant_bits,
                 variable_bits,
@@ -428,6 +451,22 @@ impl GenericStreamOp {
                 entry_width: reader.read_u8()?,
                 code_width: reader.read_u8()?,
             },
+            11 => {
+                let base = reader.read_i64_le()?;
+                let unit = reader.read_i64_le()?;
+                let entry_count = reader.read_u32_le()?;
+                let entry_width = reader.read_u8()?;
+                let code_lengths = (0..entry_count)
+                    .map(|_| reader.read_u8())
+                    .collect::<Result<Vec<_>>>()?;
+                Self::HuffmanDictionary {
+                    base,
+                    unit,
+                    entry_count,
+                    entry_width,
+                    code_lengths,
+                }
+            }
             8 => Self::UuidConstMask {
                 constant_bits: reader.read_u8()?,
                 variable_bits: reader.read_u8()?,
@@ -500,6 +539,17 @@ impl GenericStreamOp {
                     Ok(())
                 }
             }
+            Self::HuffmanDictionary {
+                unit,
+                entry_count,
+                entry_width,
+                ref code_lengths,
+                ..
+            } => {
+                validate_unit(unit)?;
+                validate_bit_width(entry_width)?;
+                validate_huffman_code_lengths(entry_count, code_lengths)
+            }
             Self::UuidConstMask {
                 constant_bits,
                 variable_bits,
@@ -511,6 +561,12 @@ impl GenericStreamOp {
                 }
             }
         }
+    }
+
+    pub fn encoded_len(&self) -> Result<usize> {
+        let mut out = Vec::new();
+        self.encode_to(&mut out)?;
+        Ok(out.len())
     }
 }
 
@@ -905,6 +961,26 @@ fn validate_bit_width(bit_width: u8) -> Result<()> {
 fn validate_unit_width(unit: i64, bit_width: u8) -> Result<()> {
     validate_unit(unit)?;
     validate_bit_width(bit_width)
+}
+
+fn validate_huffman_code_lengths(entry_count: u32, code_lengths: &[u8]) -> Result<()> {
+    if entry_count == 0 || code_lengths.len() != entry_count as usize {
+        return Err(AuraError::InvalidValue("huffman code lengths"));
+    }
+    if entry_count == 1 {
+        return if code_lengths == [0] || code_lengths == [1] {
+            Ok(())
+        } else {
+            Err(AuraError::InvalidValue("huffman code lengths"))
+        };
+    }
+    if code_lengths
+        .iter()
+        .any(|length| *length == 0 || *length > 64)
+    {
+        return Err(AuraError::InvalidValue("huffman code lengths"));
+    }
+    Ok(())
 }
 
 fn encode_optional_slot(slot: Option<u16>) -> Result<u16> {
