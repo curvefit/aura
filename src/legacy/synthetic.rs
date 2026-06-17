@@ -1,4 +1,4 @@
-use crate::{BookEvent, BookId, LevelChange};
+use crate::legacy::{BookEvent, BookId, LevelChange};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyntheticConfig {

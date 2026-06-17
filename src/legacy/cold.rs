@@ -1,5 +1,5 @@
 use crate::bytes::ByteReader;
-use crate::types::{BookEvent, BookId, LevelChange};
+use crate::legacy::types::{BookEvent, BookId, LevelChange};
 use crate::varint;
 use crate::{AuraError, Result};
 

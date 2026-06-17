@@ -1,5 +1,5 @@
 use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, put_u8, ByteReader};
-use crate::types::{BookEvent, BookId, LevelChange};
+use crate::legacy::types::{BookEvent, BookId, LevelChange};
 use crate::{AuraError, Result};
 
 pub const MAGIC: &[u8; 4] = crate::format::AURA1_MAGIC;

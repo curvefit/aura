@@ -8,15 +8,13 @@ pub mod bitpack;
 pub mod body;
 pub mod bytes;
 pub mod chunk;
-pub mod cold;
-pub mod convert;
 pub mod error;
 pub mod footer;
 pub mod format;
 pub mod generic_planner;
-pub mod grouped;
 pub mod header;
 pub mod instructions;
+pub mod legacy;
 pub mod ohlcv;
 pub mod plan;
 pub mod program;
@@ -25,11 +23,8 @@ pub mod records;
 pub mod schema;
 pub mod scoped;
 pub mod stats;
-pub mod synthetic;
 pub mod types;
-pub mod ultra;
 pub mod varint;
-pub mod warm;
 pub mod writer;
 
 pub use body::{decode_generic_stream_body, encode_generic_stream_body, GenericStreamBodyValue};
@@ -53,5 +48,5 @@ pub use schema::{
     SchemaDescriptor, TransformCandidates,
 };
 pub use stats::{FieldStats, IngestStats, PhysicalWidth, RunHistogramEntry, ShapeStats};
-pub use types::{BookEvent, BookId, LevelChange, Profile};
+pub use types::Profile;
 pub use writer::{AuraI64Writer, AuraTypedValue, AuraTypedWriter};

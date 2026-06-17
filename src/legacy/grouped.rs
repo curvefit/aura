@@ -1,4 +1,4 @@
-use crate::types::BookEvent;
+use crate::legacy::types::BookEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GroupPolicy {
@@ -61,7 +61,7 @@ pub const fn largest_power_of_two(value: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BookEvent, BookId};
+    use crate::legacy::{BookEvent, BookId};
 
     fn event(ts: u64, seq: u64) -> BookEvent {
         BookEvent::new(ts, seq, BookId::BookA, vec![], vec![])

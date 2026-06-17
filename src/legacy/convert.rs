@@ -1,5 +1,6 @@
-use crate::ultra::UltraLayout;
-use crate::{cold, ultra, warm, BookEvent, Result};
+use crate::legacy::ultra::UltraLayout;
+use crate::legacy::{cold, ultra, warm, BookEvent};
+use crate::Result;
 
 pub fn cold_to_events(bytes: &[u8]) -> Result<Vec<BookEvent>> {
     cold::decode_events(bytes)
@@ -23,7 +24,7 @@ pub fn warm_to_ultra(bytes: &[u8], layout: UltraLayout) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BookId, LevelChange};
+    use crate::legacy::{BookId, LevelChange};
 
     #[test]
     fn converts_cold_to_warm_and_ultra() {

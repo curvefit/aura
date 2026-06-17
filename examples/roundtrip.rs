@@ -1,6 +1,6 @@
-use aura_codec::synthetic::{generate_events, SyntheticConfig};
-use aura_codec::ultra::UltraLayout;
-use aura_codec::{cold, convert, ultra, warm};
+use aura_codec::legacy::synthetic::{generate_events, SyntheticConfig};
+use aura_codec::legacy::ultra::UltraLayout;
+use aura_codec::legacy::{cold, convert, ultra, warm};
 
 fn main() -> aura_codec::Result<()> {
     let events = generate_events(SyntheticConfig {

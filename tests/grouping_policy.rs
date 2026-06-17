@@ -1,5 +1,5 @@
-use aura_codec::grouped::{plan_groups, GroupPolicy};
-use aura_codec::{BookEvent, BookId};
+use aura_codec::legacy::grouped::{plan_groups, GroupPolicy};
+use aura_codec::legacy::{BookEvent, BookId};
 
 fn event(ts: u64, sequence: u64) -> BookEvent {
     BookEvent::new(ts, sequence, BookId::BookA, vec![], vec![])
