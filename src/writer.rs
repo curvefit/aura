@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use crate::header::DerivedExpressionSource;
 use crate::records::{self, I64FileInput};
 use crate::schema::{FieldType, SchemaDescriptor};
 use crate::{AuraDiagnostic, AuraError, Profile, Result};
@@ -149,13 +150,14 @@ impl AuraI64Writer {
 
 impl AuraTypedWriter {
     pub fn new(schema: SchemaDescriptor) -> Self {
+        let internally_derived_slots = schema_internal_derived_slots(&schema);
         Self {
             schema,
             rows: Vec::new(),
             stream_id: 0,
             dictionary_id: 0,
             header_comment: None,
-            internally_derived_slots: BTreeSet::new(),
+            internally_derived_slots,
         }
     }
 
@@ -408,6 +410,19 @@ fn validate_typed_value(
 }
 
 fn validate_i64_input(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<()> {
+    for expression in &schema.derived_expressions {
+        if expression.source() == DerivedExpressionSource::Internal {
+            return Err(layout_diagnostic(
+                None,
+                Some(expression.output_slot),
+                "derived",
+                "i64",
+                "derived slot source conflict",
+                "supplied row value",
+                Some("use external derived ownership for supplied row slots"),
+            ));
+        }
+    }
     for field in &schema.fields {
         if matches!(field.field_type, FieldType::I128 | FieldType::Opaque16) {
             return Err(layout_diagnostic(
@@ -443,6 +458,15 @@ fn validate_i64_input(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<()
         }
     }
     Ok(())
+}
+
+fn schema_internal_derived_slots(schema: &SchemaDescriptor) -> BTreeSet<u16> {
+    schema
+        .derived_expressions
+        .iter()
+        .filter(|expression| expression.source() == DerivedExpressionSource::Internal)
+        .map(|expression| expression.output_slot)
+        .collect()
 }
 
 fn validate_i64_range(

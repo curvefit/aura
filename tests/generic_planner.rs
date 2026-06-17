@@ -3,7 +3,7 @@ use aura_codec::{
     GenericGroupInstruction, GenericStreamBodyValue, GenericStreamOp,
 };
 use aura_codec::{decode_generic_stream_body, encode_generic_stream_body};
-use aura_codec::{generic_i64_parent_schema, FieldScope};
+use aura_codec::{generic_i64_parent_schema, DerivedExpression, DerivedExpressionOp, FieldScope};
 
 #[test]
 fn generic_planner_does_not_infer_shape_math_from_parent_hints() {
@@ -61,6 +61,62 @@ fn generic_planner_does_not_infer_shape_math_from_parent_hints() {
                     | DerivedOp::MinMinusResidual,
                 ..
             }
+        )
+    }));
+}
+
+#[test]
+fn generic_planner_consumes_declared_derived_expressions() {
+    let expressions = vec![
+        DerivedExpression::new(1, 1, DerivedExpressionOp::FirstOffsetThenDelta, vec![4]).unwrap(),
+        DerivedExpression::new(2, 2, DerivedExpressionOp::MaxPlusResidual, vec![1, 4]).unwrap(),
+        DerivedExpression::new(3, 3, DerivedExpressionOp::MinMinusResidual, vec![1, 4]).unwrap(),
+    ];
+    let schema = generic_i64_parent_schema("declared_shape_math", &[100, 101, 102, 103, 2, 0])
+        .unwrap()
+        .with_derived_expressions(expressions)
+        .unwrap();
+    let rows = vec![
+        vec![1_000, 100, 103, 99, 101, 10_000],
+        vec![2_000, 102, 106, 101, 104, 10_100],
+        vec![3_000, 103, 105, 100, 102, 10_200],
+        vec![4_000, 102, 108, 101, 107, 10_300],
+    ];
+
+    let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+
+    assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::DerivedStream {
+                output_slot: 1,
+                op: DerivedOp::FirstOffsetThenDelta,
+                input_slots,
+                ..
+            } if input_slots.as_slice() == [4]
+        )
+    }));
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::DerivedStream {
+                output_slot: 2,
+                op: DerivedOp::MaxPlusResidual,
+                input_slots,
+                ..
+            } if input_slots.as_slice() == [1, 4]
+        )
+    }));
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::DerivedStream {
+                output_slot: 3,
+                op: DerivedOp::MinMinusResidual,
+                input_slots,
+                ..
+            } if input_slots.as_slice() == [1, 4]
         )
     }));
 }

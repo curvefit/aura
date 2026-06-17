@@ -81,15 +81,22 @@ entry:
                        max_plus_residual | min_minus_residual |
                        first_offset_then_delta
   output_slot   u16
-  flags         u8
+  flags         u8    bit 0 = internally derived output
   input_count   u8
   input_slots   input_count * u16
   literal_count u8
   literals      literal_count * i64
 ```
 
-Constants, scales, residual streams, and physical coding choices remain in the
-footer/body.
+The current planner consumes the residual expression family that maps directly
+to stamped generic footer instructions: add residual, subtract residual,
+max-plus residual, min-minus residual, and first-offset-then-delta. Arithmetic
+definition opcodes are reserved in the table for generic expression definitions,
+but they are rejected by the planner until a matching footer instruction exists.
+
+Constants, residual streams, and physical coding choices remain in the
+footer/body. Decimal scale metadata is stamped in the footer schema field table,
+not the front header.
 `comment_utf8` is optional human-facing text, such as CSV-style field labels.
 The stamped footer schema remains the authoritative schema copy.
 

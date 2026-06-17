@@ -3,7 +3,10 @@ use aura_codec::schema::{
     FieldRelation, FieldRole, FieldScope, FieldTransform, FieldType, RelatedFieldMapping,
     SchemaMapHint,
 };
-use aura_codec::{records, AuraError, FieldEncoding, Profile};
+use aura_codec::{
+    records, AuraError, DerivedExpression, DerivedExpressionOp, DerivedExpressionSource,
+    FieldEncoding, Profile,
+};
 
 fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes.try_into().unwrap())
@@ -171,7 +174,16 @@ fn generic_i64_parent_schema_maps_extended_header_bytes() {
     assert_eq!(SchemaMapHint::Bitfield { bits: 8 }, entries[7].hint);
     assert_eq!(SchemaMapHint::DoNotAttempt, entries[8].hint);
 
-    let schema = generic_i64_parent_schema("extended_header_v1", &parent_slots).unwrap();
+    let schema = generic_i64_parent_schema("extended_header_v1", &parent_slots)
+        .unwrap()
+        .with_derived_expressions(vec![DerivedExpression::new(
+            1,
+            1,
+            DerivedExpressionOp::AddResidual,
+            vec![0],
+        )
+        .unwrap()])
+        .unwrap();
     assert_eq!(FieldRole::Boolean, schema.fields[5].role);
     assert_eq!(FieldRole::Enum, schema.fields[6].role);
     assert_eq!(FieldRole::Bitfield, schema.fields[7].role);
@@ -179,6 +191,139 @@ fn generic_i64_parent_schema_maps_extended_header_bytes() {
     assert_eq!(
         parent_slots.as_slice(),
         schema_parent_mapping(&schema).unwrap().as_slice()
+    );
+}
+
+#[test]
+fn schema_derived_expressions_validate_graph_and_map_refs() {
+    let forward = generic_i64_parent_schema("forward_exprs", &[100, 101, 102])
+        .unwrap()
+        .with_derived_expressions(vec![
+            DerivedExpression::new(1, 1, DerivedExpressionOp::AddResidual, vec![0]).unwrap(),
+            DerivedExpression::new(2, 2, DerivedExpressionOp::AddResidual, vec![1]).unwrap(),
+        ])
+        .unwrap();
+
+    assert_eq!(
+        &[100, 101, 102],
+        schema_parent_mapping(&forward).unwrap().as_slice()
+    );
+
+    let cyclic = generic_i64_parent_schema("cyclic_exprs", &[100, 101, 102])
+        .unwrap()
+        .with_derived_expressions(vec![
+            DerivedExpression::new(1, 1, DerivedExpressionOp::AddResidual, vec![2]).unwrap(),
+            DerivedExpression::new(2, 2, DerivedExpressionOp::AddResidual, vec![1]).unwrap(),
+        ]);
+
+    assert_eq!(
+        Err(AuraError::InvalidValue("derived expression cycle")),
+        cyclic
+    );
+}
+
+#[test]
+fn derived_expression_table_round_trips_through_header_and_footer() {
+    let expressions = vec![
+        DerivedExpression::new(1, 1, DerivedExpressionOp::FirstOffsetThenDelta, vec![4]).unwrap(),
+        DerivedExpression::new(2, 2, DerivedExpressionOp::MaxPlusResidual, vec![1, 4]).unwrap(),
+        DerivedExpression::new(3, 3, DerivedExpressionOp::MinMinusResidual, vec![1, 4]).unwrap(),
+    ];
+    let schema = generic_i64_parent_schema("declared_ohlc_exprs", &[100, 101, 102, 103, 2, 0])
+        .unwrap()
+        .with_derived_expressions(expressions.clone())
+        .unwrap();
+    let rows = vec![
+        vec![1_000, 100, 103, 98, 101, 10_000],
+        vec![2_000, 102, 106, 101, 104, 11_000],
+        vec![3_000, 105, 107, 103, 106, 12_000],
+    ];
+
+    let ingest = records::encode_ingest_i64_file(records::I64FileInput {
+        schema: schema.clone(),
+        rows: rows.clone(),
+        stream_id: 42,
+        dictionary_id: 7,
+        header_comment: Some("ts,open,high,low,close,volume".to_owned()),
+    })
+    .unwrap();
+    let decoded = records::decode_i64_file(&ingest).unwrap();
+
+    assert_eq!(rows, decoded.rows);
+    assert_eq!(expressions, decoded.header.derived_expressions);
+    assert_eq!(expressions, decoded.schema.derived_expressions);
+    assert_eq!(
+        &[100, 101, 102, 103, 2, 0],
+        decoded.header.schema_mapping.as_slice()
+    );
+
+    let aura0 = records::compile_i64_file(&ingest, Profile::Aura0).unwrap();
+    let decoded_aura0 = records::decode_i64_file(&aura0).unwrap();
+
+    assert_eq!(rows, decoded_aura0.rows);
+    assert_eq!(expressions, decoded_aura0.header.derived_expressions);
+    assert_eq!(expressions, decoded_aura0.schema.derived_expressions);
+}
+
+#[test]
+fn internal_derived_expression_rejects_supplied_i64_rows() {
+    let expression = DerivedExpression::new(1, 1, DerivedExpressionOp::AddResidual, vec![0])
+        .unwrap()
+        .with_source(DerivedExpressionSource::Internal)
+        .unwrap();
+    let schema = generic_i64_parent_schema("internal_expr", &[100, 101])
+        .unwrap()
+        .with_derived_expressions(vec![expression])
+        .unwrap();
+    let result = records::encode_ingest_i64_file(records::I64FileInput {
+        schema,
+        rows: vec![vec![1_000, 10]],
+        stream_id: 0,
+        dictionary_id: 0,
+        header_comment: None,
+    });
+
+    assert!(matches!(
+        result,
+        Err(AuraError::Diagnostic(diagnostic))
+            if diagnostic.reason == "derived slot source conflict"
+    ));
+}
+
+#[test]
+fn field_scales_are_stamped_in_footer_schema() {
+    let schema = generic_i64_parent_schema("scaled_ohlcv", &[100, 0, 2, 2, 2, 0])
+        .unwrap()
+        .with_field_scales(vec![0, -2, -2, -2, -2, -6])
+        .unwrap();
+    let rows = vec![
+        vec![1_000, 10_000, 10_050, 9_950, 10_025, 1_000_000],
+        vec![2_000, 10_025, 10_075, 10_000, 10_050, 1_250_000],
+    ];
+
+    let ingest = records::encode_ingest_i64_file(records::I64FileInput {
+        schema,
+        rows: rows.clone(),
+        stream_id: 0,
+        dictionary_id: 0,
+        header_comment: None,
+    })
+    .unwrap();
+    let decoded = records::decode_i64_file(&ingest).unwrap();
+
+    assert_eq!(rows, decoded.rows);
+    assert_eq!(
+        vec![0, -2, -2, -2, -2, -6],
+        decoded
+            .schema
+            .fields
+            .iter()
+            .map(|field| field.scale)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        &[100, 0, 2, 2, 2, 0],
+        decoded.header.schema_mapping.as_slice()
     );
 }
 

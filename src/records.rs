@@ -147,6 +147,7 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
     match header.profile {
         Profile::Ingest => {
             let footer = AuraFooter::decode(&bytes[footer_start..footer_len_offset])?;
+            validate_header_schema_agreement(&header, &footer.schema)?;
             let rows = decode_raw_body(body)?;
             validate_rows(&footer.schema, &rows)?;
             Ok(DecodedI64File {
@@ -159,6 +160,7 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
         }
         Profile::Aura0 => {
             let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+            validate_header_schema_agreement(&header, &footer.schema)?;
             let rows = if let Some(plan) = footer.generic_aura0_plan.clone() {
                 decode_generic_i64_rows_body(
                     plan,
@@ -186,6 +188,7 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
         }
         Profile::Aura1 => {
             let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+            validate_header_schema_agreement(&header, &footer.schema)?;
             let plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
             let rows = decode_aura1_body(
                 body,
@@ -218,6 +221,17 @@ fn read_trailer_footer_len(bytes: &[u8], offset: usize) -> Result<usize> {
         footer_len_bytes[2],
         footer_len_bytes[3],
     ]) as usize)
+}
+
+fn validate_header_schema_agreement(header: &AuraHeader, schema: &SchemaDescriptor) -> Result<()> {
+    let expected_mapping = schema_parent_mapping(schema)?;
+    if header.schema_mapping != expected_mapping {
+        return Err(AuraError::InvalidValue("header schema mapping"));
+    }
+    if header.derived_expressions != schema.derived_expressions {
+        return Err(AuraError::InvalidValue("header derived expressions"));
+    }
+    Ok(())
 }
 
 impl DecodedI64File {
@@ -295,6 +309,7 @@ fn encode_file(
     let header = AuraHeader::new(profile)
         .with_stream(stream_id, dictionary_id, base_time_ns)
         .with_schema_mapping(schema_parent_mapping(&footer.schema)?)?
+        .with_derived_expressions(footer.schema.derived_expressions.clone())?
         .with_comment(header_comment)?;
     let header_bytes = header.encode()?;
 
@@ -324,6 +339,7 @@ fn encode_compiled_file(
     let header = AuraHeader::new(profile)
         .with_stream(stream_id, dictionary_id, base_time_ns)
         .with_schema_mapping(schema_parent_mapping(&footer.schema)?)?
+        .with_derived_expressions(footer.schema.derived_expressions.clone())?
         .with_comment(header_comment)?;
     let header_bytes = header.encode()?;
 

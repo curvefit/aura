@@ -10,6 +10,8 @@ const HEADER_LEN_OFFSET: usize = 7;
 const HEADER_LEN_END: usize = 9;
 const DERIVED_EXPRESSION_ID_MIN: u8 = 1;
 const DERIVED_EXPRESSION_ID_MAX: u8 = 99;
+pub const DERIVED_EXPRESSION_INTERNAL_FLAG: u8 = 0b0000_0001;
+const DERIVED_EXPRESSION_KNOWN_FLAGS: u8 = DERIVED_EXPRESSION_INTERNAL_FLAG;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -44,6 +46,12 @@ impl DerivedExpressionOp {
             _ => Err(AuraError::InvalidValue("derived expression op")),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedExpressionSource {
+    External,
+    Internal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,9 +94,37 @@ impl DerivedExpression {
         Ok(expression)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn with_source(mut self, source: DerivedExpressionSource) -> Result<Self> {
+        match source {
+            DerivedExpressionSource::External => {
+                self.flags &= !DERIVED_EXPRESSION_INTERNAL_FLAG;
+            }
+            DerivedExpressionSource::Internal => {
+                self.flags |= DERIVED_EXPRESSION_INTERNAL_FLAG;
+            }
+        }
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub const fn source(&self) -> DerivedExpressionSource {
+        if self.flags & DERIVED_EXPRESSION_INTERNAL_FLAG != 0 {
+            DerivedExpressionSource::Internal
+        } else {
+            DerivedExpressionSource::External
+        }
+    }
+
+    pub const fn is_internal(&self) -> bool {
+        matches!(self.source(), DerivedExpressionSource::Internal)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
         if !(DERIVED_EXPRESSION_ID_MIN..=DERIVED_EXPRESSION_ID_MAX).contains(&self.expression_id) {
             return Err(AuraError::InvalidValue("derived expression id"));
+        }
+        if self.flags & !DERIVED_EXPRESSION_KNOWN_FLAGS != 0 {
+            return Err(AuraError::InvalidValue("derived expression flags"));
         }
         if self.input_slots.len() > u8::MAX as usize {
             return Err(AuraError::InvalidValue("derived expression inputs"));
@@ -312,7 +348,9 @@ fn validate_header_lengths(
     Ok(())
 }
 
-fn validate_derived_expressions(derived_expressions: &[DerivedExpression]) -> Result<()> {
+pub(crate) fn validate_derived_expressions(
+    derived_expressions: &[DerivedExpression],
+) -> Result<()> {
     let mut ids = BTreeSet::new();
     for expression in derived_expressions {
         expression.validate()?;
@@ -323,7 +361,9 @@ fn validate_derived_expressions(derived_expressions: &[DerivedExpression]) -> Re
     Ok(())
 }
 
-fn derived_expression_table_len(derived_expressions: &[DerivedExpression]) -> Result<usize> {
+pub(crate) fn derived_expression_table_len(
+    derived_expressions: &[DerivedExpression],
+) -> Result<usize> {
     validate_derived_expressions(derived_expressions)?;
     let mut len = 1usize;
     for expression in derived_expressions {
@@ -340,7 +380,9 @@ fn derived_expression_table_len(derived_expressions: &[DerivedExpression]) -> Re
     }
 }
 
-fn encode_derived_expression_table(derived_expressions: &[DerivedExpression]) -> Result<Vec<u8>> {
+pub(crate) fn encode_derived_expression_table(
+    derived_expressions: &[DerivedExpression],
+) -> Result<Vec<u8>> {
     if derived_expressions.is_empty() {
         return Ok(Vec::new());
     }
@@ -367,7 +409,7 @@ fn encode_derived_expression_table(derived_expressions: &[DerivedExpression]) ->
     Ok(out)
 }
 
-fn decode_derived_expression_table(bytes: &[u8]) -> Result<Vec<DerivedExpression>> {
+pub(crate) fn decode_derived_expression_table(bytes: &[u8]) -> Result<Vec<DerivedExpression>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }

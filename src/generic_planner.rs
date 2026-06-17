@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use crate::bitpack::{signed_bitpack_width_for_range, unsigned_bitpack_width};
 use crate::body::{decode_generic_stream_body, encode_generic_stream_body, GenericStreamBodyValue};
 use crate::bytes::{put_u16_le, put_u32_le, put_u64_le, ByteReader};
+use crate::header::{DerivedExpression, DerivedExpressionOp, DerivedExpressionSource};
 use crate::instructions::{
     DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
     GenericStreamOp,
@@ -1132,6 +1133,7 @@ fn plan_i64_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<Planned
     validate_rows(schema, rows)?;
     let mut state = PlannerState::new();
     let partition_runs = add_group_hints(schema, rows, &mut state)?;
+    add_schema_derived_hints(schema, rows, &mut state)?;
     add_group_value_hints(schema, rows, &mut state, partition_runs.as_ref())?;
     add_segmented_delta_hints(schema, rows, &mut state, partition_runs.as_ref())?;
     add_sparse_presence_hints(schema, rows, &mut state)?;
@@ -1171,6 +1173,111 @@ fn plan_i64_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<Planned
     }
 
     state.finish()
+}
+
+fn add_schema_derived_hints(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<i64>],
+    state: &mut PlannerState,
+) -> Result<()> {
+    schema.validate_derived_expressions()?;
+    for expression in &schema.derived_expressions {
+        if expression.source() == DerivedExpressionSource::Internal {
+            return Err(AuraError::InvalidValue("derived slot source conflict"));
+        }
+        if state.planned_slots.contains(&expression.output_slot) {
+            return Err(AuraError::InvalidValue("derived expression output"));
+        }
+        let op = derived_expression_op(expression)?;
+        let values = derived_expression_residuals(expression, rows)?;
+        state.add_derived(
+            expression.output_slot,
+            op,
+            expression.input_slots.clone(),
+            values,
+        )?;
+    }
+    Ok(())
+}
+
+fn derived_expression_op(expression: &DerivedExpression) -> Result<DerivedOp> {
+    match expression.op {
+        DerivedExpressionOp::AddResidual => Ok(DerivedOp::AddResidual),
+        DerivedExpressionOp::SubtractResidual => Ok(DerivedOp::SubtractResidual),
+        DerivedExpressionOp::MaxPlusResidual => Ok(DerivedOp::MaxPlusResidual),
+        DerivedExpressionOp::MinMinusResidual => Ok(DerivedOp::MinMinusResidual),
+        DerivedExpressionOp::FirstOffsetThenDelta => Ok(DerivedOp::FirstOffsetThenDelta),
+        DerivedExpressionOp::Add
+        | DerivedExpressionOp::Sub
+        | DerivedExpressionOp::Mul
+        | DerivedExpressionOp::Div
+        | DerivedExpressionOp::Min
+        | DerivedExpressionOp::Max => Err(AuraError::InvalidValue("derived expression op")),
+    }
+}
+
+fn derived_expression_residuals(
+    expression: &DerivedExpression,
+    rows: &[Vec<i64>],
+) -> Result<Vec<i64>> {
+    rows.iter()
+        .enumerate()
+        .map(|(row_index, _)| inverse_declared_derive_value(expression, row_index, rows))
+        .collect()
+}
+
+fn inverse_declared_derive_value(
+    expression: &DerivedExpression,
+    row_index: usize,
+    rows: &[Vec<i64>],
+) -> Result<i64> {
+    let output = rows
+        .get(row_index)
+        .and_then(|row| row.get(usize::from(expression.output_slot)))
+        .copied()
+        .ok_or(AuraError::InvalidValue("output slot"))?;
+    match expression.op {
+        DerivedExpressionOp::AddResidual => {
+            let base = rows[row_index][usize::from(expression.input_slots[0])];
+            checked_delta(output, base)
+        }
+        DerivedExpressionOp::SubtractResidual => {
+            let base = rows[row_index][usize::from(expression.input_slots[0])];
+            checked_delta(base, output)
+        }
+        DerivedExpressionOp::MaxPlusResidual => {
+            let base = expression
+                .input_slots
+                .iter()
+                .map(|slot| rows[row_index][usize::from(*slot)])
+                .max()
+                .ok_or(AuraError::InvalidValue("input slots"))?;
+            checked_delta(output, base)
+        }
+        DerivedExpressionOp::MinMinusResidual => {
+            let base = expression
+                .input_slots
+                .iter()
+                .map(|slot| rows[row_index][usize::from(*slot)])
+                .min()
+                .ok_or(AuraError::InvalidValue("input slots"))?;
+            checked_delta(base, output)
+        }
+        DerivedExpressionOp::FirstOffsetThenDelta => {
+            if row_index == 0 {
+                Ok(output)
+            } else {
+                let base = rows[row_index - 1][usize::from(expression.input_slots[0])];
+                checked_delta(output, base)
+            }
+        }
+        DerivedExpressionOp::Add
+        | DerivedExpressionOp::Sub
+        | DerivedExpressionOp::Mul
+        | DerivedExpressionOp::Div
+        | DerivedExpressionOp::Min
+        | DerivedExpressionOp::Max => Err(AuraError::InvalidValue("derived expression op")),
+    }
 }
 
 fn add_group_hints(

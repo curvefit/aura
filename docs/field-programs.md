@@ -94,6 +94,14 @@ stream is smaller than the existing candidate. Scale constants and residual
 streams are footer/body facts; permission to calculate a derived expression is a
 schema-header fact.
 
+The implemented generic planner consumes header/schema expression definitions
+for `add_residual`, `subtract_residual`, `max_plus_residual`,
+`min_minus_residual`, and `first_offset_then_delta`. It validates that
+`101-199` schema-map bytes reference matching expression IDs and output slots,
+rejects duplicate outputs and expression dependency cycles, and stamps the
+selected round-trip `DerivedStream` instruction in the footer plan. It does not
+look at OHLCV field names.
+
 The file no longer needs to keep min/max ranges or candidate scoring tables in
 the compiled footer. Those were ingest-time evidence. A reader only needs the
 instruction, the schema order, the record count, and any constants referenced by

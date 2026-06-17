@@ -1,7 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::bytes::{put_u16_le, put_u32_le, put_u8, ByteReader};
-use crate::header::HEADER_PREFIX_SIZE;
+use crate::header::{
+    decode_derived_expression_table, encode_derived_expression_table, validate_derived_expressions,
+    DerivedExpression, DerivedExpressionOp, HEADER_PREFIX_SIZE,
+};
 use crate::{AuraError, Result};
 
 const SCHEMA_ENCODING_PARENT_VECTOR: u8 = 0;
@@ -280,6 +283,7 @@ pub struct FieldDescriptor {
     pub name: String,
     pub field_type: FieldType,
     pub role: FieldRole,
+    pub scale: i8,
     pub scope: FieldScope,
     pub nullable: bool,
     pub relation: FieldRelation,
@@ -319,11 +323,54 @@ pub struct SchemaDescriptor {
     pub name: String,
     pub fields: Vec<FieldDescriptor>,
     pub compact_schema_map: Option<Vec<u8>>,
+    pub derived_expressions: Vec<DerivedExpression>,
 }
 
 impl SchemaDescriptor {
     pub fn field(&self, name: &str) -> Option<&FieldDescriptor> {
         self.fields.iter().find(|field| field.name == name)
+    }
+
+    pub fn with_field_scales(mut self, scales: Vec<i8>) -> Result<Self> {
+        if scales.len() != self.fields.len() {
+            return Err(AuraError::InvalidValue("field scales"));
+        }
+        for (field, scale) in self.fields.iter_mut().zip(scales) {
+            field.scale = scale;
+        }
+        self.refresh_schema_id();
+        Ok(self)
+    }
+
+    pub fn with_derived_expressions(
+        mut self,
+        derived_expressions: Vec<DerivedExpression>,
+    ) -> Result<Self> {
+        validate_schema_derived_expressions(
+            &self.fields,
+            self.compact_schema_map.as_deref(),
+            &derived_expressions,
+        )?;
+        self.derived_expressions = derived_expressions;
+        self.refresh_schema_id();
+        Ok(self)
+    }
+
+    pub(crate) fn validate_derived_expressions(&self) -> Result<()> {
+        validate_schema_derived_expressions(
+            &self.fields,
+            self.compact_schema_map.as_deref(),
+            &self.derived_expressions,
+        )
+    }
+
+    fn refresh_schema_id(&mut self) {
+        self.schema_id = schema_hash(
+            &self.name,
+            &self.fields,
+            self.compact_schema_map.as_deref(),
+            &self.derived_expressions,
+        );
     }
 }
 
@@ -538,6 +585,7 @@ impl SchemaBuilder {
             name: name.into(),
             field_type,
             role,
+            scale: 0,
             scope,
             nullable,
             relation,
@@ -581,10 +629,11 @@ impl SchemaBuilder {
         }
 
         Ok(SchemaDescriptor {
-            schema_id: schema_hash(&self.name, &self.fields, None),
+            schema_id: schema_hash(&self.name, &self.fields, None, &[]),
             name: self.name,
             fields: self.fields,
             compact_schema_map: None,
+            derived_expressions: Vec::new(),
         })
     }
 }
@@ -672,6 +721,7 @@ pub fn generic_i64_parent_schema(name: &str, parent_slots: &[u8]) -> Result<Sche
         &schema.name,
         &schema.fields,
         schema.compact_schema_map.as_deref(),
+        &schema.derived_expressions,
     );
     Ok(schema)
 }
@@ -792,6 +842,7 @@ pub fn decode_schema_map(parent_slots: &[u8]) -> Result<Vec<SchemaMapEntry>> {
 }
 
 pub fn schema_parent_mapping(schema: &SchemaDescriptor) -> Result<Vec<u8>> {
+    schema.validate_derived_expressions()?;
     if let Some(mapping) = &schema.compact_schema_map {
         let entries = decode_schema_map(mapping)?;
         if entries.len() != schema.fields.len() {
@@ -800,6 +851,7 @@ pub fn schema_parent_mapping(schema: &SchemaDescriptor) -> Result<Vec<u8>> {
         return Ok(mapping.clone());
     }
 
+    let expression_ids = expression_ids_by_output(&schema.derived_expressions)?;
     let mut mapping = Vec::with_capacity(schema.fields.len());
     let mut index = 0;
     while index < schema.fields.len() {
@@ -812,19 +864,30 @@ pub fn schema_parent_mapping(schema: &SchemaDescriptor) -> Result<Vec<u8>> {
             }
             mapping.push(SCHEMA_MAP_GROUP_BASE + width as u8);
             for repeated_index in index + 1..group_end {
-                mapping.push(schema_field_map_byte(&schema.fields[repeated_index])?);
+                mapping.push(schema_field_map_byte(
+                    &schema.fields[repeated_index],
+                    &expression_ids,
+                )?);
             }
             index = group_end;
             continue;
         }
 
-        mapping.push(schema_field_map_byte(field)?);
+        mapping.push(schema_field_map_byte(field, &expression_ids)?);
         index += 1;
     }
     Ok(mapping)
 }
 
-fn schema_field_map_byte(field: &FieldDescriptor) -> Result<u8> {
+fn schema_field_map_byte(
+    field: &FieldDescriptor,
+    expression_ids: &BTreeMap<u16, u8>,
+) -> Result<u8> {
+    if let Some(expression_id) = expression_ids.get(&field.index) {
+        return SCHEMA_MAP_DERIVED_EXPR_BASE
+            .checked_add(*expression_id)
+            .ok_or(AuraError::InvalidValue("schema parent mapping"));
+    }
     if matches!(field.field_type, FieldType::Opaque16) {
         return Ok(SCHEMA_MAP_DO_NOT_ATTEMPT);
     }
@@ -943,6 +1006,10 @@ pub(crate) fn decode_schema_block(reader: &mut ByteReader<'_>) -> Result<SchemaD
 }
 
 fn parent_slots_for_generic_i64_schema(schema: &SchemaDescriptor) -> Option<Vec<u8>> {
+    if !schema.derived_expressions.is_empty() || schema.fields.iter().any(|field| field.scale != 0)
+    {
+        return None;
+    }
     if let Some(mapping) = &schema.compact_schema_map {
         return Some(mapping.clone());
     }
@@ -993,6 +1060,7 @@ fn encode_full_field_schema(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Res
         put_u16_le(out, field.index);
         put_u8(out, field.field_type as u8);
         put_u8(out, field.role as u8);
+        put_u8(out, field.scale as u8);
         put_u8(out, field.scope as u8);
         put_u8(out, field.nullable as u8);
         put_u8(out, field.relation.kind_code());
@@ -1003,6 +1071,15 @@ fn encode_full_field_schema(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Res
         put_u16_le(out, field.candidates.bits());
         put_string(out, &field.name)?;
     }
+    if let Some(compact_schema_map) = &schema.compact_schema_map {
+        put_u16_len(out, compact_schema_map.len(), "schema mapping length")?;
+        out.extend_from_slice(compact_schema_map);
+    } else {
+        put_u16_le(out, 0);
+    }
+    let expression_table = encode_derived_expression_table(&schema.derived_expressions)?;
+    put_u16_len(out, expression_table.len(), "derived expression length")?;
+    out.extend_from_slice(&expression_table);
     Ok(())
 }
 
@@ -1013,6 +1090,7 @@ fn decode_full_field_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescrip
         let index = reader.read_u16_le()?;
         let field_type = FieldType::from_code(reader.read_u8()?)?;
         let role = FieldRole::from_code(reader.read_u8()?)?;
+        let scale = reader.read_u8()? as i8;
         let scope = FieldScope::from_code(reader.read_u8()?)?;
         let nullable = reader.read_u8()? != 0;
         let relation_kind = reader.read_u8()?;
@@ -1024,22 +1102,207 @@ fn decode_full_field_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescrip
             name,
             field_type,
             role,
+            scale,
             scope,
             nullable,
             relation: FieldRelation::from_codes(relation_kind, related_field_index)?,
             candidates,
         });
     }
-    Ok(schema_from_fields(DECODED_SCHEMA_NAME, fields))
+    let compact_schema_map = if reader.remaining() == 0 {
+        None
+    } else {
+        let len = reader.read_u16_le()? as usize;
+        let mapping = reader.read_exact(len)?.to_vec();
+        if mapping.is_empty() {
+            None
+        } else {
+            Some(mapping)
+        }
+    };
+    let derived_expressions = if reader.remaining() == 0 {
+        Vec::new()
+    } else {
+        let len = reader.read_u16_le()? as usize;
+        decode_derived_expression_table(reader.read_exact(len)?)?
+    };
+    schema_from_fields(
+        DECODED_SCHEMA_NAME,
+        fields,
+        compact_schema_map,
+        derived_expressions,
+    )
 }
 
-fn schema_from_fields(name: &str, fields: Vec<FieldDescriptor>) -> SchemaDescriptor {
-    SchemaDescriptor {
-        schema_id: schema_hash(name, &fields, None),
+fn schema_from_fields(
+    name: &str,
+    fields: Vec<FieldDescriptor>,
+    compact_schema_map: Option<Vec<u8>>,
+    derived_expressions: Vec<DerivedExpression>,
+) -> Result<SchemaDescriptor> {
+    validate_schema_derived_expressions(
+        &fields,
+        compact_schema_map.as_deref(),
+        &derived_expressions,
+    )?;
+    Ok(SchemaDescriptor {
+        schema_id: schema_hash(
+            name,
+            &fields,
+            compact_schema_map.as_deref(),
+            &derived_expressions,
+        ),
         name: name.to_owned(),
         fields,
-        compact_schema_map: None,
+        compact_schema_map,
+        derived_expressions,
+    })
+}
+
+fn validate_schema_derived_expressions(
+    fields: &[FieldDescriptor],
+    compact_schema_map: Option<&[u8]>,
+    derived_expressions: &[DerivedExpression],
+) -> Result<()> {
+    validate_derived_expressions(derived_expressions)?;
+    let field_count = fields.len();
+    let mut output_slots = BTreeSet::new();
+    for expression in derived_expressions {
+        validate_expression_shape(expression)?;
+        if usize::from(expression.output_slot) >= field_count {
+            return Err(AuraError::InvalidValue("derived expression output"));
+        }
+        if !output_slots.insert(expression.output_slot) {
+            return Err(AuraError::InvalidValue("derived expression output"));
+        }
+        if fields[usize::from(expression.output_slot)].relation != FieldRelation::None {
+            return Err(AuraError::InvalidValue("derived expression output"));
+        }
+        for input_slot in &expression.input_slots {
+            if usize::from(*input_slot) >= field_count {
+                return Err(AuraError::InvalidValue("derived expression input"));
+            }
+        }
     }
+
+    if let Some(compact_schema_map) = compact_schema_map {
+        validate_compact_expression_refs(compact_schema_map, derived_expressions)?;
+    }
+    validate_expression_graph(derived_expressions)
+}
+
+fn validate_expression_shape(expression: &DerivedExpression) -> Result<()> {
+    match expression.op {
+        DerivedExpressionOp::Add
+        | DerivedExpressionOp::Mul
+        | DerivedExpressionOp::Min
+        | DerivedExpressionOp::Max => {
+            if expression.input_slots.is_empty() && expression.literals.is_empty() {
+                return Err(AuraError::InvalidValue("derived expression inputs"));
+            }
+        }
+        DerivedExpressionOp::Sub | DerivedExpressionOp::Div => {
+            if expression.input_slots.is_empty() {
+                return Err(AuraError::InvalidValue("derived expression inputs"));
+            }
+        }
+        DerivedExpressionOp::AddResidual
+        | DerivedExpressionOp::SubtractResidual
+        | DerivedExpressionOp::FirstOffsetThenDelta => {
+            if expression.input_slots.len() != 1 || !expression.literals.is_empty() {
+                return Err(AuraError::InvalidValue("derived expression inputs"));
+            }
+        }
+        DerivedExpressionOp::MaxPlusResidual | DerivedExpressionOp::MinMinusResidual => {
+            if expression.input_slots.is_empty() || !expression.literals.is_empty() {
+                return Err(AuraError::InvalidValue("derived expression inputs"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_compact_expression_refs(
+    compact_schema_map: &[u8],
+    derived_expressions: &[DerivedExpression],
+) -> Result<()> {
+    let entries = decode_schema_map(compact_schema_map)?;
+    let expressions_by_id = derived_expressions
+        .iter()
+        .map(|expression| (expression.expression_id, expression))
+        .collect::<BTreeMap<_, _>>();
+    let mut referenced_ids = BTreeSet::new();
+    for entry in entries {
+        let SchemaMapHint::DerivedExpression { expression_index } = entry.hint else {
+            continue;
+        };
+        let expression = expressions_by_id
+            .get(&expression_index)
+            .ok_or(AuraError::InvalidValue("derived expression map"))?;
+        if expression.output_slot != entry.field_index {
+            return Err(AuraError::InvalidValue("derived expression map"));
+        }
+        referenced_ids.insert(expression_index);
+    }
+    for expression in derived_expressions {
+        if !referenced_ids.contains(&expression.expression_id) {
+            return Err(AuraError::InvalidValue("derived expression map"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_expression_graph(derived_expressions: &[DerivedExpression]) -> Result<()> {
+    let graph = derived_expressions
+        .iter()
+        .map(|expression| (expression.output_slot, expression.input_slots.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for output_slot in graph.keys().copied() {
+        visit_expression_slot(output_slot, &graph, &mut visiting, &mut visited)?;
+    }
+    Ok(())
+}
+
+fn visit_expression_slot(
+    slot: u16,
+    graph: &BTreeMap<u16, Vec<u16>>,
+    visiting: &mut BTreeSet<u16>,
+    visited: &mut BTreeSet<u16>,
+) -> Result<()> {
+    if visited.contains(&slot) {
+        return Ok(());
+    }
+    if !visiting.insert(slot) {
+        return Err(AuraError::InvalidValue("derived expression cycle"));
+    }
+    if let Some(input_slots) = graph.get(&slot) {
+        for input_slot in input_slots {
+            if graph.contains_key(input_slot) {
+                visit_expression_slot(*input_slot, graph, visiting, visited)?;
+            }
+        }
+    }
+    visiting.remove(&slot);
+    visited.insert(slot);
+    Ok(())
+}
+
+fn expression_ids_by_output(
+    derived_expressions: &[DerivedExpression],
+) -> Result<BTreeMap<u16, u8>> {
+    validate_derived_expressions(derived_expressions)?;
+    let mut out = BTreeMap::new();
+    for expression in derived_expressions {
+        if out
+            .insert(expression.output_slot, expression.expression_id)
+            .is_some()
+        {
+            return Err(AuraError::InvalidValue("derived expression output"));
+        }
+    }
+    Ok(out)
 }
 
 fn put_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
@@ -1109,7 +1372,12 @@ fn validate_schema_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn schema_hash(name: &str, fields: &[FieldDescriptor], compact_schema_map: Option<&[u8]>) -> u32 {
+fn schema_hash(
+    name: &str,
+    fields: &[FieldDescriptor],
+    compact_schema_map: Option<&[u8]>,
+    derived_expressions: &[DerivedExpression],
+) -> u32 {
     let mut hash = 0x811c9dc5u32;
     update_hash(&mut hash, name.as_bytes());
     for field in fields {
@@ -1120,6 +1388,7 @@ fn schema_hash(name: &str, fields: &[FieldDescriptor], compact_schema_map: Optio
             &[
                 field.field_type as u8,
                 field.role as u8,
+                field.scale as u8,
                 field.scope as u8,
                 field.nullable as u8,
                 field.relation.kind_code(),
@@ -1137,6 +1406,17 @@ fn schema_hash(name: &str, fields: &[FieldDescriptor], compact_schema_map: Optio
     }
     if let Some(compact_schema_map) = compact_schema_map {
         update_hash(&mut hash, compact_schema_map);
+    }
+    for expression in derived_expressions {
+        update_hash(&mut hash, &[expression.expression_id, expression.op as u8]);
+        update_hash(&mut hash, &expression.output_slot.to_le_bytes());
+        update_hash(&mut hash, &[expression.flags]);
+        for input_slot in &expression.input_slots {
+            update_hash(&mut hash, &input_slot.to_le_bytes());
+        }
+        for literal in &expression.literals {
+            update_hash(&mut hash, &literal.to_le_bytes());
+        }
     }
     hash
 }
