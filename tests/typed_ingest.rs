@@ -22,7 +22,7 @@ fn diagnostic(error: AuraError) -> aura_codec::AuraDiagnostic {
 
 #[test]
 fn typed_writer_defaults_to_i64_and_accepts_declared_wide_values() {
-    let schema = generic_i64_parent_schema("typed_default_i64", &[255, 0, 2]).unwrap();
+    let schema = generic_i64_parent_schema("typed_default_i64", &[100, 0, 2]).unwrap();
     let mut writer = AuraTypedWriter::new(schema).with_stream(7, 3);
     writer
         .extend_rows([
@@ -85,7 +85,7 @@ fn wide_values_roundtrip_or_return_structured_profile_diagnostic() {
 
 #[test]
 fn typed_writer_reports_slot_row_and_upgrade_for_overflow() {
-    let schema = generic_i64_parent_schema("typed_overflow", &[255, 0]).unwrap();
+    let schema = generic_i64_parent_schema("typed_overflow", &[100, 0]).unwrap();
     let mut writer = AuraTypedWriter::new(schema);
     let result = writer.push_row(vec![
         AuraTypedValue::I64(1_000),
@@ -104,7 +104,7 @@ fn typed_writer_reports_slot_row_and_upgrade_for_overflow() {
 
 #[test]
 fn derived_slot_rejects_double_population() {
-    let schema = generic_i64_parent_schema("typed_internal_derivation", &[255, 0, 2]).unwrap();
+    let schema = generic_i64_parent_schema("typed_internal_derivation", &[100, 0, 2]).unwrap();
     let mut writer = AuraTypedWriter::new(schema);
     writer.mark_internal_derivation(2).unwrap();
 
@@ -126,7 +126,7 @@ fn derived_slot_rejects_double_population() {
 
 #[test]
 fn externally_supplied_derived_slot_roundtrips_as_logical_field() {
-    let schema = generic_i64_parent_schema("typed_external_derivation", &[255, 0, 2, 2]).unwrap();
+    let schema = generic_i64_parent_schema("typed_external_derivation", &[100, 0, 2, 2]).unwrap();
     assert_eq!(FieldRelation::DeltaFromField(1), schema.fields[2].relation);
     let mut writer = AuraTypedWriter::new(schema);
     writer

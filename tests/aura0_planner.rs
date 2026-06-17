@@ -200,7 +200,7 @@ fn aura0_planner_uses_bitpacked_related_deltas() {
 
 #[test]
 fn aura0_planner_derives_constant_related_offsets() {
-    let schema = generic_i64_parent_schema("derived_offset", &[255, 0, 2]).unwrap();
+    let schema = generic_i64_parent_schema("derived_offset", &[100, 0, 2]).unwrap();
     let mut stats = IngestStats::new_for_schema(&schema).unwrap();
     for idx in 0..8 {
         let parent = 1_000_000 + i64::from(idx) * 10;
@@ -220,7 +220,7 @@ fn aura0_planner_derives_constant_related_offsets() {
 
 #[test]
 fn aura0_planner_uses_biased_bitpacked_related_deltas() {
-    let schema = generic_i64_parent_schema("biased_related", &[255, 0, 2]).unwrap();
+    let schema = generic_i64_parent_schema("biased_related", &[100, 0, 2]).unwrap();
     let mut stats = IngestStats::new_for_schema(&schema).unwrap();
     for idx in 0..130 {
         let parent = if idx % 2 == 0 { 1_000_000 } else { 2_000_000 };

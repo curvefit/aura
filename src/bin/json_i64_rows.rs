@@ -365,7 +365,7 @@ fn timestamp_slots(schema_header: &[u8]) -> Result<Vec<bool>> {
 
 fn timestamp_slot(schema_header: &[u8], slot: usize) -> Result<bool> {
     let value = schema_header[slot];
-    if value == 255 {
+    if value == 100 {
         return Ok(true);
     }
     let Some(parent) = parent_slot(value) else {
@@ -379,8 +379,7 @@ fn timestamp_slot(schema_header: &[u8], slot: usize) -> Result<bool> {
 
 fn parent_slot(value: u8) -> Option<usize> {
     match value {
-        1..=127 => Some(usize::from(value - 1)),
-        129..=254 => Some(usize::from(value - 129)),
+        1..=99 => Some(usize::from(value - 1)),
         _ => None,
     }
 }

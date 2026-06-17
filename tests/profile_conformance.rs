@@ -1,8 +1,8 @@
 use aura_codec::schema::{generic_i64_parent_schema, ohlcv_schema, SchemaDescriptor};
 use aura_codec::{records, Profile};
 
-const FLAT_PARENT_MAP: &[u8] = &[255, 0, 2, 2, 2, 0];
-const REPEATED_PARENT_MAP: &[u8] = &[255, 0, 0, 128, 132, 133, 133];
+const FLAT_PARENT_MAP: &[u8] = &[100, 0, 2, 2, 2, 0];
+const REPEATED_PARENT_MAP: &[u8] = &[100, 0, 0, 204, 4, 5, 5];
 
 fn flat_rows() -> Vec<Vec<i64>> {
     vec![

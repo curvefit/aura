@@ -60,7 +60,7 @@ fn writer_profile_output_preserves_rows_and_footer_stamps() {
     let input = I64FileInput {
         schema: generic_i64_parent_schema(
             "writer_stamp_flow",
-            &[255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8],
+            &[100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8],
         )
         .unwrap(),
         rows: (0..48)
@@ -117,7 +117,7 @@ fn writer_profile_output_preserves_rows_and_footer_stamps() {
 
 #[test]
 fn writer_header_schema_map_matches_current_emitted_dialect() {
-    let parent_map = [255, 0, 2, 128, 132, 133, 133];
+    let parent_map = [100, 0, 2, 204, 4, 5, 5];
     let schema = generic_i64_parent_schema("writer_schema_map", &parent_map).unwrap();
     let mut writer = AuraI64Writer::new(schema)
         .with_stream(1, 1)

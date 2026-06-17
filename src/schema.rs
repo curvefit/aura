@@ -7,10 +7,17 @@ use crate::{AuraError, Result};
 const SCHEMA_ENCODING_PARENT_VECTOR: u8 = 0;
 const SCHEMA_ENCODING_FULL_FIELDS: u8 = 1;
 const DECODED_SCHEMA_NAME: &str = "schema";
-pub(crate) const SCHEMA_MAP_TIME_SLOT: u8 = u8::MAX;
-pub(crate) const SCHEMA_MAP_REPEATED_ROOT_SLOT: u8 = 128;
-pub(crate) const SCHEMA_MAP_REPEATED_PARENT_BASE: u8 = 129;
-pub(crate) const SCHEMA_MAP_EVENT_PARENT_MAX: u8 = 127;
+pub(crate) const SCHEMA_MAP_PARENT_MAX: u8 = 99;
+pub(crate) const SCHEMA_MAP_TIME_SLOT: u8 = 100;
+pub(crate) const SCHEMA_MAP_DERIVED_BASE: u8 = 100;
+pub(crate) const SCHEMA_MAP_DERIVED_MAX: u8 = 199;
+pub(crate) const SCHEMA_MAP_DUAL_DOMAIN_GROUP: u8 = 200;
+pub(crate) const SCHEMA_MAP_GROUP_BASE: u8 = 200;
+pub(crate) const SCHEMA_MAP_GROUP_MAX: u8 = 239;
+pub(crate) const SCHEMA_MAP_BOOL_1BIT: u8 = 241;
+pub(crate) const SCHEMA_MAP_ENUM_2BIT: u8 = 242;
+pub(crate) const SCHEMA_MAP_BITFIELD_8BIT: u8 = 243;
+pub(crate) const SCHEMA_MAP_DO_NOT_ATTEMPT: u8 = u8::MAX;
 
 /// Logical field type recorded by an Aura schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -78,6 +85,9 @@ pub enum FieldRole {
     Count = 8,
     Flag = 9,
     PriceAnchor = 10,
+    Boolean = 11,
+    Enum = 12,
+    Bitfield = 13,
 }
 
 impl FieldRole {
@@ -93,6 +103,9 @@ impl FieldRole {
             8 => Ok(Self::Count),
             9 => Ok(Self::Flag),
             10 => Ok(Self::PriceAnchor),
+            11 => Ok(Self::Boolean),
+            12 => Ok(Self::Enum),
+            13 => Ok(Self::Bitfield),
             _ => Err(AuraError::InvalidValue("field role")),
         }
     }
@@ -224,7 +237,11 @@ impl TransformCandidates {
                 .with(FieldTransform::DeltaBase)
                 .with(FieldTransform::DeltaPrevious)
                 .with(FieldTransform::Bitpack),
-            FieldRole::Side | FieldRole::Flag => Self::empty()
+            FieldRole::Side
+            | FieldRole::Flag
+            | FieldRole::Boolean
+            | FieldRole::Enum
+            | FieldRole::Bitfield => Self::empty()
                 .with(FieldTransform::Absolute)
                 .with(FieldTransform::DeltaBase)
                 .with(FieldTransform::Bitpack),
@@ -269,13 +286,30 @@ pub struct FieldDescriptor {
     pub candidates: TransformCandidates,
 }
 
+/// Decoded generic hint carried by one compact front-header schema-map byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaMapHint {
+    Root,
+    Parent { parent_index: u16 },
+    Timestamp,
+    DerivedRoot { slot_number: u8 },
+    DualDomainGroup,
+    Group { width: u8 },
+    Boolean { bits: u8 },
+    Enum { bits: u8 },
+    Bitfield { bits: u8 },
+    DoNotAttempt,
+}
+
 /// Decoded meaning of one compact front-header schema-map byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchemaMapEntry {
     pub field_index: u16,
+    pub raw_byte: u8,
     pub scope: FieldScope,
     pub is_timestamp: bool,
     pub relation: FieldRelation,
+    pub hint: SchemaMapHint,
 }
 
 /// Logical schema descriptor shared by ingest, Aura0, and Aura1.
@@ -284,6 +318,7 @@ pub struct SchemaDescriptor {
     pub schema_id: u32,
     pub name: String,
     pub fields: Vec<FieldDescriptor>,
+    pub compact_schema_map: Option<Vec<u8>>,
 }
 
 impl SchemaDescriptor {
@@ -546,9 +581,10 @@ impl SchemaBuilder {
         }
 
         Ok(SchemaDescriptor {
-            schema_id: schema_hash(&self.name, &self.fields),
+            schema_id: schema_hash(&self.name, &self.fields, None),
             name: self.name,
             fields: self.fields,
+            compact_schema_map: None,
         })
     }
 }
@@ -594,11 +630,11 @@ pub fn generic_i64_schema(
 
 /// Build a positional i64 schema from compact time/parent bytes.
 ///
-/// `parent_slots[0]` describes the timestamp slot. Every later slot is a
-/// generic `i64` value. A parent byte of `255` marks the timestamp slot, `0`
-/// means an event/root slot, `1..127` means an event slot that may delta from
-/// slot `value - 1`, `128` means a repeated child root slot, and `129..254`
-/// means a repeated child slot that may delta from slot `value - 129`.
+/// A byte of `100` marks the timestamp slot, normally at slot 0. If no
+/// timestamp marker is present, the schema is treated as non-time-series data.
+/// `0` means root, `1..99` means parent slot `value - 1`, `101..199` marks a
+/// derived/root slot, `201..239` marks a repeated group width, `241..243`
+/// mark compact leaf types, and `255` marks an opaque do-not-attempt slot.
 pub fn generic_i64_parent_schema(name: &str, parent_slots: &[u8]) -> Result<SchemaDescriptor> {
     let entries = decode_schema_map(parent_slots)?;
     if entries.len() > u16::MAX as usize {
@@ -612,16 +648,31 @@ pub fn generic_i64_parent_schema(name: &str, parent_slots: &[u8]) -> Result<Sche
             continue;
         }
 
+        let (field_type, role) = match entry.hint {
+            SchemaMapHint::Boolean { .. } => (FieldType::U8, FieldRole::Boolean),
+            SchemaMapHint::Enum { .. } => (FieldType::U8, FieldRole::Enum),
+            SchemaMapHint::Bitfield { .. } => (FieldType::U8, FieldRole::Bitfield),
+            SchemaMapHint::DoNotAttempt => (FieldType::Opaque16, FieldRole::Identifier),
+            _ => (FieldType::I64, FieldRole::Value),
+        };
+
         builder = builder.field_with_relation(
             format!("v{}", entry.field_index),
-            FieldType::I64,
-            FieldRole::Value,
+            field_type,
+            role,
             entry.scope,
             false,
             entry.relation,
         );
     }
-    builder.finish()
+    let mut schema = builder.finish()?;
+    schema.compact_schema_map = Some(parent_slots.to_vec());
+    schema.schema_id = schema_hash(
+        &schema.name,
+        &schema.fields,
+        schema.compact_schema_map.as_deref(),
+    );
+    Ok(schema)
 }
 
 pub fn decode_schema_map(parent_slots: &[u8]) -> Result<Vec<SchemaMapEntry>> {
@@ -630,9 +681,11 @@ pub fn decode_schema_map(parent_slots: &[u8]) -> Result<Vec<SchemaMapEntry>> {
     }
     let mut entries = Vec::with_capacity(parent_slots.len());
     let mut time_slot = None;
+    let mut repeated_until = None;
     for (field_index, parent_slot) in parent_slots.iter().copied().enumerate() {
         let field_index_u16 =
             u16::try_from(field_index).map_err(|_| AuraError::InvalidValue("field index"))?;
+        let in_group = repeated_until.is_some_and(|end| field_index < end);
         let entry = match parent_slot {
             SCHEMA_MAP_TIME_SLOT => {
                 if time_slot.replace(field_index).is_some() || field_index != 0 {
@@ -640,97 +693,211 @@ pub fn decode_schema_map(parent_slots: &[u8]) -> Result<Vec<SchemaMapEntry>> {
                 }
                 SchemaMapEntry {
                     field_index: field_index_u16,
+                    raw_byte: parent_slot,
                     scope: FieldScope::Event,
                     is_timestamp: true,
                     relation: FieldRelation::None,
+                    hint: SchemaMapHint::Timestamp,
                 }
             }
             0 => SchemaMapEntry {
                 field_index: field_index_u16,
-                scope: FieldScope::Event,
+                raw_byte: parent_slot,
+                scope: scope_for_group(in_group),
                 is_timestamp: false,
                 relation: FieldRelation::None,
+                hint: SchemaMapHint::Root,
             },
-            1..=SCHEMA_MAP_EVENT_PARENT_MAX => {
+            1..=SCHEMA_MAP_PARENT_MAX => {
                 let parent_index = u16::from(parent_slot - 1);
                 if usize::from(parent_index) >= field_index {
                     return Err(AuraError::InvalidValue("parent slot"));
                 }
                 SchemaMapEntry {
                     field_index: field_index_u16,
-                    scope: FieldScope::Event,
+                    raw_byte: parent_slot,
+                    scope: scope_for_group(in_group),
                     is_timestamp: false,
                     relation: FieldRelation::DeltaFromField(parent_index),
+                    hint: SchemaMapHint::Parent { parent_index },
                 }
             }
-            SCHEMA_MAP_REPEATED_ROOT_SLOT => SchemaMapEntry {
+            101..=SCHEMA_MAP_DERIVED_MAX => SchemaMapEntry {
                 field_index: field_index_u16,
+                raw_byte: parent_slot,
+                scope: scope_for_group(in_group),
+                is_timestamp: false,
+                relation: FieldRelation::None,
+                hint: SchemaMapHint::DerivedRoot {
+                    slot_number: parent_slot - SCHEMA_MAP_DERIVED_BASE,
+                },
+            },
+            SCHEMA_MAP_DUAL_DOMAIN_GROUP => SchemaMapEntry {
+                field_index: field_index_u16,
+                raw_byte: parent_slot,
                 scope: FieldScope::Repeated,
                 is_timestamp: false,
                 relation: FieldRelation::None,
+                hint: SchemaMapHint::DualDomainGroup,
             },
-            SCHEMA_MAP_REPEATED_PARENT_BASE..=254 => {
-                let parent_index = u16::from(parent_slot - SCHEMA_MAP_REPEATED_PARENT_BASE);
-                if usize::from(parent_index) >= field_index {
-                    return Err(AuraError::InvalidValue("parent slot"));
+            201..=SCHEMA_MAP_GROUP_MAX => {
+                let width = parent_slot - SCHEMA_MAP_GROUP_BASE;
+                let end = field_index
+                    .checked_add(usize::from(width))
+                    .ok_or(AuraError::InvalidValue("group width"))?;
+                if end > parent_slots.len() {
+                    return Err(AuraError::InvalidValue("group width"));
                 }
+                repeated_until =
+                    Some(repeated_until.map_or(end, |current: usize| current.max(end)));
                 SchemaMapEntry {
                     field_index: field_index_u16,
+                    raw_byte: parent_slot,
                     scope: FieldScope::Repeated,
                     is_timestamp: false,
-                    relation: FieldRelation::DeltaFromField(parent_index),
+                    relation: FieldRelation::None,
+                    hint: SchemaMapHint::Group { width },
                 }
             }
+            SCHEMA_MAP_BOOL_1BIT => leaf_entry(
+                field_index_u16,
+                parent_slot,
+                in_group,
+                SchemaMapHint::Boolean { bits: 1 },
+            ),
+            SCHEMA_MAP_ENUM_2BIT => leaf_entry(
+                field_index_u16,
+                parent_slot,
+                in_group,
+                SchemaMapHint::Enum { bits: 2 },
+            ),
+            SCHEMA_MAP_BITFIELD_8BIT => leaf_entry(
+                field_index_u16,
+                parent_slot,
+                in_group,
+                SchemaMapHint::Bitfield { bits: 8 },
+            ),
+            SCHEMA_MAP_DO_NOT_ATTEMPT => leaf_entry(
+                field_index_u16,
+                parent_slot,
+                in_group,
+                SchemaMapHint::DoNotAttempt,
+            ),
+            _ => return Err(AuraError::InvalidValue("schema map byte")),
         };
         entries.push(entry);
-    }
-    if time_slot != Some(0) {
-        return Err(AuraError::InvalidValue("time slot"));
     }
     Ok(entries)
 }
 
 pub fn schema_parent_mapping(schema: &SchemaDescriptor) -> Result<Vec<u8>> {
-    let mut mapping = Vec::with_capacity(schema.fields.len());
-    for (position, field) in schema.fields.iter().enumerate() {
-        if usize::from(field.index) != position {
-            return Err(AuraError::InvalidValue("schema field index"));
+    if let Some(mapping) = &schema.compact_schema_map {
+        let entries = decode_schema_map(mapping)?;
+        if entries.len() != schema.fields.len() {
+            return Err(AuraError::InvalidValue("schema parent mapping"));
         }
-        let parent = match (field.role, field.scope, field.relation) {
-            (FieldRole::Timestamp, FieldScope::Event, FieldRelation::None) => SCHEMA_MAP_TIME_SLOT,
-            (FieldRole::Timestamp, _, _) => {
-                return Err(AuraError::InvalidValue("schema time mapping"));
+        return Ok(mapping.clone());
+    }
+
+    let mut mapping = Vec::with_capacity(schema.fields.len());
+    let mut index = 0;
+    while index < schema.fields.len() {
+        let field = &schema.fields[index];
+        if field.scope == FieldScope::Repeated {
+            let group_end = repeated_group_end(schema, index)?;
+            let width = group_end - index;
+            if width > 39 {
+                return Err(AuraError::InvalidValue("schema group width"));
             }
-            (_, FieldScope::Event, FieldRelation::None) => 0,
-            (_, FieldScope::Event, FieldRelation::DeltaFromField(parent_index)) => {
-                if parent_index >= field.index {
-                    return Err(AuraError::InvalidValue("schema parent mapping"));
-                }
-                let parent_slot = parent_index
-                    .checked_add(1)
-                    .ok_or(AuraError::InvalidValue("schema parent mapping"))?;
-                if parent_slot > u16::from(SCHEMA_MAP_EVENT_PARENT_MAX) {
-                    return Err(AuraError::InvalidValue("schema parent mapping"));
-                }
-                parent_slot as u8
+            mapping.push(SCHEMA_MAP_GROUP_BASE + width as u8);
+            for repeated_index in index + 1..group_end {
+                mapping.push(schema_field_map_byte(&schema.fields[repeated_index])?);
             }
-            (_, FieldScope::Repeated, FieldRelation::None) => SCHEMA_MAP_REPEATED_ROOT_SLOT,
-            (_, FieldScope::Repeated, FieldRelation::DeltaFromField(parent_index)) => {
-                if parent_index >= field.index {
-                    return Err(AuraError::InvalidValue("schema parent mapping"));
-                }
-                let parent_slot = parent_index
-                    .checked_add(u16::from(SCHEMA_MAP_REPEATED_PARENT_BASE))
-                    .ok_or(AuraError::InvalidValue("schema parent mapping"))?;
-                if parent_slot >= u16::from(SCHEMA_MAP_TIME_SLOT) {
-                    return Err(AuraError::InvalidValue("schema parent mapping"));
-                }
-                parent_slot as u8
-            }
-        };
-        mapping.push(parent);
+            index = group_end;
+            continue;
+        }
+
+        mapping.push(schema_field_map_byte(field)?);
+        index += 1;
     }
     Ok(mapping)
+}
+
+fn schema_field_map_byte(field: &FieldDescriptor) -> Result<u8> {
+    if matches!(field.field_type, FieldType::Opaque16) {
+        return Ok(SCHEMA_MAP_DO_NOT_ATTEMPT);
+    }
+    match field.role {
+        FieldRole::Timestamp
+            if field.index == 0
+                && field.scope == FieldScope::Event
+                && field.relation == FieldRelation::None =>
+        {
+            return Ok(SCHEMA_MAP_TIME_SLOT);
+        }
+        FieldRole::Timestamp => return Err(AuraError::InvalidValue("schema time mapping")),
+        FieldRole::Boolean if field.relation == FieldRelation::None => {
+            return Ok(SCHEMA_MAP_BOOL_1BIT)
+        }
+        FieldRole::Enum if field.relation == FieldRelation::None => {
+            return Ok(SCHEMA_MAP_ENUM_2BIT)
+        }
+        FieldRole::Bitfield if field.relation == FieldRelation::None => {
+            return Ok(SCHEMA_MAP_BITFIELD_8BIT);
+        }
+        _ => {}
+    }
+
+    match field.relation {
+        FieldRelation::None => Ok(0),
+        FieldRelation::DeltaFromField(parent_index) => {
+            if parent_index >= field.index {
+                return Err(AuraError::InvalidValue("schema parent mapping"));
+            }
+            let parent_slot = parent_index
+                .checked_add(1)
+                .ok_or(AuraError::InvalidValue("schema parent mapping"))?;
+            if parent_slot > u16::from(SCHEMA_MAP_PARENT_MAX) {
+                return Err(AuraError::InvalidValue("schema parent mapping"));
+            }
+            Ok(parent_slot as u8)
+        }
+    }
+}
+
+fn repeated_group_end(schema: &SchemaDescriptor, start: usize) -> Result<usize> {
+    let mut end = start;
+    while end < schema.fields.len() && schema.fields[end].scope == FieldScope::Repeated {
+        end += 1;
+    }
+    if end == start {
+        return Err(AuraError::InvalidValue("schema group width"));
+    }
+    Ok(end)
+}
+
+fn scope_for_group(in_group: bool) -> FieldScope {
+    if in_group {
+        FieldScope::Repeated
+    } else {
+        FieldScope::Event
+    }
+}
+
+fn leaf_entry(
+    field_index: u16,
+    raw_byte: u8,
+    in_group: bool,
+    hint: SchemaMapHint,
+) -> SchemaMapEntry {
+    SchemaMapEntry {
+        field_index,
+        raw_byte,
+        scope: scope_for_group(in_group),
+        is_timestamp: false,
+        relation: FieldRelation::None,
+        hint,
+    }
 }
 
 fn validate_i64_schema_definition_header(schema_len: usize, comment_len: usize) -> Result<()> {
@@ -775,6 +942,9 @@ pub(crate) fn decode_schema_block(reader: &mut ByteReader<'_>) -> Result<SchemaD
 }
 
 fn parent_slots_for_generic_i64_schema(schema: &SchemaDescriptor) -> Option<Vec<u8>> {
+    if let Some(mapping) = &schema.compact_schema_map {
+        return Some(mapping.clone());
+    }
     if schema.fields.is_empty() || schema.fields.len() > u8::MAX as usize {
         return None;
     }
@@ -864,9 +1034,10 @@ fn decode_full_field_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescrip
 
 fn schema_from_fields(name: &str, fields: Vec<FieldDescriptor>) -> SchemaDescriptor {
     SchemaDescriptor {
-        schema_id: schema_hash(name, &fields),
+        schema_id: schema_hash(name, &fields, None),
         name: name.to_owned(),
         fields,
+        compact_schema_map: None,
     }
 }
 
@@ -937,7 +1108,7 @@ fn validate_schema_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn schema_hash(name: &str, fields: &[FieldDescriptor]) -> u32 {
+fn schema_hash(name: &str, fields: &[FieldDescriptor], compact_schema_map: Option<&[u8]>) -> u32 {
     let mut hash = 0x811c9dc5u32;
     update_hash(&mut hash, name.as_bytes());
     for field in fields {
@@ -962,6 +1133,9 @@ fn schema_hash(name: &str, fields: &[FieldDescriptor]) -> u32 {
                 .to_le_bytes(),
         );
         update_hash(&mut hash, &field.candidates.bits().to_le_bytes());
+    }
+    if let Some(compact_schema_map) = compact_schema_map {
+        update_hash(&mut hash, compact_schema_map);
     }
     hash
 }

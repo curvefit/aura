@@ -3,8 +3,8 @@ use std::process::Command;
 
 use aura_codec::{records, Profile};
 
-const SCHEMA_HEADER: &str = "255,0,2,2,2,0,1,0,0,6,8";
-const SCHEMA_BYTES: &[u8] = &[255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8];
+const SCHEMA_HEADER: &str = "100,0,2,2,2,0,1,0,0,6,8";
+const SCHEMA_BYTES: &[u8] = &[100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8];
 
 #[test]
 fn json_positional_rows_encode_compile_and_decode_from_schema_header() {

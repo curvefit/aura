@@ -7,7 +7,7 @@ use aura_codec::{generic_i64_parent_schema, FieldScope};
 
 #[test]
 fn generic_planner_derives_candle_shape_from_parent_hints() {
-    let schema = generic_i64_parent_schema("candles", &[255, 0, 2, 2, 2, 0]).unwrap();
+    let schema = generic_i64_parent_schema("candles", &[100, 0, 2, 2, 2, 0]).unwrap();
     let rows = vec![
         vec![1_000, 100_000, 100_250, 99_900, 100_120, 8_000],
         vec![2_000, 100_130, 100_400, 100_050, 100_300, 8_100],
@@ -67,7 +67,7 @@ fn generic_planner_derives_candle_shape_from_parent_hints() {
 
 #[test]
 fn generic_planner_selects_tick_stream_ops_without_field_names() {
-    let schema = generic_i64_parent_schema("ticks", &[255, 0, 0, 0, 0, 0]).unwrap();
+    let schema = generic_i64_parent_schema("ticks", &[100, 0, 0, 0, 0, 0]).unwrap();
     let rows = (0..300)
         .map(|index| {
             vec![
@@ -100,7 +100,7 @@ fn generic_planner_selects_tick_stream_ops_without_field_names() {
 
 #[test]
 fn generic_planner_emits_group_hints_for_repeated_slots() {
-    let schema = generic_i64_parent_schema("book", &[255, 0, 0, 128, 128, 128, 128]).unwrap();
+    let schema = generic_i64_parent_schema("book", &[100, 0, 0, 204, 0, 0, 0]).unwrap();
     let rows = vec![
         vec![1_000, 10, 1, 0, 100_000, 5, 0],
         vec![1_000, 10, 1, 1, 100_010, 0, 1],
@@ -138,8 +138,7 @@ fn generic_planner_emits_group_hints_for_repeated_slots() {
 #[test]
 fn generic_planner_uses_sparse_presence_for_zero_heavy_repeated_slots() {
     let schema =
-        generic_i64_parent_schema("parented_repeated", &[255, 0, 0, 128, 132, 133, 133, 133])
-            .unwrap();
+        generic_i64_parent_schema("parented_repeated", &[100, 0, 0, 205, 4, 5, 5, 5]).unwrap();
     let rows = (0..256)
         .flat_map(|event| {
             (0..8).map(move |level| {
@@ -208,7 +207,7 @@ fn generic_planner_uses_sparse_presence_for_zero_heavy_repeated_slots() {
 #[test]
 fn generic_planner_selects_sparse_set_by_total_saved_bytes() {
     let schema =
-        generic_i64_parent_schema("parented_repeated", &[255, 0, 0, 128, 132, 133, 133]).unwrap();
+        generic_i64_parent_schema("parented_repeated", &[100, 0, 0, 204, 4, 5, 5]).unwrap();
     let rows = (0..128)
         .flat_map(|event| {
             (0..4).map(move |level| {
@@ -253,8 +252,7 @@ fn generic_planner_selects_sparse_set_by_total_saved_bytes() {
 #[test]
 fn generic_planner_uses_partition_runs_and_segmented_child_deltas() {
     let schema =
-        generic_i64_parent_schema("parented_repeated", &[255, 0, 0, 128, 132, 133, 133, 133])
-            .unwrap();
+        generic_i64_parent_schema("parented_repeated", &[100, 0, 0, 205, 4, 5, 5, 5]).unwrap();
     let rows = (0..96)
         .flat_map(|event| {
             let run_sizes = [
@@ -330,7 +328,7 @@ fn generic_planner_uses_partition_runs_and_segmented_child_deltas() {
 
 #[test]
 fn generic_planner_uses_fixed_partition_order_with_variable_run_counts() {
-    let schema = generic_i64_parent_schema("parented_repeated", &[255, 0, 0, 128, 132]).unwrap();
+    let schema = generic_i64_parent_schema("parented_repeated", &[100, 0, 0, 202, 4]).unwrap();
     let rows = (0..16)
         .flat_map(|event| {
             let first_len = 1 + usize::from(event % 3 == 0);
@@ -371,7 +369,7 @@ fn generic_planner_uses_fixed_partition_order_with_variable_run_counts() {
 
 #[test]
 fn generic_planner_uses_prev_varint_for_skewed_previous_deltas() {
-    let schema = generic_i64_parent_schema("skewed", &[255, 0]).unwrap();
+    let schema = generic_i64_parent_schema("skewed", &[100, 0]).unwrap();
     let rows = (0..12)
         .scan(1_000_000i64, |value, index| {
             if index == 6 {
@@ -393,7 +391,7 @@ fn generic_planner_uses_prev_varint_for_skewed_previous_deltas() {
 
 #[test]
 fn generic_planner_uses_packed_dictionary_for_repeated_wide_values() {
-    let schema = generic_i64_parent_schema("wide_repeats", &[255]).unwrap();
+    let schema = generic_i64_parent_schema("wide_repeats", &[100]).unwrap();
     let buckets = [0, 1_000_000_000_000, 17, 999_999_999_937];
     let rows = (0..15)
         .map(|index| {

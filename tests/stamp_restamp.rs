@@ -5,7 +5,7 @@ use aura_codec::schema::{
 use aura_codec::writer;
 use aura_codec::{records, AuraError, AuraTypedValue, AuraTypedWriter, Profile};
 
-const PARENT_MAP: &[u8] = &[255, 0, 2, 2, 2, 0];
+const PARENT_MAP: &[u8] = &[100, 0, 2, 2, 2, 0];
 
 fn rows() -> Vec<Vec<i64>> {
     vec![
@@ -58,7 +58,7 @@ fn restamp_preserves_rows_metadata_and_rejects_non_lossless_schema() {
     let source_schema = generic_i64_parent_schema("restamp_source", PARENT_MAP).unwrap();
     let source = writer::stamp_i64(input(source_schema)).unwrap();
     let flatter_schema =
-        generic_i64_parent_schema("restamp_flatter", &[255, 0, 0, 0, 0, 0]).unwrap();
+        generic_i64_parent_schema("restamp_flatter", &[100, 0, 0, 0, 0, 0]).unwrap();
     let restamped = writer::restamp_i64(&source, flatter_schema).unwrap();
     let decoded = records::decode_i64_file(&restamped).unwrap();
 
@@ -67,12 +67,12 @@ fn restamp_preserves_rows_metadata_and_rejects_non_lossless_schema() {
     assert_eq!(19, decoded.header.dictionary_id);
     assert_eq!("ts,open,high,low,close,volume", decoded.header.comment);
     assert_eq!(
-        &[255, 0, 0, 0, 0, 0],
+        &[100, 0, 0, 0, 0, 0],
         decoded.header.schema_mapping.as_slice()
     );
     assert_eq!(rows(), decoded.rows);
 
-    let short_schema = generic_i64_parent_schema("restamp_short", &[255, 0, 0]).unwrap();
+    let short_schema = generic_i64_parent_schema("restamp_short", &[100, 0, 0]).unwrap();
     let short_error = diagnostic(writer::restamp_i64(&source, short_schema).unwrap_err());
     assert_eq!("field count mismatch", short_error.reason);
     assert_eq!(Some(0), short_error.row_index);

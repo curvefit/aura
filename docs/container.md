@@ -51,20 +51,25 @@ type, tick size, and quantity step. The current Rust implementation emits this
 compact schema-map dialect:
 
 ```text
-255      timestamp slot; currently required at physical slot 0
 0        event/root slot with no parent
-1-127    event slot parent; parent index = byte - 1
-128      repeated child root slot
-129-254  repeated child parent; parent index = byte - 129
+1-99     parent slot; parent index = byte - 1
+100      timestamp slot; expected at physical slot 0 when present
+101-199  derived parent/root marker; slot number = byte - 100
+200      dual-domain repeated group marker
+201-239  repeated group width; width = byte - 200 slots
+241      1-bit boolean leaf
+242      2-bit enum leaf, up to 4 outcomes
+243      bitfield leaf, up to 8 flags
+255      opaque / do-not-attempt stream
 ```
 
 Constants, scales, residuals, and physical coding choices remain in the
 footer/body. `comment_utf8` is optional human-facing text, such as CSV-style
 field labels. The stamped footer schema remains the authoritative schema copy.
 
-The richer target dialect discussed in planning reserves bytes for overflow
-derived references, group array widths, booleans, enums, and opaque streams. It
-is not the current emitted Rust contract.
+Files without a `100` timestamp marker are treated as non-time-series data.
+Group-width bytes mark the current slot and the following `width - 1` slots as
+repeated fields.
 
 ## Body
 

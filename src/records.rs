@@ -13,7 +13,7 @@ use crate::header::{AuraHeader, HEADER_PREFIX_SIZE};
 use crate::instructions::GenericInstructionPlan;
 use crate::plan::{unpack_ref_divisor, unpack_two_refs, Aura0Plan, Aura1Plan, FieldEncoding};
 use crate::program::{CompiledFooter, DecodeProgram};
-use crate::schema::{schema_parent_mapping, SchemaDescriptor};
+use crate::schema::{schema_parent_mapping, FieldRole, SchemaDescriptor};
 use crate::stats::IngestStats;
 use crate::{AuraError, PhysicalWidth, Profile, Result};
 
@@ -45,7 +45,10 @@ pub(crate) fn encode_ingest_i64_file_inner(input: I64FileInput) -> Result<Vec<u8
     for row in &input.rows {
         stats.observe_i64_record(&input.schema, row)?;
     }
-    observe_timestamp_runs(&mut stats, &input.rows);
+    let timestamp_index = timestamp_field_index(&input.schema);
+    if let Some(timestamp_index) = timestamp_index {
+        observe_timestamp_runs(&mut stats, &input.rows, timestamp_index);
+    }
 
     let aura0_plan = Aura0Plan::from_schema_rows_stats(&input.schema, &stats, &input.rows)?;
     let aura1_plan = Aura1Plan::from_stats(&stats, 1);
@@ -55,10 +58,8 @@ pub(crate) fn encode_ingest_i64_file_inner(input: I64FileInput) -> Result<Vec<u8
         .with_aura1_plan(aura1_plan)
         .with_generic_aura0_plan(generic_aura0_plan);
     let body = encode_raw_body(input.schema.fields.len(), &input.rows)?;
-    let base_time_ns = input
-        .rows
-        .first()
-        .and_then(|row| row.first().copied())
+    let base_time_ns = timestamp_index
+        .and_then(|index| input.rows.first().and_then(|row| row.get(index)).copied())
         .unwrap_or(0);
     let header_comment = input.header_comment.as_deref().unwrap_or("");
 
@@ -1275,11 +1276,19 @@ pub(crate) fn validate_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Res
     Ok(())
 }
 
-fn observe_timestamp_runs(stats: &mut IngestStats, rows: &[Vec<i64>]) {
+fn timestamp_field_index(schema: &SchemaDescriptor) -> Option<usize> {
+    schema
+        .fields
+        .iter()
+        .find(|field| field.role == FieldRole::Timestamp)
+        .map(|field| usize::from(field.index))
+}
+
+fn observe_timestamp_runs(stats: &mut IngestStats, rows: &[Vec<i64>], timestamp_index: usize) {
     let mut previous_ts = None;
     let mut run_len = 0u32;
     for row in rows {
-        let ts = row.first().copied();
+        let ts = row.get(timestamp_index).copied();
         if ts == previous_ts {
             run_len += 1;
         } else {

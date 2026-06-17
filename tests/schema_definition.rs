@@ -15,7 +15,7 @@ const FIELD_NAMES: &[&str] = &[
     "taker_buy_quote_asset_volume",
 ];
 
-const PARENT_SLOTS: &[u8] = &[255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8];
+const PARENT_SLOTS: &[u8] = &[100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8];
 
 #[test]
 fn code_defined_i64_schema_definition_supplies_schema_and_header_comment() {
@@ -55,7 +55,7 @@ fn code_defined_i64_schema_definition_supplies_schema_and_header_comment() {
 
 #[test]
 fn code_defined_i64_schema_definition_validates_header_shape() {
-    assert!(I64SchemaDefinition::from_field_names("bad", &["ts"], &[0]).is_err());
-    assert!(I64SchemaDefinition::from_field_names("bad", &["ts", "v1"], &[255, 2]).is_err());
-    assert!(I64SchemaDefinition::from_field_names("bad", &["ts"], &[255, 0]).is_err());
+    assert!(I64SchemaDefinition::from_field_names("bad", &["ts"], &[]).is_err());
+    assert!(I64SchemaDefinition::from_field_names("bad", &["ts", "v1"], &[100, 2]).is_err());
+    assert!(I64SchemaDefinition::from_field_names("bad", &["ts"], &[100, 0]).is_err());
 }

@@ -5,8 +5,8 @@ use aura_codec::schema::{
 };
 use aura_codec::{records, Profile};
 
-const GENERIC_PARENT_MAP: &[u8] = &[255, 0, 2, 2, 2, 0];
-const REPEATED_PARENT_MAP: &[u8] = &[255, 0, 0, 128, 132, 133, 133];
+const GENERIC_PARENT_MAP: &[u8] = &[100, 0, 2, 2, 2, 0];
+const REPEATED_PARENT_MAP: &[u8] = &[100, 0, 0, 204, 4, 5, 5];
 
 fn sample_rows() -> Vec<Vec<i64>> {
     vec![
@@ -133,10 +133,11 @@ fn schema_map_byte_contract_round_trips_event_and_repeated_slots() {
     );
 
     assert!(decode_schema_map(&[]).is_err());
-    assert!(decode_schema_map(&[0, 255]).is_err());
-    assert!(decode_schema_map(&[255, 255]).is_err());
-    assert!(decode_schema_map(&[255, 2]).is_err());
-    assert!(decode_schema_map(&[255, 3, 0]).is_err());
+    assert!(decode_schema_map(&[100, 100]).is_err());
+    assert!(decode_schema_map(&[100, 2]).is_err());
+    assert!(decode_schema_map(&[100, 3, 0]).is_err());
+    assert!(decode_schema_map(&[100, 0, 205]).is_err());
+    assert!(decode_schema_map(&[100, 240]).is_err());
 }
 
 fn schema_parent_map_from_file(

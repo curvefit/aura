@@ -1,6 +1,7 @@
 use aura_codec::schema::{
-    generic_i64_parent_schema, generic_i64_schema, FieldRelation, FieldScope, FieldTransform,
-    RelatedFieldMapping,
+    decode_schema_map, generic_i64_parent_schema, generic_i64_schema, schema_parent_mapping,
+    FieldRelation, FieldRole, FieldScope, FieldTransform, FieldType, RelatedFieldMapping,
+    SchemaMapHint,
 };
 use aura_codec::{records, AuraError, FieldEncoding, Profile};
 
@@ -118,7 +119,7 @@ fn generic_i64_schema_rejects_invalid_related_mappings() {
 #[test]
 fn generic_i64_parent_schema_maps_time_and_parent_bytes() {
     let schema =
-        generic_i64_parent_schema("dynamic_ohlcv_plus_flow_v1", &[255, 0, 2, 2, 2, 0, 6, 6])
+        generic_i64_parent_schema("dynamic_ohlcv_plus_flow_v1", &[100, 0, 2, 2, 2, 0, 6, 6])
             .unwrap();
 
     assert_eq!(8, schema.fields.len());
@@ -135,11 +136,8 @@ fn generic_i64_parent_schema_maps_time_and_parent_bytes() {
 
 #[test]
 fn generic_i64_parent_schema_maps_repeated_child_scope() {
-    let schema = generic_i64_parent_schema(
-        "dynamic_book_delta_v1",
-        &[255, 0, 0, 128, 128, 128, 128, 128],
-    )
-    .unwrap();
+    let schema =
+        generic_i64_parent_schema("dynamic_book_delta_v1", &[100, 0, 0, 205, 0, 0, 0, 0]).unwrap();
 
     assert_eq!(FieldScope::Event, schema.fields[0].scope);
     assert_eq!(FieldScope::Event, schema.fields[1].scope);
@@ -150,8 +148,67 @@ fn generic_i64_parent_schema_maps_repeated_child_scope() {
 }
 
 #[test]
+fn generic_i64_parent_schema_maps_extended_header_bytes() {
+    let parent_slots = [100, 101, 2, 204, 4, 241, 242, 243, 255];
+    let entries = decode_schema_map(&parent_slots).unwrap();
+
+    assert_eq!(SchemaMapHint::Timestamp, entries[0].hint);
+    assert_eq!(
+        SchemaMapHint::DerivedRoot { slot_number: 1 },
+        entries[1].hint
+    );
+    assert_eq!(FieldRelation::DeltaFromField(1), entries[2].relation);
+    assert_eq!(SchemaMapHint::Group { width: 4 }, entries[3].hint);
+    assert_eq!(FieldScope::Repeated, entries[3].scope);
+    assert_eq!(FieldScope::Repeated, entries[4].scope);
+    assert_eq!(FieldScope::Repeated, entries[5].scope);
+    assert_eq!(FieldScope::Repeated, entries[6].scope);
+    assert_eq!(FieldScope::Event, entries[7].scope);
+    assert_eq!(SchemaMapHint::Boolean { bits: 1 }, entries[5].hint);
+    assert_eq!(SchemaMapHint::Enum { bits: 2 }, entries[6].hint);
+    assert_eq!(SchemaMapHint::Bitfield { bits: 8 }, entries[7].hint);
+    assert_eq!(SchemaMapHint::DoNotAttempt, entries[8].hint);
+
+    let schema = generic_i64_parent_schema("extended_header_v1", &parent_slots).unwrap();
+    assert_eq!(FieldRole::Boolean, schema.fields[5].role);
+    assert_eq!(FieldRole::Enum, schema.fields[6].role);
+    assert_eq!(FieldRole::Bitfield, schema.fields[7].role);
+    assert_eq!(FieldType::Opaque16, schema.fields[8].field_type);
+    assert_eq!(
+        parent_slots.as_slice(),
+        schema_parent_mapping(&schema).unwrap().as_slice()
+    );
+}
+
+#[test]
+fn generic_i64_parent_schema_accepts_non_time_series_maps() {
+    let parent_slots = [0, 0, 241];
+    let schema = generic_i64_parent_schema("non_time_series_v1", &parent_slots).unwrap();
+
+    assert_eq!("v0", schema.fields[0].name);
+    assert_eq!(FieldRole::Value, schema.fields[0].role);
+    assert_eq!(FieldRole::Boolean, schema.fields[2].role);
+
+    let ingest = records::encode_ingest_i64_file(records::I64FileInput {
+        schema,
+        rows: vec![vec![10, 20, 1], vec![11, 21, 0]],
+        stream_id: 0,
+        dictionary_id: 0,
+        header_comment: None,
+    })
+    .unwrap();
+    let decoded = records::decode_i64_file(&ingest).unwrap();
+
+    assert_eq!(0, decoded.header.base_time_ns);
+    assert_eq!(
+        parent_slots.as_slice(),
+        decoded.header.schema_mapping.as_slice()
+    );
+}
+
+#[test]
 fn generic_i64_writer_preserves_scoped_parent_map_in_header() {
-    let parent_slots = vec![255, 0, 0, 128, 128, 128, 128, 128];
+    let parent_slots = vec![100, 0, 0, 205, 0, 0, 0, 0];
     let schema = generic_i64_parent_schema("dynamic_book_delta_v1", &parent_slots).unwrap();
     let rows = vec![
         vec![1_000, 10, 20, 1, 0, 100_000, 5, 0],
@@ -176,7 +233,7 @@ fn generic_i64_writer_preserves_scoped_parent_map_in_header() {
 #[test]
 fn generic_i64_parent_schema_drives_dynamic_aura0_related_deltas() {
     let schema =
-        generic_i64_parent_schema("dynamic_ohlcv_plus_flow_v1", &[255, 0, 2, 2, 2, 0, 6, 6])
+        generic_i64_parent_schema("dynamic_ohlcv_plus_flow_v1", &[100, 0, 2, 2, 2, 0, 6, 6])
             .unwrap();
     let rows = vec![
         vec![
@@ -243,7 +300,7 @@ fn generic_i64_parent_schema_drives_dynamic_aura0_related_deltas() {
 #[test]
 fn generic_i64_parent_schema_uses_length_prefixed_parent_encoding() {
     let schema =
-        generic_i64_parent_schema("dynamic_ohlcv_plus_flow_v1", &[255, 0, 2, 2, 2, 0, 6, 6])
+        generic_i64_parent_schema("dynamic_ohlcv_plus_flow_v1", &[100, 0, 2, 2, 2, 0, 6, 6])
             .unwrap();
     let rows = vec![vec![
         1_000_000_000,
@@ -268,17 +325,17 @@ fn generic_i64_parent_schema_uses_length_prefixed_parent_encoding() {
     let (schema_len, schema_encoding) = ingest_schema_block(&ingest);
 
     assert_eq!(10, schema_len);
-    assert_eq!(&[0, 8, 255, 0, 2, 2, 2, 0, 6, 6], schema_encoding);
+    assert_eq!(&[0, 8, 100, 0, 2, 2, 2, 0, 6, 6], schema_encoding);
 }
 
 #[test]
 fn generic_i64_parent_schema_rejects_forward_and_self_parents() {
     assert_eq!(
         Err(AuraError::InvalidValue("parent slot")),
-        generic_i64_parent_schema("bad_self_parent", &[255, 2])
+        generic_i64_parent_schema("bad_self_parent", &[100, 2])
     );
     assert_eq!(
         Err(AuraError::InvalidValue("parent slot")),
-        generic_i64_parent_schema("bad_forward_parent", &[255, 0, 4])
+        generic_i64_parent_schema("bad_forward_parent", &[100, 0, 4])
     );
 }

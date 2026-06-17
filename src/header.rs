@@ -137,7 +137,7 @@ mod tests {
     fn header_round_trips_front_schema_mapping() {
         let open = AuraHeader::new(Profile::Ingest)
             .with_stream(7, 3, 1_725_000_000_000_000_000)
-            .with_schema_mapping(vec![255, 0, 2, 2, 2, 0])
+            .with_schema_mapping(vec![100, 0, 2, 2, 2, 0])
             .unwrap();
         let encoded = open.encode().unwrap();
         let decoded_open = AuraHeader::decode(&encoded).unwrap();
@@ -146,7 +146,7 @@ mod tests {
         assert_eq!(3, decoded_open.dictionary_id);
         assert_eq!(1_725_000_000_000_000_000, decoded_open.base_time_ns);
         assert_eq!(
-            &[255, 0, 2, 2, 2, 0],
+            &[100, 0, 2, 2, 2, 0],
             decoded_open.schema_mapping.as_slice()
         );
         assert_eq!("", decoded_open.comment);

@@ -10,7 +10,7 @@ use aura_codec::program::{CompiledFooter, DecodeProgram};
 use aura_codec::schema::generic_i64_parent_schema;
 use aura_codec::{records, IngestStats, Profile};
 
-const RICH_PARENT_MAP: &[u8] = &[255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8];
+const RICH_PARENT_MAP: &[u8] = &[100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8];
 
 fn rich_rows() -> Vec<Vec<i64>> {
     (0..48)
@@ -378,7 +378,7 @@ fn compiled_footer_identity_survives_round_trip_chain() {
 #[test]
 fn generic_instruction_footer_preserves_all_stream_and_group_variants() {
     let schema =
-        generic_i64_parent_schema("all_variant_footer", &[255, 0, 0, 128, 128, 128, 128]).unwrap();
+        generic_i64_parent_schema("all_variant_footer", &[100, 0, 0, 204, 0, 0, 0]).unwrap();
     let mut stats = IngestStats::new_for_schema(&schema).unwrap();
     stats
         .observe_i64_record(&schema, &[1_000, 10, 20, 0, 100, 5, 1])

@@ -43,9 +43,10 @@ pub use instructions::{
 pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 pub use reader::AuraI64Reader;
 pub use schema::{
-    generic_i64_parent_schema, schema_parent_mapping, FieldDescriptor, FieldRelation, FieldRole,
-    FieldScope, FieldTransform, FieldType, I64SchemaDefinition, RelatedFieldMapping, SchemaBuilder,
-    SchemaDescriptor, TransformCandidates,
+    decode_schema_map, generic_i64_parent_schema, schema_parent_mapping, FieldDescriptor,
+    FieldRelation, FieldRole, FieldScope, FieldTransform, FieldType, I64SchemaDefinition,
+    RelatedFieldMapping, SchemaBuilder, SchemaDescriptor, SchemaMapEntry, SchemaMapHint,
+    TransformCandidates,
 };
 pub use stats::{FieldStats, IngestStats, PhysicalWidth, RunHistogramEntry, ShapeStats};
 pub use types::Profile;

@@ -13,22 +13,25 @@ comment_utf8  comment_len bytes
 The current Rust compact schema-map dialect is intentionally small:
 
 ```text
-255      timestamp slot; currently required at physical slot 0
 0        event/root slot with no parent
-1-127    event slot parent; parent index = byte - 1
-128      repeated child root slot
-129-254  repeated child parent; parent index = byte - 129
+1-99     parent slot; parent index = byte - 1
+100      timestamp slot; expected at physical slot 0 when present
+101-199  derived parent/root marker; slot number = byte - 100
+200      dual-domain repeated group marker
+201-239  repeated group width; width = byte - 200 slots
+241      1-bit boolean leaf
+242      2-bit enum leaf, up to 4 outcomes
+243      bitfield leaf, up to 8 flags
+255      opaque / do-not-attempt stream
 ```
 
-Timestamp is currently expected in physical slot `0`. Parent refs encode an
-earlier physical slot, so byte `2` means "delta from slot 1". Repeated slots use
-the same parent idea with the `128` offset. This is enough for the current
-generic i64 path to expose event roots, event parent relationships, repeated
-child roots, and repeated child parent relationships.
-
-The richer target dialect discussed in planning can add overflow derived
-references, group array widths, boolean and enum leaves, and opaque streams.
-Those target bytes are design notes, not current Rust output.
+Timestamp is expected in physical slot `0` when present. Files without byte
+`100` are treated as non-time-series data. Parent refs encode an earlier
+physical slot, so byte `2` means "delta from slot 1". A group-width byte marks
+the current slot and the following `width - 1` slots as repeated child fields.
+The mapping exposes event roots, parent relationships, derived roots, repeated
+groups, boolean/enum/bitfield leaves, and opaque streams without naming a
+market-data schema.
 
 The mapping is a quick file-shape preview and body-start metadata. It is not the
 full footer program. Constants, decimal scales, residual values, bit widths,
@@ -50,7 +53,7 @@ slots:
 5 volume
 
 schema map:
-255 0 2 2 2 0
+100 0 2 2 2 0
 ```
 
 Repeated child rows flattened into fixed-width logical records:
@@ -66,22 +69,22 @@ slots:
 6 child_flag  repeated parent=slot4
 
 schema map:
-255 0 0 128 132 133 133
+100 0 0 204 4 5 5
 ```
 
-### Target extended examples
+### Extended examples
 
-The following examples show the planned richer header hints. They require an
-extended dialect before they are valid emitted bytes in this crate.
+These richer hints are valid compact schema bytes in the current crate:
 
 ```text
 100 timestamp axis
-101 derived expression reference
-200 wrapper for the next group/node
-202 repeated element width = 2
-241 one-bit boolean stream
-242 two-bit enum stream
-255 opaque stream
+101 derived/root marker for slot 1
+200 dual-domain repeated group marker
+202 repeated group width = 2 slots
+241 one-bit boolean leaf
+242 two-bit enum leaf
+243 bitfield leaf, up to 8 flags
+255 opaque / do-not-attempt stream
 ```
 
 ```text
@@ -103,9 +106,9 @@ schema_map_len   u8
 schema_map       schema_map_len bytes
 ```
 
-Slot `0` is the timestamp slot when the map starts with `255`. Slots `1..N` are
-generic `i64` values. This uses the same byte convention as the current front
-header.
+Slot `0` is the timestamp slot when the map starts with `100`. Slots without
+leaf markers are generic `i64` values. This uses the same byte convention as the
+current front header.
 
 Schema encoding type `1` is the full field-descriptor fallback for richer
 schemas:
@@ -184,19 +187,18 @@ slot  field         role        common Aura0 result
 The front header mapping for this shape is intentionally plain:
 
 ```text
-[255, 0, 0, 0, 0]
+[100, 0, 0, 0, 0]
 ```
 
 or, with flags:
 
 ```text
-[255, 0, 0, 0, 0, 0]
+[100, 0, 0, 0, 0, 241]
 ```
 
 This says slot `0` is time and ordinary numeric slots are roots. Boolean and
-enum leaf markers belong to the target extended dialect, not the current Rust
-emitted dialect. The useful tick transforms are previous-row and base
-transforms, so no fake parent link is needed.
+enum leaf markers are compact generic hints; the useful tick transforms are
+previous-row and base transforms, so no fake parent link is needed.
 
 Bybit spot trades expose a numeric `execId`, which can be modeled as an
 `Identifier` and compressed with previous/base bitpacking when it is monotonic.
@@ -276,16 +278,15 @@ high   max(open, close) + residual
 low    min(open, close) - residual
 ```
 
-For repeated child streams, the current emitted dialect marks repeated roots
-with `128` and repeated parent links with `129..254`. The target extended
-dialect can add group-width bytes such as `201..239` and wrappers such as
-`200`, but those bytes are not emitted by the current Rust helper.
+For repeated child streams, the current emitted dialect marks the first repeated
+slot with a group-width byte such as `204`, which means "this slot and the next
+three slots are repeated." Slots inside the group still use ordinary root bytes
+or `1..99` parent bytes.
 
 If a future transform cannot be derived from those hints plus observed values,
 the schema header needs a generic hint, not a domain-specific one. The current
-minimum emitted hint set is timestamp, parent relationships, and repeated
-scope. The target hint set also includes generic group, derived-expression,
-leaf-size, boolean/enum, and opaque markers.
+minimum emitted hint set is timestamp, parent relationships, derived roots,
+repeated groups, boolean/enum/bitfield leaves, and opaque markers.
 
 `generic_i64_parent_schema` is the compact schema-map path for dynamic
 OHLCV-like records and repeated child records. The map includes the timestamp
@@ -304,7 +305,7 @@ slots:
 7 taker_sell
 
 schema map:
-255 0 2 2 2 0 6 6
+100 0 2 2 2 0 6 6
 ```
 
 This says slot `0` is the timestamp, high/low/close are parented to open, and
@@ -333,7 +334,7 @@ slots:
 6 delete_flag
 
 schema map:
-255 0 0 128 128 128 128
+100 0 0 204 0 0 0
 ```
 
 Slots `0..2` are event-level fields and slots `3..6` are repeated child fields.
@@ -378,14 +379,14 @@ field_names = [
   "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume",
 ]
 
-schema_map = [255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8]
+schema_map = [100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8]
 ```
 
 This produces:
 
 ```text
 comment     = open_time_ms,open,high,low,close,volume,...
-schema_map  = [255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8]
+schema_map  = [100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8]
 ```
 
 The generic schema-definition helper validates that slot `0` is the primary

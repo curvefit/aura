@@ -111,15 +111,16 @@ shape:
 
 ```text
 0        no parent / root
-1-99     direct parent slot ref, exact physical slot number
+1-99     direct parent slot ref; parent index = byte - 1
 100      timestamp axis / timestamp parent ref
-101-199  derived expression ref, exact expression number
+101-199  derived parent/root marker; slot number = byte - 100
 200      dual-domain wrapper for the next group/node
 201-239  group array: width = byte - 200
 240      reserved
 241      1-bit boolean stream
 242      2-bit enum stream, up to 4 outcomes
-243-253  reserved
+243      bitfield stream, up to 8 flags
+244-253  reserved
 255      opaque / do-not-attempt stream
 ```
 

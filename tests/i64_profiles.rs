@@ -59,7 +59,7 @@ fn ingest_header_stores_parent_mapping_before_body() {
     assert_eq!(7u16.to_le_bytes(), file[18..20]);
     assert_eq!(6, file[20]);
     assert_eq!(0, file[21]);
-    assert_eq!(&[255, 0, 2, 2, 2, 0], &file[22..28]);
+    assert_eq!(&[100, 0, 2, 2, 2, 0], &file[22..28]);
     assert_eq!(3, read_u64_le(&file[header_len..header_len + 8]));
 }
 
@@ -82,7 +82,7 @@ fn ingest_header_stores_comment_after_parent_mapping() {
     assert_eq!(57, header_len);
     assert_eq!(6, file[20]);
     assert_eq!(29, file[21]);
-    assert_eq!(&[255, 0, 2, 2, 2, 0], &file[22..28]);
+    assert_eq!(&[100, 0, 2, 2, 2, 0], &file[22..28]);
     assert_eq!(comment.as_bytes(), &file[28..57]);
     assert_eq!(3, read_u64_le(&file[header_len..header_len + 8]));
 
@@ -119,7 +119,7 @@ fn ingest_i64_file_round_trips_rows_and_footer_plans() {
     assert_eq!(7, decoded.header.dictionary_id);
     assert_eq!(1_000_000_000, decoded.header.base_time_ns);
     assert_eq!(
-        &[255, 0, 2, 2, 2, 0],
+        &[100, 0, 2, 2, 2, 0],
         decoded.header.schema_mapping.as_slice()
     );
     assert_eq!(rows, decoded.rows);
@@ -140,7 +140,7 @@ fn ingest_i64_file_round_trips_rows_and_footer_plans() {
 
 #[test]
 fn aura0_conversion_preserves_generic_stamp_from_ingest() {
-    let schema = generic_i64_parent_schema("generic_stamp_flow", &[255, 0, 2, 2, 2, 0]).unwrap();
+    let schema = generic_i64_parent_schema("generic_stamp_flow", &[100, 0, 2, 2, 2, 0]).unwrap();
     let rows: Vec<Vec<i64>> = (0..64)
         .map(|idx| {
             let open = 10_000 + i64::from(idx % 5) * 10;
@@ -289,7 +289,7 @@ fn compiled_aura0_uses_bitpacked_delta_body() {
 #[test]
 fn compiled_aura0_round_trips_derived_and_biased_bitpacked_fields() {
     let schema =
-        aura_codec::generic_i64_parent_schema("derived_and_biased", &[255, 0, 2, 0]).unwrap();
+        aura_codec::generic_i64_parent_schema("derived_and_biased", &[100, 0, 2, 0]).unwrap();
     let mut previous = 10_000;
     let mut rows = Vec::new();
     for idx in 0..130 {
@@ -337,7 +337,7 @@ fn compiled_aura0_round_trips_derived_and_biased_bitpacked_fields() {
 
 #[test]
 fn compiled_aura0_round_trips_full_i64_span_without_delta_overflow() {
-    let schema = generic_i64_parent_schema("wide_value_v1", &[255, 0]).unwrap();
+    let schema = generic_i64_parent_schema("wide_value_v1", &[100, 0]).unwrap();
     let rows = vec![vec![1_000, i64::MIN], vec![1_001, i64::MAX], vec![1_002, 0]];
 
     let ingest = records::encode_ingest_i64_file(records::I64FileInput {
@@ -356,7 +356,7 @@ fn compiled_aura0_round_trips_full_i64_span_without_delta_overflow() {
 #[test]
 fn compiled_aura0_uses_candle_and_residual_footer_programs() {
     let schema =
-        aura_codec::generic_i64_parent_schema("btc_like", &[255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8])
+        aura_codec::generic_i64_parent_schema("btc_like", &[100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8])
             .unwrap();
     let rows = vec![
         vec![
@@ -418,7 +418,7 @@ fn compiled_aura0_uses_candle_and_residual_footer_programs() {
 fn compiled_profiles_share_stamp_and_convert_without_replanning() {
     let schema = aura_codec::generic_i64_parent_schema(
         "aura0_to_aura1",
-        &[255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8],
+        &[100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8],
     )
     .unwrap();
     let rows: Vec<Vec<i64>> = (0..32)
