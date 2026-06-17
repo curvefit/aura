@@ -129,6 +129,32 @@ Collectors should write normalized `.aura` ingest values using generous integer
 types. The schema tells Aura what those values mean; ingest stats tell Aura how
 small or fast the compiled representation can be.
 
+Phase 3 supports a typed writer boundary in addition to the existing
+`Vec<Vec<i64>>` compatibility path:
+
+```text
+default numeric value  i64
+explicit wide number   i128
+opaque identifier      opaque16
+```
+
+Explicit `i128` is for true numeric overflow or arithmetic fields that cannot
+fit in `i64`. `opaque16` is for fixed 16-byte identifiers and is not treated as
+an arithmetic number. Opaque fields default to absolute-only candidates and
+cannot be parent-delta fields.
+
+The current sealed body implementation remains i64-only. A typed writer may
+accept declared `i128` or `opaque16` values for validation, but it rejects
+sealing with a structured diagnostic until a lossless wide-field body exists.
+Strict mode never silently downcasts and never mutates the schema. Overflow and
+width mismatches report the row, slot, declared type, observed type/value class,
+and suggested upgrade.
+
+Derived slots have one owner for a given ingest path. A slot may be supplied by
+the caller as an ordinary logical field or reserved for an internal derivation,
+but the writer rejects supplying values for a slot also marked internally
+derived. Internal derivation execution is separate from this ownership guard.
+
 Starter schema constructors exist for:
 
 ```text

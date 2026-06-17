@@ -33,7 +33,7 @@ pub mod warm;
 pub mod writer;
 
 pub use body::{decode_generic_stream_body, encode_generic_stream_body, GenericStreamBodyValue};
-pub use error::{AuraError, Result};
+pub use error::{AuraDiagnostic, AuraError, Result};
 pub use footer::{AuraFooter, CompressionDescriptor, CompressionKind};
 pub use generic_planner::{
     decode_generic_i64_rows, decode_generic_i64_rows_body, encode_generic_i64_rows,
@@ -54,4 +54,4 @@ pub use schema::{
 };
 pub use stats::{FieldStats, IngestStats, PhysicalWidth, RunHistogramEntry, ShapeStats};
 pub use types::{BookEvent, BookId, LevelChange, Profile};
-pub use writer::AuraI64Writer;
+pub use writer::{AuraI64Writer, AuraTypedValue, AuraTypedWriter};

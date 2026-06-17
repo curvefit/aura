@@ -79,6 +79,11 @@ The body is profile-specific:
 The body should not need per-record schema mutation. Schema and layout decisions
 are file-level facts recorded in the footer.
 
+The current writer body path is lossless for declared i64-compatible rows.
+Declared `i128` and `opaque16` values are validated at the typed writer boundary
+but are rejected before sealing until the body codecs can preserve those fields
+losslessly.
+
 ## Footer
 
 The footer stores the facts readers and converters need before replaying the

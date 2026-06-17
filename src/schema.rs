@@ -25,6 +25,8 @@ pub enum FieldType {
     I64 = 7,
     U64 = 8,
     TimestampNs = 9,
+    I128 = 10,
+    Opaque16 = 11,
 }
 
 impl FieldType {
@@ -39,7 +41,25 @@ impl FieldType {
             7 => Ok(Self::I64),
             8 => Ok(Self::U64),
             9 => Ok(Self::TimestampNs),
+            10 => Ok(Self::I128),
+            11 => Ok(Self::Opaque16),
             _ => Err(AuraError::InvalidValue("field type")),
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::I8 => "i8",
+            Self::U8 => "u8",
+            Self::I16 => "i16",
+            Self::U16 => "u16",
+            Self::I32 => "i32",
+            Self::U32 => "u32",
+            Self::I64 => "i64",
+            Self::U64 => "u64",
+            Self::TimestampNs => "timestamp_ns",
+            Self::I128 => "i128",
+            Self::Opaque16 => "opaque16",
         }
     }
 }
@@ -455,7 +475,11 @@ impl SchemaBuilder {
         nullable: bool,
         relation: FieldRelation,
     ) -> Self {
-        let mut candidates = TransformCandidates::default_for_role(role);
+        let mut candidates = if field_type == FieldType::Opaque16 {
+            TransformCandidates::empty().with(FieldTransform::Absolute)
+        } else {
+            TransformCandidates::default_for_role(role)
+        };
         if matches!(relation, FieldRelation::DeltaFromField(_)) {
             candidates = candidates.with(FieldTransform::DeltaRelated);
         }
@@ -504,6 +528,12 @@ impl SchemaBuilder {
             }
             if field.role == FieldRole::Timestamp && field.scope != FieldScope::Event {
                 return Err(AuraError::InvalidValue("timestamp scope"));
+            }
+            if field.field_type == FieldType::Opaque16
+                && field.relation != FieldRelation::None
+                && field.candidates.contains(FieldTransform::DeltaRelated)
+            {
+                return Err(AuraError::InvalidValue("opaque field relation"));
             }
             if let FieldRelation::DeltaFromField(related_index) = field.relation {
                 if usize::from(related_index) >= self.fields.len() || related_index == field.index {
