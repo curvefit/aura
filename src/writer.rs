@@ -139,7 +139,7 @@ impl AuraI64Writer {
     }
 
     pub fn finish(self) -> Result<Vec<u8>> {
-        encode_i64(self.into_input())
+        stamp_i64(self.into_input())
     }
 
     pub fn compile_profile(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
@@ -305,11 +305,32 @@ impl AuraTypedWriter {
 }
 
 pub fn encode_i64(input: I64FileInput) -> Result<Vec<u8>> {
+    validate_i64_input(&input.schema, &input.rows)?;
     records::encode_ingest_i64_file_inner(input)
+}
+
+pub fn stamp_i64(input: I64FileInput) -> Result<Vec<u8>> {
+    encode_i64(input)
 }
 
 pub fn compile_i64(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
     records::compile_i64_file_inner(bytes, target_profile)
+}
+
+pub fn restamp_i64(bytes: &[u8], schema: SchemaDescriptor) -> Result<Vec<u8>> {
+    let decoded = crate::reader::decode_i64(bytes)?;
+    validate_i64_input(&schema, &decoded.rows)?;
+    stamp_i64(I64FileInput {
+        schema,
+        rows: decoded.rows,
+        stream_id: decoded.header.stream_id,
+        dictionary_id: decoded.header.dictionary_id,
+        header_comment: if decoded.header.comment.is_empty() {
+            None
+        } else {
+            Some(decoded.header.comment)
+        },
+    })
 }
 
 fn validate_typed_value(
@@ -384,6 +405,44 @@ fn validate_typed_value(
             suggested_upgrade(declared_type, value),
         )),
     }
+}
+
+fn validate_i64_input(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<()> {
+    for field in &schema.fields {
+        if matches!(field.field_type, FieldType::I128 | FieldType::Opaque16) {
+            return Err(layout_diagnostic(
+                None,
+                Some(field.index),
+                field.field_type.name(),
+                field.field_type.name(),
+                "unsupported profile",
+                "wide field",
+                Some("use typed writer diagnostics until wide-field body support lands"),
+            ));
+        }
+    }
+    for (row_index, row) in rows.iter().enumerate() {
+        if row.len() != schema.fields.len() {
+            return Err(layout_diagnostic(
+                Some(row_index),
+                None,
+                "row",
+                "row",
+                "field count mismatch",
+                "wrong slot count",
+                None,
+            ));
+        }
+        for field in &schema.fields {
+            validate_typed_value(
+                row_index,
+                field.index,
+                field.field_type,
+                &AuraTypedValue::I64(row[usize::from(field.index)]),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_i64_range(

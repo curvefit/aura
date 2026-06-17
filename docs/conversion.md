@@ -9,6 +9,12 @@ The Rust crate's intended API boundary is `writer` for sealing/compiling and
 `reader` for decoding. The older `records::*` helpers remain compatibility
 aliases over those facades.
 
+`writer::stamp_i64` seals the current in-memory ingest representation into a
+canonical `.aura` source. `writer::restamp_i64` decodes an existing sealed file,
+validates that a replacement schema can represent every logical row losslessly,
+and reseals a new `.aura` while preserving stream ID, dictionary ID, comment,
+and rows by default.
+
 ```text
 .aura  -> .aura0
 .aura  -> .aura1
@@ -40,6 +46,9 @@ the same footer.
 The current crate provides small in-memory helpers for generic integer records
 and OHLCV Parquet input. The production version should stream chunk-by-chunk and
 write temporary output files that are atomically promoted after validation.
+In the current all-memory implementation, failed finish/restamp returns an error
+and no sealed bytes. A final Aura file is valid only after the footer length and
+`sealed:)` trailer have been written.
 
 Phase 3 does not choose final `.aura0` compression settings. It preserves the
 current Aura0 physical planner, generic instruction planner, and stamped footer

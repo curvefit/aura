@@ -5,6 +5,24 @@ During ingest the writer may collect stats, test candidates, and choose a
 layout. At stamp time it writes the final footer once. After that the footer is
 constant unless the file is restamped.
 
+## Current vs target
+
+The current Rust container uses this trailer:
+
+```text
+footer_len  u32 little-endian
+sealed:)
+```
+
+The current `.aura` ingest footer stores schema, ingest stats, Aura0 physical
+plan, Aura1 physical plan, generic Aura0 instruction plan, and chunks. The
+current `.aura0`/`.aura1` compiled footer stores both decode programs plus the
+generic Aura0 instruction plan. Compiled-profile hotswaps copy the compiled
+footer unchanged.
+
+The slot-tail layout below is the target fast-path footer design. It is not yet
+the emitted Phase 3 trailer.
+
 The target stamped trailer locates both the whole footer and the hot slot tail:
 
 ```text

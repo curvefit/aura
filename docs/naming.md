@@ -15,6 +15,11 @@ market-data-2026-06-12T19.aura.tmp
 market-data-2026-06-12T19.aura
 ```
 
+The Phase 3 Rust writer returns in-memory bytes only after a successful
+finish/seal. It does not yet expose a path-based streaming writer. When that API
+lands, it must write to a temporary path and promote only after the footer
+length and `sealed:)` trailer are validated.
+
 Compressed chunks are an internal file-layout choice. Do not encode compression
 or hot-layout variants into the extension.
 

@@ -1,7 +1,14 @@
+use aura_codec::footer::AuraFooter;
 use aura_codec::format::SEAL_MAGIC;
+use aura_codec::instructions::{
+    DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
+    GenericStreamOp,
+};
+use aura_codec::plan::{Aura0Plan, Aura1Plan};
 use aura_codec::program::COMPILED_FOOTER_MAGIC;
+use aura_codec::program::{CompiledFooter, DecodeProgram};
 use aura_codec::schema::generic_i64_parent_schema;
-use aura_codec::{records, Profile};
+use aura_codec::{records, IngestStats, Profile};
 
 const RICH_PARENT_MAP: &[u8] = &[255, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8];
 
@@ -75,6 +82,233 @@ fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes.try_into().unwrap())
 }
 
+fn all_variant_generic_plan() -> GenericInstructionPlan {
+    GenericInstructionPlan {
+        streams: vec![
+            GenericStreamInstruction {
+                stream_id: 0,
+                target_slot: Some(0),
+                op: GenericStreamOp::FixedStep {
+                    base: 1_000,
+                    step: 1,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 1,
+                target_slot: Some(1),
+                op: GenericStreamOp::PatchedBitpack {
+                    base: -2,
+                    unit: 1,
+                    low_width: 2,
+                    high_width: 3,
+                    exception_count: 4,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 2,
+                target_slot: Some(2),
+                op: GenericStreamOp::BlockLocal {
+                    block_size: 8,
+                    mode_count: 2,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 3,
+                target_slot: Some(3),
+                op: GenericStreamOp::BitplaneRle {
+                    base: 0,
+                    unit: 1,
+                    bit_width: 2,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 4,
+                target_slot: Some(4),
+                op: GenericStreamOp::Dictionary {
+                    unit: 1,
+                    entry_count: 3,
+                    code_width: 2,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 5,
+                target_slot: Some(5),
+                op: GenericStreamOp::UuidConstMask {
+                    constant_bits: 8,
+                    variable_bits: 120,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 6,
+                target_slot: None,
+                op: GenericStreamOp::Rle {
+                    base: 0,
+                    unit: 1,
+                    bit_width: 3,
+                    run_count: 2,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 7,
+                target_slot: None,
+                op: GenericStreamOp::Dictionary {
+                    unit: 1,
+                    entry_count: 2,
+                    code_width: 1,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 8,
+                target_slot: None,
+                op: GenericStreamOp::Rle {
+                    base: 0,
+                    unit: 1,
+                    bit_width: 1,
+                    run_count: 2,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 9,
+                target_slot: None,
+                op: GenericStreamOp::BaseBitpack {
+                    base: 100,
+                    unit: 1,
+                    bit_width: 8,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 10,
+                target_slot: None,
+                op: GenericStreamOp::Dictionary {
+                    unit: 1,
+                    entry_count: 4,
+                    code_width: 2,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 11,
+                target_slot: None,
+                op: GenericStreamOp::BaseBitpack {
+                    base: 100,
+                    unit: 1,
+                    bit_width: 8,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 12,
+                target_slot: None,
+                op: GenericStreamOp::PrevDelta {
+                    base: 1_000,
+                    unit: 1,
+                    bit_width: 8,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 13,
+                target_slot: None,
+                op: GenericStreamOp::PrevVarint {
+                    base: 1_000,
+                    unit: 1,
+                },
+            },
+            GenericStreamInstruction {
+                stream_id: 14,
+                target_slot: None,
+                op: GenericStreamOp::PackedDictionary {
+                    base: 10,
+                    unit: 1,
+                    entry_count: 4,
+                    entry_width: 4,
+                    code_width: 2,
+                },
+            },
+        ],
+        groups: vec![
+            GenericGroupInstruction::Group {
+                group_id: 0,
+                event_slots: vec![0, 1, 2],
+                repeated_slots: vec![3, 4, 5, 6],
+            },
+            GenericGroupInstruction::PartitionRuns {
+                group_id: 1,
+                parent_group_id: 0,
+                partition_slot: 3,
+                count_stream_id: 6,
+                fixed_order: true,
+            },
+            GenericGroupInstruction::PartitionRunLengths {
+                group_id: 8,
+                parent_group_id: 0,
+                partition_slot: 3,
+                fixed_order: true,
+                value_stream_id: 8,
+                count_stream_id: 6,
+                event_count_stream_id: Some(13),
+            },
+            GenericGroupInstruction::SegmentedDeltaStream {
+                group_id: 9,
+                parent_group_id: 8,
+                output_slot: 4,
+                base_stream_id: Some(11),
+                first_stream_id: 9,
+                delta_stream_id: 10,
+            },
+            GenericGroupInstruction::GroupValueStream {
+                group_id: 10,
+                parent_group_id: 8,
+                output_slot: 0,
+                stream_id: 12,
+            },
+            GenericGroupInstruction::PresenceMap {
+                group_id: 2,
+                parent_group_id: 0,
+                slots: vec![5, 6],
+                stream_id: 3,
+            },
+            GenericGroupInstruction::DerivedStream {
+                group_id: 3,
+                parent_group_id: Some(1),
+                output_slot: 4,
+                op: DerivedOp::FirstOffsetThenDelta,
+                input_slots: vec![3],
+                stream_id: 2,
+            },
+            GenericGroupInstruction::DerivedStream {
+                group_id: 4,
+                parent_group_id: None,
+                output_slot: 8,
+                op: DerivedOp::MaxPlusResidual,
+                input_slots: vec![1, 2],
+                stream_id: 1,
+            },
+            GenericGroupInstruction::DerivedStream {
+                group_id: 5,
+                parent_group_id: None,
+                output_slot: 9,
+                op: DerivedOp::MinMinusResidual,
+                input_slots: vec![1, 2],
+                stream_id: 1,
+            },
+            GenericGroupInstruction::SparseStream {
+                group_id: 6,
+                parent_group_id: 0,
+                presence_group_id: 2,
+                output_slot: 5,
+                presence_index: 0,
+                stream_id: 7,
+            },
+            GenericGroupInstruction::PresenceValue {
+                group_id: 7,
+                parent_group_id: 0,
+                presence_group_id: 2,
+                output_slot: 7,
+                presence_index: 1,
+                value: 1,
+            },
+        ],
+    }
+}
+
 #[test]
 fn compiled_profile_hotswaps_preserve_footer_bytes() {
     let rows = rich_rows();
@@ -139,4 +373,37 @@ fn compiled_footer_identity_survives_round_trip_chain() {
         assert_eq!(target, decoded.header.profile);
         assert_eq!(rows, decoded.rows);
     }
+}
+
+#[test]
+fn generic_instruction_footer_preserves_all_stream_and_group_variants() {
+    let schema =
+        generic_i64_parent_schema("all_variant_footer", &[255, 0, 0, 128, 128, 128, 128]).unwrap();
+    let mut stats = IngestStats::new_for_schema(&schema).unwrap();
+    stats
+        .observe_i64_record(&schema, &[1_000, 10, 20, 0, 100, 5, 1])
+        .unwrap();
+    let aura0_plan = Aura0Plan::from_schema_stats(&schema, &stats).unwrap();
+    let aura1_plan = Aura1Plan::from_stats(&stats, 4);
+    let plan = all_variant_generic_plan();
+    let footer = AuraFooter::new(schema.clone(), stats.clone())
+        .with_aura0_plan(aura0_plan.clone())
+        .with_aura1_plan(aura1_plan.clone())
+        .with_generic_aura0_plan(plan.clone());
+
+    let decoded_footer = AuraFooter::decode(&footer.encode().unwrap()).unwrap();
+    assert_eq!(Some(&plan), decoded_footer.generic_aura0_plan.as_ref());
+
+    let compiled = CompiledFooter::new(
+        schema.clone(),
+        stats.record_count,
+        aura1_plan.block_capacity,
+        DecodeProgram::from_aura0_plan(&aura0_plan, schema.fields.len()).unwrap(),
+        DecodeProgram::from_aura1_plan(&aura1_plan, schema.fields.len()).unwrap(),
+    )
+    .unwrap()
+    .with_generic_aura0_plan(plan.clone());
+
+    let decoded_compiled = CompiledFooter::decode(&compiled.encode().unwrap()).unwrap();
+    assert_eq!(Some(&plan), decoded_compiled.generic_aura0_plan.as_ref());
 }

@@ -235,6 +235,82 @@ fn generic_instruction_plan_rejects_invalid_uuid_mask_shape() {
 }
 
 #[test]
+fn generic_instruction_plan_rejects_duplicate_ids_and_invalid_refs() {
+    let duplicate_streams = GenericInstructionPlan {
+        streams: vec![
+            GenericStreamInstruction {
+                stream_id: 0,
+                target_slot: Some(0),
+                op: GenericStreamOp::FixedStep { base: 0, step: 1 },
+            },
+            GenericStreamInstruction {
+                stream_id: 0,
+                target_slot: Some(1),
+                op: GenericStreamOp::FixedStep { base: 0, step: 1 },
+            },
+        ],
+        groups: Vec::new(),
+    };
+    assert!(duplicate_streams.encode().is_err());
+
+    let invalid_group_ref = GenericInstructionPlan {
+        streams: vec![GenericStreamInstruction {
+            stream_id: 0,
+            target_slot: Some(0),
+            op: GenericStreamOp::FixedStep { base: 0, step: 1 },
+        }],
+        groups: vec![GenericGroupInstruction::PartitionRuns {
+            group_id: 1,
+            parent_group_id: 99,
+            partition_slot: 0,
+            count_stream_id: 0,
+            fixed_order: true,
+        }],
+    };
+    assert!(invalid_group_ref.encode().is_err());
+
+    let invalid_stream_ref = GenericInstructionPlan {
+        streams: vec![GenericStreamInstruction {
+            stream_id: 0,
+            target_slot: Some(0),
+            op: GenericStreamOp::FixedStep { base: 0, step: 1 },
+        }],
+        groups: vec![
+            GenericGroupInstruction::Group {
+                group_id: 0,
+                event_slots: vec![0],
+                repeated_slots: vec![1],
+            },
+            GenericGroupInstruction::PartitionRuns {
+                group_id: 1,
+                parent_group_id: 0,
+                partition_slot: 1,
+                count_stream_id: 99,
+                fixed_order: true,
+            },
+        ],
+    };
+    assert!(invalid_stream_ref.encode().is_err());
+
+    let duplicate_groups = GenericInstructionPlan {
+        streams: Vec::new(),
+        groups: vec![
+            GenericGroupInstruction::Group {
+                group_id: 0,
+                event_slots: vec![0],
+                repeated_slots: vec![1],
+            },
+            GenericGroupInstruction::Group {
+                group_id: 0,
+                event_slots: vec![0],
+                repeated_slots: vec![1],
+            },
+        ],
+    };
+    assert!(duplicate_groups.encode().is_err());
+}
+
+#[test]
 fn generic_stream_body_round_trips_core_i64_ops() {
     assert_i64_body_round_trip(
         GenericStreamOp::FixedStep { base: 100, step: 5 },
