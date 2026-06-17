@@ -186,15 +186,15 @@ fn field_program_round_trips_biased_bitpacked_previous_delta() {
 }
 
 #[test]
-fn field_program_round_trips_candle_wick_ops() {
+fn field_program_round_trips_max_min_residual_ops() {
     for (encoding, op) in [
         (
-            FieldEncoding::BitpackedCandleMaxOffset,
-            ProgramOp::BitpackedCandleMaxOffset,
+            FieldEncoding::BitpackedMaxPlusResidual,
+            ProgramOp::BitpackedMaxPlusResidual,
         ),
         (
-            FieldEncoding::BitpackedCandleMinOffset,
-            ProgramOp::BitpackedCandleMinOffset,
+            FieldEncoding::BitpackedMinMinusResidual,
+            ProgramOp::BitpackedMinMinusResidual,
         ),
     ] {
         let plan = PhysicalFieldPlan {

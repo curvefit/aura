@@ -154,7 +154,9 @@ fn generic_i64_parent_schema_maps_extended_header_bytes() {
 
     assert_eq!(SchemaMapHint::Timestamp, entries[0].hint);
     assert_eq!(
-        SchemaMapHint::DerivedRoot { slot_number: 1 },
+        SchemaMapHint::DerivedExpression {
+            expression_index: 1
+        },
         entries[1].hint
     );
     assert_eq!(FieldRelation::DeltaFromField(1), entries[2].relation);

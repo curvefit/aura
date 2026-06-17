@@ -41,8 +41,16 @@ fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes.try_into().unwrap())
 }
 
+fn read_u16_le(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes(bytes.try_into().unwrap())
+}
+
 fn read_u64_le(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes.try_into().unwrap())
+}
+
+fn write_u16_le(bytes: &mut [u8], value: u16) {
+    bytes.copy_from_slice(&value.to_le_bytes());
 }
 
 fn write_u32_le(bytes: &mut [u8], value: u32) {
@@ -74,7 +82,7 @@ fn mutated(mut file: Vec<u8>, change: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
 #[test]
 fn container_header_body_footer_trailer_offsets_match_contract() {
     let file = encoded_generic_file();
-    let header_len = usize::from(file[7]);
+    let header_len = AuraHeader::encoded_len(&file).unwrap();
     let original_footer_len_offset = footer_len_offset(&file);
     let footer_start = footer_start(&file);
 
@@ -82,12 +90,13 @@ fn container_header_body_footer_trailer_offsets_match_contract() {
     assert_eq!(FORMAT_VERSION.to_le_bytes(), file[4..6]);
     assert_eq!(Profile::Ingest as u8, file[6]);
     assert_eq!(HEADER_PREFIX_SIZE + GENERIC_PARENT_MAP.len(), header_len);
-    assert_eq!(1_000_000_000i64.to_le_bytes(), file[8..16]);
-    assert_eq!(3u16.to_le_bytes(), file[16..18]);
-    assert_eq!(11u16.to_le_bytes(), file[18..20]);
-    assert_eq!(GENERIC_PARENT_MAP.len() as u8, file[20]);
-    assert_eq!(0, file[21]);
-    assert_eq!(GENERIC_PARENT_MAP, &file[22..header_len]);
+    assert_eq!(1_000_000_000i64.to_le_bytes(), file[9..17]);
+    assert_eq!(3u16.to_le_bytes(), file[17..19]);
+    assert_eq!(11u16.to_le_bytes(), file[19..21]);
+    assert_eq!(GENERIC_PARENT_MAP.len() as u8, file[21]);
+    assert_eq!(0, file[22]);
+    assert_eq!(0, read_u16_le(&file[23..25]));
+    assert_eq!(GENERIC_PARENT_MAP, &file[25..header_len]);
     assert_eq!(3, read_u64_le(&file[header_len..header_len + 8]));
     assert_eq!(file.len() - 12, footer_start + footer_len(&file));
     assert_eq!(original_footer_len_offset, footer_start + footer_len(&file));
@@ -202,7 +211,7 @@ fn assert_schema_archive_agreement(
 #[test]
 fn invalid_container_boundaries_are_rejected() {
     let file = encoded_generic_file();
-    let header_len = usize::from(file[7]);
+    let header_len = AuraHeader::encoded_len(&file).unwrap();
 
     let bad_magic = mutated(file.clone(), |bytes| bytes[0..4].copy_from_slice(b"NOPE"));
     assert!(records::decode_i64_file(&bad_magic).is_err());
@@ -220,7 +229,7 @@ fn invalid_container_boundaries_are_rejected() {
     assert!(records::decode_i64_file(&oversized_footer).is_err());
 
     let short_header = mutated(file.clone(), |bytes| {
-        bytes[7] = (HEADER_PREFIX_SIZE - 1) as u8;
+        write_u16_le(&mut bytes[7..9], (HEADER_PREFIX_SIZE - 1) as u16);
     });
     assert!(records::decode_i64_file(&short_header).is_err());
 
@@ -240,10 +249,11 @@ fn invalid_container_boundaries_are_rejected() {
     })
     .unwrap();
     let invalid_utf8_comment = mutated(with_comment, |bytes| {
-        let comment_start = HEADER_PREFIX_SIZE + usize::from(bytes[20]);
+        let comment_start =
+            HEADER_PREFIX_SIZE + usize::from(bytes[21]) + usize::from(read_u16_le(&bytes[23..25]));
         bytes[comment_start] = 0xff;
     });
-    let invalid_header_len = usize::from(invalid_utf8_comment[7]);
+    let invalid_header_len = AuraHeader::encoded_len(&invalid_utf8_comment).unwrap();
     assert!(AuraHeader::decode(&invalid_utf8_comment[..invalid_header_len]).is_err());
     assert!(records::decode_i64_file(&invalid_utf8_comment).is_err());
 }

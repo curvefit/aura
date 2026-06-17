@@ -6,8 +6,8 @@ use aura_codec::{decode_generic_stream_body, encode_generic_stream_body};
 use aura_codec::{generic_i64_parent_schema, FieldScope};
 
 #[test]
-fn generic_planner_derives_candle_shape_from_parent_hints() {
-    let schema = generic_i64_parent_schema("candles", &[100, 0, 2, 2, 2, 0]).unwrap();
+fn generic_planner_does_not_infer_shape_math_from_parent_hints() {
+    let schema = generic_i64_parent_schema("parent_only_values", &[100, 0, 2, 2, 2, 0]).unwrap();
     let rows = (0..128)
         .scan(100_000i64, |previous_close, index| {
             let open = *previous_close + i64::from(index % 3) - 1;
@@ -45,33 +45,22 @@ fn generic_planner_derives_candle_shape_from_parent_hints() {
         matches!(
             group,
             GenericGroupInstruction::DerivedStream {
-                output_slot: 1,
-                op: DerivedOp::FirstOffsetThenDelta,
+                output_slot: 2 | 3 | 4,
+                op: DerivedOp::AddResidual,
                 input_slots,
                 ..
-            } if input_slots.as_slice() == [4]
+            } if input_slots.as_slice() == [1]
         )
     }));
-    assert!(encoded.plan.groups.iter().any(|group| {
+    assert!(!encoded.plan.groups.iter().any(|group| {
         matches!(
             group,
             GenericGroupInstruction::DerivedStream {
-                output_slot: 2,
-                op: DerivedOp::MaxPlusResidual,
-                input_slots,
+                op: DerivedOp::FirstOffsetThenDelta
+                    | DerivedOp::MaxPlusResidual
+                    | DerivedOp::MinMinusResidual,
                 ..
-            } if input_slots.as_slice() == [1, 4]
-        )
-    }));
-    assert!(encoded.plan.groups.iter().any(|group| {
-        matches!(
-            group,
-            GenericGroupInstruction::DerivedStream {
-                output_slot: 3,
-                op: DerivedOp::MinMinusResidual,
-                input_slots,
-                ..
-            } if input_slots.as_slice() == [1, 4]
+            }
         )
     }));
 }

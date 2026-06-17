@@ -33,8 +33,8 @@ pub enum ProgramOp {
     BitpackedDeltaRelatedOffset = 9,
     BitpackedDeltaPreviousOffset = 10,
     BitpackedDeltaPreviousFieldOffset = 11,
-    BitpackedCandleMaxOffset = 12,
-    BitpackedCandleMinOffset = 13,
+    BitpackedMaxPlusResidual = 12,
+    BitpackedMinMinusResidual = 13,
     BitpackedProductResidual = 14,
     BitpackedProportionalResidual = 15,
 }
@@ -54,8 +54,8 @@ impl ProgramOp {
             9 => Ok(Self::BitpackedDeltaRelatedOffset),
             10 => Ok(Self::BitpackedDeltaPreviousOffset),
             11 => Ok(Self::BitpackedDeltaPreviousFieldOffset),
-            12 => Ok(Self::BitpackedCandleMaxOffset),
-            13 => Ok(Self::BitpackedCandleMinOffset),
+            12 => Ok(Self::BitpackedMaxPlusResidual),
+            13 => Ok(Self::BitpackedMinMinusResidual),
             14 => Ok(Self::BitpackedProductResidual),
             15 => Ok(Self::BitpackedProportionalResidual),
             _ => Err(AuraError::InvalidValue("program op")),
@@ -78,8 +78,8 @@ impl ProgramOp {
             Self::BitpackedDeltaPreviousFieldOffset => {
                 FieldEncoding::BitpackedDeltaPreviousFieldOffset
             }
-            Self::BitpackedCandleMaxOffset => FieldEncoding::BitpackedCandleMaxOffset,
-            Self::BitpackedCandleMinOffset => FieldEncoding::BitpackedCandleMinOffset,
+            Self::BitpackedMaxPlusResidual => FieldEncoding::BitpackedMaxPlusResidual,
+            Self::BitpackedMinMinusResidual => FieldEncoding::BitpackedMinMinusResidual,
             Self::BitpackedProductResidual => FieldEncoding::BitpackedProductResidual,
             Self::BitpackedProportionalResidual => FieldEncoding::BitpackedProportionalResidual,
         }
@@ -177,8 +177,8 @@ impl FieldProgram {
             FieldEncoding::BitpackedDeltaPreviousFieldOffset => {
                 ProgramOp::BitpackedDeltaPreviousFieldOffset
             }
-            FieldEncoding::BitpackedCandleMaxOffset => ProgramOp::BitpackedCandleMaxOffset,
-            FieldEncoding::BitpackedCandleMinOffset => ProgramOp::BitpackedCandleMinOffset,
+            FieldEncoding::BitpackedMaxPlusResidual => ProgramOp::BitpackedMaxPlusResidual,
+            FieldEncoding::BitpackedMinMinusResidual => ProgramOp::BitpackedMinMinusResidual,
             FieldEncoding::BitpackedProductResidual => ProgramOp::BitpackedProductResidual,
             FieldEncoding::BitpackedProportionalResidual => {
                 ProgramOp::BitpackedProportionalResidual
@@ -195,8 +195,8 @@ impl FieldProgram {
                 | ProgramOp::BitpackedDeltaRelatedOffset
                 | ProgramOp::BitpackedDeltaPreviousOffset
                 | ProgramOp::BitpackedDeltaPreviousFieldOffset
-                | ProgramOp::BitpackedCandleMaxOffset
-                | ProgramOp::BitpackedCandleMinOffset
+                | ProgramOp::BitpackedMaxPlusResidual
+                | ProgramOp::BitpackedMinMinusResidual
                 | ProgramOp::BitpackedProductResidual
                 | ProgramOp::BitpackedProportionalResidual
         );
@@ -205,8 +205,8 @@ impl FieldProgram {
             ProgramOp::FixedStep
                 | ProgramOp::BitpackedDeltaPreviousOffset
                 | ProgramOp::BitpackedDeltaPreviousFieldOffset
-                | ProgramOp::BitpackedCandleMaxOffset
-                | ProgramOp::BitpackedCandleMinOffset
+                | ProgramOp::BitpackedMaxPlusResidual
+                | ProgramOp::BitpackedMinMinusResidual
                 | ProgramOp::BitpackedProductResidual
                 | ProgramOp::BitpackedProportionalResidual
         );
@@ -222,8 +222,8 @@ impl FieldProgram {
                     | ProgramOp::DerivedOffset
                     | ProgramOp::BitpackedDeltaRelatedOffset
                     | ProgramOp::BitpackedDeltaPreviousFieldOffset
-                    | ProgramOp::BitpackedCandleMaxOffset
-                    | ProgramOp::BitpackedCandleMinOffset
+                    | ProgramOp::BitpackedMaxPlusResidual
+                    | ProgramOp::BitpackedMinMinusResidual
                     | ProgramOp::BitpackedProductResidual
                     | ProgramOp::BitpackedProportionalResidual
             )
@@ -321,8 +321,8 @@ impl FieldProgram {
                 | ProgramOp::DerivedOffset
                 | ProgramOp::BitpackedDeltaRelatedOffset
                 | ProgramOp::BitpackedDeltaPreviousFieldOffset
-                | ProgramOp::BitpackedCandleMaxOffset
-                | ProgramOp::BitpackedCandleMinOffset
+                | ProgramOp::BitpackedMaxPlusResidual
+                | ProgramOp::BitpackedMinMinusResidual
                 | ProgramOp::BitpackedProductResidual
                 | ProgramOp::BitpackedProportionalResidual
         ) {
@@ -372,8 +372,8 @@ const fn is_bitpacked_op(op: ProgramOp) -> bool {
             | ProgramOp::BitpackedDeltaRelatedOffset
             | ProgramOp::BitpackedDeltaPreviousOffset
             | ProgramOp::BitpackedDeltaPreviousFieldOffset
-            | ProgramOp::BitpackedCandleMaxOffset
-            | ProgramOp::BitpackedCandleMinOffset
+            | ProgramOp::BitpackedMaxPlusResidual
+            | ProgramOp::BitpackedMinMinusResidual
             | ProgramOp::BitpackedProductResidual
             | ProgramOp::BitpackedProportionalResidual
     )

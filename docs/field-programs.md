@@ -33,8 +33,8 @@ The current compiled operation codes are:
 9  bitpack_rel_offset  bitpack (value - related - min_delta)
 10 bitpack_prev_offset bitpack (value - previous - min_delta)
 11 bitpack_prev_field  bitpack (value - previous related field - min_delta)
-12 candle_max_offset   bitpack (value - max(ref_a, ref_b) - min_wick)
-13 candle_min_offset   bitpack (min(ref_a, ref_b) - value - min_wick)
+12 max_plus_residual   bitpack (value - max(ref_a, ref_b) - min_residual)
+13 min_minus_residual  bitpack (min(ref_a, ref_b) - value - min_residual)
 14 product_residual    bitpack (value - quantity * price / divisor - min_residual)
 15 proportional_resid  bitpack (value - total_value * child_qty / total_qty - min_residual)
 ```
@@ -58,10 +58,10 @@ store one extra `u8` bit width.
 Plain bitpacked deltas use fixed-width two's-complement signed bitpacking.
 Offset and residual ops store unsigned bitpacked spans after subtracting the
 minimum observed delta or residual. The minimum is kept in `base`; for
-previous-field and candle ops, `step` stores the second reference or the
-minimum previous delta. Product residuals pack `(price_ref, divisor)` into
-`step`, and proportional residuals pack `(child_qty_ref, total_qty_ref)` into
-`step`.
+previous-field and legacy max/min residual ops, `step` stores the second
+reference or the minimum previous delta. Product residuals pack
+`(price_ref, divisor)` into `step`, and proportional residuals pack
+`(child_qty_ref, total_qty_ref)` into `step`.
 
 Aura0 bodies are columnar by field program order. This keeps each slot's stream
 contiguous, so a bitpacked slot does not need row-level byte padding between
@@ -69,14 +69,14 @@ unrelated fields. Aura1 bodies remain fixed-width row-major replay data.
 
 ## Example
 
-An OHLCV-like positional integer schema can compile to these instructions
-without naming OHLCV in the schema:
+An OHLCV-like positional integer schema can compile to these instructions only
+when the schema header declares the min/max derived expressions:
 
 ```text
 ts     op=fixed_step          width=zero  const=i64  base,step
 open   op=bitpack_prev_field  bits=N      ref=close base=open0 step=min(open - prev_close)
-high   op=candle_max_offset   bits=N      ref=open  step=close min_wick
-low    op=candle_min_offset   bits=N      ref=open  step=close min_wick
+high   op=max_plus_residual   bits=N      ref=open  step=close min_residual
+low    op=min_minus_residual   bits=N      ref=open  step=close min_residual
 close  op=bitpack_rel_offset  bits=N      ref=open  base=min(close - open)
 volume op=bitpack_base        bits=N      const=i64  base
 ```
@@ -88,10 +88,11 @@ quote_volume     op=product_residual  ref=volume         aux=mean_floor(high, lo
 taker_buy_quote  op=product_residual  ref=taker_buy_base aux=mean_floor(high, low)
 ```
 
-These are still generic field programs. The planner derives them from integer
-relationships and only keeps them when their bitpacked residual stream is
-smaller than the existing candidate. Scale constants and residual streams are
-footer/body facts, not compact schema-header bytes.
+These are still generic field programs. The planner derives them from declared
+schema/header relationships and only keeps them when their bitpacked residual
+stream is smaller than the existing candidate. Scale constants and residual
+streams are footer/body facts; permission to calculate a derived expression is a
+schema-header fact.
 
 The file no longer needs to keep min/max ranges or candidate scoring tables in
 the compiled footer. Those were ingest-time evidence. A reader only needs the
@@ -116,8 +117,9 @@ schema-declared related-field deltas
 
 The planner scores candidates from those facts and picks the smallest reversible
 instruction. Schema relationships make related deltas possible, but they are not
-forced; if a previous-value delta, constant offset, candle-shape residual, or
-product residual is smaller and reversible, the planner can choose it.
+forced. If a previous-value delta, constant offset, header-declared max/min
+residual, or product residual is smaller and reversible, the planner can choose
+it.
 
 When a full typed schema is available, residual search is role-gated. Product
 residuals are only searched with quantity and price-like operands, and
@@ -140,6 +142,6 @@ flags        op=bitpack_base         bits=0..1
 
 Aura0 decoding is columnar, so some fields are delayed until their dependencies
 exist. The decoder resolves previous-field pairs first, then related offsets,
-product residuals, proportional residuals, and candle wick offsets. Aura1 uses
-its own stamped fixed-width field program from the same compiled footer; it is
-not derived by replanning an Aura0 file.
+product residuals, proportional residuals, and header-declared max/min
+residuals. Aura1 uses its own stamped fixed-width field program from the same
+compiled footer; it is not derived by replanning an Aura0 file.

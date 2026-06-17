@@ -20,8 +20,8 @@ pub enum FieldEncoding {
     BitpackedDeltaRelatedOffset = 10,
     BitpackedDeltaPreviousOffset = 11,
     BitpackedDeltaPreviousFieldOffset = 12,
-    BitpackedCandleMaxOffset = 13,
-    BitpackedCandleMinOffset = 14,
+    BitpackedMaxPlusResidual = 13,
+    BitpackedMinMinusResidual = 14,
     BitpackedProductResidual = 15,
     BitpackedProportionalResidual = 16,
 }
@@ -42,8 +42,8 @@ impl FieldEncoding {
             10 => Ok(Self::BitpackedDeltaRelatedOffset),
             11 => Ok(Self::BitpackedDeltaPreviousOffset),
             12 => Ok(Self::BitpackedDeltaPreviousFieldOffset),
-            13 => Ok(Self::BitpackedCandleMaxOffset),
-            14 => Ok(Self::BitpackedCandleMinOffset),
+            13 => Ok(Self::BitpackedMaxPlusResidual),
+            14 => Ok(Self::BitpackedMinMinusResidual),
             15 => Ok(Self::BitpackedProductResidual),
             16 => Ok(Self::BitpackedProportionalResidual),
             _ => Err(crate::AuraError::InvalidValue("field encoding")),
@@ -111,7 +111,6 @@ impl Aura0Plan {
         rows: &[Vec<i64>],
     ) -> Result<Self> {
         let mut plan = Self::from_schema_stats(schema, stats)?;
-        apply_candle_shape_candidates(schema, rows, &mut plan);
         apply_residual_candidates(schema, rows, &mut plan);
         Ok(plan)
     }
@@ -361,83 +360,6 @@ fn bitpacked_previous_delta_offset_plan(field: &FieldStats) -> Option<PhysicalFi
     })
 }
 
-fn bitpacked_previous_field_offset_plan(
-    field_index: u16,
-    reference_field_index: u16,
-    values: &[i64],
-    reference_values: &[i64],
-) -> Option<PhysicalFieldPlan> {
-    if values.len() != reference_values.len() || values.is_empty() {
-        return None;
-    }
-    let deltas = values
-        .iter()
-        .skip(1)
-        .zip(reference_values)
-        .map(|(value, previous_reference)| checked_i64_delta(*value, *previous_reference))
-        .collect::<Option<Vec<_>>>()?;
-    let (min_delta, max_delta) = min_max_i64(&deltas)?;
-    let span = delta_span(min_delta, max_delta)?;
-    let bit_width = unsigned_bitpack_width(span);
-    Some(PhysicalFieldPlan {
-        field_index,
-        encoding: FieldEncoding::BitpackedDeltaPreviousFieldOffset,
-        width: PhysicalWidth::Zero,
-        bit_width,
-        reference_field_index: Some(reference_field_index),
-        base_value: values[0],
-        step: min_delta,
-        estimated_bytes: bitpacked_byte_len(values.len().saturating_sub(1) as u64, bit_width),
-    })
-}
-
-fn bitpacked_candle_wick_plan(
-    field_index: u16,
-    encoding: FieldEncoding,
-    first_reference_field_index: u16,
-    second_reference_field_index: u16,
-    values: &[i64],
-    first_reference_values: &[i64],
-    second_reference_values: &[i64],
-) -> Option<PhysicalFieldPlan> {
-    if values.len() != first_reference_values.len()
-        || values.len() != second_reference_values.len()
-        || values.is_empty()
-    {
-        return None;
-    }
-    let residuals = values
-        .iter()
-        .zip(first_reference_values)
-        .zip(second_reference_values)
-        .map(|((value, first), second)| match encoding {
-            FieldEncoding::BitpackedCandleMaxOffset => {
-                checked_i64_delta(*value, (*first).max(*second))
-            }
-            FieldEncoding::BitpackedCandleMinOffset => {
-                checked_i64_delta((*first).min(*second), *value)
-            }
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let (min_residual, max_residual) = min_max_i64(&residuals)?;
-    if min_residual < 0 {
-        return None;
-    }
-    let span = delta_span(min_residual, max_residual)?;
-    let bit_width = unsigned_bitpack_width(span);
-    Some(PhysicalFieldPlan {
-        field_index,
-        encoding,
-        width: PhysicalWidth::Zero,
-        bit_width,
-        reference_field_index: Some(first_reference_field_index),
-        base_value: min_residual,
-        step: i64::from(second_reference_field_index),
-        estimated_bytes: bitpacked_byte_len(values.len() as u64, bit_width),
-    })
-}
-
 fn bitpacked_product_residual_plan(
     field_index: u16,
     quantity_field_index: u16,
@@ -531,160 +453,14 @@ fn residual_plan(
     })
 }
 
-fn apply_candle_shape_candidates(
-    schema: &SchemaDescriptor,
-    rows: &[Vec<i64>],
-    plan: &mut Aura0Plan,
-) {
-    if rows.len() < 2 {
-        return;
-    }
-    for open_pos in 1..schema.fields.len().saturating_sub(3) {
-        let open_index = schema.fields[open_pos].index;
-        let related: Vec<u16> = schema
-            .fields
-            .iter()
-            .filter(|field| field.relation.related_field_index() == Some(open_index))
-            .map(|field| field.index)
-            .collect();
-        if related.len() < 3 {
-            continue;
-        }
-        let Some(candidate) = best_candle_candidate(open_index, &related, rows, plan) else {
-            continue;
-        };
-        if candidate.estimated_bytes < plan_bytes(plan, &candidate.fields) {
-            replace_plan_fields(plan, candidate.fields);
-        }
-    }
-}
-
-struct CandidatePlan {
-    fields: Vec<PhysicalFieldPlan>,
-    estimated_bytes: u64,
-}
-
-fn best_candle_candidate(
-    open_index: u16,
-    related: &[u16],
-    rows: &[Vec<i64>],
-    plan: &Aura0Plan,
-) -> Option<CandidatePlan> {
-    let open_values = column_values(rows, open_index)?;
-    let mut best = None;
-    for close_index in related {
-        let close_values = column_values(rows, *close_index)?;
-        for high_index in related {
-            if high_index == close_index {
-                continue;
-            }
-            let high_values = column_values(rows, *high_index)?;
-            if !high_values
-                .iter()
-                .zip(&open_values)
-                .zip(&close_values)
-                .all(|((high, open), close)| *high >= (*open).max(*close))
-            {
-                continue;
-            }
-            for low_index in related {
-                if low_index == close_index || low_index == high_index {
-                    continue;
-                }
-                let low_values = column_values(rows, *low_index)?;
-                if !low_values
-                    .iter()
-                    .zip(&open_values)
-                    .zip(&close_values)
-                    .all(|((low, open), close)| *low <= (*open).min(*close))
-                {
-                    continue;
-                }
-                let open_plan = bitpacked_previous_field_offset_plan(
-                    open_index,
-                    *close_index,
-                    &open_values,
-                    &close_values,
-                )?;
-                let close_plan = bitpacked_related_offset_plan_from_values(
-                    *close_index,
-                    open_index,
-                    &close_values,
-                    &open_values,
-                )?;
-                let high_plan = bitpacked_candle_wick_plan(
-                    *high_index,
-                    FieldEncoding::BitpackedCandleMaxOffset,
-                    open_index,
-                    *close_index,
-                    &high_values,
-                    &open_values,
-                    &close_values,
-                )?;
-                let low_plan = bitpacked_candle_wick_plan(
-                    *low_index,
-                    FieldEncoding::BitpackedCandleMinOffset,
-                    open_index,
-                    *close_index,
-                    &low_values,
-                    &open_values,
-                    &close_values,
-                )?;
-                let fields = vec![open_plan, high_plan, low_plan, close_plan];
-                let candidate = CandidatePlan {
-                    estimated_bytes: fields.iter().map(|field| field.estimated_bytes).sum(),
-                    fields,
-                };
-                if candidate.estimated_bytes < plan_bytes(plan, &candidate.fields)
-                    && best.as_ref().is_none_or(|current: &CandidatePlan| {
-                        candidate.estimated_bytes < current.estimated_bytes
-                    })
-                {
-                    best = Some(candidate);
-                }
-            }
-        }
-    }
-    best
-}
-
-fn bitpacked_related_offset_plan_from_values(
-    field_index: u16,
-    related_field_index: u16,
-    values: &[i64],
-    related_values: &[i64],
-) -> Option<PhysicalFieldPlan> {
-    if values.len() != related_values.len() || values.is_empty() {
-        return None;
-    }
-    let deltas = values
-        .iter()
-        .zip(related_values)
-        .map(|(value, related)| checked_i64_delta(*value, *related))
-        .collect::<Option<Vec<_>>>()?;
-    let (min_delta, max_delta) = min_max_i64(&deltas)?;
-    let span = delta_span(min_delta, max_delta)?;
-    let bit_width = unsigned_bitpack_width(span);
-    Some(PhysicalFieldPlan {
-        field_index,
-        encoding: FieldEncoding::BitpackedDeltaRelatedOffset,
-        width: PhysicalWidth::Zero,
-        bit_width,
-        reference_field_index: Some(related_field_index),
-        base_value: min_delta,
-        step: 0,
-        estimated_bytes: bitpacked_byte_len(values.len() as u64, bit_width),
-    })
-}
-
 fn apply_residual_candidates(schema: &SchemaDescriptor, rows: &[Vec<i64>], plan: &mut Aura0Plan) {
     let field_count = rows.first().map(|row| row.len()).unwrap_or(0);
     if field_count == 0 {
         return;
     }
     let semantic_roles = uses_semantic_roles(schema);
-    let protected_targets = candle_protected_fields(plan);
-    let pending_references = candle_pending_fields(plan);
+    let protected_targets = multi_ref_residual_protected_fields(plan);
+    let pending_references = multi_ref_residual_pending_fields(plan);
     for target_index in 0..field_count {
         if protected_targets.contains(&(target_index as u16)) {
             continue;
@@ -874,21 +650,21 @@ fn proportional_quantity_allowed(
         .is_some_and(|field| field.role == FieldRole::Quantity)
 }
 
-fn candle_protected_fields(plan: &Aura0Plan) -> Vec<u16> {
+fn multi_ref_residual_protected_fields(plan: &Aura0Plan) -> Vec<u16> {
     let mut out = Vec::new();
     for field in &plan.fields {
         match field.encoding {
             FieldEncoding::BitpackedDeltaPreviousFieldOffset
-            | FieldEncoding::BitpackedCandleMaxOffset
-            | FieldEncoding::BitpackedCandleMinOffset => {
+            | FieldEncoding::BitpackedMaxPlusResidual
+            | FieldEncoding::BitpackedMinMinusResidual => {
                 push_unique(&mut out, field.field_index);
                 if let Some(reference) = field.reference_field_index {
                     push_unique(&mut out, reference);
                 }
                 if matches!(
                     field.encoding,
-                    FieldEncoding::BitpackedCandleMaxOffset
-                        | FieldEncoding::BitpackedCandleMinOffset
+                    FieldEncoding::BitpackedMaxPlusResidual
+                        | FieldEncoding::BitpackedMinMinusResidual
                 ) {
                     if let Ok(reference) = u16::try_from(field.step) {
                         push_unique(&mut out, reference);
@@ -901,12 +677,12 @@ fn candle_protected_fields(plan: &Aura0Plan) -> Vec<u16> {
     out
 }
 
-fn candle_pending_fields(plan: &Aura0Plan) -> Vec<u16> {
+fn multi_ref_residual_pending_fields(plan: &Aura0Plan) -> Vec<u16> {
     let mut out = Vec::new();
     for field in &plan.fields {
         if matches!(
             field.encoding,
-            FieldEncoding::BitpackedCandleMaxOffset | FieldEncoding::BitpackedCandleMinOffset
+            FieldEncoding::BitpackedMaxPlusResidual | FieldEncoding::BitpackedMinMinusResidual
         ) {
             push_unique(&mut out, field.field_index);
         }
@@ -942,18 +718,6 @@ fn better_field_plan(
     }
 }
 
-fn plan_bytes(plan: &Aura0Plan, fields: &[PhysicalFieldPlan]) -> u64 {
-    fields
-        .iter()
-        .filter_map(|candidate| {
-            plan.fields
-                .iter()
-                .find(|field| field.field_index == candidate.field_index)
-        })
-        .map(|field| field.estimated_bytes)
-        .sum()
-}
-
 fn replace_plan_fields(plan: &mut Aura0Plan, fields: Vec<PhysicalFieldPlan>) {
     for replacement in fields {
         if let Some(field) = plan
@@ -981,10 +745,6 @@ fn min_max_i64(values: &[i64]) -> Option<(i64, i64)> {
         max = max.max(value);
     }
     Some((min, max))
-}
-
-fn checked_i64_delta(value: i64, reference: i64) -> Option<i64> {
-    value.checked_sub(reference)
 }
 
 fn checked_i128_to_i64(value: i128) -> Option<i64> {
@@ -1049,8 +809,8 @@ fn encoding_preference(encoding: FieldEncoding) -> u8 {
         FieldEncoding::BitpackedDeltaPrevious => 8,
         FieldEncoding::BitpackedDeltaPreviousOffset => 9,
         FieldEncoding::BitpackedDeltaPreviousFieldOffset => 10,
-        FieldEncoding::BitpackedCandleMaxOffset => 11,
-        FieldEncoding::BitpackedCandleMinOffset => 12,
+        FieldEncoding::BitpackedMaxPlusResidual => 11,
+        FieldEncoding::BitpackedMinMinusResidual => 12,
         FieldEncoding::BitpackedProductResidual => 13,
         FieldEncoding::BitpackedProportionalResidual => 14,
         FieldEncoding::TimestampStep => 15,

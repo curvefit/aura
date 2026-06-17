@@ -12,7 +12,7 @@ Seal
 
 ## Header
 
-The front header starts at byte zero. Its fixed prefix is 22 bytes; `header_len`
+The front header starts at byte zero. Its fixed prefix is 25 bytes; `header_len`
 is the total front-header size and is the byte offset where the body starts.
 
 ```text
@@ -20,18 +20,22 @@ offset  size  field
 0       4     magic          AURA
 4       2     version        format version
 6       1     profile        ingest | Aura0 | Aura1
-7       1     header_len     total header bytes before body
-8       8     start_time_ns  file-local time anchor
-16      2     stream_id      external stream dictionary key
-18      2     dictionary_id  external dictionary/version key
-20      1     schema_len     compact schema-map byte count
-21      1     comment_len    UTF-8 comment byte count
-22      N     schema_map     time marker and parent bytes
-22+N    M     comment_utf8   optional human-readable field labels
+7       2     header_len     total header bytes before body
+9       8     start_time_ns  file-local time anchor
+17      2     stream_id      external stream dictionary key
+19      2     dictionary_id  external dictionary/version key
+21      1     schema_len     compact schema-map byte count
+22      1     comment_len    UTF-8 comment byte count
+23      2     derived_len    derived-expression table byte count
+25      N     schema_map     time marker and parent bytes
+25+N    D     derived_exprs  optional generic expression table
+25+N+D  M     comment_utf8   optional human-readable field labels
 ```
 
-`header_len = 22 + schema_len + comment_len`. `comment_len = 0` means the file
-has no front-header comment.
+`header_len = 25 + schema_len + derived_len + comment_len`. `derived_len = 0`
+means no derived-expression table. `comment_len = 0` means the file has no
+front-header comment. `header_len` and `derived_len` are little-endian `u16`
+fields so derived-expression metadata can exceed 255 bytes.
 
 The header is write-once. When the file is sealed, the writer appends the
 footer, writes the footer length, and writes the trailing seal magic. No header
@@ -54,7 +58,7 @@ compact schema-map dialect:
 0        event/root slot with no parent
 1-99     parent slot; parent index = byte - 1
 100      timestamp slot; expected at physical slot 0 when present
-101-199  derived parent/root marker; slot number = byte - 100
+101-199  derived expression ref; expression id = byte - 100
 200      dual-domain repeated group marker
 201-239  repeated group width; width = byte - 200 slots
 241      1-bit boolean leaf
@@ -63,9 +67,31 @@ compact schema-map dialect:
 255      opaque / do-not-attempt stream
 ```
 
-Constants, scales, residuals, and physical coding choices remain in the
-footer/body. `comment_utf8` is optional human-facing text, such as CSV-style
-field labels. The stamped footer schema remains the authoritative schema copy.
+Derived expression definitions belong to the schema header and declare generic
+same-row calculations such as add/sub/mul/div/min/max residual forms. The table
+is byte-aligned:
+
+```text
+expr_count u8
+
+entry:
+  expression_id u8    1..99, referenced by schema byte 100 + id
+  op            u8    add | sub | mul | div | min | max |
+                       add_residual | subtract_residual |
+                       max_plus_residual | min_minus_residual |
+                       first_offset_then_delta
+  output_slot   u16
+  flags         u8
+  input_count   u8
+  input_slots   input_count * u16
+  literal_count u8
+  literals      literal_count * i64
+```
+
+Constants, scales, residual streams, and physical coding choices remain in the
+footer/body.
+`comment_utf8` is optional human-facing text, such as CSV-style field labels.
+The stamped footer schema remains the authoritative schema copy.
 
 Files without a `100` timestamp marker are treated as non-time-series data.
 Group-width bytes mark the current slot and the following `width - 1` slots as
@@ -149,8 +175,8 @@ Optional extras follow only when the code asks for them: an extended `u16`
 reference field, a base constant, a step constant, and one bit-width byte for
 bitpacked streams. That keeps common fields to two bytes of instruction data
 while still representing base deltas, previous-value deltas, related-field
-deltas, implicit fixed-step timestamps, constant offsets, candle wick residuals,
-and product/proportional residuals.
+deltas, implicit fixed-step timestamps, constant offsets, header-declared
+max/min residuals, and product/proportional residuals.
 
 Aura0 bodies are columnar by decode-program order. Aura1 bodies are row-major
 fixed-width replay data. Both use the same compiled footer bytes; converting

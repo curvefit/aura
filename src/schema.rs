@@ -9,7 +9,7 @@ const SCHEMA_ENCODING_FULL_FIELDS: u8 = 1;
 const DECODED_SCHEMA_NAME: &str = "schema";
 pub(crate) const SCHEMA_MAP_PARENT_MAX: u8 = 99;
 pub(crate) const SCHEMA_MAP_TIME_SLOT: u8 = 100;
-pub(crate) const SCHEMA_MAP_DERIVED_BASE: u8 = 100;
+pub(crate) const SCHEMA_MAP_DERIVED_EXPR_BASE: u8 = 100;
 pub(crate) const SCHEMA_MAP_DERIVED_MAX: u8 = 199;
 pub(crate) const SCHEMA_MAP_DUAL_DOMAIN_GROUP: u8 = 200;
 pub(crate) const SCHEMA_MAP_GROUP_BASE: u8 = 200;
@@ -292,7 +292,7 @@ pub enum SchemaMapHint {
     Root,
     Parent { parent_index: u16 },
     Timestamp,
-    DerivedRoot { slot_number: u8 },
+    DerivedExpression { expression_index: u8 },
     DualDomainGroup,
     Group { width: u8 },
     Boolean { bits: u8 },
@@ -632,9 +632,10 @@ pub fn generic_i64_schema(
 ///
 /// A byte of `100` marks the timestamp slot, normally at slot 0. If no
 /// timestamp marker is present, the schema is treated as non-time-series data.
-/// `0` means root, `1..99` means parent slot `value - 1`, `101..199` marks a
-/// derived/root slot, `201..239` marks a repeated group width, `241..243`
-/// mark compact leaf types, and `255` marks an opaque do-not-attempt slot.
+/// `0` means root, `1..99` means parent slot `value - 1`, `101..199`
+/// references a header-declared derived expression `value - 100`, `201..239`
+/// marks a repeated group width, `241..243` mark compact leaf types, and `255`
+/// marks an opaque do-not-attempt slot.
 pub fn generic_i64_parent_schema(name: &str, parent_slots: &[u8]) -> Result<SchemaDescriptor> {
     let entries = decode_schema_map(parent_slots)?;
     if entries.len() > u16::MAX as usize {
@@ -728,8 +729,8 @@ pub fn decode_schema_map(parent_slots: &[u8]) -> Result<Vec<SchemaMapEntry>> {
                 scope: scope_for_group(in_group),
                 is_timestamp: false,
                 relation: FieldRelation::None,
-                hint: SchemaMapHint::DerivedRoot {
-                    slot_number: parent_slot - SCHEMA_MAP_DERIVED_BASE,
+                hint: SchemaMapHint::DerivedExpression {
+                    expression_index: parent_slot - SCHEMA_MAP_DERIVED_EXPR_BASE,
                 },
             },
             SCHEMA_MAP_DUAL_DOMAIN_GROUP => SchemaMapEntry {
@@ -907,7 +908,7 @@ fn validate_i64_schema_definition_header(schema_len: usize, comment_len: usize) 
     if comment_len > u8::MAX as usize {
         return Err(AuraError::InvalidValue("schema comment"));
     }
-    if HEADER_PREFIX_SIZE + schema_len + comment_len > u8::MAX as usize {
+    if HEADER_PREFIX_SIZE + schema_len + comment_len > u16::MAX as usize {
         return Err(AuraError::InvalidValue("schema header"));
     }
     Ok(())

@@ -14,6 +14,10 @@ fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes.try_into().unwrap())
 }
 
+fn read_u16_le(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes(bytes.try_into().unwrap())
+}
+
 fn read_u64_le(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes.try_into().unwrap())
 }
@@ -48,18 +52,19 @@ fn ingest_header_stores_parent_mapping_before_body() {
     })
     .unwrap();
 
-    let header_len = usize::from(file[7]);
+    let header_len = usize::from(read_u16_le(&file[7..9]));
 
     assert_eq!(b"AURA", &file[..4]);
     assert_eq!(FORMAT_VERSION.to_le_bytes(), file[4..6]);
     assert_eq!(Profile::Ingest as u8, file[6]);
-    assert_eq!(28, header_len);
-    assert_eq!(1_000_000_000i64.to_le_bytes(), file[8..16]);
-    assert_eq!(1u16.to_le_bytes(), file[16..18]);
-    assert_eq!(7u16.to_le_bytes(), file[18..20]);
-    assert_eq!(6, file[20]);
-    assert_eq!(0, file[21]);
-    assert_eq!(&[100, 0, 2, 2, 2, 0], &file[22..28]);
+    assert_eq!(31, header_len);
+    assert_eq!(1_000_000_000i64.to_le_bytes(), file[9..17]);
+    assert_eq!(1u16.to_le_bytes(), file[17..19]);
+    assert_eq!(7u16.to_le_bytes(), file[19..21]);
+    assert_eq!(6, file[21]);
+    assert_eq!(0, file[22]);
+    assert_eq!(0, read_u16_le(&file[23..25]));
+    assert_eq!(&[100, 0, 2, 2, 2, 0], &file[25..31]);
     assert_eq!(3, read_u64_le(&file[header_len..header_len + 8]));
 }
 
@@ -77,13 +82,14 @@ fn ingest_header_stores_comment_after_parent_mapping() {
     })
     .unwrap();
 
-    let header_len = usize::from(file[7]);
+    let header_len = usize::from(read_u16_le(&file[7..9]));
 
-    assert_eq!(57, header_len);
-    assert_eq!(6, file[20]);
-    assert_eq!(29, file[21]);
-    assert_eq!(&[100, 0, 2, 2, 2, 0], &file[22..28]);
-    assert_eq!(comment.as_bytes(), &file[28..57]);
+    assert_eq!(60, header_len);
+    assert_eq!(6, file[21]);
+    assert_eq!(29, file[22]);
+    assert_eq!(0, read_u16_le(&file[23..25]));
+    assert_eq!(&[100, 0, 2, 2, 2, 0], &file[25..31]);
+    assert_eq!(comment.as_bytes(), &file[31..60]);
     assert_eq!(3, read_u64_le(&file[header_len..header_len + 8]));
 
     let decoded = records::decode_i64_file(&file).unwrap();
@@ -354,7 +360,7 @@ fn compiled_aura0_round_trips_full_i64_span_without_delta_overflow() {
 }
 
 #[test]
-fn compiled_aura0_uses_candle_and_residual_footer_programs() {
+fn compiled_aura0_uses_parent_delta_and_residual_footer_programs() {
     let schema =
         aura_codec::generic_i64_parent_schema("btc_like", &[100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8])
             .unwrap();
@@ -392,18 +398,14 @@ fn compiled_aura0_uses_candle_and_residual_footer_programs() {
         .unwrap();
 
     assert_eq!(rows, decoded.rows);
-    assert_eq!(
-        FieldEncoding::BitpackedDeltaPreviousFieldOffset,
-        plan.field("v1", &schema).unwrap().encoding
-    );
-    assert_eq!(
-        FieldEncoding::BitpackedCandleMaxOffset,
-        plan.field("v2", &schema).unwrap().encoding
-    );
-    assert_eq!(
-        FieldEncoding::BitpackedCandleMinOffset,
-        plan.field("v3", &schema).unwrap().encoding
-    );
+    assert!(!matches!(
+        plan.field("v2", &schema).unwrap().encoding,
+        FieldEncoding::BitpackedMaxPlusResidual | FieldEncoding::BitpackedMinMinusResidual
+    ));
+    assert!(!matches!(
+        plan.field("v3", &schema).unwrap().encoding,
+        FieldEncoding::BitpackedMaxPlusResidual | FieldEncoding::BitpackedMinMinusResidual
+    ));
     assert_eq!(
         FieldEncoding::BitpackedProductResidual,
         plan.field("v7", &schema).unwrap().encoding

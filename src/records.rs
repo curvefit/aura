@@ -9,7 +9,7 @@ use crate::generic_planner::{
     decode_generic_i64_rows_body, encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan,
     plan_generic_i64_rows,
 };
-use crate::header::{AuraHeader, HEADER_PREFIX_SIZE};
+use crate::header::{AuraHeader, LEGACY_HEADER_PREFIX_SIZE};
 use crate::instructions::GenericInstructionPlan;
 use crate::plan::{unpack_ref_divisor, unpack_two_refs, Aura0Plan, Aura1Plan, FieldEncoding};
 use crate::program::{CompiledFooter, DecodeProgram};
@@ -121,7 +121,7 @@ pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
 }
 
 pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
-    if bytes.len() < HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+    if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
         return Err(AuraError::UnexpectedEof);
     }
     let seal_offset = bytes.len() - SEAL_MAGIC.len();
@@ -132,8 +132,8 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
     }
     let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
     let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
-    let header_len = usize::from(bytes[7]);
-    if header_len < HEADER_PREFIX_SIZE || header_len > footer_len_offset {
+    let header_len = AuraHeader::encoded_len(bytes)?;
+    if header_len > footer_len_offset {
         return Err(AuraError::UnexpectedEof);
     }
     let header = AuraHeader::decode(&bytes[..header_len])?;
@@ -522,26 +522,26 @@ fn encode_aura0_column(
                 .collect::<Result<Vec<_>>>()?;
             out.extend_from_slice(&pack_unsigned_values(&values, field_plan.bit_width)?);
         }
-        FieldEncoding::BitpackedCandleMaxOffset | FieldEncoding::BitpackedCandleMinOffset => {
+        FieldEncoding::BitpackedMaxPlusResidual | FieldEncoding::BitpackedMinMinusResidual => {
             let first_reference_index = field_reference_index(field_plan, rows, field_index)?;
             let second_reference_index = step_reference_index(field_plan, rows)?;
             let values = rows
                 .iter()
                 .map(|row| {
                     let reference = match field_plan.encoding {
-                        FieldEncoding::BitpackedCandleMaxOffset => {
+                        FieldEncoding::BitpackedMaxPlusResidual => {
                             row[first_reference_index].max(row[second_reference_index])
                         }
-                        FieldEncoding::BitpackedCandleMinOffset => {
+                        FieldEncoding::BitpackedMinMinusResidual => {
                             row[first_reference_index].min(row[second_reference_index])
                         }
                         _ => unreachable!(),
                     };
                     match field_plan.encoding {
-                        FieldEncoding::BitpackedCandleMaxOffset => {
+                        FieldEncoding::BitpackedMaxPlusResidual => {
                             checked_biased_delta(row[field_index], reference, field_plan.base_value)
                         }
-                        FieldEncoding::BitpackedCandleMinOffset => {
+                        FieldEncoding::BitpackedMinMinusResidual => {
                             checked_biased_delta(reference, row[field_index], field_plan.base_value)
                         }
                         _ => unreachable!(),
@@ -614,7 +614,7 @@ fn decode_aura0_body(
                     read_bitpacked_unsigned_values(&mut reader, field_plan.bit_width, rows.len())?;
                 pending.push((*field_plan, values));
             }
-            FieldEncoding::BitpackedCandleMaxOffset | FieldEncoding::BitpackedCandleMinOffset => {
+            FieldEncoding::BitpackedMaxPlusResidual | FieldEncoding::BitpackedMinMinusResidual => {
                 let values =
                     read_bitpacked_unsigned_values(&mut reader, field_plan.bit_width, rows.len())?;
                 pending.push((*field_plan, values));
@@ -692,7 +692,7 @@ fn decode_aura0_body(
         }
         if matches!(
             field_plan.encoding,
-            FieldEncoding::BitpackedCandleMaxOffset | FieldEncoding::BitpackedCandleMinOffset
+            FieldEncoding::BitpackedMaxPlusResidual | FieldEncoding::BitpackedMinMinusResidual
         ) {
             decode_pending_aura0_column(&mut rows, field_plan, values)?;
             consumed[index] = true;
@@ -819,7 +819,7 @@ fn decode_aura0_column(
                     checked_sum(rows[row_index - 1][field_index], delta)?;
             }
         }
-        FieldEncoding::BitpackedCandleMaxOffset | FieldEncoding::BitpackedCandleMinOffset => {
+        FieldEncoding::BitpackedMaxPlusResidual | FieldEncoding::BitpackedMinMinusResidual => {
             return Err(AuraError::InvalidValue("pending field"));
         }
         FieldEncoding::BitpackedProductResidual => {
@@ -868,18 +868,18 @@ fn decode_pending_aura0_column(
     let second_reference_index = step_reference_index_for_count(field_plan, rows[0].len())?;
     for (row, residual) in rows.iter_mut().zip(values.iter().copied()) {
         let reference = match field_plan.encoding {
-            FieldEncoding::BitpackedCandleMaxOffset => {
+            FieldEncoding::BitpackedMaxPlusResidual => {
                 row[first_reference_index].max(row[second_reference_index])
             }
-            FieldEncoding::BitpackedCandleMinOffset => {
+            FieldEncoding::BitpackedMinMinusResidual => {
                 row[first_reference_index].min(row[second_reference_index])
             }
             _ => return Err(AuraError::InvalidValue("pending field")),
         };
         let delta = checked_sum_unsigned(field_plan.base_value, residual)?;
         row[field_index] = match field_plan.encoding {
-            FieldEncoding::BitpackedCandleMaxOffset => checked_sum(reference, delta)?,
-            FieldEncoding::BitpackedCandleMinOffset => reference
+            FieldEncoding::BitpackedMaxPlusResidual => checked_sum(reference, delta)?,
+            FieldEncoding::BitpackedMinMinusResidual => reference
                 .checked_sub(delta)
                 .ok_or(AuraError::InvalidValue("delta value"))?,
             _ => unreachable!(),
@@ -920,7 +920,7 @@ fn decode_pending_previous_related_pair(
         || previous_plan.reference_field_index != Some(related_plan.field_index)
         || related_plan.reference_field_index != Some(previous_plan.field_index)
     {
-        return Err(AuraError::InvalidValue("candle pair"));
+        return Err(AuraError::InvalidValue("previous related pair"));
     }
     if let Some(first) = rows.first_mut() {
         first[previous_field_index] = previous_plan.base_value;

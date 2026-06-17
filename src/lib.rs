@@ -35,7 +35,10 @@ pub use generic_planner::{
     encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan, plan_generic_i64_rows,
     plan_uuid_const_mask_stream, GenericEncodedI64Rows, GenericEncodedStream,
 };
-pub use header::{AuraHeader, HEADER_PREFIX_SIZE};
+pub use header::{
+    AuraHeader, DerivedExpression, DerivedExpressionOp, HEADER_PREFIX_SIZE,
+    LEGACY_HEADER_PREFIX_SIZE,
+};
 pub use instructions::{
     DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
     GenericStreamOp,

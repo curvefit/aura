@@ -1,5 +1,6 @@
 use aura_codec::footer::AuraFooter;
 use aura_codec::format::SEAL_MAGIC;
+use aura_codec::header::AuraHeader;
 use aura_codec::instructions::{
     DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
     GenericStreamOp,
@@ -74,7 +75,7 @@ fn footer_len(file: &[u8]) -> usize {
 }
 
 fn body_bytes(file: &[u8]) -> &[u8] {
-    let header_len = usize::from(file[7]);
+    let header_len = AuraHeader::encoded_len(file).unwrap();
     &file[header_len..footer_start(file)]
 }
 

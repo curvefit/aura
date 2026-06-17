@@ -6,7 +6,9 @@ Every file repeats a compact schema map in the front header:
 ```text
 schema_len    u8
 comment_len   u8
+derived_len   u16
 schema_map    schema_len bytes
+derived_exprs derived_len bytes
 comment_utf8  comment_len bytes
 ```
 
@@ -16,7 +18,7 @@ The current Rust compact schema-map dialect is intentionally small:
 0        event/root slot with no parent
 1-99     parent slot; parent index = byte - 1
 100      timestamp slot; expected at physical slot 0 when present
-101-199  derived parent/root marker; slot number = byte - 100
+101-199  derived expression ref; expression id = byte - 100
 200      dual-domain repeated group marker
 201-239  repeated group width; width = byte - 200 slots
 241      1-bit boolean leaf
@@ -29,19 +31,85 @@ Timestamp is expected in physical slot `0` when present. Files without byte
 `100` are treated as non-time-series data. Parent refs encode an earlier
 physical slot, so byte `2` means "delta from slot 1". A group-width byte marks
 the current slot and the following `width - 1` slots as repeated child fields.
-The mapping exposes event roots, parent relationships, derived roots, repeated
-groups, boolean/enum/bitfield leaves, and opaque streams without naming a
-market-data schema.
+The mapping exposes event roots, parent relationships, derived expression refs,
+repeated groups, boolean/enum/bitfield leaves, and opaque streams without
+naming a market-data schema.
 
 The mapping is a quick file-shape preview and body-start metadata. It is not the
 full footer program. Constants, decimal scales, residual values, bit widths,
 varint/bitpack choices, and compression choices live in the footer/body.
+Derived expression definitions belong to the schema header, not the footer,
+because they decide which same-row calculations are legal during ingestion.
 `comment_utf8` is optional human-readable text, usually CSV-style labels;
 `comment_len = 0` means no comment.
 
+### Derived Expression Header
+
+Bytes `101-199` are not literal parent slots. They reference schema-header
+derived expressions by id:
+
+```text
+101 -> expression 1
+102 -> expression 2
+...
+199 -> expression 99
+```
+
+A derived expression is generic arithmetic metadata in the schema header. It
+must define at least:
+
+```text
+expression_id
+output_slot
+op              add | sub | mul | div | min | max | add_residual |
+                subtract_residual | max_plus_residual | min_minus_residual |
+                first_offset_then_delta
+input_slots
+literal constants, if any
+residual direction, if the op emits a residual stream
+```
+
+The serialized v2 table is:
+
+```text
+derived_len u16
+expr_count  u8
+
+entry:
+  expression_id u8
+  op            u8
+  output_slot   u16
+  flags         u8
+  input_count   u8
+  input_slots   input_count * u16
+  literal_count u8
+  literals      literal_count * i64
+```
+
+`derived_len` is a two-byte little-endian length because expression definitions
+can exceed 255 bytes.
+
+The compact byte only says "this slot uses expression N." The expression table
+says what calculation is legal. For example, a high-like field can be represented
+without schema names as `max_plus_residual(output=slot2, inputs=[slot1, slot4])`,
+and a low-like field as `min_minus_residual(output=slot3, inputs=[slot1, slot4])`.
+Those calculations are allowed only because the header expression table declares
+them; a parent-only map such as `100 0 2 2 2 0` does not authorize max/min
+shape discovery.
+
+The footer later stamps the chosen round-trip instruction and residual stream
+layout. The footer may choose direct storage if the declared expression does not
+win on measured size, but it must not invent a new derived expression that was
+not present in the schema header.
+
+Current Rust decodes `101-199` as expression refs, preserves those bytes in the
+compact map, and round-trips the v2 header expression table. The planner
+execution path that turns those refs into max/min candidates is still the next
+required implementation step.
+
 ### Current emitted examples
 
-OHLCV-like positional i64:
+OHLCV-like positional i64 with direct parent deltas only:
 
 ```text
 slots:
@@ -54,6 +122,26 @@ slots:
 
 schema map:
 100 0 2 2 2 0
+```
+
+That map authorizes `slot2 - slot1`, `slot3 - slot1`, and `slot4 - slot1`
+candidate streams. It does not authorize `max(slot1, slot4)` or
+`min(slot1, slot4)` calculations.
+
+The same logical fields with declared min/max expression refs would use
+derived-expression bytes for the slots that need shape math:
+
+```text
+slots:
+0 ts
+1 open
+2 high  expr2 = max(slot1, slot4) + residual
+3 low   expr3 = min(slot1, slot4) - residual
+4 close parent=open
+5 volume
+
+schema map:
+100 0 102 103 2 0
 ```
 
 Repeated child rows flattened into fixed-width logical records:
@@ -78,7 +166,7 @@ These richer hints are valid compact schema bytes in the current crate:
 
 ```text
 100 timestamp axis
-101 derived/root marker for slot 1
+101 derived expression ref 1
 200 dual-domain repeated group marker
 202 repeated group width = 2 slots
 241 one-bit boolean leaf
@@ -247,6 +335,7 @@ schema names. It uses only:
 slot position
 timestamp marker
 parent relationship
+derived expression reference
 group and leaf markers
 observed values collected during ingest
 ```
@@ -268,14 +357,15 @@ partition_runs
 derived_stream
 ```
 
-For OHLC-like data, the parent map is enough for the planner to discover the
-shape without a named OHLCV mode:
+For OHLC-like data, a parent map is enough to test direct related deltas such as
+`close - open`. It is not enough to discover shape math. Min/max residuals must
+be declared through derived expression refs:
 
 ```text
-open   first value, then delta from previous close
-close  open + residual
-high   max(open, close) + residual
-low    min(open, close) - residual
+100 0 102 103 2 0
+
+expr2: output slot 2 = max(slot 1, slot 4) + residual
+expr3: output slot 3 = min(slot 1, slot 4) - residual
 ```
 
 For repeated child streams, the current emitted dialect marks the first repeated
@@ -283,10 +373,11 @@ slot with a group-width byte such as `204`, which means "this slot and the next
 three slots are repeated." Slots inside the group still use ordinary root bytes
 or `1..99` parent bytes.
 
-If a future transform cannot be derived from those hints plus observed values,
-the schema header needs a generic hint, not a domain-specific one. The current
-minimum emitted hint set is timestamp, parent relationships, derived roots,
-repeated groups, boolean/enum/bitfield leaves, and opaque markers.
+If a future transform cannot be represented by parent refs, group refs, leaf
+markers, or derived expression refs, the schema header needs another generic
+hint, not a domain-specific one. The current minimum emitted hint set is
+timestamp, parent relationships, derived expression refs, repeated groups,
+boolean/enum/bitfield leaves, and opaque markers.
 
 `generic_i64_parent_schema` is the compact schema-map path for dynamic
 OHLCV-like records and repeated child records. The map includes the timestamp
@@ -309,13 +400,11 @@ schema map:
 ```
 
 This says slot `0` is the timestamp, high/low/close are parented to open, and
-taker buy/sell volumes are parented to total volume. The Aura0 planner can still
-discover candle residuals generically from those parent relationships:
-
-```text
-E1 = max(slot 1, slot 4)
-E2 = min(slot 1, slot 4)
-```
+taker buy/sell volumes are parented to total volume. The Aura0 planner may score
+related residuals from those parent relationships. If high/low should use
+`max(open, close)` or `min(open, close)` residuals, the schema header must use
+`101-199` expression refs for those output slots and include the expression
+definitions.
 
 The codec still chooses the actual physical encoding from stats. The schema map
 is only relationship evidence, not a command to force a related delta.
@@ -411,8 +500,8 @@ derived_offset
 bitpacked_delta_related_offset
 bitpacked_delta_previous_offset
 bitpacked_delta_previous_field_offset
-bitpacked_candle_max_offset
-bitpacked_candle_min_offset
+bitpacked_max_plus_residual
+bitpacked_min_minus_residual
 bitpacked_product_residual
 bitpacked_proportional_residual
 ```
@@ -442,15 +531,15 @@ gap counts from missed expected steps
 zigzag varint byte estimates
 signed bit widths for bitpacking
 related-field delta ranges
-candle open/close/high/low residual ranges when relationships imply a shape
+header-declared derived expression residual ranges
 product residual ranges such as quote = quantity * price / divisor
 proportional residual ranges such as child_quote = quote * child_qty / qty
 ```
 
-These calculations are mostly column-local. Related-field, candle-shape, product,
-and proportional residuals are row scans driven by schema/order evidence. They
-are inputs to a seal-time planner, not state that every compiled file must
-retain.
+These calculations are mostly column-local. Related-field, header-declared
+derived expressions, product, and proportional residuals are row scans driven by
+schema/order evidence. They are inputs to a seal-time planner, not state that
+every compiled file must retain.
 
 Snapshot-style schemas are expected to be separate logical schemas or explicit
 record kinds. They should not be forced into the delta schema just because both

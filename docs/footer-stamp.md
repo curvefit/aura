@@ -113,7 +113,7 @@ shape:
 0        no parent / root
 1-99     direct parent slot ref; parent index = byte - 1
 100      timestamp axis / timestamp parent ref
-101-199  derived parent/root marker; slot number = byte - 100
+101-199  derived expression ref; expression id = byte - 100
 200      dual-domain wrapper for the next group/node
 201-239  group array: width = byte - 200
 240      reserved
@@ -124,9 +124,10 @@ shape:
 255      opaque / do-not-attempt stream
 ```
 
-The front map describes relationship shape only. Constants, decimal scales,
-residual streams, bit widths, and physical coding choices are stamped here in
-the footer or stored in the body streams.
+The front map describes relationship shape only. Derived expression refs point
+to schema-header expression definitions; the footer stores only the selected
+round-trip instruction, constants, residual streams, bit widths, and physical
+coding choices.
 
 Scale is fixed-width and placed before any variable data so a parser can read it
 with one predictable offset:
@@ -301,12 +302,15 @@ domain-specific operation names.
 the schema header hints and observed rows. It can plan and round-trip fixed
 steps, base/previous bitpacking, previous zigzag-varints, patched bitpacking,
 RLE, bitplane RLE, dictionary streams, packed dictionary streams, block-local
-streams, UUID constant masks, sparse presence streams, candle-shape derived
+streams, UUID constant masks, sparse presence streams, parent residual derived
 streams, partition run lengths, grouped event-value streams, segmented child
 deltas, and repeated-slot grouping. Parent relationships are scored as
 transform candidates, not forced deltas; if a candidate body is larger than a
-direct stream, the writer keeps the direct stream. The planner uses
-relationships and scope bytes, not field names.
+direct stream, the writer keeps the direct stream. The instruction layer can
+round-trip generic max/min derived streams when stamped, and the v2 front header
+can carry the expression table referenced by `101-199`. The remaining work is
+for the planner to consume those header expressions as candidate instructions.
+The planner uses relationships and scope bytes, not field names.
 
 The `.aura` ingest footer now stamps a generic Aura0 plan alongside the legacy
 field program candidates. `.aura -> .aura0` conversion follows that stamped

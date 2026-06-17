@@ -1,3 +1,4 @@
+use aura_codec::header::AuraHeader;
 use aura_codec::schema::{generic_i64_parent_schema, ohlcv_schema, SchemaDescriptor};
 use aura_codec::{records, Profile};
 
@@ -138,7 +139,7 @@ fn profile_metadata_survives_compile() {
 
 fn without_last_body_byte(mut file: Vec<u8>) -> Vec<u8> {
     let body_end = footer_start(&file);
-    assert!(usize::from(file[7]) < body_end);
+    assert!(AuraHeader::encoded_len(&file).unwrap() < body_end);
     file.remove(body_end - 1);
     file
 }
