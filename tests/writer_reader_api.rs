@@ -56,6 +56,46 @@ fn reader_decodes_all_profiles_and_exposes_metadata() {
 }
 
 #[test]
+fn experimental_column_decode_matches_rows_without_row_materialization() {
+    let input = sample_input();
+    let rows = input.rows.clone();
+    let ingest = writer::encode_i64(input).unwrap();
+    let aura0 = writer::compile_i64(&ingest, Profile::Aura0).unwrap();
+
+    let decoded = records::decode_i64_columns_file(&aura0)
+        .unwrap()
+        .expect("generic Aura0 columns");
+
+    assert_eq!(Profile::Aura0, decoded.header.profile);
+    assert_eq!(rows.len(), decoded.record_count);
+    assert_eq!(rows[0].len(), decoded.columns.len());
+    for (slot, column) in decoded.columns.iter().enumerate() {
+        assert_eq!(
+            rows.iter().map(|row| row[slot]).collect::<Vec<_>>(),
+            *column
+        );
+    }
+}
+
+#[test]
+fn experimental_aura1_row_visitor_matches_rows_without_returning_vectors() {
+    let input = sample_input();
+    let rows = input.rows.clone();
+    let ingest = writer::encode_i64(input).unwrap();
+    let aura1 = writer::compile_i64(&ingest, Profile::Aura1).unwrap();
+    let mut visited = Vec::new();
+
+    let count = records::visit_i64_rows_file(&aura1, |row| {
+        visited.push(row.to_vec());
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(rows.len(), count);
+    assert_eq!(rows, visited);
+}
+
+#[test]
 fn writer_profile_output_preserves_rows_and_footer_stamps() {
     let input = I64FileInput {
         schema: generic_i64_parent_schema(

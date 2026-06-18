@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::bitpack::{
@@ -48,6 +49,905 @@ pub fn decode_generic_stream_body(
             Ok(GenericStreamBodyValue::I64(values))
         }
     }
+}
+
+pub(crate) fn try_generic_i64_stream_cursor<'a>(
+    instruction: &GenericStreamInstruction,
+    bytes: &'a [u8],
+    value_count: usize,
+) -> Result<Option<GenericI64StreamCursor<'a>>> {
+    match instruction.op {
+        GenericStreamOp::UuidConstMask { .. } | GenericStreamOp::BitplaneRle { .. } => Ok(None),
+        _ => GenericI64StreamCursor::try_new(&instruction.op, bytes, value_count),
+    }
+}
+
+pub(crate) struct GenericI64StreamCursor<'a> {
+    inner: GenericI64StreamCursorKind<'a>,
+    remaining: usize,
+}
+
+impl<'a> GenericI64StreamCursor<'a> {
+    fn try_new(
+        op: &GenericStreamOp,
+        bytes: &'a [u8],
+        value_count: usize,
+    ) -> Result<Option<Self>> {
+        let mut reader = ByteReader::new(bytes);
+        let Some(inner) = GenericI64StreamCursorKind::try_new(op, &mut reader, value_count)? else {
+            return Ok(None);
+        };
+        if !inner.keeps_reader() {
+            reader.finish()?;
+        }
+        Ok(Some(Self {
+            inner,
+            remaining: value_count,
+        }))
+    }
+
+    pub(crate) const fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    pub(crate) fn dictionary_values(&self) -> Option<&[i64]> {
+        self.inner.dictionary_values()
+    }
+
+    pub(crate) fn next_i64(&mut self) -> Result<i64> {
+        if self.remaining == 0 {
+            return Err(AuraError::InvalidValue("stream value count"));
+        }
+        let index = self.inner.produced_count(self.remaining);
+        let value = self.inner.next_i64(index)?;
+        self.remaining -= 1;
+        Ok(value)
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        if self.remaining != 0 {
+            return Err(AuraError::InvalidValue("stream value count"));
+        }
+        self.inner.finish()
+    }
+}
+
+enum GenericI64StreamCursorKind<'a> {
+    FixedStep {
+        base: i64,
+        step: i64,
+        value_count: usize,
+    },
+    BaseBitpack {
+        base: i64,
+        unit: i64,
+        values: BitpackUnsignedCursor<'a>,
+        value_count: usize,
+    },
+    PrevDelta {
+        unit: i64,
+        current: i64,
+        first_pending: bool,
+        deltas: BitpackSignedCursor<'a>,
+        value_count: usize,
+    },
+    PrevVarint {
+        unit: i64,
+        current: i64,
+        first_pending: bool,
+        reader: ByteReader<'a>,
+        value_count: usize,
+    },
+    PatchedBitpack {
+        base: i64,
+        unit: i64,
+        low_width: u8,
+        lows: BitpackUnsignedCursor<'a>,
+        indexes: BitpackUnsignedCursor<'a>,
+        highs: BitpackUnsignedCursor<'a>,
+        next_exception: Option<(usize, u64)>,
+        exceptions_remaining: usize,
+        value_count: usize,
+    },
+    Rle {
+        base: i64,
+        unit: i64,
+        run_values: BitpackUnsignedCursor<'a>,
+        lengths: ByteReader<'a>,
+        run_count: usize,
+        run_index: usize,
+        current_residual: u64,
+        current_remaining: usize,
+        value_count: usize,
+    },
+    Dictionary {
+        entries: Vec<i64>,
+        codes: BitpackUnsignedCursor<'a>,
+        value_count: usize,
+    },
+    PackedDictionary {
+        base: i64,
+        unit: i64,
+        entries: Vec<u64>,
+        codes: BitpackUnsignedCursor<'a>,
+        value_count: usize,
+    },
+    HuffmanSingle {
+        value: i64,
+        value_count: usize,
+    },
+    HuffmanBounded {
+        table: BoundedHuffmanValueDecodeTable,
+        bits: HuffmanTableBitReader<'a>,
+        value_count: usize,
+    },
+    BlockLocal {
+        block_size: usize,
+        block_count: usize,
+        body: &'a [u8],
+        offset: usize,
+        current: Option<Box<GenericI64StreamCursor<'a>>>,
+        produced: usize,
+        value_count: usize,
+    },
+}
+
+impl<'a> GenericI64StreamCursorKind<'a> {
+    fn try_new(
+        op: &GenericStreamOp,
+        reader: &mut ByteReader<'a>,
+        value_count: usize,
+    ) -> Result<Option<Self>> {
+        Ok(Some(match *op {
+            GenericStreamOp::FixedStep { base, step } => Self::FixedStep {
+                base,
+                step,
+                value_count,
+            },
+            GenericStreamOp::BaseBitpack {
+                base,
+                unit,
+                bit_width,
+            } => Self::BaseBitpack {
+                base,
+                unit,
+                values: read_bitpack_unsigned_cursor(reader, bit_width, value_count)?,
+                value_count,
+            },
+            GenericStreamOp::PrevDelta {
+                base,
+                unit,
+                bit_width,
+            } => Self::PrevDelta {
+                unit,
+                current: base,
+                first_pending: value_count != 0,
+                deltas: read_bitpack_signed_cursor(
+                    reader,
+                    bit_width,
+                    value_count.saturating_sub(1),
+                )?,
+                value_count,
+            },
+            GenericStreamOp::PrevVarint { base, unit } => {
+                validate_unit(unit)?;
+                let bytes = reader.read_exact(reader.remaining())?;
+                Self::PrevVarint {
+                    unit,
+                    current: base,
+                    first_pending: value_count != 0,
+                    reader: ByteReader::new(bytes),
+                    value_count,
+                }
+            }
+            GenericStreamOp::PatchedBitpack {
+                base,
+                unit,
+                low_width,
+                high_width,
+                exception_count,
+            } => {
+                let exception_count = exception_count as usize;
+                if exception_count > value_count {
+                    return Err(AuraError::InvalidValue("exception count"));
+                }
+                let lows = read_bitpack_unsigned_cursor(reader, low_width, value_count)?;
+                let mut indexes =
+                    read_bitpack_unsigned_cursor(reader, index_width(value_count), exception_count)?;
+                let mut highs = read_bitpack_unsigned_cursor(reader, high_width, exception_count)?;
+                let next_exception = read_next_patch_exception(&mut indexes, &mut highs)?;
+                Self::PatchedBitpack {
+                    base,
+                    unit,
+                    low_width,
+                    lows,
+                    indexes,
+                    highs,
+                    next_exception,
+                    exceptions_remaining: exception_count,
+                    value_count,
+                }
+            }
+            GenericStreamOp::Rle {
+                base,
+                unit,
+                bit_width,
+                run_count,
+            } => {
+                let run_count = run_count as usize;
+                let run_values = read_bitpack_unsigned_cursor(reader, bit_width, run_count)?;
+                let length_bytes = reader.read_exact(reader.remaining())?;
+                Self::Rle {
+                    base,
+                    unit,
+                    run_values,
+                    lengths: ByteReader::new(length_bytes),
+                    run_count,
+                    run_index: 0,
+                    current_residual: 0,
+                    current_remaining: 0,
+                    value_count,
+                }
+            }
+            GenericStreamOp::Dictionary {
+                unit,
+                entry_count,
+                code_width,
+            } => {
+                let entry_count = entry_count as usize;
+                let mut entries = Vec::with_capacity(entry_count);
+                for _ in 0..entry_count {
+                    entries.push(reconstruct_scaled_value(varint::decode_i64(reader)?, unit)?);
+                }
+                let codes = read_bitpack_unsigned_cursor(reader, code_width, value_count)?;
+                Self::Dictionary {
+                    entries,
+                    codes,
+                    value_count,
+                }
+            }
+            GenericStreamOp::PackedDictionary {
+                base,
+                unit,
+                entry_count,
+                entry_width,
+                code_width,
+            } => {
+                let entries = read_bitpacked_unsigned(reader, entry_width, entry_count as usize)?;
+                let codes = read_bitpack_unsigned_cursor(reader, code_width, value_count)?;
+                Self::PackedDictionary {
+                    base,
+                    unit,
+                    entries,
+                    codes,
+                    value_count,
+                }
+            }
+            GenericStreamOp::HuffmanDictionary {
+                base,
+                unit,
+                entry_count,
+                entry_width,
+                ref code_lengths,
+            } => {
+                let Some(cursor) = try_huffman_cursor(
+                    base,
+                    unit,
+                    entry_count,
+                    entry_width,
+                    code_lengths,
+                    reader,
+                    value_count,
+                )?
+                else {
+                    return Ok(None);
+                };
+                cursor
+            }
+            GenericStreamOp::BlockLocal {
+                block_size,
+                mode_count,
+            } => {
+                let body = reader.read_exact(reader.remaining())?;
+                let Some(()) =
+                    validate_block_local_cursor_body(block_size, mode_count, body, value_count)?
+                else {
+                    return Ok(None);
+                };
+                Self::BlockLocal {
+                    block_size: usize::from(block_size),
+                    block_count: mode_count as usize,
+                    body,
+                    offset: 0,
+                    current: None,
+                    produced: 0,
+                    value_count,
+                }
+            }
+            GenericStreamOp::BitplaneRle { .. } | GenericStreamOp::UuidConstMask { .. } => {
+                return Ok(None);
+            }
+        }))
+    }
+
+    const fn keeps_reader(&self) -> bool {
+        matches!(self, Self::PrevVarint { .. } | Self::Rle { .. })
+    }
+
+    fn produced_count(&self, remaining: usize) -> usize {
+        self.value_count().saturating_sub(remaining)
+    }
+
+    const fn value_count(&self) -> usize {
+        match self {
+            Self::FixedStep { value_count, .. }
+            | Self::BaseBitpack { value_count, .. }
+            | Self::PrevDelta { value_count, .. }
+            | Self::PrevVarint { value_count, .. }
+            | Self::PatchedBitpack { value_count, .. }
+            | Self::Rle { value_count, .. }
+            | Self::Dictionary { value_count, .. }
+            | Self::PackedDictionary { value_count, .. }
+            | Self::HuffmanSingle { value_count, .. }
+            | Self::HuffmanBounded { value_count, .. }
+            | Self::BlockLocal { value_count, .. } => *value_count,
+        }
+    }
+
+    fn dictionary_values(&self) -> Option<&[i64]> {
+        match self {
+            Self::Dictionary { entries, .. } => Some(entries.as_slice()),
+            _ => None,
+        }
+    }
+
+    fn next_i64(&mut self, index: usize) -> Result<i64> {
+        match self {
+            Self::FixedStep { base, step, .. } => fixed_step_value(*base, *step, index),
+            Self::BaseBitpack {
+                base,
+                unit,
+                values,
+                ..
+            } => reconstruct_unsigned_offset(*base, *unit, values.next()?),
+            Self::PrevDelta {
+                unit,
+                current,
+                first_pending,
+                deltas,
+                ..
+            } => {
+                if *first_pending {
+                    *first_pending = false;
+                    return Ok(*current);
+                }
+                *current = reconstruct_signed_delta(*current, *unit, deltas.next()?)?;
+                Ok(*current)
+            }
+            Self::PrevVarint {
+                unit,
+                current,
+                first_pending,
+                reader,
+                ..
+            } => {
+                if *first_pending {
+                    *first_pending = false;
+                    return Ok(*current);
+                }
+                *current = reconstruct_signed_delta(*current, *unit, varint::decode_i64(reader)?)?;
+                Ok(*current)
+            }
+            Self::PatchedBitpack {
+                base,
+                unit,
+                low_width,
+                lows,
+                indexes,
+                highs,
+                next_exception,
+                exceptions_remaining,
+                ..
+            } => {
+                let mut residual = lows.next()?;
+                if let Some((exception_index, high)) = *next_exception {
+                    match exception_index.cmp(&index) {
+                        Ordering::Less => return Err(AuraError::InvalidValue("exception index")),
+                        Ordering::Equal => {
+                            let shifted = if *low_width == 64 {
+                                if high != 0 {
+                                    return Err(AuraError::InvalidValue("exception high"));
+                                }
+                                0
+                            } else {
+                                high.checked_shl(u32::from(*low_width))
+                                    .ok_or(AuraError::InvalidValue("exception high"))?
+                            };
+                            residual |= shifted;
+                            *exceptions_remaining = exceptions_remaining.saturating_sub(1);
+                            *next_exception = read_next_patch_exception(indexes, highs)?;
+                        }
+                        Ordering::Greater => {}
+                    }
+                }
+                reconstruct_unsigned_offset(*base, *unit, residual)
+            }
+            Self::Rle {
+                base,
+                unit,
+                run_values,
+                lengths,
+                run_count,
+                run_index,
+                current_residual,
+                current_remaining,
+                ..
+            } => {
+                if *current_remaining == 0 {
+                    if *run_index >= *run_count {
+                        return Err(AuraError::InvalidValue("run length"));
+                    }
+                    *current_residual = run_values.next()?;
+                    *current_remaining = usize::try_from(varint::decode_u64(lengths)?)
+                        .map_err(|_| AuraError::InvalidValue("run length"))?;
+                    if *current_remaining == 0 {
+                        return Err(AuraError::InvalidValue("run length"));
+                    }
+                    *run_index += 1;
+                }
+                *current_remaining -= 1;
+                reconstruct_unsigned_offset(*base, *unit, *current_residual)
+            }
+            Self::Dictionary { entries, codes, .. } => {
+                let code =
+                    usize::try_from(codes.next()?).map_err(|_| AuraError::InvalidValue("dictionary code"))?;
+                entries
+                    .get(code)
+                    .copied()
+                    .ok_or(AuraError::InvalidValue("dictionary code"))
+            }
+            Self::PackedDictionary {
+                base,
+                unit,
+                entries,
+                codes,
+                ..
+            } => {
+                let code =
+                    usize::try_from(codes.next()?).map_err(|_| AuraError::InvalidValue("dictionary code"))?;
+                let entry = *entries
+                    .get(code)
+                    .ok_or(AuraError::InvalidValue("dictionary code"))?;
+                reconstruct_unsigned_offset(*base, *unit, entry)
+            }
+            Self::HuffmanSingle { value, .. } => Ok(*value),
+            Self::HuffmanBounded { table, bits, .. } => decode_one_huffman_bounded_value(table, bits),
+            Self::BlockLocal {
+                block_size,
+                block_count,
+                body,
+                offset,
+                current,
+                produced,
+                value_count,
+            } => {
+                if current.as_ref().is_none_or(|cursor| cursor.remaining() == 0) {
+                    if let Some(cursor) = current {
+                        cursor.finish()?;
+                    }
+                    if *produced >= *value_count {
+                        return Err(AuraError::InvalidValue("stream value count"));
+                    }
+                    let block_index = *produced / *block_size;
+                    if block_index >= *block_count {
+                        return Err(AuraError::InvalidValue("block count"));
+                    }
+                    let remaining = *value_count - *produced;
+                    let count = remaining.min(*block_size);
+                    let (next, next_offset) = read_block_local_cursor(*body, *offset, count)?;
+                    *offset = next_offset;
+                    *current = Some(Box::new(next));
+                }
+                let value = current
+                    .as_mut()
+                    .ok_or(AuraError::InvalidValue("block local body"))?
+                    .next_i64()?;
+                *produced += 1;
+                Ok(value)
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        match self {
+            Self::PrevVarint { reader, .. } => {
+                if reader.remaining() == 0 {
+                    Ok(())
+                } else {
+                    Err(AuraError::TrailingBytes(reader.remaining()))
+                }
+            }
+            Self::PatchedBitpack {
+                next_exception,
+                exceptions_remaining,
+                ..
+            } => {
+                if *exceptions_remaining == 0 && next_exception.is_none() {
+                    Ok(())
+                } else {
+                    Err(AuraError::InvalidValue("exception count"))
+                }
+            }
+            Self::Rle {
+                lengths,
+                run_count,
+                run_index,
+                current_remaining,
+                ..
+            } => {
+                if *current_remaining != 0 || *run_index != *run_count {
+                    return Err(AuraError::InvalidValue("run length"));
+                }
+                if lengths.remaining() == 0 {
+                    Ok(())
+                } else {
+                    Err(AuraError::TrailingBytes(lengths.remaining()))
+                }
+            }
+            Self::BlockLocal {
+                body,
+                offset,
+                current,
+                ..
+            } => {
+                if let Some(cursor) = current {
+                    cursor.finish()?;
+                }
+                if *offset == body.len() {
+                    Ok(())
+                } else {
+                    Err(AuraError::TrailingBytes(body.len() - *offset))
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+struct BitpackUnsignedCursor<'a> {
+    bytes: &'a [u8],
+    bit_width: u8,
+    value_count: usize,
+    index: usize,
+    byte_index: usize,
+    buffer: u128,
+    buffered_bits: u8,
+}
+
+struct BitpackSignedCursor<'a> {
+    unsigned: BitpackUnsignedCursor<'a>,
+}
+
+impl<'a> BitpackUnsignedCursor<'a> {
+    fn new(bytes: &'a [u8], bit_width: u8, value_count: usize) -> Result<Self> {
+        low_mask(bit_width)?;
+        let expected_len = bitpacked_byte_len(value_count as u64, bit_width) as usize;
+        if bytes.len() != expected_len {
+            return Err(AuraError::InvalidValue("bitpacked length"));
+        }
+        Ok(Self {
+            bytes,
+            bit_width,
+            value_count,
+            index: 0,
+            byte_index: 0,
+            buffer: 0,
+            buffered_bits: 0,
+        })
+    }
+
+    fn next(&mut self) -> Result<u64> {
+        if self.index >= self.value_count {
+            return Err(AuraError::InvalidValue("bitpacked length"));
+        }
+        self.index += 1;
+        if self.bit_width == 0 {
+            return Ok(0);
+        }
+        let mask = if self.bit_width == 64 {
+            u128::from(u64::MAX)
+        } else {
+            (1u128 << self.bit_width) - 1
+        };
+        while self.buffered_bits < self.bit_width {
+            let byte = self.bytes.get(self.byte_index).ok_or(AuraError::UnexpectedEof)?;
+            self.buffer |= u128::from(*byte) << self.buffered_bits;
+            self.buffered_bits += 8;
+            self.byte_index += 1;
+        }
+        let value = (self.buffer & mask) as u64;
+        self.buffer >>= self.bit_width;
+        self.buffered_bits -= self.bit_width;
+        Ok(value)
+    }
+}
+
+impl<'a> BitpackSignedCursor<'a> {
+    fn new(bytes: &'a [u8], bit_width: u8, value_count: usize) -> Result<Self> {
+        Ok(Self {
+            unsigned: BitpackUnsignedCursor::new(bytes, bit_width, value_count)?,
+        })
+    }
+
+    fn next(&mut self) -> Result<i64> {
+        let raw = self.unsigned.next()?;
+        sign_extend_bitpacked(raw, self.unsigned.bit_width)
+    }
+}
+
+fn read_bitpack_unsigned_cursor<'a>(
+    reader: &mut ByteReader<'a>,
+    bit_width: u8,
+    value_count: usize,
+) -> Result<BitpackUnsignedCursor<'a>> {
+    let byte_len = bitpacked_byte_len(value_count as u64, bit_width) as usize;
+    BitpackUnsignedCursor::new(reader.read_exact(byte_len)?, bit_width, value_count)
+}
+
+fn read_bitpack_signed_cursor<'a>(
+    reader: &mut ByteReader<'a>,
+    bit_width: u8,
+    value_count: usize,
+) -> Result<BitpackSignedCursor<'a>> {
+    let byte_len = bitpacked_byte_len(value_count as u64, bit_width) as usize;
+    BitpackSignedCursor::new(reader.read_exact(byte_len)?, bit_width, value_count)
+}
+
+fn sign_extend_bitpacked(raw: u64, bit_width: u8) -> Result<i64> {
+    match bit_width {
+        0 => Ok(0),
+        1..=63 => {
+            let sign_bit = 1u64 << (bit_width - 1);
+            let value = if raw & sign_bit == 0 {
+                i128::from(raw)
+            } else {
+                i128::from(raw) - (1i128 << bit_width)
+            };
+            i64::try_from(value).map_err(|_| AuraError::InvalidValue("bitpacked value"))
+        }
+        64 => Ok(raw as i64),
+        _ => Err(AuraError::InvalidValue("bit width")),
+    }
+}
+
+fn read_next_patch_exception(
+    indexes: &mut BitpackUnsignedCursor<'_>,
+    highs: &mut BitpackUnsignedCursor<'_>,
+) -> Result<Option<(usize, u64)>> {
+    if indexes.index >= indexes.value_count {
+        return Ok(None);
+    }
+    let index = usize::try_from(indexes.next()?).map_err(|_| AuraError::InvalidValue("index"))?;
+    let high = highs.next()?;
+    Ok(Some((index, high)))
+}
+
+fn try_huffman_cursor<'a>(
+    base: i64,
+    unit: i64,
+    entry_count: u32,
+    entry_width: u8,
+    code_lengths: &[u8],
+    reader: &mut ByteReader<'a>,
+    value_count: usize,
+) -> Result<Option<GenericI64StreamCursorKind<'a>>> {
+    let entry_count = entry_count as usize;
+    if code_lengths.len() != entry_count {
+        return Err(AuraError::InvalidValue("huffman code lengths"));
+    }
+    let entries = read_bitpacked_unsigned(reader, entry_width, entry_count)?;
+    if entry_count == 1 && matches!(code_lengths, [0] | [1]) {
+        let entry = *entries
+            .first()
+            .ok_or(AuraError::InvalidValue("dictionary entry count"))?;
+        let value = reconstruct_unsigned_offset(base, unit, entry)?;
+        let code_bytes = reader.read_exact(reader.remaining())?;
+        if !code_bytes.is_empty() && code_lengths == [0] {
+            return Err(AuraError::InvalidValue("huffman code"));
+        }
+        return Ok(Some(GenericI64StreamCursorKind::HuffmanSingle {
+            value,
+            value_count,
+        }));
+    }
+
+    let decoded_entries = entries
+        .iter()
+        .map(|entry| reconstruct_unsigned_offset(base, unit, *entry))
+        .collect::<Result<Vec<_>>>()?;
+    let canonical_codes = canonical_huffman_codes(code_lengths)?;
+    let max_len = canonical_codes
+        .iter()
+        .filter_map(|code| code.map(|code| code.bit_len))
+        .max()
+        .ok_or(AuraError::InvalidValue("huffman code lengths"))?;
+    let code_bytes = reader.read_exact(reader.remaining())?;
+    let Ok(table) = huffman_bounded_value_decode_table(
+        &canonical_codes,
+        &decoded_entries,
+        max_len.min(HUFFMAN_BOUNDED_ROOT_BITS),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(GenericI64StreamCursorKind::HuffmanBounded {
+        table,
+        bits: HuffmanTableBitReader::new(code_bytes),
+        value_count,
+    }))
+}
+
+fn decode_one_huffman_bounded_value(
+    table: &BoundedHuffmanValueDecodeTable,
+    bit_reader: &mut HuffmanTableBitReader<'_>,
+) -> Result<i64> {
+    let key = bit_reader.peek_bits(table.root_bits)? as usize;
+    let entry = match table
+        .root
+        .get(key)
+        .ok_or(AuraError::InvalidValue("huffman code"))?
+    {
+        BoundedHuffmanRootSlot::Empty => return Err(AuraError::InvalidValue("huffman code")),
+        BoundedHuffmanRootSlot::Leaf(entry) => *entry,
+        BoundedHuffmanRootSlot::Subtable(subtable_index) => {
+            let subtable = table
+                .subtables
+                .get(*subtable_index)
+                .ok_or(AuraError::InvalidValue("huffman code"))?;
+            let total_bits = table
+                .root_bits
+                .checked_add(subtable.bits)
+                .ok_or(AuraError::InvalidValue("huffman code"))?;
+            let suffix_mask = low_mask(subtable.bits)?;
+            let suffix = usize::try_from(bit_reader.peek_bits(total_bits)? & suffix_mask)
+                .map_err(|_| AuraError::InvalidValue("huffman code"))?;
+            subtable
+                .slots
+                .get(suffix)
+                .and_then(|entry| *entry)
+                .ok_or(AuraError::InvalidValue("huffman code"))?
+        }
+    };
+    bit_reader.consume_bits(entry.bit_len)?;
+    Ok(entry.value)
+}
+
+fn validate_block_local_cursor_body(
+    block_size: u16,
+    mode_count: u32,
+    body: &[u8],
+    value_count: usize,
+) -> Result<Option<()>> {
+    let block_size = usize::from(block_size);
+    if block_size == 0 {
+        return Err(AuraError::InvalidValue("block size"));
+    }
+    let block_count = value_count.div_ceil(block_size);
+    if block_count != mode_count as usize {
+        return Err(AuraError::InvalidValue("block count"));
+    }
+    let mut offset = 0usize;
+    for block_index in 0..block_count {
+        let count = (value_count - block_index * block_size).min(block_size);
+        let mut reader = ByteReader::new(
+            body.get(offset..)
+                .ok_or(AuraError::InvalidValue("block local body"))?,
+        );
+        let op = decode_local_op_header(&mut reader)?;
+        let header_len = local_op_header_len(&op);
+        let Some(body_len) = local_op_body_len(&op, count, reader.read_exact(reader.remaining())?)?
+        else {
+            return Ok(None);
+        };
+        offset = offset
+            .checked_add(header_len)
+            .and_then(|value| value.checked_add(body_len))
+            .ok_or(AuraError::InvalidValue("block local body"))?;
+        if offset > body.len() {
+            return Err(AuraError::UnexpectedEof);
+        }
+    }
+    if offset != body.len() {
+        return Err(AuraError::TrailingBytes(body.len() - offset));
+    }
+    Ok(Some(()))
+}
+
+fn read_block_local_cursor<'a>(
+    body: &'a [u8],
+    offset: usize,
+    value_count: usize,
+) -> Result<(GenericI64StreamCursor<'a>, usize)> {
+    let mut reader = ByteReader::new(
+        body.get(offset..)
+            .ok_or(AuraError::InvalidValue("block local body"))?,
+    );
+    let op = decode_local_op_header(&mut reader)?;
+    let header_len = local_op_header_len(&op);
+    let body_start = offset
+        .checked_add(header_len)
+        .ok_or(AuraError::InvalidValue("block local body"))?;
+    let Some(body_len) = local_op_body_len(&op, value_count, reader.read_exact(reader.remaining())?)?
+    else {
+        return Err(AuraError::InvalidValue("block local mode"));
+    };
+    let body_end = body_start
+        .checked_add(body_len)
+        .ok_or(AuraError::InvalidValue("block local body"))?;
+    let local_body = body
+        .get(body_start..body_end)
+        .ok_or(AuraError::UnexpectedEof)?;
+    let cursor = GenericI64StreamCursor::try_new(&op, local_body, value_count)?
+        .ok_or(AuraError::InvalidValue("block local mode"))?;
+    Ok((cursor, body_end))
+}
+
+fn local_op_body_len(op: &GenericStreamOp, value_count: usize, bytes: &[u8]) -> Result<Option<usize>> {
+    let len = match *op {
+        GenericStreamOp::FixedStep { .. } => 0,
+        GenericStreamOp::BaseBitpack { bit_width, .. } => {
+            bitpacked_byte_len(value_count as u64, bit_width) as usize
+        }
+        GenericStreamOp::PrevDelta { bit_width, .. } => {
+            bitpacked_byte_len(value_count.saturating_sub(1) as u64, bit_width) as usize
+        }
+        GenericStreamOp::PatchedBitpack {
+            low_width,
+            high_width,
+            exception_count,
+            ..
+        } => {
+            let exception_count = u64::from(exception_count);
+            let lows = bitpacked_byte_len(value_count as u64, low_width);
+            let indexes = bitpacked_byte_len(exception_count, index_width(value_count));
+            let highs = bitpacked_byte_len(exception_count, high_width);
+            usize::try_from(lows + indexes + highs)
+                .map_err(|_| AuraError::InvalidValue("block local body"))?
+        }
+        GenericStreamOp::Rle {
+            bit_width,
+            run_count,
+            ..
+        } => {
+            let run_count_usize = run_count as usize;
+            let run_values_len = bitpacked_byte_len(u64::from(run_count), bit_width) as usize;
+            let varint_bytes = bytes
+                .get(run_values_len..)
+                .ok_or(AuraError::UnexpectedEof)?;
+            let mut reader = ByteReader::new(varint_bytes);
+            let mut total = 0usize;
+            for _ in 0..run_count_usize {
+                let len = usize::try_from(varint::decode_u64(&mut reader)?)
+                    .map_err(|_| AuraError::InvalidValue("run length"))?;
+                if len == 0 {
+                    return Err(AuraError::InvalidValue("run length"));
+                }
+                total = total
+                    .checked_add(len)
+                    .ok_or(AuraError::InvalidValue("run length"))?;
+            }
+            if total != value_count {
+                return Err(AuraError::InvalidValue("run length"));
+            }
+            run_values_len
+                .checked_add(reader.offset())
+                .ok_or(AuraError::InvalidValue("block local body"))?
+        }
+        _ => return Ok(None),
+    };
+    if len > bytes.len() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    Ok(Some(len))
 }
 
 fn encode_i64_op(op: &GenericStreamOp, values: &[i64]) -> Result<Vec<u8>> {

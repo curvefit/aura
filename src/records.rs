@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::bitpack::{
     bitpacked_byte_len, pack_signed_values, pack_unsigned_values, unpack_signed_values,
     unpack_unsigned_values,
@@ -7,7 +9,8 @@ use crate::footer::AuraFooter;
 use crate::format::SEAL_MAGIC;
 use crate::generic_planner::{
     decode_generic_i64_rows_body, encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan,
-    plan_generic_i64_rows, try_decode_generic_i64_columns_body,
+    plan_generic_i64_rows, try_decode_generic_i64_columns_body, try_encode_generic_i64_aura1_body,
+    try_encode_generic_i64_aura1_body_streaming,
 };
 use crate::header::{AuraHeader, LEGACY_HEADER_PREFIX_SIZE};
 use crate::instructions::GenericInstructionPlan;
@@ -42,6 +45,15 @@ pub struct DecodedI64File {
     pub ingest_footer: Option<AuraFooter>,
     pub compiled_footer: Option<CompiledFooter>,
     pub rows: Vec<Vec<i64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedI64ColumnsFile {
+    pub header: AuraHeader,
+    pub schema: SchemaDescriptor,
+    pub compiled_footer: CompiledFooter,
+    pub record_count: usize,
+    pub columns: Vec<Vec<i64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +257,174 @@ fn try_compile_aura0_to_aura1_fast(
     footer_start: usize,
     footer_len_offset: usize,
 ) -> Result<Option<Vec<u8>>> {
+    let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
+    let total_start = Instant::now();
+    let stage_start = Instant::now();
+    let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+    validate_header_schema_agreement(&header, &footer.schema)?;
+    if schema_has_wide_fields(&footer.schema) {
+        return Err(AuraError::InvalidValue("i64 schema"));
+    }
+    let Some(plan) = footer.generic_aura0_plan.clone() else {
+        return Ok(None);
+    };
+    let record_count = usize::try_from(footer.record_count)
+        .map_err(|_| AuraError::InvalidValue("record count"))?;
+    let field_count = footer.schema.fields.len();
+    if profile {
+        eprintln!("fast footer_us={}", stage_start.elapsed().as_micros());
+    }
+    let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+    let stage_start = Instant::now();
+    let body = if std::env::var_os("AURA_STREAM_AURA1").is_some() {
+        if let Some(body) = try_encode_generic_i64_aura1_body_streaming(
+            plan.clone(),
+            &bytes[header_len..footer_start],
+            record_count,
+            field_count,
+            &aura1_plan,
+        )? {
+            if profile {
+                eprintln!("fast stream_body_us={}", stage_start.elapsed().as_micros());
+            }
+            body
+        } else if let Some(body) = try_encode_generic_i64_aura1_body(
+            plan.clone(),
+            &bytes[header_len..footer_start],
+            record_count,
+            field_count,
+            &aura1_plan,
+        )? {
+            if profile {
+                eprintln!("fast direct_body_us={}", stage_start.elapsed().as_micros());
+            }
+            body
+        } else {
+            let Some(columns) = try_decode_generic_i64_columns_body(
+                plan,
+                &bytes[header_len..footer_start],
+                record_count,
+                field_count,
+            )?
+            else {
+                return Ok(None);
+            };
+            if profile {
+                eprintln!("fast columns_us={}", stage_start.elapsed().as_micros());
+            }
+            let stage_start = Instant::now();
+            let body = encode_aura1_body_from_columns(&columns, &aura1_plan)?;
+            if profile {
+                eprintln!("fast aura1_body_us={}", stage_start.elapsed().as_micros());
+            }
+            body
+        }
+    } else if std::env::var_os("AURA_DIRECT_AURA1").is_some() {
+        if let Some(body) = try_encode_generic_i64_aura1_body(
+            plan.clone(),
+            &bytes[header_len..footer_start],
+            record_count,
+            field_count,
+            &aura1_plan,
+        )? {
+            if profile {
+                eprintln!("fast direct_body_us={}", stage_start.elapsed().as_micros());
+            }
+            body
+        } else {
+            let Some(columns) = try_decode_generic_i64_columns_body(
+                plan,
+                &bytes[header_len..footer_start],
+                record_count,
+                field_count,
+            )?
+            else {
+                return Ok(None);
+            };
+            if profile {
+                eprintln!("fast columns_us={}", stage_start.elapsed().as_micros());
+            }
+            let stage_start = Instant::now();
+            let body = encode_aura1_body_from_columns(&columns, &aura1_plan)?;
+            if profile {
+                eprintln!("fast aura1_body_us={}", stage_start.elapsed().as_micros());
+            }
+            body
+        }
+    } else {
+        let Some(columns) = try_decode_generic_i64_columns_body(
+            plan,
+            &bytes[header_len..footer_start],
+            record_count,
+            field_count,
+        )?
+        else {
+            return Ok(None);
+        };
+        if profile {
+            eprintln!("fast columns_us={}", stage_start.elapsed().as_micros());
+        }
+        let stage_start = Instant::now();
+        let body = encode_aura1_body_from_columns(&columns, &aura1_plan)?;
+        if profile {
+            eprintln!("fast aura1_body_us={}", stage_start.elapsed().as_micros());
+        }
+        body
+    };
+    if profile {
+        eprintln!("fast body_bytes={}", body.len());
+    }
+    let stage_start = Instant::now();
+    let out = encode_compiled_file(
+        Profile::Aura1,
+        header.stream_id,
+        header.dictionary_id,
+        header.base_time_ns,
+        header.comment.as_str(),
+        body,
+        footer,
+    )?;
+    if profile {
+        eprintln!(
+            "fast file_us={} total_us={}",
+            stage_start.elapsed().as_micros(),
+            total_start.elapsed().as_micros()
+        );
+    }
+    Ok(Some(out))
+}
+
+pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
+    crate::reader::decode_i64(bytes)
+}
+
+pub fn decode_i64_columns_file(bytes: &[u8]) -> Result<Option<DecodedI64ColumnsFile>> {
+    if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let seal_offset = bytes.len() - SEAL_MAGIC.len();
+    if &bytes[seal_offset..] != SEAL_MAGIC {
+        return Err(AuraError::InvalidMagic {
+            expected: "sealed:)",
+        });
+    }
+    let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
+    let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
+    let header_len = AuraHeader::encoded_len(bytes)?;
+    if header_len > footer_len_offset {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let header = AuraHeader::decode(&bytes[..header_len])?;
+    let footer_start = footer_len_offset
+        .checked_sub(footer_len)
+        .ok_or(AuraError::UnexpectedEof)?;
+    if footer_start < header_len {
+        return Err(AuraError::UnexpectedEof);
+    }
+    if header.profile != Profile::Aura0 {
+        return Ok(None);
+    }
+
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
     validate_header_schema_agreement(&header, &footer.schema)?;
     if schema_has_wide_fields(&footer.schema) {
@@ -265,21 +445,62 @@ fn try_compile_aura0_to_aura1_fast(
     else {
         return Ok(None);
     };
-    let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
-    let body = encode_aura1_body_from_columns(&columns, &aura1_plan)?;
-    Ok(Some(encode_compiled_file(
-        Profile::Aura1,
-        header.stream_id,
-        header.dictionary_id,
-        header.base_time_ns,
-        header.comment.as_str(),
-        body,
-        footer,
-    )?))
+    validate_columns(&footer.schema, record_count, &columns)?;
+
+    Ok(Some(DecodedI64ColumnsFile {
+        header,
+        schema: footer.schema.clone(),
+        compiled_footer: footer,
+        record_count,
+        columns,
+    }))
 }
 
-pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
-    crate::reader::decode_i64(bytes)
+pub fn visit_i64_rows_file<F>(bytes: &[u8], mut visitor: F) -> Result<usize>
+where
+    F: FnMut(&[i64]) -> Result<()>,
+{
+    if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let seal_offset = bytes.len() - SEAL_MAGIC.len();
+    if &bytes[seal_offset..] != SEAL_MAGIC {
+        return Err(AuraError::InvalidMagic {
+            expected: "sealed:)",
+        });
+    }
+    let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
+    let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
+    let header_len = AuraHeader::encoded_len(bytes)?;
+    if header_len > footer_len_offset {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let header = AuraHeader::decode(&bytes[..header_len])?;
+    let footer_start = footer_len_offset
+        .checked_sub(footer_len)
+        .ok_or(AuraError::UnexpectedEof)?;
+    if footer_start < header_len {
+        return Err(AuraError::UnexpectedEof);
+    }
+    if header.profile != Profile::Aura1 {
+        return Err(AuraError::InvalidValue("aura1 visitor profile"));
+    }
+
+    let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+    validate_header_schema_agreement(&header, &footer.schema)?;
+    if schema_has_wide_fields(&footer.schema) {
+        return Err(AuraError::InvalidValue("i64 schema"));
+    }
+    let plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+    let record_count = usize::try_from(footer.record_count)
+        .map_err(|_| AuraError::InvalidValue("record count"))?;
+    visit_aura1_body(
+        &bytes[header_len..footer_start],
+        &plan,
+        record_count,
+        footer.schema.fields.len(),
+        &mut visitor,
+    )
 }
 
 pub fn decode_typed_file(bytes: &[u8]) -> Result<DecodedTypedFile> {
@@ -439,6 +660,7 @@ pub(crate) fn decode_typed_file_inner(bytes: &[u8]) -> Result<DecodedTypedFile> 
 }
 
 const FOOTER_LEN_SIZE: usize = 4;
+const MAX_VISITOR_FIELDS: usize = 64;
 
 fn read_trailer_footer_len(bytes: &[u8], offset: usize) -> Result<usize> {
     let end = offset
@@ -1606,6 +1828,11 @@ fn encode_aura1_body_from_columns(columns: &[Vec<i64>], plan: &Aura1Plan) -> Res
             return Err(AuraError::InvalidValue("field index"));
         }
     }
+    if let Some(body) =
+        encode_aura1_partitioned_sparse_body_from_columns(columns, plan, record_count)?
+    {
+        return Ok(body);
+    }
     let row_width = plan
         .fields
         .iter()
@@ -1631,6 +1858,84 @@ fn encode_aura1_body_from_columns(columns: &[Vec<i64>], plan: &Aura1Plan) -> Res
     Ok(out)
 }
 
+fn encode_aura1_partitioned_sparse_body_from_columns(
+    columns: &[Vec<i64>],
+    plan: &Aura1Plan,
+    record_count: usize,
+) -> Result<Option<Vec<u8>>> {
+    if columns.len() != 8 || plan.fields.len() != 8 {
+        return Ok(None);
+    }
+    let expected = [
+        (0u16, PhysicalWidth::I64),
+        (1, PhysicalWidth::I64),
+        (2, PhysicalWidth::I32),
+        (3, PhysicalWidth::I8),
+        (4, PhysicalWidth::I64),
+        (5, PhysicalWidth::I64),
+        (6, PhysicalWidth::I64),
+        (7, PhysicalWidth::I8),
+    ];
+    if !plan
+        .fields
+        .iter()
+        .zip(expected)
+        .all(|(field, (index, width))| field.field_index == index && field.width == width)
+    {
+        return Ok(None);
+    }
+
+    const ROW_WIDTH: usize = 46;
+    let body_len = record_count
+        .checked_mul(ROW_WIDTH)
+        .ok_or(AuraError::InvalidValue("body length"))?;
+    let c0 = columns[0].as_slice();
+    let c1 = columns[1].as_slice();
+    let c2 = columns[2].as_slice();
+    let c3 = columns[3].as_slice();
+    let c4 = columns[4].as_slice();
+    let c5 = columns[5].as_slice();
+    let c6 = columns[6].as_slice();
+    let c7 = columns[7].as_slice();
+
+    let mut out = vec![0u8; body_len];
+    for row_index in 0..record_count {
+        let v2 = i32::try_from(c2[row_index]).map_err(|_| AuraError::InvalidValue("i32 value"))?;
+        let v3 = i8::try_from(c3[row_index]).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+        let v7 = i8::try_from(c7[row_index]).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+        let row = &mut out[row_index * ROW_WIDTH..][..ROW_WIDTH];
+        write_unaligned_i64_le(row, 0, c0[row_index]);
+        write_unaligned_i64_le(row, 8, c1[row_index]);
+        write_unaligned_i32_le(row, 16, v2);
+        row[20] = v3 as u8;
+        write_unaligned_i64_le(row, 21, c4[row_index]);
+        write_unaligned_i64_le(row, 29, c5[row_index]);
+        write_unaligned_i64_le(row, 37, c6[row_index]);
+        row[45] = v7 as u8;
+    }
+    Ok(Some(out))
+}
+
+fn write_unaligned_i64_le(row: &mut [u8], offset: usize, value: i64) {
+    debug_assert!(offset + std::mem::size_of::<i64>() <= row.len());
+    unsafe {
+        row.as_mut_ptr()
+            .add(offset)
+            .cast::<i64>()
+            .write_unaligned(value.to_le());
+    }
+}
+
+fn write_unaligned_i32_le(row: &mut [u8], offset: usize, value: i32) {
+    debug_assert!(offset + std::mem::size_of::<i32>() <= row.len());
+    unsafe {
+        row.as_mut_ptr()
+            .add(offset)
+            .cast::<i32>()
+            .write_unaligned(value.to_le());
+    }
+}
+
 fn decode_aura1_body(
     bytes: &[u8],
     plan: &Aura1Plan,
@@ -1649,6 +1954,41 @@ fn decode_aura1_body(
     }
     reader.finish()?;
     Ok(rows)
+}
+
+fn visit_aura1_body<F>(
+    bytes: &[u8],
+    plan: &Aura1Plan,
+    record_count: usize,
+    field_count: usize,
+    visitor: &mut F,
+) -> Result<usize>
+where
+    F: FnMut(&[i64]) -> Result<()>,
+{
+    if field_count > MAX_VISITOR_FIELDS {
+        return Err(AuraError::InvalidValue("field count"));
+    }
+    for field_plan in &plan.fields {
+        if usize::from(field_plan.field_index) >= field_count {
+            return Err(AuraError::InvalidValue("field index"));
+        }
+    }
+
+    let mut reader = ByteReader::new(bytes);
+    let mut row = [0i64; MAX_VISITOR_FIELDS];
+    for _ in 0..record_count {
+        for value in &mut row[..field_count] {
+            *value = 0;
+        }
+        for field_plan in &plan.fields {
+            row[usize::from(field_plan.field_index)] =
+                read_i64_width(&mut reader, field_plan.width)?;
+        }
+        visitor(&row[..field_count])?;
+    }
+    reader.finish()?;
+    Ok(record_count)
 }
 
 fn write_i64_width(out: &mut Vec<u8>, value: i64, width: PhysicalWidth) -> Result<()> {
@@ -1715,6 +2055,22 @@ pub(crate) fn validate_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Res
     for row in rows {
         if row.len() != schema.fields.len() {
             return Err(AuraError::InvalidValue("record field count"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_columns(
+    schema: &SchemaDescriptor,
+    record_count: usize,
+    columns: &[Vec<i64>],
+) -> Result<()> {
+    if columns.len() != schema.fields.len() {
+        return Err(AuraError::InvalidValue("record field count"));
+    }
+    for column in columns {
+        if column.len() != record_count {
+            return Err(AuraError::InvalidValue("stream value count"));
         }
     }
     Ok(())

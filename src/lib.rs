@@ -45,7 +45,9 @@ pub use instructions::{
 };
 pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 pub use reader::{AuraI64Reader, AuraTypedReader};
-pub use records::{DecodedI64File, DecodedTypedFile, I64FileInput, TypedFileInput};
+pub use records::{
+    DecodedI64ColumnsFile, DecodedI64File, DecodedTypedFile, I64FileInput, TypedFileInput,
+};
 pub use schema::{
     decode_schema_map, generic_i64_parent_schema, schema_parent_mapping, FieldDescriptor,
     FieldRelation, FieldRole, FieldScope, FieldTransform, FieldType, I64SchemaDefinition,
