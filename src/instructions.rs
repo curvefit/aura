@@ -1,5 +1,8 @@
 use std::collections::BTreeSet;
 
+use crate::bitpack::{
+    bitpacked_byte_len, pack_unsigned_values, unpack_unsigned_values, unsigned_bitpack_width,
+};
 use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u8, ByteReader};
 use crate::header::DerivedExpressionOp;
 use crate::{AuraError, Result};
@@ -389,14 +392,12 @@ impl GenericStreamOp {
                 entry_width,
                 ref code_lengths,
             } => {
-                put_u8(out, 11);
+                put_u8(out, 12);
                 put_i64_le(out, base);
                 put_i64_le(out, unit);
                 put_u32_le(out, entry_count);
                 put_u8(out, entry_width);
-                for code_length in code_lengths {
-                    put_u8(out, *code_length);
-                }
+                put_packed_huffman_code_lengths(out, code_lengths)?;
             }
             Self::UuidConstMask {
                 constant_bits,
@@ -472,6 +473,20 @@ impl GenericStreamOp {
                 let code_lengths = (0..entry_count)
                     .map(|_| reader.read_u8())
                     .collect::<Result<Vec<_>>>()?;
+                Self::HuffmanDictionary {
+                    base,
+                    unit,
+                    entry_count,
+                    entry_width,
+                    code_lengths,
+                }
+            }
+            12 => {
+                let base = reader.read_i64_le()?;
+                let unit = reader.read_i64_le()?;
+                let entry_count = reader.read_u32_le()?;
+                let entry_width = reader.read_u8()?;
+                let code_lengths = read_packed_huffman_code_lengths(reader, entry_count)?;
                 Self::HuffmanDictionary {
                     base,
                     unit,
@@ -1080,6 +1095,37 @@ fn validate_huffman_code_lengths(entry_count: u32, code_lengths: &[u8]) -> Resul
         return Err(AuraError::InvalidValue("huffman code lengths"));
     }
     Ok(())
+}
+
+fn put_packed_huffman_code_lengths(out: &mut Vec<u8>, code_lengths: &[u8]) -> Result<()> {
+    let max = code_lengths.iter().copied().max().unwrap_or(0);
+    let bit_width = unsigned_bitpack_width(u64::from(max));
+    put_u8(out, bit_width);
+    out.extend(pack_unsigned_values(
+        &code_lengths
+            .iter()
+            .map(|value| u64::from(*value))
+            .collect::<Vec<_>>(),
+        bit_width,
+    )?);
+    Ok(())
+}
+
+fn read_packed_huffman_code_lengths(
+    reader: &mut ByteReader<'_>,
+    entry_count: u32,
+) -> Result<Vec<u8>> {
+    let bit_width = reader.read_u8()?;
+    validate_bit_width(bit_width)?;
+    let byte_len = bitpacked_byte_len(u64::from(entry_count), bit_width) as usize;
+    unpack_unsigned_values(
+        reader.read_exact(byte_len)?,
+        bit_width,
+        entry_count as usize,
+    )?
+    .into_iter()
+    .map(|value| u8::try_from(value).map_err(|_| AuraError::InvalidValue("huffman code lengths")))
+    .collect()
 }
 
 fn encode_optional_slot(slot: Option<u16>) -> Result<u16> {

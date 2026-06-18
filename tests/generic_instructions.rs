@@ -463,6 +463,69 @@ fn generic_stream_body_round_trips_core_i64_ops() {
 }
 
 #[test]
+fn huffman_instruction_packs_code_lengths_in_footer_plan() {
+    let code_lengths = vec![4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 15, 15, 15];
+    let huffman = GenericStreamOp::HuffmanDictionary {
+        base: 10,
+        unit: 1,
+        entry_count: code_lengths.len() as u32,
+        entry_width: 6,
+        code_lengths,
+    };
+    let legacy_len = 1 + 8 + 8 + 4 + 1 + 16;
+
+    assert!(huffman.encoded_len().unwrap() < legacy_len);
+
+    let plan = GenericInstructionPlan {
+        streams: vec![GenericStreamInstruction {
+            stream_id: 0,
+            target_slot: Some(0),
+            op: huffman,
+        }],
+        groups: Vec::new(),
+    };
+
+    assert_eq!(
+        plan,
+        GenericInstructionPlan::decode(&plan.encode().unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn legacy_huffman_instruction_raw_code_lengths_still_decodes() {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(b"AURI");
+    encoded.push(1);
+    encoded.extend_from_slice(&1u16.to_le_bytes());
+    encoded.extend_from_slice(&0u16.to_le_bytes());
+    encoded.extend_from_slice(&7u16.to_le_bytes());
+    encoded.extend_from_slice(&u16::MAX.to_le_bytes());
+    encoded.push(11);
+    encoded.extend_from_slice(&10i64.to_le_bytes());
+    encoded.extend_from_slice(&1i64.to_le_bytes());
+    encoded.extend_from_slice(&4u32.to_le_bytes());
+    encoded.push(4);
+    encoded.extend_from_slice(&[1, 2, 3, 3]);
+
+    let expected = GenericInstructionPlan {
+        streams: vec![GenericStreamInstruction {
+            stream_id: 7,
+            target_slot: None,
+            op: GenericStreamOp::HuffmanDictionary {
+                base: 10,
+                unit: 1,
+                entry_count: 4,
+                entry_width: 4,
+                code_lengths: vec![1, 2, 3, 3],
+            },
+        }],
+        groups: Vec::new(),
+    };
+
+    assert_eq!(expected, GenericInstructionPlan::decode(&encoded).unwrap());
+}
+
+#[test]
 fn generic_uuid_const_mask_body_round_trips_u128_values() {
     let instruction = GenericStreamInstruction {
         stream_id: 0,

@@ -1462,13 +1462,17 @@ impl<'a> HuffmanBitReader<'a> {
         let mut out = 0u64;
         let mut byte_index = self.byte_index;
         let mut used_bits = self.used_bits;
-        for _ in 0..bit_count {
-            let bit = self
-                .bytes
-                .get(byte_index)
-                .map_or(0, |byte| (byte >> (7 - used_bits)) & 1);
-            out = (out << 1) | u64::from(bit);
-            used_bits += 1;
+        let mut remaining = bit_count;
+        while remaining > 0 {
+            let available = 8 - used_bits;
+            let take = remaining.min(available);
+            let byte = self.bytes.get(byte_index).copied().unwrap_or(0);
+            let shift = available - take;
+            let mask = ((1u16 << take) - 1) << shift;
+            let bits = u64::from((u16::from(byte) & mask) >> shift);
+            out = (out << take) | bits;
+            used_bits += take;
+            remaining -= take;
             if used_bits == 8 {
                 byte_index += 1;
                 used_bits = 0;

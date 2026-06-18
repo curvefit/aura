@@ -3729,7 +3729,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stream_score_counts_huffman_footer_bytes() {
+    fn stream_score_counts_compact_huffman_footer_bytes() {
         let values = [10, 10, 10, 20, 10, 30, 40, 20, 10];
         let packed = GenericStreamOp::PackedDictionary {
             base: 10,
@@ -3750,10 +3750,10 @@ mod tests {
             encoded_i64_len_with_op(&huffman, &values).unwrap()
                 < encoded_i64_len_with_op(&packed, &values).unwrap()
         );
-        assert!(
-            encoded_i64_score_with_op(&packed, &values).unwrap()
-                < encoded_i64_score_with_op(&huffman, &values).unwrap()
-        );
+        assert!(huffman.encoded_len().unwrap() < 1 + 8 + 8 + 4 + 1 + 4);
+        let legacy_huffman_score =
+            encoded_i64_len_with_op(&huffman, &values).unwrap() + 1 + 8 + 8 + 4 + 1 + 4;
+        assert!(encoded_i64_score_with_op(&huffman, &values).unwrap() < legacy_huffman_score);
     }
 
     #[test]
