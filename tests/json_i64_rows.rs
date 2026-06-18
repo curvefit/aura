@@ -7,8 +7,8 @@ use aura_codec::{
 
 const SCHEMA_HEADER: &str = "100,0,2,2,2,0,1,0,0,6,8";
 const SCHEMA_BYTES: &[u8] = &[100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8];
-const DERIVED_SCHEMA_HEADER: &str = "100,0,102,103,2,0,1,0,0,6,8";
-const DERIVED_SCHEMA_BYTES: &[u8] = &[100, 0, 102, 103, 2, 0, 1, 0, 0, 6, 8];
+const DERIVED_SCHEMA_HEADER: &str = "100,101,102,103,2,0,1,107,0,6,110";
+const DERIVED_SCHEMA_BYTES: &[u8] = &[100, 101, 102, 103, 2, 0, 1, 107, 0, 6, 110];
 
 #[test]
 fn json_positional_rows_encode_compile_and_decode_from_schema_header() {
@@ -122,10 +122,10 @@ fn json_positional_rows_accept_derived_expression_schema_header() {
         let low = open.min(close) - i64::from(index % 3);
         let volume = 1_000 + i64::from((index * 13) % 200);
         let close_time = open_time + 59_999;
-        let quote_volume = volume * close;
+        let quote_volume = volume * close + i64::from(index % 5);
         let trade_count = 100 + i64::from(index % 17);
         let taker_buy_base = volume / 3;
-        let taker_buy_quote = quote_volume * taker_buy_base / volume;
+        let taker_buy_quote = close * taker_buy_base + i64::from((index * 3) % 7);
         previous_close = close;
         rows_json.push_str(&format!(
             "  [{open_time}, \"{open}.00\", \"{high}.00\", \"{low}.00\", \"{close}.00\", \"{volume}.00000\", {close_time}, \"{quote_volume}.0000000\", {trade_count}, \"{taker_buy_base}.00000\", \"{taker_buy_quote}.0000000\", \"0\"]"
@@ -141,9 +141,15 @@ fn json_positional_rows_accept_derived_expression_schema_header() {
         .arg("--schema")
         .arg(DERIVED_SCHEMA_HEADER)
         .arg("--derive")
+        .arg("1:first_offset_then_delta:1:4")
+        .arg("--derive")
         .arg("2:max_plus_residual:2:1,4")
         .arg("--derive")
         .arg("3:min_minus_residual:3:1,4")
+        .arg("--derive")
+        .arg("7:mul:7:4,5")
+        .arg("--derive")
+        .arg("10:mul:10:4,9")
         .arg("--out")
         .arg(&output)
         .arg(&input)
@@ -156,11 +162,14 @@ fn json_positional_rows_accept_derived_expression_schema_header() {
         String::from_utf8_lossy(&output_result.stderr)
     );
     let stdout = String::from_utf8_lossy(&output_result.stdout);
-    assert!(stdout.contains("derived_expressions=2"));
+    assert!(stdout.contains("derived_expressions=5"));
 
     let expected_derives = vec![
+        DerivedExpression::new(1, 1, DerivedExpressionOp::FirstOffsetThenDelta, vec![4]).unwrap(),
         DerivedExpression::new(2, 2, DerivedExpressionOp::MaxPlusResidual, vec![1, 4]).unwrap(),
         DerivedExpression::new(3, 3, DerivedExpressionOp::MinMinusResidual, vec![1, 4]).unwrap(),
+        DerivedExpression::new(7, 7, DerivedExpressionOp::Mul, vec![4, 5]).unwrap(),
+        DerivedExpression::new(10, 10, DerivedExpressionOp::Mul, vec![4, 9]).unwrap(),
     ];
 
     let aura = records::decode_i64_file(&fs::read(&output).unwrap()).unwrap();
@@ -188,6 +197,17 @@ fn json_positional_rows_accept_derived_expression_schema_header() {
         matches!(
             group,
             GenericGroupInstruction::DerivedStream {
+                output_slot: 1,
+                op: DerivedOp::FirstOffsetThenDelta,
+                input_slots,
+                ..
+            } if input_slots.as_slice() == [4]
+        )
+    }));
+    assert!(plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::DerivedStream {
                 output_slot: 2,
                 op: DerivedOp::MaxPlusResidual,
                 input_slots,
@@ -204,6 +224,28 @@ fn json_positional_rows_accept_derived_expression_schema_header() {
                 input_slots,
                 ..
             } if input_slots.as_slice() == [1, 4]
+        )
+    }));
+    assert!(plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::ExpressionStream {
+                output_slot: 7,
+                op: DerivedExpressionOp::Mul,
+                input_slots,
+                ..
+            } if input_slots.as_slice() == [4, 5]
+        )
+    }));
+    assert!(plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::ExpressionStream {
+                output_slot: 10,
+                op: DerivedExpressionOp::Mul,
+                input_slots,
+                ..
+            } if input_slots.as_slice() == [4, 9]
         )
     }));
 

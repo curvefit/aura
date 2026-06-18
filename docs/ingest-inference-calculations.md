@@ -255,6 +255,7 @@ subtract_residual   -> input - output
 max_plus_residual   -> output - max(input_a, input_b)
 min_minus_residual  -> min(input_a, input_b) - output
 first_offset_then_delta -> first output, then output - previous(input)
+add/sub/mul/div/min/max -> output - expression(input slots, literals)
 ```
 
 Parent-child bytes alone do not authorize min/max shape discovery. A map such as
@@ -265,8 +266,11 @@ or `min_minus_residual` expressions.
 
 ## Product and Proportional Calculations
 
-Where a full descriptor or candidate flag allows arithmetic relationships, the
-ingestor may test:
+The compact one-byte map alone does not identify price/quantity semantics.
+Product and proportional relationships must be authorized by either a
+header-declared derived expression ref (`101-199`) or a richer schema descriptor
+with generic transform-candidate flags. Where that evidence exists, the ingestor
+may test:
 
 ```text
 value - quantity * price / divisor
@@ -274,9 +278,18 @@ value - total_value * child_quantity / total_quantity
 parent - child
 ```
 
-The compact one-byte map alone does not identify price/quantity semantics. If a
-source adapter wants product/proportional candidates, it must provide generic
-field roles or transform-candidate flags in the richer schema descriptor.
+For product relationships representable without a divisor, the compact form is
+just a generic `mul` expression:
+
+```text
+slot byte = 100 + expression id
+expression op = mul
+residual stream = output - input_a * input_b
+```
+
+If fixed-point decimal scales require division, the source adapter must either
+normalize values so the product lands in the output scale or declare a richer
+expression with the required divisor before that transform is legal.
 
 ## Group Calculations During Ingest
 
@@ -437,6 +450,26 @@ slot2 - max(slot1, slot4)
 min(slot1, slot4) - slot3
 volume direct/base/block candidates
 frequency histograms for declared derived residuals
+```
+
+For kline-like rows that also contain quote notional fields, the schema can
+declare product residuals without naming Binance or any exchange:
+
+```text
+100 101 102 103 2 0 1 107 0 6 110
+
+expr1:  output slot 1  = first value, then slot 1 - previous(slot 4)
+expr2:  output slot 2  = max(slot 1, slot 4) + residual
+expr3:  output slot 3  = min(slot 1, slot 4) - residual
+expr7:  output slot 7  = slot 4 * slot 5 + residual
+expr10: output slot 10 = slot 4 * slot 9 + residual
+```
+
+Ingestor calculations for the product fields:
+
+```text
+slot7 residual  = slot7 - slot4 * slot5
+slot10 residual = slot10 - slot4 * slot9
 ```
 
 Prototype winners:

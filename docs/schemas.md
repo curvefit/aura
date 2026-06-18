@@ -470,14 +470,20 @@ field_names = [
   "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume",
 ]
 
-schema_map = [100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8]
+schema_map = [100, 101, 102, 103, 2, 0, 1, 107, 0, 6, 110]
+
+expr1  = first_offset_then_delta(output=1, input=4)
+expr2  = max_plus_residual(output=2, inputs=[1,4])
+expr3  = min_minus_residual(output=3, inputs=[1,4])
+expr7  = mul(output=7, inputs=[4,5])
+expr10 = mul(output=10, inputs=[4,9])
 ```
 
 This produces:
 
 ```text
 comment     = open_time_ms,open,high,low,close,volume,...
-schema_map  = [100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8]
+schema_map  = [100, 101, 102, 103, 2, 0, 1, 107, 0, 6, 110]
 ```
 
 The generic schema-definition helper validates that slot `0` is the primary
