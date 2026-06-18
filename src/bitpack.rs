@@ -76,12 +76,28 @@ pub fn unpack_signed_values(bytes: &[u8], bit_width: u8, value_count: usize) -> 
         return Ok(vec![0; value_count]);
     }
 
-    let mut reader = BitReader::new(bytes);
-    let mut values = Vec::with_capacity(value_count);
-    for _ in 0..value_count {
-        values.push(sign_extend(reader.read_bits(bit_width)?, bit_width)?);
+    match bit_width {
+        8 => Ok(bytes.iter().map(|value| *value as i8 as i64).collect()),
+        16 => Ok(bytes
+            .chunks_exact(2)
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]) as i64)
+            .collect()),
+        32 => Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as i64)
+            .collect()),
+        64 => Ok(bytes
+            .chunks_exact(8)
+            .map(|chunk| {
+                i64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ])
+            })
+            .collect()),
+        _ => unpack_bits(bytes, bit_width, value_count, |raw| {
+            sign_extend(raw, bit_width)
+        }),
     }
-    Ok(values)
 }
 
 pub fn unpack_unsigned_values(bytes: &[u8], bit_width: u8, value_count: usize) -> Result<Vec<u64>> {
@@ -94,12 +110,26 @@ pub fn unpack_unsigned_values(bytes: &[u8], bit_width: u8, value_count: usize) -
         return Ok(vec![0; value_count]);
     }
 
-    let mut reader = BitReader::new(bytes);
-    let mut values = Vec::with_capacity(value_count);
-    for _ in 0..value_count {
-        values.push(reader.read_bits(bit_width)?);
+    match bit_width {
+        8 => Ok(bytes.iter().map(|value| u64::from(*value)).collect()),
+        16 => Ok(bytes
+            .chunks_exact(2)
+            .map(|chunk| u64::from(u16::from_le_bytes([chunk[0], chunk[1]])))
+            .collect()),
+        32 => Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| u64::from(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])))
+            .collect()),
+        64 => Ok(bytes
+            .chunks_exact(8)
+            .map(|chunk| {
+                u64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ])
+            })
+            .collect()),
+        _ => unpack_bits(bytes, bit_width, value_count, Ok),
     }
-    Ok(values)
 }
 
 fn validate_bit_width(bit_width: u8) -> Result<()> {
@@ -148,6 +178,36 @@ fn sign_extend(raw: u64, bit_width: u8) -> Result<i64> {
     i64::try_from(value).map_err(|_| AuraError::InvalidValue("bitpacked value"))
 }
 
+fn unpack_bits<T, F>(
+    bytes: &[u8],
+    bit_width: u8,
+    value_count: usize,
+    mut decode: F,
+) -> Result<Vec<T>>
+where
+    F: FnMut(u64) -> Result<T>,
+{
+    let mask = (1u128 << bit_width) - 1;
+    let mut values = Vec::with_capacity(value_count);
+    let mut byte_index = 0usize;
+    let mut buffer = 0u128;
+    let mut buffered_bits = 0u8;
+
+    for _ in 0..value_count {
+        while buffered_bits < bit_width {
+            let byte = bytes.get(byte_index).ok_or(AuraError::UnexpectedEof)?;
+            buffer |= u128::from(*byte) << buffered_bits;
+            buffered_bits += 8;
+            byte_index += 1;
+        }
+        values.push(decode((buffer & mask) as u64)?);
+        buffer >>= bit_width;
+        buffered_bits -= bit_width;
+    }
+
+    Ok(values)
+}
+
 struct BitWriter {
     bytes: Vec<u8>,
     current: u8,
@@ -189,45 +249,5 @@ impl BitWriter {
             self.bytes.push(self.current);
         }
         self.bytes
-    }
-}
-
-struct BitReader<'a> {
-    bytes: &'a [u8],
-    byte_index: usize,
-    used_bits: u8,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self {
-            bytes,
-            byte_index: 0,
-            used_bits: 0,
-        }
-    }
-
-    fn read_bits(&mut self, mut bit_count: u8) -> Result<u64> {
-        let mut out = 0u64;
-        let mut out_shift = 0u8;
-        while bit_count > 0 {
-            let byte = *self
-                .bytes
-                .get(self.byte_index)
-                .ok_or(AuraError::UnexpectedEof)?;
-            let available = 8 - self.used_bits;
-            let take = bit_count.min(available);
-            let mask = (1u16 << take) - 1;
-            let bits = u64::from((u16::from(byte >> self.used_bits) & mask) as u8);
-            out |= bits << out_shift;
-            self.used_bits += take;
-            out_shift += take;
-            bit_count -= take;
-            if self.used_bits == 8 {
-                self.byte_index += 1;
-                self.used_bits = 0;
-            }
-        }
-        Ok(out)
     }
 }
