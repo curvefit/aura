@@ -7,6 +7,7 @@ use aura_codec::records::{
 };
 use aura_codec::schema::generic_i64_parent_schema;
 use aura_codec::Profile;
+use aura_codec::{DerivedExpression, DerivedExpressionOp, DerivedExpressionSource};
 use serde_json::Value;
 
 const DEFAULT_TIMESTAMP_MULTIPLIER: i64 = 1_000_000;
@@ -20,6 +21,7 @@ struct Args {
     timestamp_multiplier: i64,
     stream_id: u16,
     dictionary_id: u16,
+    derived_expressions: Vec<DerivedExpression>,
 }
 
 fn main() -> Result<()> {
@@ -27,7 +29,10 @@ fn main() -> Result<()> {
     let input_bytes = fs::metadata(&args.input)
         .with_context(|| format!("stat {}", args.input.display()))?
         .len();
-    let schema = generic_i64_parent_schema("json_i64_rows_v1", &args.schema_header)?;
+    let mut schema = generic_i64_parent_schema("json_i64_rows_v1", &args.schema_header)?;
+    if !args.derived_expressions.is_empty() {
+        schema = schema.with_derived_expressions(args.derived_expressions.clone())?;
+    }
     let (rows, decimal_scales) = read_positional_rows(
         &args.input,
         &args.schema_header,
@@ -45,9 +50,27 @@ fn main() -> Result<()> {
     let aura0 = compile_i64_file(&aura, Profile::Aura0)?;
     let aura1 = compile_i64_file(&aura, Profile::Aura1)?;
 
-    verify_round_trip(&aura, &rows, &args.schema_header, Profile::Ingest)?;
-    verify_round_trip(&aura0, &rows, &args.schema_header, Profile::Aura0)?;
-    verify_round_trip(&aura1, &rows, &args.schema_header, Profile::Aura1)?;
+    verify_round_trip(
+        &aura,
+        &rows,
+        &args.schema_header,
+        &args.derived_expressions,
+        Profile::Ingest,
+    )?;
+    verify_round_trip(
+        &aura0,
+        &rows,
+        &args.schema_header,
+        &args.derived_expressions,
+        Profile::Aura0,
+    )?;
+    verify_round_trip(
+        &aura1,
+        &rows,
+        &args.schema_header,
+        &args.derived_expressions,
+        Profile::Aura1,
+    )?;
 
     fs::write(&args.output, &aura).with_context(|| format!("write {}", args.output.display()))?;
     let aura0_path = args.output.with_extension("aura0");
@@ -59,6 +82,7 @@ fn main() -> Result<()> {
     println!("rows={}", rows.len());
     println!("slots={}", args.schema_header.len());
     println!("schema_header={:?}", args.schema_header);
+    println!("derived_expressions={}", args.derived_expressions.len());
     println!(
         "decimal_scale={}",
         args.decimal_scale
@@ -88,6 +112,7 @@ fn parse_args() -> Result<Args> {
     let mut timestamp_multiplier = DEFAULT_TIMESTAMP_MULTIPLIER;
     let mut stream_id = 0;
     let mut dictionary_id = 0;
+    let mut derived_expressions = Vec::new();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -99,6 +124,9 @@ fn parse_args() -> Result<Args> {
             "--decimal-scale" => decimal_scale = Some(next_parse(&mut args, "--decimal-scale")?),
             "--timestamp-multiplier" => {
                 timestamp_multiplier = next_parse(&mut args, "--timestamp-multiplier")?
+            }
+            "--derive" => {
+                derived_expressions.push(parse_derive(&next_string(&mut args, "--derive")?)?)
             }
             "--stream-id" => stream_id = next_parse(&mut args, "--stream-id")?,
             "--dictionary-id" => dictionary_id = next_parse(&mut args, "--dictionary-id")?,
@@ -132,6 +160,7 @@ fn parse_args() -> Result<Args> {
         timestamp_multiplier,
         stream_id,
         dictionary_id,
+        derived_expressions,
     })
 }
 
@@ -405,10 +434,94 @@ fn parse_schema_header(raw: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+fn parse_derive(raw: &str) -> Result<DerivedExpression> {
+    let parts = raw.split(':').collect::<Vec<_>>();
+    if parts.len() < 4 || parts.len() > 6 {
+        bail!(
+            "--derive must be <id>:<op>:<output_slot>:<input_slots_csv>[:literals_csv][:internal]"
+        );
+    }
+    let expression_id = parts[0]
+        .parse::<u8>()
+        .with_context(|| format!("invalid derived expression id {}", parts[0]))?;
+    let op = parse_derived_op(parts[1])?;
+    let output_slot = parts[2]
+        .parse::<u16>()
+        .with_context(|| format!("invalid derived output slot {}", parts[2]))?;
+    let input_slots = parse_u16_csv(parts[3], "derived input slot")?;
+    let mut literals = Vec::new();
+    let mut internal = false;
+    match parts.get(4).copied() {
+        None => {}
+        Some("internal") => internal = true,
+        Some(raw_literals) => literals = parse_i64_csv(raw_literals, "derived literal")?,
+    }
+    match parts.get(5).copied() {
+        None => {}
+        Some("internal") => internal = true,
+        Some(value) => bail!("invalid derived expression suffix {value}"),
+    }
+
+    let expression =
+        DerivedExpression::with_literals(expression_id, output_slot, op, input_slots, literals, 0)?;
+    if internal {
+        Ok(expression.with_source(DerivedExpressionSource::Internal)?)
+    } else {
+        Ok(expression)
+    }
+}
+
+fn parse_derived_op(raw: &str) -> Result<DerivedExpressionOp> {
+    match raw {
+        "add" => Ok(DerivedExpressionOp::Add),
+        "sub" => Ok(DerivedExpressionOp::Sub),
+        "mul" => Ok(DerivedExpressionOp::Mul),
+        "div" => Ok(DerivedExpressionOp::Div),
+        "min" => Ok(DerivedExpressionOp::Min),
+        "max" => Ok(DerivedExpressionOp::Max),
+        "add_residual" => Ok(DerivedExpressionOp::AddResidual),
+        "subtract_residual" => Ok(DerivedExpressionOp::SubtractResidual),
+        "max_plus_residual" => Ok(DerivedExpressionOp::MaxPlusResidual),
+        "min_minus_residual" => Ok(DerivedExpressionOp::MinMinusResidual),
+        "first_offset_then_delta" => Ok(DerivedExpressionOp::FirstOffsetThenDelta),
+        _ => bail!("invalid derived expression op {raw}"),
+    }
+}
+
+fn parse_u16_csv(raw: &str, name: &'static str) -> Result<Vec<u16>> {
+    parse_csv(raw, name, |part| {
+        part.parse::<u16>()
+            .with_context(|| format!("invalid {name} {part}"))
+    })
+}
+
+fn parse_i64_csv(raw: &str, name: &'static str) -> Result<Vec<i64>> {
+    parse_csv(raw, name, |part| {
+        part.parse::<i64>()
+            .with_context(|| format!("invalid {name} {part}"))
+    })
+}
+
+fn parse_csv<T>(
+    raw: &str,
+    _name: &'static str,
+    parse_part: impl Fn(&str) -> Result<T>,
+) -> Result<Vec<T>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        return Ok(Vec::new());
+    }
+    trimmed
+        .split(',')
+        .map(|part| parse_part(part.trim()))
+        .collect()
+}
+
 fn verify_round_trip(
     bytes: &[u8],
     rows: &[Vec<i64>],
     schema_header: &[u8],
+    derived_expressions: &[DerivedExpression],
     profile: Profile,
 ) -> Result<()> {
     let decoded = decode_i64_file(bytes)?;
@@ -417,6 +530,9 @@ fn verify_round_trip(
     }
     if decoded.header.schema_mapping != schema_header {
         bail!("decoded schema header mismatch");
+    }
+    if decoded.header.derived_expressions != derived_expressions {
+        bail!("decoded derived expressions mismatch");
     }
     if decoded.rows != rows {
         bail!("decoded rows mismatch");
@@ -453,6 +569,6 @@ where
 
 fn print_usage() {
     println!(
-        "usage: aura-json-i64 --schema <bytes> --out <file.aura> [--decimal-scale N] [--timestamp-multiplier N] [--stream-id N] [--dictionary-id N] <rows.json>"
+        "usage: aura-json-i64 --schema <bytes> --out <file.aura> [--derive <id:op:output:inputs[:literals][:internal]>] [--decimal-scale N] [--timestamp-multiplier N] [--stream-id N] [--dictionary-id N] <rows.json>"
     );
 }
