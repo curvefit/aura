@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
 use crate::header::{DerivedExpression, DerivedExpressionOp, DerivedExpressionSource};
-use crate::records::{self, I64FileInput};
+use crate::records::{self, I64FileInput, TypedFileInput};
 use crate::schema::{FieldType, SchemaDescriptor};
-use crate::{AuraDiagnostic, AuraError, Profile, Result};
+use crate::{AuraDiagnostic, AuraError, AuraTypedValue, Profile, Result};
 
 /// In-memory writer for positional i64 Aura ingest files.
 ///
@@ -19,46 +19,7 @@ pub struct AuraI64Writer {
     header_comment: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuraTypedValue {
-    I64(i64),
-    I128(i128),
-    Opaque16([u8; 16]),
-}
-
-impl From<i64> for AuraTypedValue {
-    fn from(value: i64) -> Self {
-        Self::I64(value)
-    }
-}
-
-impl AuraTypedValue {
-    pub const fn observed_type(&self) -> &'static str {
-        match self {
-            Self::I64(_) => "i64",
-            Self::I128(_) => "i128",
-            Self::Opaque16(_) => "opaque16",
-        }
-    }
-
-    pub fn observed_value_class(&self) -> &'static str {
-        match self {
-            Self::I64(value) if *value < 0 => "negative integer",
-            Self::I64(_) => "integer",
-            Self::I128(value) if *value < i64::MIN as i128 || *value > i64::MAX as i128 => {
-                "wide integer"
-            }
-            Self::I128(_) => "integer",
-            Self::Opaque16(_) => "fixed bytes",
-        }
-    }
-}
-
 /// Declared-layout writer for typed row values.
-///
-/// Phase 3 keeps the sealed body implementation i64-only. Explicit `i128` and
-/// opaque 16-byte declarations are accepted at the API boundary, then rejected
-/// with structured diagnostics before sealing until a lossless wide body exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuraTypedWriter {
     schema: SchemaDescriptor,
@@ -266,56 +227,20 @@ impl AuraTypedWriter {
     }
 
     pub fn finish(self) -> Result<Vec<u8>> {
-        if let Some(field) = self
-            .schema
-            .fields
-            .iter()
-            .find(|field| matches!(field.field_type, FieldType::I128 | FieldType::Opaque16))
-        {
-            return Err(layout_diagnostic(
-                None,
-                Some(field.index),
-                field.field_type.name(),
-                field.field_type.name(),
-                "unsupported profile",
-                "wide field",
-                Some("wait for lossless wide-field body support"),
-            ));
+        if schema_is_i64_compatible(&self.schema) {
+            let rows = typed_rows_to_i64(&self.schema, self.rows)?;
+            return records::encode_ingest_i64_file_inner(I64FileInput {
+                schema: self.schema,
+                rows,
+                stream_id: self.stream_id,
+                dictionary_id: self.dictionary_id,
+                header_comment: self.header_comment,
+            });
         }
 
-        let rows = self
-            .rows
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|value| match value {
-                        AuraTypedValue::I64(value) => Ok(value),
-                        AuraTypedValue::I128(_) => Err(layout_diagnostic(
-                            None,
-                            None,
-                            "i64",
-                            "i128",
-                            "unsupported profile",
-                            "wide integer",
-                            Some("declare i128 and wait for wide-field body support"),
-                        )),
-                        AuraTypedValue::Opaque16(_) => Err(layout_diagnostic(
-                            None,
-                            None,
-                            "i64",
-                            "opaque16",
-                            "unsupported profile",
-                            "fixed bytes",
-                            Some("declare opaque16 and wait for wide-field body support"),
-                        )),
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        records::encode_ingest_i64_file_inner(I64FileInput {
+        records::encode_ingest_typed_file_inner(TypedFileInput {
             schema: self.schema,
-            rows,
+            rows: self.rows,
             stream_id: self.stream_id,
             dictionary_id: self.dictionary_id,
             header_comment: self.header_comment,
@@ -529,6 +454,59 @@ pub fn encode_i64(input: I64FileInput) -> Result<Vec<u8>> {
     records::encode_ingest_i64_file_inner(input)
 }
 
+pub fn encode_typed(input: TypedFileInput) -> Result<Vec<u8>> {
+    records::validate_typed_rows(&input.schema, &input.rows)?;
+    if schema_is_i64_compatible(&input.schema) {
+        let rows = typed_rows_to_i64(&input.schema, input.rows)?;
+        return encode_i64(I64FileInput {
+            schema: input.schema,
+            rows,
+            stream_id: input.stream_id,
+            dictionary_id: input.dictionary_id,
+            header_comment: input.header_comment,
+        });
+    }
+    records::encode_ingest_typed_file_inner(input)
+}
+
+fn schema_is_i64_compatible(schema: &SchemaDescriptor) -> bool {
+    schema
+        .fields
+        .iter()
+        .all(|field| !matches!(field.field_type, FieldType::I128 | FieldType::Opaque16))
+}
+
+fn typed_rows_to_i64(
+    schema: &SchemaDescriptor,
+    rows: Vec<Vec<AuraTypedValue>>,
+) -> Result<Vec<Vec<i64>>> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            row.into_iter()
+                .enumerate()
+                .map(|(slot_index, value)| {
+                    let slot_index = u16::try_from(slot_index)
+                        .map_err(|_| AuraError::InvalidValue("field index"))?;
+                    validate_typed_value(
+                        row_index,
+                        slot_index,
+                        schema.fields[usize::from(slot_index)].field_type,
+                        &value,
+                    )?;
+                    match value {
+                        AuraTypedValue::I64(value) => Ok(value),
+                        AuraTypedValue::I128(value) => {
+                            i64::try_from(value).map_err(|_| AuraError::InvalidValue("i128 value"))
+                        }
+                        AuraTypedValue::Opaque16(_) => Err(AuraError::InvalidValue("opaque value")),
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 pub fn stamp_i64(input: I64FileInput) -> Result<Vec<u8>> {
     encode_i64(input)
 }
@@ -650,7 +628,7 @@ fn validate_i64_input(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<()
                 field.field_type.name(),
                 "unsupported profile",
                 "wide field",
-                Some("use typed writer diagnostics until wide-field body support lands"),
+                Some("use typed ingest for i128 or opaque16 fields"),
             ));
         }
     }

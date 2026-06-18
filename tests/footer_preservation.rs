@@ -9,7 +9,7 @@ use aura_codec::plan::{Aura0Plan, Aura1Plan};
 use aura_codec::program::COMPILED_FOOTER_MAGIC;
 use aura_codec::program::{CompiledFooter, DecodeProgram};
 use aura_codec::schema::generic_i64_parent_schema;
-use aura_codec::{records, IngestStats, Profile};
+use aura_codec::{records, DerivedExpressionOp, IngestStats, Profile};
 
 const RICH_PARENT_MAP: &[u8] = &[100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8];
 
@@ -316,6 +316,15 @@ fn all_variant_generic_plan() -> GenericInstructionPlan {
                 output_slot: 7,
                 presence_index: 1,
                 value: 1,
+            },
+            GenericGroupInstruction::ExpressionValue {
+                group_id: 11,
+                parent_group_id: None,
+                output_slot: 6,
+                op: DerivedExpressionOp::Add,
+                input_slots: vec![1, 2],
+                literals: vec![3],
+                residual: 0,
             },
         ],
     }

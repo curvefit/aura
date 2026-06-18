@@ -234,17 +234,19 @@ fit in `i64`. `opaque16` is for fixed 16-byte identifiers and is not treated as
 an arithmetic number. Opaque fields default to absolute-only candidates and
 cannot be parent-delta fields.
 
-The current sealed body implementation remains i64-only. A typed writer may
-accept declared `i128` or `opaque16` values for validation, but it rejects
-sealing with a structured diagnostic until a lossless wide-field body exists.
-Strict mode never silently downcasts and never mutates the schema. Overflow and
-width mismatches report the row, slot, declared type, observed type/value class,
-and suggested upgrade.
+Typed ingest can seal declared `i128` and `opaque16` values losslessly in
+`.aura` files. The typed body stores ordinary i64-compatible slots as i64,
+`i128` slots as 16-byte little-endian integers, and `opaque16` slots as fixed
+16-byte payloads. The i64 reader and i64 compiler reject wide typed files
+instead of silently downcasting. Strict mode never silently downcasts and never
+mutates the schema. Overflow and width mismatches report the row, slot,
+declared type, observed type/value class, and suggested upgrade.
 
 Derived slots have one owner for a given ingest path. A slot may be supplied by
-the caller as an ordinary logical field or reserved for an internal derivation,
-but the writer rejects supplying values for a slot also marked internally
-derived. Internal derivation execution is separate from this ownership guard.
+the caller as an ordinary logical field or reserved for an internal derivation.
+The typed writer can accept rows with internal-derived slots omitted, compute
+the slot from the schema expression, and then seal the full logical row. It
+rejects supplying values for a slot also marked internally derived.
 
 Starter schema constructors exist for:
 

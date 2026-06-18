@@ -13,14 +13,23 @@ use crate::header::{AuraHeader, LEGACY_HEADER_PREFIX_SIZE};
 use crate::instructions::GenericInstructionPlan;
 use crate::plan::{unpack_ref_divisor, unpack_two_refs, Aura0Plan, Aura1Plan, FieldEncoding};
 use crate::program::{CompiledFooter, DecodeProgram};
-use crate::schema::{schema_parent_mapping, FieldRole, SchemaDescriptor};
+use crate::schema::{schema_parent_mapping, FieldRole, FieldType, SchemaDescriptor};
 use crate::stats::IngestStats;
-use crate::{AuraError, PhysicalWidth, Profile, Result};
+use crate::{AuraError, AuraTypedValue, PhysicalWidth, Profile, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct I64FileInput {
     pub schema: SchemaDescriptor,
     pub rows: Vec<Vec<i64>>,
+    pub stream_id: u16,
+    pub dictionary_id: u16,
+    pub header_comment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedFileInput {
+    pub schema: SchemaDescriptor,
+    pub rows: Vec<Vec<AuraTypedValue>>,
     pub stream_id: u16,
     pub dictionary_id: u16,
     pub header_comment: Option<String>,
@@ -35,8 +44,56 @@ pub struct DecodedI64File {
     pub rows: Vec<Vec<i64>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedTypedFile {
+    pub header: AuraHeader,
+    pub schema: SchemaDescriptor,
+    pub ingest_footer: Option<AuraFooter>,
+    pub compiled_footer: Option<CompiledFooter>,
+    pub rows: Vec<Vec<AuraTypedValue>>,
+}
+
 pub fn encode_ingest_i64_file(input: I64FileInput) -> Result<Vec<u8>> {
     crate::writer::encode_i64(input)
+}
+
+pub fn encode_ingest_typed_file(input: TypedFileInput) -> Result<Vec<u8>> {
+    crate::writer::encode_typed(input)
+}
+
+pub(crate) fn encode_ingest_typed_file_inner(input: TypedFileInput) -> Result<Vec<u8>> {
+    validate_typed_rows(&input.schema, &input.rows)?;
+    let mut stats = IngestStats::new_for_schema(&input.schema)?;
+    for row in &input.rows {
+        observe_typed_record(&mut stats, &input.schema, row)?;
+    }
+    let timestamp_index = timestamp_field_index(&input.schema);
+    if let Some(timestamp_index) = timestamp_index {
+        observe_typed_timestamp_runs(&mut stats, &input.rows, timestamp_index);
+    }
+
+    let footer = AuraFooter::new(input.schema.clone(), stats);
+    let body = encode_typed_body(&input.schema, &input.rows)?;
+    let base_time_ns = timestamp_index
+        .and_then(|index| {
+            input
+                .rows
+                .first()
+                .and_then(|row| row.get(index))
+                .and_then(typed_value_as_i64)
+        })
+        .unwrap_or(0);
+    let header_comment = input.header_comment.as_deref().unwrap_or("");
+
+    encode_file(
+        Profile::Ingest,
+        input.stream_id,
+        input.dictionary_id,
+        base_time_ns,
+        header_comment,
+        body,
+        footer,
+    )
 }
 
 pub(crate) fn encode_ingest_i64_file_inner(input: I64FileInput) -> Result<Vec<u8>> {
@@ -120,6 +177,10 @@ pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
     crate::reader::decode_i64(bytes)
 }
 
+pub fn decode_typed_file(bytes: &[u8]) -> Result<DecodedTypedFile> {
+    crate::reader::decode_typed(bytes)
+}
+
 pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
     if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
         return Err(AuraError::UnexpectedEof);
@@ -148,6 +209,9 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
         Profile::Ingest => {
             let footer = AuraFooter::decode(&bytes[footer_start..footer_len_offset])?;
             validate_header_schema_agreement(&header, &footer.schema)?;
+            if schema_has_wide_fields(&footer.schema) {
+                return Err(AuraError::InvalidValue("i64 schema"));
+            }
             let rows = decode_raw_body(body)?;
             validate_rows(&footer.schema, &rows)?;
             Ok(DecodedI64File {
@@ -161,6 +225,9 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
         Profile::Aura0 => {
             let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
             validate_header_schema_agreement(&header, &footer.schema)?;
+            if schema_has_wide_fields(&footer.schema) {
+                return Err(AuraError::InvalidValue("i64 schema"));
+            }
             let rows = if let Some(plan) = footer.generic_aura0_plan.clone() {
                 decode_generic_i64_rows_body(
                     plan,
@@ -189,6 +256,9 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
         Profile::Aura1 => {
             let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
             validate_header_schema_agreement(&header, &footer.schema)?;
+            if schema_has_wide_fields(&footer.schema) {
+                return Err(AuraError::InvalidValue("i64 schema"));
+            }
             let plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
             let rows = decode_aura1_body(
                 body,
@@ -203,6 +273,61 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
                 ingest_footer: None,
                 compiled_footer: Some(footer),
                 rows,
+            })
+        }
+    }
+}
+
+pub(crate) fn decode_typed_file_inner(bytes: &[u8]) -> Result<DecodedTypedFile> {
+    if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let seal_offset = bytes.len() - SEAL_MAGIC.len();
+    if &bytes[seal_offset..] != SEAL_MAGIC {
+        return Err(AuraError::InvalidMagic {
+            expected: "sealed:)",
+        });
+    }
+    let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
+    let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
+    let header_len = AuraHeader::encoded_len(bytes)?;
+    if header_len > footer_len_offset {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let header = AuraHeader::decode(&bytes[..header_len])?;
+    let footer_start = footer_len_offset
+        .checked_sub(footer_len)
+        .ok_or(AuraError::UnexpectedEof)?;
+    if footer_start < header_len {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let body = &bytes[header_len..footer_start];
+    match header.profile {
+        Profile::Ingest => {
+            let footer = AuraFooter::decode(&bytes[footer_start..footer_len_offset])?;
+            validate_header_schema_agreement(&header, &footer.schema)?;
+            let rows = if schema_has_wide_fields(&footer.schema) {
+                decode_typed_body(&footer.schema, body)?
+            } else {
+                i64_rows_to_typed(decode_raw_body(body)?)
+            };
+            validate_typed_rows(&footer.schema, &rows)?;
+            Ok(DecodedTypedFile {
+                header,
+                schema: footer.schema.clone(),
+                ingest_footer: Some(footer),
+                compiled_footer: None,
+                rows,
+            })
+        }
+        Profile::Aura0 | Profile::Aura1 => {
+            let decoded = decode_i64_file_inner(bytes)?;
+            Ok(DecodedTypedFile {
+                header: decoded.header,
+                schema: decoded.schema,
+                ingest_footer: decoded.ingest_footer,
+                compiled_footer: decoded.compiled_footer,
+                rows: i64_rows_to_typed(decoded.rows),
             })
         }
     }
@@ -366,6 +491,43 @@ fn encode_raw_body(field_count: usize, rows: &[Vec<i64>]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn encode_typed_body(schema: &SchemaDescriptor, rows: &[Vec<AuraTypedValue>]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    put_u64_le(&mut out, rows.len() as u64);
+    put_u16_len(&mut out, schema.fields.len(), "field count")?;
+    for row in rows {
+        if row.len() != schema.fields.len() {
+            return Err(AuraError::InvalidValue("record field count"));
+        }
+        for field in &schema.fields {
+            let value = &row[usize::from(field.index)];
+            match field.field_type {
+                FieldType::I128 => {
+                    let value = match value {
+                        AuraTypedValue::I128(value) => *value,
+                        AuraTypedValue::I64(value) => i128::from(*value),
+                        AuraTypedValue::Opaque16(_) => {
+                            return Err(AuraError::InvalidValue("typed value"));
+                        }
+                    };
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+                FieldType::Opaque16 => {
+                    let AuraTypedValue::Opaque16(value) = value else {
+                        return Err(AuraError::InvalidValue("typed value"));
+                    };
+                    out.extend_from_slice(value);
+                }
+                _ => put_i64_le(
+                    &mut out,
+                    typed_value_i64_for_field(field.field_type, value)?,
+                ),
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn decode_raw_body(bytes: &[u8]) -> Result<Vec<Vec<i64>>> {
     let mut reader = ByteReader::new(bytes);
     let record_count = reader.read_u64_le()? as usize;
@@ -380,6 +542,49 @@ fn decode_raw_body(bytes: &[u8]) -> Result<Vec<Vec<i64>>> {
     }
     reader.finish()?;
     Ok(rows)
+}
+
+fn decode_typed_body(schema: &SchemaDescriptor, bytes: &[u8]) -> Result<Vec<Vec<AuraTypedValue>>> {
+    let mut reader = ByteReader::new(bytes);
+    let record_count = reader.read_u64_le()? as usize;
+    let field_count = reader.read_u16_le()? as usize;
+    if field_count != schema.fields.len() {
+        return Err(AuraError::InvalidValue("field count"));
+    }
+    let mut rows = Vec::with_capacity(record_count);
+    for _ in 0..record_count {
+        let mut row = Vec::with_capacity(field_count);
+        for field in &schema.fields {
+            row.push(match field.field_type {
+                FieldType::I128 => {
+                    let bytes = reader.read_exact(16)?;
+                    AuraTypedValue::I128(i128::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+                        bytes[14], bytes[15],
+                    ]))
+                }
+                FieldType::Opaque16 => {
+                    let bytes = reader.read_exact(16)?;
+                    AuraTypedValue::Opaque16([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+                        bytes[14], bytes[15],
+                    ])
+                }
+                _ => AuraTypedValue::I64(reader.read_i64_le()?),
+            });
+        }
+        rows.push(row);
+    }
+    reader.finish()?;
+    Ok(rows)
+}
+
+fn i64_rows_to_typed(rows: Vec<Vec<i64>>) -> Vec<Vec<AuraTypedValue>> {
+    rows.into_iter()
+        .map(|row| row.into_iter().map(AuraTypedValue::I64).collect())
+        .collect()
 }
 
 fn encode_aura0_body(rows: &[Vec<i64>], plan: &Aura0Plan) -> Result<Vec<u8>> {
@@ -1292,6 +1497,93 @@ pub(crate) fn validate_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Res
     Ok(())
 }
 
+pub(crate) fn validate_typed_rows(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<AuraTypedValue>],
+) -> Result<()> {
+    for row in rows {
+        if row.len() != schema.fields.len() {
+            return Err(AuraError::InvalidValue("record field count"));
+        }
+        for field in &schema.fields {
+            let value = &row[usize::from(field.index)];
+            let _ = match field.field_type {
+                FieldType::I128 => match value {
+                    AuraTypedValue::I128(value) => *value,
+                    AuraTypedValue::I64(value) => i128::from(*value),
+                    AuraTypedValue::Opaque16(_) => {
+                        return Err(AuraError::InvalidValue("typed value"));
+                    }
+                },
+                FieldType::Opaque16 => {
+                    if !matches!(value, AuraTypedValue::Opaque16(_)) {
+                        return Err(AuraError::InvalidValue("typed value"));
+                    }
+                    0
+                }
+                _ => i128::from(typed_value_i64_for_field(field.field_type, value)?),
+            };
+        }
+    }
+    Ok(())
+}
+
+fn observe_typed_record(
+    stats: &mut IngestStats,
+    schema: &SchemaDescriptor,
+    row: &[AuraTypedValue],
+) -> Result<()> {
+    if row.len() != schema.fields.len() {
+        return Err(AuraError::InvalidValue("record field count"));
+    }
+    stats.observe_record();
+    for field in &schema.fields {
+        if let Some(value) = typed_value_as_i64(&row[usize::from(field.index)]) {
+            stats.observe_i64(field.index, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn typed_value_as_i64(value: &AuraTypedValue) -> Option<i64> {
+    match value {
+        AuraTypedValue::I64(value) => Some(*value),
+        AuraTypedValue::I128(value) => i64::try_from(*value).ok(),
+        AuraTypedValue::Opaque16(_) => None,
+    }
+}
+
+fn typed_value_i64_for_field(field_type: FieldType, value: &AuraTypedValue) -> Result<i64> {
+    let value = match value {
+        AuraTypedValue::I64(value) => *value,
+        AuraTypedValue::I128(value) => {
+            i64::try_from(*value).map_err(|_| AuraError::InvalidValue("typed value"))?
+        }
+        AuraTypedValue::Opaque16(_) => return Err(AuraError::InvalidValue("typed value")),
+    };
+    validate_i64_field_range(field_type, value)?;
+    Ok(value)
+}
+
+fn validate_i64_field_range(field_type: FieldType, value: i64) -> Result<()> {
+    let valid = match field_type {
+        FieldType::I8 => (i8::MIN as i64..=i8::MAX as i64).contains(&value),
+        FieldType::U8 => (0..=u8::MAX as i64).contains(&value),
+        FieldType::I16 => (i16::MIN as i64..=i16::MAX as i64).contains(&value),
+        FieldType::U16 => (0..=u16::MAX as i64).contains(&value),
+        FieldType::I32 => (i32::MIN as i64..=i32::MAX as i64).contains(&value),
+        FieldType::U32 => (0..=u32::MAX as i64).contains(&value),
+        FieldType::U64 => value >= 0,
+        FieldType::TimestampNs | FieldType::I64 => true,
+        FieldType::I128 | FieldType::Opaque16 => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(AuraError::InvalidValue("typed value"))
+    }
+}
+
 fn timestamp_field_index(schema: &SchemaDescriptor) -> Option<usize> {
     schema
         .fields
@@ -1314,6 +1606,33 @@ fn observe_timestamp_runs(stats: &mut IngestStats, rows: &[Vec<i64>], timestamp_
         }
     }
     stats.observe_timestamp_run(run_len);
+}
+
+fn observe_typed_timestamp_runs(
+    stats: &mut IngestStats,
+    rows: &[Vec<AuraTypedValue>],
+    timestamp_index: usize,
+) {
+    let mut previous_ts = None;
+    let mut run_len = 0u32;
+    for row in rows {
+        let ts = row.get(timestamp_index).and_then(typed_value_as_i64);
+        if ts == previous_ts {
+            run_len += 1;
+        } else {
+            stats.observe_timestamp_run(run_len);
+            previous_ts = ts;
+            run_len = 1;
+        }
+    }
+    stats.observe_timestamp_run(run_len);
+}
+
+fn schema_has_wide_fields(schema: &SchemaDescriptor) -> bool {
+    schema
+        .fields
+        .iter()
+        .any(|field| matches!(field.field_type, FieldType::I128 | FieldType::Opaque16))
 }
 
 fn put_u16_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> {

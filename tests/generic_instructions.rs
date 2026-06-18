@@ -259,6 +259,27 @@ fn generic_instruction_plan_round_trips_expression_stream() {
 }
 
 #[test]
+fn generic_instruction_plan_round_trips_expression_value() {
+    let plan = GenericInstructionPlan {
+        streams: Vec::new(),
+        groups: vec![GenericGroupInstruction::ExpressionValue {
+            group_id: 0,
+            parent_group_id: None,
+            output_slot: 3,
+            op: DerivedExpressionOp::Add,
+            input_slots: vec![1, 2],
+            literals: vec![5],
+            residual: 0,
+        }],
+    };
+
+    let encoded = plan.encode().unwrap();
+    let decoded = GenericInstructionPlan::decode(&encoded).unwrap();
+
+    assert_eq!(plan, decoded);
+}
+
+#[test]
 fn generic_instruction_plan_rejects_invalid_uuid_mask_shape() {
     let plan = GenericInstructionPlan {
         streams: vec![GenericStreamInstruction {

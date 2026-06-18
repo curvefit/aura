@@ -3,8 +3,8 @@ use aura_codec::schema::{
     generic_i64_parent_schema, FieldRelation, FieldRole, FieldTransform, FieldType, SchemaBuilder,
 };
 use aura_codec::{
-    records, AuraError, AuraTypedValue, AuraTypedWriter, DerivedExpression, DerivedExpressionOp,
-    DerivedExpressionSource, IngestStats, Profile,
+    records, AuraError, AuraTypedReader, AuraTypedValue, AuraTypedWriter, DerivedExpression,
+    DerivedExpressionOp, DerivedExpressionSource, IngestStats, Profile,
 };
 
 fn typed_wide_schema() -> aura_codec::SchemaDescriptor {
@@ -63,27 +63,24 @@ fn typed_writer_defaults_to_i64_and_accepts_declared_wide_values() {
 }
 
 #[test]
-fn wide_values_roundtrip_or_return_structured_profile_diagnostic() {
+fn wide_values_roundtrip_through_typed_ingest() {
     let schema = typed_wide_schema();
     let mut writer = AuraTypedWriter::new(schema);
-    writer
-        .push_row(vec![
-            AuraTypedValue::I64(1_000),
-            AuraTypedValue::Opaque16([1; 16]),
-            AuraTypedValue::I128(i128::from(i64::MAX) + 10),
-        ])
-        .unwrap();
+    let rows = vec![vec![
+        AuraTypedValue::I64(1_000),
+        AuraTypedValue::Opaque16([1; 16]),
+        AuraTypedValue::I128(i128::from(i64::MAX) + 10),
+    ]];
+    writer.push_row(rows[0].clone()).unwrap();
 
-    let diagnostic = diagnostic(writer.finish().unwrap_err());
+    let file = writer.finish().unwrap();
+    let decoded = records::decode_typed_file(&file).unwrap();
+    let reader = AuraTypedReader::open(&file).unwrap();
 
-    assert_eq!("unsupported profile", diagnostic.reason);
-    assert_eq!(Some(1), diagnostic.slot_index);
-    assert_eq!("opaque16", diagnostic.declared_type);
-    assert_eq!("wide field", diagnostic.observed_value_class);
-    assert_eq!(
-        Some("wait for lossless wide-field body support"),
-        diagnostic.suggested_upgrade
-    );
+    assert_eq!(rows, decoded.rows);
+    assert_eq!(rows, reader.rows());
+    assert!(records::decode_i64_file(&file).is_err());
+    assert!(records::compile_i64_file(&file, Profile::Aura0).is_err());
 }
 
 #[test]

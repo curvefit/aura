@@ -105,10 +105,14 @@ fn restamp_preserves_rows_metadata_and_rejects_non_lossless_schema() {
     assert_eq!("unsupported profile", wide_error.reason);
     assert_eq!(Some(1), wide_error.slot_index);
     assert_eq!("opaque16", wide_error.declared_type);
+    assert_eq!(
+        Some("use typed ingest for i128 or opaque16 fields"),
+        wide_error.suggested_upgrade
+    );
 }
 
 #[test]
-fn failed_finish_does_not_produce_fake_valid_aura_file() {
+fn wide_typed_finish_produces_typed_aura_not_i64_aura() {
     let schema = SchemaBuilder::new("failed_finish")
         .field("ts", FieldType::TimestampNs, FieldRole::Timestamp)
         .field("wide", FieldType::I128, FieldRole::Value)
@@ -122,9 +126,16 @@ fn failed_finish_does_not_produce_fake_valid_aura_file() {
         ])
         .unwrap();
 
-    let error = diagnostic(writer.finish().unwrap_err());
-    assert_eq!("unsupported profile", error.reason);
-    assert!(records::decode_i64_file(&[]).is_err());
+    let file = writer.finish().unwrap();
+    let decoded = records::decode_typed_file(&file).unwrap();
+    assert_eq!(
+        vec![vec![
+            AuraTypedValue::I64(1_000),
+            AuraTypedValue::I128(i128::from(i64::MAX) + 1)
+        ]],
+        decoded.rows
+    );
+    assert!(records::decode_i64_file(&file).is_err());
 
     let valid = writer::stamp_i64(input(
         generic_i64_parent_schema("valid", PARENT_MAP).unwrap(),

@@ -154,6 +154,45 @@ fn generic_planner_consumes_arithmetic_expression_with_literals() {
 }
 
 #[test]
+fn generic_planner_omits_stream_for_exact_arithmetic_expression() {
+    let expression =
+        DerivedExpression::with_literals(3, 3, DerivedExpressionOp::Add, vec![1, 2], vec![5], 0)
+            .unwrap();
+    let schema = generic_i64_parent_schema("declared_exact_arithmetic", &[100, 0, 0, 103])
+        .unwrap()
+        .with_derived_expressions(vec![expression])
+        .unwrap();
+    let rows = vec![
+        vec![1_000, 10, 2, 17],
+        vec![2_000, 11, 3, 19],
+        vec![3_000, 12, 4, 21],
+    ];
+
+    let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+
+    assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::ExpressionValue {
+                output_slot: 3,
+                op: DerivedExpressionOp::Add,
+                input_slots,
+                literals,
+                residual: 0,
+                ..
+            } if input_slots.as_slice() == [1, 2] && literals.as_slice() == [5]
+        )
+    }));
+    assert!(!encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::ExpressionStream { output_slot: 3, .. }
+        )
+    }));
+}
+
+#[test]
 fn generic_planner_selects_tick_stream_ops_without_field_names() {
     let schema = generic_i64_parent_schema("ticks", &[100, 0, 0, 0, 0, 0]).unwrap();
     let rows = (0..300)

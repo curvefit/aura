@@ -144,6 +144,13 @@ impl GenericInstructionPlan {
                     }
                     ensure_stream_ref(&stream_ids, *stream_id)?;
                 }
+                GenericGroupInstruction::ExpressionValue {
+                    parent_group_id, ..
+                } => {
+                    if let Some(parent_group_id) = parent_group_id {
+                        ensure_group_ref(&group_ids, *parent_group_id)?;
+                    }
+                }
                 GenericGroupInstruction::SparseStream {
                     parent_group_id,
                     presence_group_id,
@@ -659,6 +666,15 @@ pub enum GenericGroupInstruction {
         literals: Vec<i64>,
         stream_id: u16,
     },
+    ExpressionValue {
+        group_id: u16,
+        parent_group_id: Option<u16>,
+        output_slot: u16,
+        op: DerivedExpressionOp,
+        input_slots: Vec<u16>,
+        literals: Vec<i64>,
+        residual: i64,
+    },
     SparseStream {
         group_id: u16,
         parent_group_id: u16,
@@ -688,6 +704,7 @@ impl GenericGroupInstruction {
             | Self::PresenceMap { group_id, .. }
             | Self::DerivedStream { group_id, .. }
             | Self::ExpressionStream { group_id, .. }
+            | Self::ExpressionValue { group_id, .. }
             | Self::SparseStream { group_id, .. }
             | Self::PresenceValue { group_id, .. } => group_id,
         }
@@ -812,6 +829,24 @@ impl GenericGroupInstruction {
                 put_i64_vec(out, literals, "expression literals")?;
                 put_u16_le(out, *stream_id);
             }
+            Self::ExpressionValue {
+                group_id,
+                parent_group_id,
+                output_slot,
+                op,
+                input_slots,
+                literals,
+                residual,
+            } => {
+                put_u8(out, 10);
+                put_u16_le(out, *group_id);
+                put_u16_le(out, encode_optional_group(*parent_group_id));
+                put_u16_le(out, *output_slot);
+                put_u8(out, *op as u8);
+                put_u16_vec(out, input_slots, "input slots")?;
+                put_i64_vec(out, literals, "expression literals")?;
+                put_i64_le(out, *residual);
+            }
             Self::SparseStream {
                 group_id,
                 parent_group_id,
@@ -932,6 +967,15 @@ impl GenericGroupInstruction {
                 literals: read_i64_vec(reader)?,
                 stream_id: reader.read_u16_le()?,
             },
+            10 => Self::ExpressionValue {
+                group_id: reader.read_u16_le()?,
+                parent_group_id: decode_optional_group(reader.read_u16_le()?),
+                output_slot: reader.read_u16_le()?,
+                op: DerivedExpressionOp::from_code(reader.read_u8()?)?,
+                input_slots: read_u16_vec(reader)?,
+                literals: read_i64_vec(reader)?,
+                residual: reader.read_i64_le()?,
+            },
             _ => return Err(AuraError::InvalidValue("group instruction op")),
         };
         group.validate()?;
@@ -960,6 +1004,12 @@ impl GenericGroupInstruction {
                 }
             }
             Self::ExpressionStream {
+                op,
+                input_slots,
+                literals,
+                ..
+            }
+            | Self::ExpressionValue {
                 op,
                 input_slots,
                 literals,

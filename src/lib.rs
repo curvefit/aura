@@ -44,7 +44,8 @@ pub use instructions::{
     GenericStreamOp,
 };
 pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
-pub use reader::AuraI64Reader;
+pub use reader::{AuraI64Reader, AuraTypedReader};
+pub use records::{DecodedI64File, DecodedTypedFile, I64FileInput, TypedFileInput};
 pub use schema::{
     decode_schema_map, generic_i64_parent_schema, schema_parent_mapping, FieldDescriptor,
     FieldRelation, FieldRole, FieldScope, FieldTransform, FieldType, I64SchemaDefinition,
@@ -52,5 +53,5 @@ pub use schema::{
     TransformCandidates,
 };
 pub use stats::{FieldStats, IngestStats, PhysicalWidth, RunHistogramEntry, ShapeStats};
-pub use types::Profile;
-pub use writer::{AuraI64Writer, AuraTypedValue, AuraTypedWriter};
+pub use types::{AuraTypedValue, Profile};
+pub use writer::{AuraI64Writer, AuraTypedWriter};
