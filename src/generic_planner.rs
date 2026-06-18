@@ -373,6 +373,53 @@ pub fn decode_generic_i64_rows_body(
     })
 }
 
+pub(crate) fn try_decode_generic_i64_columns_body(
+    plan: GenericInstructionPlan,
+    bytes: &[u8],
+    record_count: usize,
+    field_count: usize,
+) -> Result<Option<Vec<Vec<i64>>>> {
+    if plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::PartitionRuns { .. }
+                | GenericGroupInstruction::DerivedStream { .. }
+                | GenericGroupInstruction::ExpressionStream { .. }
+                | GenericGroupInstruction::ExpressionValue { .. }
+        )
+    }) {
+        return Ok(None);
+    }
+
+    let instructions = plan
+        .streams
+        .iter()
+        .map(|instruction| (instruction.stream_id, instruction))
+        .collect::<BTreeMap<_, _>>();
+    let mut stream_values = BTreeMap::new();
+    let mut reader = ByteReader::new(bytes);
+    let stream_count = reader.read_u16_le()? as usize;
+    for _ in 0..stream_count {
+        let stream_id = reader.read_u16_le()?;
+        let value_count = usize::try_from(reader.read_u64_le()?)
+            .map_err(|_| AuraError::InvalidValue("stream value count"))?;
+        let body_len = reader.read_u32_le()? as usize;
+        let body = reader.read_exact(body_len)?;
+        let instruction = instructions
+            .get(&stream_id)
+            .ok_or(AuraError::InvalidValue("stream id"))?;
+        match decode_generic_stream_body(instruction, body, value_count)? {
+            GenericStreamBodyValue::I64(values) => {
+                stream_values.insert(stream_id, values);
+            }
+            GenericStreamBodyValue::U128(_) => return Err(AuraError::InvalidValue("body type")),
+        }
+    }
+    reader.finish()?;
+
+    materialize_generic_i64_columns(&plan, &stream_values, record_count, field_count)
+}
+
 pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Vec<i64>>> {
     let instructions = encoded
         .plan
@@ -1053,6 +1100,344 @@ fn presence_bit_set(mask: i64, index: u16) -> Result<bool> {
         .checked_shl(u32::from(index))
         .ok_or(AuraError::InvalidValue("presence bit"))?;
     Ok(mask & bit != 0)
+}
+
+fn materialize_generic_i64_columns(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+    field_count: usize,
+) -> Result<Option<Vec<Vec<i64>>>> {
+    let mut columns = vec![vec![0i64; record_count]; field_count];
+    let mut filled_slots = vec![false; field_count];
+
+    for instruction in &plan.streams {
+        let Some(slot) = instruction.target_slot else {
+            continue;
+        };
+        let slot = usize::from(slot);
+        if slot >= field_count {
+            return Err(AuraError::InvalidValue("target slot"));
+        }
+        let values = stream_values
+            .get(&instruction.stream_id)
+            .ok_or(AuraError::InvalidValue("stream body"))?;
+        if values.len() != record_count {
+            return Err(AuraError::InvalidValue("stream value count"));
+        }
+        columns[slot].copy_from_slice(values);
+        filled_slots[slot] = true;
+    }
+
+    let partition_runs = materialize_partition_run_length_columns(
+        plan,
+        stream_values,
+        record_count,
+        field_count,
+        &mut columns,
+        &mut filled_slots,
+    )?;
+    materialize_group_value_columns(
+        plan,
+        stream_values,
+        &partition_runs,
+        field_count,
+        &mut columns,
+        &mut filled_slots,
+    )?;
+    materialize_segmented_delta_columns(
+        plan,
+        stream_values,
+        &partition_runs,
+        field_count,
+        &mut columns,
+        &mut filled_slots,
+    )?;
+    materialize_presence_columns(
+        plan,
+        stream_values,
+        record_count,
+        field_count,
+        &mut columns,
+        &mut filled_slots,
+    )?;
+
+    if filled_slots.iter().all(|slot| *slot) {
+        Ok(Some(columns))
+    } else {
+        Ok(None)
+    }
+}
+
+fn materialize_partition_run_length_columns(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+    field_count: usize,
+    columns: &mut [Vec<i64>],
+    filled_slots: &mut [bool],
+) -> Result<BTreeMap<u16, Vec<PartitionRun>>> {
+    let mut out = BTreeMap::new();
+    for group in &plan.groups {
+        let GenericGroupInstruction::PartitionRunLengths {
+            group_id,
+            partition_slot,
+            fixed_order,
+            value_stream_id,
+            count_stream_id,
+            ..
+        } = group
+        else {
+            continue;
+        };
+        let partition_slot = usize::from(*partition_slot);
+        if partition_slot >= field_count {
+            return Err(AuraError::InvalidValue("partition slot"));
+        }
+        let values = stream_values
+            .get(value_stream_id)
+            .ok_or(AuraError::InvalidValue("partition value stream"))?;
+        let counts = stream_values
+            .get(count_stream_id)
+            .ok_or(AuraError::InvalidValue("partition count stream"))?;
+        if *fixed_order {
+            if !counts.is_empty() && values.is_empty() {
+                return Err(AuraError::InvalidValue("fixed partition order"));
+            }
+        } else if values.len() != counts.len() {
+            return Err(AuraError::InvalidValue("partition stream length"));
+        }
+
+        let mut row_index = 0usize;
+        let mut runs = Vec::with_capacity(counts.len());
+        for (run_index, count) in counts.iter().copied().enumerate() {
+            if count <= 0 {
+                return Err(AuraError::InvalidValue("partition run length"));
+            }
+            let count = usize::try_from(count)
+                .map_err(|_| AuraError::InvalidValue("partition run length"))?;
+            let end = row_index
+                .checked_add(count)
+                .ok_or(AuraError::InvalidValue("partition run length"))?;
+            if end > record_count {
+                return Err(AuraError::InvalidValue("partition run length"));
+            }
+            let value = if *fixed_order {
+                values[run_index % values.len()]
+            } else {
+                values[run_index]
+            };
+            columns[partition_slot][row_index..end].fill(value);
+            runs.push(PartitionRun {
+                start: row_index,
+                end,
+                value,
+            });
+            row_index = end;
+        }
+        if row_index != record_count {
+            return Err(AuraError::InvalidValue("partition run length"));
+        }
+        filled_slots[partition_slot] = true;
+        out.insert(*group_id, runs);
+    }
+    Ok(out)
+}
+
+fn materialize_group_value_columns(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    partition_runs: &BTreeMap<u16, Vec<PartitionRun>>,
+    field_count: usize,
+    columns: &mut [Vec<i64>],
+    filled_slots: &mut [bool],
+) -> Result<()> {
+    for group in &plan.groups {
+        let GenericGroupInstruction::GroupValueStream {
+            parent_group_id,
+            output_slot,
+            stream_id,
+            ..
+        } = group
+        else {
+            continue;
+        };
+        let output_slot = usize::from(*output_slot);
+        if output_slot >= field_count {
+            return Err(AuraError::InvalidValue("target slot"));
+        }
+        let event_ranges = event_ranges_from_partition_runs(
+            plan,
+            stream_values,
+            partition_runs,
+            *parent_group_id,
+        )?;
+        let values = stream_values
+            .get(stream_id)
+            .ok_or(AuraError::InvalidValue("group value stream"))?;
+        if values.len() != event_ranges.len() {
+            return Err(AuraError::InvalidValue("group value stream"));
+        }
+        for ((start, end), value) in event_ranges.into_iter().zip(values.iter().copied()) {
+            columns[output_slot][start..end].fill(value);
+        }
+        filled_slots[output_slot] = true;
+    }
+    Ok(())
+}
+
+fn materialize_segmented_delta_columns(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    partition_runs: &BTreeMap<u16, Vec<PartitionRun>>,
+    field_count: usize,
+    columns: &mut [Vec<i64>],
+    filled_slots: &mut [bool],
+) -> Result<()> {
+    for group in &plan.groups {
+        let GenericGroupInstruction::SegmentedDeltaStream {
+            parent_group_id,
+            output_slot,
+            base_stream_id,
+            first_stream_id,
+            delta_stream_id,
+            ..
+        } = group
+        else {
+            continue;
+        };
+        let output_slot = usize::from(*output_slot);
+        if output_slot >= field_count {
+            return Err(AuraError::InvalidValue("target slot"));
+        }
+        let runs = partition_runs
+            .get(parent_group_id)
+            .ok_or(AuraError::InvalidValue("partition run reference"))?;
+        let first_values = stream_values
+            .get(first_stream_id)
+            .ok_or(AuraError::InvalidValue("segmented first stream"))?;
+        let delta_values = stream_values
+            .get(delta_stream_id)
+            .ok_or(AuraError::InvalidValue("segmented delta stream"))?;
+        if first_values.len() != runs.len() {
+            return Err(AuraError::InvalidValue("segmented first stream"));
+        }
+        let base_by_partition = if let Some(base_stream_id) = base_stream_id {
+            let base_values = stream_values
+                .get(base_stream_id)
+                .ok_or(AuraError::InvalidValue("segmented base stream"))?;
+            let partition_values = partition_values_from_runs(runs);
+            if base_values.len() != partition_values.len() {
+                return Err(AuraError::InvalidValue("segmented base stream"));
+            }
+            Some(
+                partition_values
+                    .into_iter()
+                    .zip(base_values.iter().copied())
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        } else {
+            None
+        };
+        let mut delta_index = 0usize;
+        for (run, first_value) in runs.iter().zip(first_values.iter().copied()) {
+            if run.start >= run.end || run.end > columns[output_slot].len() {
+                return Err(AuraError::InvalidValue("partition run"));
+            }
+            let mut value = if let Some(base_by_partition) = &base_by_partition {
+                let base = base_by_partition
+                    .get(&run.value)
+                    .copied()
+                    .ok_or(AuraError::InvalidValue("segmented base stream"))?;
+                checked_sum(base, first_value)?
+            } else {
+                first_value
+            };
+            columns[output_slot][run.start] = value;
+            for row_index in run.start + 1..run.end {
+                let delta = *delta_values
+                    .get(delta_index)
+                    .ok_or(AuraError::InvalidValue("segmented delta stream"))?;
+                value = checked_sum(value, delta)?;
+                columns[output_slot][row_index] = value;
+                delta_index += 1;
+            }
+        }
+        if delta_index != delta_values.len() {
+            return Err(AuraError::InvalidValue("segmented delta stream"));
+        }
+        filled_slots[output_slot] = true;
+    }
+    Ok(())
+}
+
+fn materialize_presence_columns(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+    field_count: usize,
+    columns: &mut [Vec<i64>],
+    filled_slots: &mut [bool],
+) -> Result<()> {
+    let presence_maps = presence_maps_by_group(plan, stream_values, record_count)?;
+    for group in &plan.groups {
+        match group {
+            GenericGroupInstruction::SparseStream {
+                presence_group_id,
+                output_slot,
+                presence_index,
+                stream_id,
+                ..
+            } => {
+                let output_slot = usize::from(*output_slot);
+                if output_slot >= field_count {
+                    return Err(AuraError::InvalidValue("target slot"));
+                }
+                let masks = presence_maps
+                    .get(presence_group_id)
+                    .ok_or(AuraError::InvalidValue("presence map reference"))?;
+                let values = stream_values
+                    .get(stream_id)
+                    .ok_or(AuraError::InvalidValue("stream body"))?;
+                let mut value_index = 0usize;
+                for row_index in 0..record_count {
+                    if presence_bit_set(masks[row_index], *presence_index)? {
+                        columns[output_slot][row_index] = *values
+                            .get(value_index)
+                            .ok_or(AuraError::InvalidValue("sparse stream body"))?;
+                        value_index += 1;
+                    }
+                }
+                if value_index != values.len() {
+                    return Err(AuraError::InvalidValue("sparse stream body"));
+                }
+                filled_slots[output_slot] = true;
+            }
+            GenericGroupInstruction::PresenceValue {
+                presence_group_id,
+                output_slot,
+                presence_index,
+                value,
+                ..
+            } => {
+                let output_slot = usize::from(*output_slot);
+                if output_slot >= field_count {
+                    return Err(AuraError::InvalidValue("target slot"));
+                }
+                let masks = presence_maps
+                    .get(presence_group_id)
+                    .ok_or(AuraError::InvalidValue("presence map reference"))?;
+                for row_index in 0..record_count {
+                    if presence_bit_set(masks[row_index], *presence_index)? {
+                        columns[output_slot][row_index] = *value;
+                    }
+                }
+                filled_slots[output_slot] = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn materialize_partition_run_lengths(
@@ -3369,5 +3754,46 @@ mod tests {
             encoded_i64_score_with_op(&packed, &values).unwrap()
                 < encoded_i64_score_with_op(&huffman, &values).unwrap()
         );
+    }
+
+    #[test]
+    fn column_decoder_matches_rows_for_grouped_sparse_plan() {
+        let schema = crate::schema::generic_i64_parent_schema(
+            "grouped_sparse_decode_v1",
+            &[100, 0, 0, 205, 4, 5, 5, 5],
+        )
+        .unwrap();
+        let rows = vec![
+            vec![1_000, 10, 20, 0, 100_000, 5, 0, 0],
+            vec![1_000, 10, 20, 0, 100_010, 0, 7, 1],
+            vec![1_000, 10, 20, 1, 100_020, 9, 0, 0],
+            vec![2_000, 11, 21, 0, 100_030, 0, 8, 1],
+            vec![2_000, 11, 21, 1, 100_040, 11, 0, 0],
+            vec![2_000, 11, 21, 1, 100_050, 0, 0, 1],
+        ];
+        let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+        let body = encode_generic_i64_rows_body(&encoded).unwrap();
+
+        let columns = try_decode_generic_i64_columns_body(
+            encoded.plan.clone(),
+            &body,
+            rows.len(),
+            schema.fields.len(),
+        )
+        .unwrap()
+        .expect("column fast path");
+        let column_rows = (0..rows.len())
+            .map(|row_index| {
+                (0..schema.fields.len())
+                    .map(|field_index| columns[field_index][row_index])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let decoded_rows =
+            decode_generic_i64_rows_body(encoded.plan, &body, rows.len(), schema.fields.len())
+                .unwrap();
+
+        assert_eq!(rows, decoded_rows);
+        assert_eq!(decoded_rows, column_rows);
     }
 }

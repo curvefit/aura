@@ -7,7 +7,7 @@ use crate::footer::AuraFooter;
 use crate::format::SEAL_MAGIC;
 use crate::generic_planner::{
     decode_generic_i64_rows_body, encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan,
-    plan_generic_i64_rows,
+    plan_generic_i64_rows, try_decode_generic_i64_columns_body,
 };
 use crate::header::{AuraHeader, LEGACY_HEADER_PREFIX_SIZE};
 use crate::instructions::GenericInstructionPlan;
@@ -194,14 +194,23 @@ fn try_compile_i64_fast(bytes: &[u8], target_profile: Profile) -> Result<Option<
         return Err(AuraError::UnexpectedEof);
     }
     let header = AuraHeader::decode(&bytes[..header_len])?;
-    if header.profile != Profile::Ingest {
-        return Ok(None);
-    }
     let footer_start = footer_len_offset
         .checked_sub(footer_len)
         .ok_or(AuraError::UnexpectedEof)?;
     if footer_start < header_len {
         return Err(AuraError::UnexpectedEof);
+    }
+    if header.profile == Profile::Aura0 {
+        return try_compile_aura0_to_aura1_fast(
+            bytes,
+            header,
+            header_len,
+            footer_start,
+            footer_len_offset,
+        );
+    }
+    if header.profile != Profile::Ingest {
+        return Ok(None);
     }
     let footer = AuraFooter::decode(&bytes[footer_start..footer_len_offset])?;
     validate_header_schema_agreement(&header, &footer.schema)?;
@@ -226,6 +235,46 @@ fn try_compile_i64_fast(bytes: &[u8], target_profile: Profile) -> Result<Option<
         header.comment.as_str(),
         body,
         compiled_footer,
+    )?))
+}
+
+fn try_compile_aura0_to_aura1_fast(
+    bytes: &[u8],
+    header: AuraHeader,
+    header_len: usize,
+    footer_start: usize,
+    footer_len_offset: usize,
+) -> Result<Option<Vec<u8>>> {
+    let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+    validate_header_schema_agreement(&header, &footer.schema)?;
+    if schema_has_wide_fields(&footer.schema) {
+        return Err(AuraError::InvalidValue("i64 schema"));
+    }
+    let Some(plan) = footer.generic_aura0_plan.clone() else {
+        return Ok(None);
+    };
+    let record_count = usize::try_from(footer.record_count)
+        .map_err(|_| AuraError::InvalidValue("record count"))?;
+    let field_count = footer.schema.fields.len();
+    let Some(columns) = try_decode_generic_i64_columns_body(
+        plan,
+        &bytes[header_len..footer_start],
+        record_count,
+        field_count,
+    )?
+    else {
+        return Ok(None);
+    };
+    let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+    let body = encode_aura1_body_from_columns(&columns, &aura1_plan)?;
+    Ok(Some(encode_compiled_file(
+        Profile::Aura1,
+        header.stream_id,
+        header.dictionary_id,
+        header.base_time_ns,
+        header.comment.as_str(),
+        body,
+        footer,
     )?))
 }
 
@@ -1542,6 +1591,44 @@ fn encode_aura1_body_from_raw_body(
     }
     reader.finish()?;
     Ok((out, record_count))
+}
+
+fn encode_aura1_body_from_columns(columns: &[Vec<i64>], plan: &Aura1Plan) -> Result<Vec<u8>> {
+    let field_count = columns.len();
+    let record_count = columns.first().map_or(0, Vec::len);
+    for column in columns {
+        if column.len() != record_count {
+            return Err(AuraError::InvalidValue("record count"));
+        }
+    }
+    for field_plan in &plan.fields {
+        if usize::from(field_plan.field_index) >= field_count {
+            return Err(AuraError::InvalidValue("field index"));
+        }
+    }
+    let row_width = plan
+        .fields
+        .iter()
+        .map(|field| usize::from(field.width.byte_width()))
+        .try_fold(0usize, |acc, width| {
+            acc.checked_add(width)
+                .ok_or(AuraError::InvalidValue("body length"))
+        })?;
+    let mut out = Vec::with_capacity(
+        record_count
+            .checked_mul(row_width)
+            .ok_or(AuraError::InvalidValue("body length"))?,
+    );
+    for row_index in 0..record_count {
+        for field_plan in &plan.fields {
+            write_i64_width(
+                &mut out,
+                columns[usize::from(field_plan.field_index)][row_index],
+                field_plan.width,
+            )?;
+        }
+    }
+    Ok(out)
 }
 
 fn decode_aura1_body(
