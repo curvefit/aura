@@ -717,18 +717,42 @@ fn decode_huffman_dictionary(
         return Ok(vec![value; value_count]);
     }
 
+    let decoded_entries = entries
+        .iter()
+        .map(|entry| reconstruct_unsigned_offset(base, unit, *entry))
+        .collect::<Result<Vec<_>>>()?;
     let canonical_codes = canonical_huffman_codes(code_lengths)?;
     let max_len = canonical_codes
         .iter()
         .filter_map(|code| code.map(|code| code.bit_len))
         .max()
         .ok_or(AuraError::InvalidValue("huffman code lengths"))?;
+    let code_bytes = reader.read_exact(reader.remaining())?;
+    if max_len <= 20 {
+        let decode_table = huffman_decode_table(&canonical_codes, max_len)?;
+        let mut bit_reader = HuffmanBitReader::new(code_bytes);
+        let mut out = Vec::with_capacity(value_count);
+        for _ in 0..value_count {
+            let key = bit_reader.peek_bits(max_len)? as usize;
+            let entry = decode_table
+                .get(key)
+                .and_then(|entry| *entry)
+                .ok_or(AuraError::InvalidValue("huffman code"))?;
+            bit_reader.consume_bits(entry.bit_len)?;
+            out.push(
+                *decoded_entries
+                    .get(entry.symbol)
+                    .ok_or(AuraError::InvalidValue("dictionary code"))?,
+            );
+        }
+        return Ok(out);
+    }
+
     let decode_map = canonical_codes
         .iter()
         .enumerate()
         .filter_map(|(symbol, code)| code.map(|code| ((code.bit_len, code.bits), symbol)))
         .collect::<BTreeMap<_, _>>();
-    let code_bytes = reader.read_exact(reader.remaining())?;
     let mut bit_reader = HuffmanBitReader::new(code_bytes);
     let mut out = Vec::with_capacity(value_count);
     for _ in 0..value_count {
@@ -742,10 +766,11 @@ fn decode_huffman_dictionary(
             }
         }
         let symbol = symbol.ok_or(AuraError::InvalidValue("huffman code"))?;
-        let entry = *entries
-            .get(symbol)
-            .ok_or(AuraError::InvalidValue("dictionary code"))?;
-        out.push(reconstruct_unsigned_offset(base, unit, entry)?);
+        out.push(
+            *decoded_entries
+                .get(symbol)
+                .ok_or(AuraError::InvalidValue("dictionary code"))?,
+        );
     }
     Ok(out)
 }
@@ -1262,6 +1287,52 @@ struct HuffmanCode {
     bit_len: u8,
 }
 
+#[derive(Clone, Copy)]
+struct HuffmanDecodeEntry {
+    symbol: usize,
+    bit_len: u8,
+}
+
+fn huffman_decode_table(
+    codes: &[Option<HuffmanCode>],
+    max_len: u8,
+) -> Result<Vec<Option<HuffmanDecodeEntry>>> {
+    let table_len = 1usize
+        .checked_shl(u32::from(max_len))
+        .ok_or(AuraError::InvalidValue("huffman code lengths"))?;
+    let mut table = vec![None; table_len];
+    for (symbol, code) in codes.iter().enumerate() {
+        let Some(code) = code else {
+            continue;
+        };
+        if code.bit_len > max_len {
+            return Err(AuraError::InvalidValue("huffman code lengths"));
+        }
+        let suffix_bits = max_len - code.bit_len;
+        let start = usize::try_from(code.bits)
+            .map_err(|_| AuraError::InvalidValue("huffman code"))?
+            .checked_shl(u32::from(suffix_bits))
+            .ok_or(AuraError::InvalidValue("huffman code"))?;
+        let end = start
+            .checked_add(
+                1usize
+                    .checked_shl(u32::from(suffix_bits))
+                    .ok_or(AuraError::InvalidValue("huffman code"))?,
+            )
+            .ok_or(AuraError::InvalidValue("huffman code"))?;
+        for slot in table
+            .get_mut(start..end)
+            .ok_or(AuraError::InvalidValue("huffman code"))?
+        {
+            *slot = Some(HuffmanDecodeEntry {
+                symbol,
+                bit_len: code.bit_len,
+            });
+        }
+    }
+    Ok(table)
+}
+
 fn canonical_huffman_codes(code_lengths: &[u8]) -> Result<Vec<Option<HuffmanCode>>> {
     if code_lengths.is_empty() {
         return Err(AuraError::InvalidValue("huffman code lengths"));
@@ -1382,6 +1453,45 @@ impl<'a> HuffmanBitReader<'a> {
             self.used_bits = 0;
         }
         Ok(bit)
+    }
+
+    fn peek_bits(&self, bit_count: u8) -> Result<u64> {
+        if bit_count > 64 {
+            return Err(AuraError::InvalidValue("huffman code"));
+        }
+        let mut out = 0u64;
+        let mut byte_index = self.byte_index;
+        let mut used_bits = self.used_bits;
+        for _ in 0..bit_count {
+            let bit = self
+                .bytes
+                .get(byte_index)
+                .map_or(0, |byte| (byte >> (7 - used_bits)) & 1);
+            out = (out << 1) | u64::from(bit);
+            used_bits += 1;
+            if used_bits == 8 {
+                byte_index += 1;
+                used_bits = 0;
+            }
+        }
+        Ok(out)
+    }
+
+    fn consume_bits(&mut self, bit_count: u8) -> Result<()> {
+        let available_bits = self
+            .bytes
+            .len()
+            .saturating_sub(self.byte_index)
+            .checked_mul(8)
+            .and_then(|bits| bits.checked_sub(usize::from(self.used_bits)))
+            .ok_or(AuraError::UnexpectedEof)?;
+        if usize::from(bit_count) > available_bits {
+            return Err(AuraError::UnexpectedEof);
+        }
+        let absolute = usize::from(self.used_bits) + usize::from(bit_count);
+        self.byte_index += absolute / 8;
+        self.used_bits = (absolute % 8) as u8;
+        Ok(())
     }
 }
 
