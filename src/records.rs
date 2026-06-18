@@ -139,6 +139,9 @@ pub(crate) fn compile_i64_file_inner(bytes: &[u8], target_profile: Profile) -> R
     if target_profile == Profile::Ingest {
         return Err(AuraError::InvalidValue("target profile"));
     }
+    if let Some(compiled) = try_compile_i64_fast(bytes, target_profile)? {
+        return Ok(compiled);
+    }
     let decoded = decode_i64_file_inner(bytes)?;
     let compiled_footer = decoded.compiled_footer_for_compile()?;
     let body = match target_profile {
@@ -171,6 +174,59 @@ pub(crate) fn compile_i64_file_inner(bytes: &[u8], target_profile: Profile) -> R
         body,
         compiled_footer,
     )
+}
+
+fn try_compile_i64_fast(bytes: &[u8], target_profile: Profile) -> Result<Option<Vec<u8>>> {
+    if target_profile != Profile::Aura1 {
+        return Ok(None);
+    }
+    if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+        return Ok(None);
+    }
+    let seal_offset = bytes.len() - SEAL_MAGIC.len();
+    if &bytes[seal_offset..] != SEAL_MAGIC {
+        return Ok(None);
+    }
+    let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
+    let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
+    let header_len = AuraHeader::encoded_len(bytes)?;
+    if header_len > footer_len_offset {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let header = AuraHeader::decode(&bytes[..header_len])?;
+    if header.profile != Profile::Ingest {
+        return Ok(None);
+    }
+    let footer_start = footer_len_offset
+        .checked_sub(footer_len)
+        .ok_or(AuraError::UnexpectedEof)?;
+    if footer_start < header_len {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let footer = AuraFooter::decode(&bytes[footer_start..footer_len_offset])?;
+    validate_header_schema_agreement(&header, &footer.schema)?;
+    if schema_has_wide_fields(&footer.schema) {
+        return Err(AuraError::InvalidValue("i64 schema"));
+    }
+    let aura1_plan = footer
+        .aura1_plan
+        .clone()
+        .ok_or(AuraError::InvalidValue("aura1 plan"))?;
+    let (body, record_count) = encode_aura1_body_from_raw_body(
+        &bytes[header_len..footer_start],
+        &footer.schema,
+        &aura1_plan,
+    )?;
+    let compiled_footer = compiled_footer_from_ingest_footer(&footer, record_count)?;
+    Ok(Some(encode_compiled_file(
+        Profile::Aura1,
+        header.stream_id,
+        header.dictionary_id,
+        header.base_time_ns,
+        header.comment.as_str(),
+        body,
+        compiled_footer,
+    )?))
 }
 
 pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
@@ -417,6 +473,38 @@ impl DecodedI64File {
         }
         Ok(footer)
     }
+}
+
+fn compiled_footer_from_ingest_footer(
+    footer: &AuraFooter,
+    record_count: usize,
+) -> Result<CompiledFooter> {
+    let record_count =
+        u64::try_from(record_count).map_err(|_| AuraError::InvalidValue("record count"))?;
+    if record_count != footer.stats.record_count {
+        return Err(AuraError::InvalidValue("record count"));
+    }
+    let aura0_plan = footer
+        .aura0_plan
+        .clone()
+        .ok_or(AuraError::InvalidValue("aura0 plan"))?;
+    let aura1_plan = footer
+        .aura1_plan
+        .clone()
+        .ok_or(AuraError::InvalidValue("aura1 plan"))?;
+    let block_capacity = aura1_plan.block_capacity;
+    let field_count = footer.schema.fields.len();
+    let mut compiled = CompiledFooter::new(
+        footer.schema.clone(),
+        record_count,
+        block_capacity,
+        DecodeProgram::from_aura0_plan(&aura0_plan, field_count)?,
+        DecodeProgram::from_aura1_plan(&aura1_plan, field_count)?,
+    )?;
+    if let Some(plan) = footer.generic_aura0_plan.clone() {
+        compiled = compiled.with_generic_aura0_plan(plan);
+    }
+    Ok(compiled)
 }
 
 fn encode_file(
@@ -1406,6 +1494,54 @@ fn encode_aura1_body(rows: &[Vec<i64>], plan: &Aura1Plan) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+fn encode_aura1_body_from_raw_body(
+    raw_body: &[u8],
+    schema: &SchemaDescriptor,
+    plan: &Aura1Plan,
+) -> Result<(Vec<u8>, usize)> {
+    let mut reader = ByteReader::new(raw_body);
+    let record_count = usize::try_from(reader.read_u64_le()?)
+        .map_err(|_| AuraError::InvalidValue("record count"))?;
+    let field_count = usize::from(reader.read_u16_le()?);
+    if field_count != schema.fields.len() {
+        return Err(AuraError::InvalidValue("field count"));
+    }
+    for field_plan in &plan.fields {
+        if usize::from(field_plan.field_index) >= field_count {
+            return Err(AuraError::InvalidValue("field index"));
+        }
+    }
+
+    let row_width = plan
+        .fields
+        .iter()
+        .map(|field| usize::from(field.width.byte_width()))
+        .try_fold(0usize, |acc, width| {
+            acc.checked_add(width)
+                .ok_or(AuraError::InvalidValue("body length"))
+        })?;
+    let mut out = Vec::with_capacity(
+        record_count
+            .checked_mul(row_width)
+            .ok_or(AuraError::InvalidValue("body length"))?,
+    );
+    let mut row = vec![0i64; field_count];
+    for _ in 0..record_count {
+        for value in &mut row {
+            *value = reader.read_i64_le()?;
+        }
+        for field_plan in &plan.fields {
+            write_i64_width(
+                &mut out,
+                row[usize::from(field_plan.field_index)],
+                field_plan.width,
+            )?;
+        }
+    }
+    reader.finish()?;
+    Ok((out, record_count))
 }
 
 fn decode_aura1_body(
