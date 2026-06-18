@@ -508,19 +508,22 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                 let values = stream_values
                     .get(stream_id)
                     .ok_or(AuraError::InvalidValue("stream body"))?;
-                let mut value_index = 0usize;
-                for row_index in 0..encoded.record_count {
-                    if presence_bit_set(masks[row_index], *presence_index)? {
-                        rows[row_index][output_slot] = *values
-                            .get(value_index)
+                let bit = presence_bit_mask(*presence_index)?;
+                let mut values = values.iter().copied();
+                for (row_index, mask) in masks.iter().copied().enumerate() {
+                    if mask < 0 {
+                        return Err(AuraError::InvalidValue("presence bit"));
+                    }
+                    if mask & bit != 0 {
+                        rows[row_index][output_slot] = values
+                            .next()
                             .ok_or(AuraError::InvalidValue("sparse stream body"))?;
-                        value_index += 1;
                     } else {
                         rows[row_index][output_slot] = 0;
                     }
                     filled[row_index][output_slot] = true;
                 }
-                if value_index != values.len() {
+                if values.next().is_some() {
                     return Err(AuraError::InvalidValue("sparse stream body"));
                 }
             }
@@ -538,13 +541,12 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                 let masks = presence_maps
                     .get(presence_group_id)
                     .ok_or(AuraError::InvalidValue("presence map reference"))?;
-                for row_index in 0..encoded.record_count {
-                    rows[row_index][output_slot] =
-                        if presence_bit_set(masks[row_index], *presence_index)? {
-                            *value
-                        } else {
-                            0
-                        };
+                let bit = presence_bit_mask(*presence_index)?;
+                for (row_index, mask) in masks.iter().copied().enumerate() {
+                    if mask < 0 {
+                        return Err(AuraError::InvalidValue("presence bit"));
+                    }
+                    rows[row_index][output_slot] = if mask & bit != 0 { *value } else { 0 };
                     filled[row_index][output_slot] = true;
                 }
             }
@@ -1062,11 +1064,11 @@ fn partition_parent_group_id(plan: &GenericInstructionPlan, group_id: u16) -> Re
         .ok_or(AuraError::InvalidValue("partition run reference"))
 }
 
-fn presence_maps_by_group(
+fn presence_maps_by_group<'a>(
     plan: &GenericInstructionPlan,
-    stream_values: &BTreeMap<u16, Vec<i64>>,
+    stream_values: &'a BTreeMap<u16, Vec<i64>>,
     record_count: usize,
-) -> Result<BTreeMap<u16, Vec<i64>>> {
+) -> Result<BTreeMap<u16, &'a [i64]>> {
     let mut out = BTreeMap::new();
     for group in &plan.groups {
         let GenericGroupInstruction::PresenceMap {
@@ -1087,19 +1089,19 @@ fn presence_maps_by_group(
         if values.len() != record_count {
             return Err(AuraError::InvalidValue("presence stream body"));
         }
-        out.insert(*group_id, values.clone());
+        out.insert(*group_id, values.as_slice());
     }
     Ok(out)
 }
 
-fn presence_bit_set(mask: i64, index: u16) -> Result<bool> {
-    if index >= 62 || mask < 0 {
+fn presence_bit_mask(index: u16) -> Result<i64> {
+    if index >= 62 {
         return Err(AuraError::InvalidValue("presence bit"));
     }
     let bit = 1i64
         .checked_shl(u32::from(index))
         .ok_or(AuraError::InvalidValue("presence bit"))?;
-    Ok(mask & bit != 0)
+    Ok(bit)
 }
 
 fn materialize_generic_i64_columns(
@@ -1252,6 +1254,27 @@ fn materialize_group_value_columns(
     columns: &mut [Vec<i64>],
     filled_slots: &mut [bool],
 ) -> Result<()> {
+    let mut event_ranges_by_group = BTreeMap::new();
+    for group in &plan.groups {
+        let GenericGroupInstruction::GroupValueStream {
+            parent_group_id, ..
+        } = group
+        else {
+            continue;
+        };
+        if !event_ranges_by_group.contains_key(parent_group_id) {
+            event_ranges_by_group.insert(
+                *parent_group_id,
+                event_ranges_from_partition_runs(
+                    plan,
+                    stream_values,
+                    partition_runs,
+                    *parent_group_id,
+                )?,
+            );
+        }
+    }
+
     for group in &plan.groups {
         let GenericGroupInstruction::GroupValueStream {
             parent_group_id,
@@ -1266,19 +1289,16 @@ fn materialize_group_value_columns(
         if output_slot >= field_count {
             return Err(AuraError::InvalidValue("target slot"));
         }
-        let event_ranges = event_ranges_from_partition_runs(
-            plan,
-            stream_values,
-            partition_runs,
-            *parent_group_id,
-        )?;
+        let event_ranges = event_ranges_by_group
+            .get(parent_group_id)
+            .ok_or(AuraError::InvalidValue("partition run reference"))?;
         let values = stream_values
             .get(stream_id)
             .ok_or(AuraError::InvalidValue("group value stream"))?;
         if values.len() != event_ranges.len() {
             return Err(AuraError::InvalidValue("group value stream"));
         }
-        for ((start, end), value) in event_ranges.into_iter().zip(values.iter().copied()) {
+        for ((start, end), value) in event_ranges.iter().copied().zip(values.iter().copied()) {
             columns[output_slot][start..end].fill(value);
         }
         filled_slots[output_slot] = true;
@@ -1399,16 +1419,19 @@ fn materialize_presence_columns(
                 let values = stream_values
                     .get(stream_id)
                     .ok_or(AuraError::InvalidValue("stream body"))?;
-                let mut value_index = 0usize;
-                for row_index in 0..record_count {
-                    if presence_bit_set(masks[row_index], *presence_index)? {
-                        columns[output_slot][row_index] = *values
-                            .get(value_index)
+                let bit = presence_bit_mask(*presence_index)?;
+                let mut values = values.iter().copied();
+                for (row_index, mask) in masks.iter().copied().enumerate() {
+                    if mask < 0 {
+                        return Err(AuraError::InvalidValue("presence bit"));
+                    }
+                    if mask & bit != 0 {
+                        columns[output_slot][row_index] = values
+                            .next()
                             .ok_or(AuraError::InvalidValue("sparse stream body"))?;
-                        value_index += 1;
                     }
                 }
-                if value_index != values.len() {
+                if values.next().is_some() {
                     return Err(AuraError::InvalidValue("sparse stream body"));
                 }
                 filled_slots[output_slot] = true;
@@ -1427,8 +1450,12 @@ fn materialize_presence_columns(
                 let masks = presence_maps
                     .get(presence_group_id)
                     .ok_or(AuraError::InvalidValue("presence map reference"))?;
-                for row_index in 0..record_count {
-                    if presence_bit_set(masks[row_index], *presence_index)? {
+                let bit = presence_bit_mask(*presence_index)?;
+                for (row_index, mask) in masks.iter().copied().enumerate() {
+                    if mask < 0 {
+                        return Err(AuraError::InvalidValue("presence bit"));
+                    }
+                    if mask & bit != 0 {
                         columns[output_slot][row_index] = *value;
                     }
                 }

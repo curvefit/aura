@@ -729,8 +729,8 @@ fn decode_huffman_dictionary(
         .ok_or(AuraError::InvalidValue("huffman code lengths"))?;
     let code_bytes = reader.read_exact(reader.remaining())?;
     if max_len <= 20 {
-        let decode_table = huffman_decode_table(&canonical_codes, max_len)?;
-        let mut bit_reader = HuffmanBitReader::new(code_bytes);
+        let decode_table = huffman_value_decode_table(&canonical_codes, &decoded_entries, max_len)?;
+        let mut bit_reader = HuffmanTableBitReader::new(code_bytes);
         let mut out = Vec::with_capacity(value_count);
         for _ in 0..value_count {
             let key = bit_reader.peek_bits(max_len)? as usize;
@@ -739,11 +739,7 @@ fn decode_huffman_dictionary(
                 .and_then(|entry| *entry)
                 .ok_or(AuraError::InvalidValue("huffman code"))?;
             bit_reader.consume_bits(entry.bit_len)?;
-            out.push(
-                *decoded_entries
-                    .get(entry.symbol)
-                    .ok_or(AuraError::InvalidValue("dictionary code"))?,
-            );
+            out.push(entry.value);
         }
         return Ok(out);
     }
@@ -1288,15 +1284,16 @@ struct HuffmanCode {
 }
 
 #[derive(Clone, Copy)]
-struct HuffmanDecodeEntry {
-    symbol: usize,
+struct HuffmanValueDecodeEntry {
+    value: i64,
     bit_len: u8,
 }
 
-fn huffman_decode_table(
+fn huffman_value_decode_table(
     codes: &[Option<HuffmanCode>],
+    values: &[i64],
     max_len: u8,
-) -> Result<Vec<Option<HuffmanDecodeEntry>>> {
+) -> Result<Vec<Option<HuffmanValueDecodeEntry>>> {
     let table_len = 1usize
         .checked_shl(u32::from(max_len))
         .ok_or(AuraError::InvalidValue("huffman code lengths"))?;
@@ -1320,12 +1317,15 @@ fn huffman_decode_table(
                     .ok_or(AuraError::InvalidValue("huffman code"))?,
             )
             .ok_or(AuraError::InvalidValue("huffman code"))?;
+        let value = *values
+            .get(symbol)
+            .ok_or(AuraError::InvalidValue("dictionary code"))?;
         for slot in table
             .get_mut(start..end)
             .ok_or(AuraError::InvalidValue("huffman code"))?
         {
-            *slot = Some(HuffmanDecodeEntry {
-                symbol,
+            *slot = Some(HuffmanValueDecodeEntry {
+                value,
                 bit_len: code.bit_len,
             });
         }
@@ -1432,6 +1432,58 @@ struct HuffmanBitReader<'a> {
     used_bits: u8,
 }
 
+struct HuffmanTableBitReader<'a> {
+    bytes: &'a [u8],
+    byte_index: usize,
+    buffer: u64,
+    buffered_bits: u8,
+}
+
+impl<'a> HuffmanTableBitReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            byte_index: 0,
+            buffer: 0,
+            buffered_bits: 0,
+        }
+    }
+
+    fn peek_bits(&mut self, bit_count: u8) -> Result<u64> {
+        if bit_count > 64 {
+            return Err(AuraError::InvalidValue("huffman code"));
+        }
+        self.fill_to(bit_count);
+        if self.buffered_bits >= bit_count {
+            Ok(self.buffer >> (self.buffered_bits - bit_count))
+        } else {
+            Ok(self.buffer << (bit_count - self.buffered_bits))
+        }
+    }
+
+    fn consume_bits(&mut self, bit_count: u8) -> Result<()> {
+        self.fill_to(bit_count);
+        if self.buffered_bits < bit_count {
+            return Err(AuraError::UnexpectedEof);
+        }
+        self.buffered_bits -= bit_count;
+        self.buffer = match self.buffered_bits {
+            0 => 0,
+            64 => self.buffer,
+            bits => self.buffer & ((1u64 << bits) - 1),
+        };
+        Ok(())
+    }
+
+    fn fill_to(&mut self, bit_count: u8) {
+        while self.buffered_bits < bit_count && self.byte_index < self.bytes.len() {
+            self.buffer = (self.buffer << 8) | u64::from(self.bytes[self.byte_index]);
+            self.buffered_bits += 8;
+            self.byte_index += 1;
+        }
+    }
+}
+
 impl<'a> HuffmanBitReader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self {
@@ -1453,49 +1505,6 @@ impl<'a> HuffmanBitReader<'a> {
             self.used_bits = 0;
         }
         Ok(bit)
-    }
-
-    fn peek_bits(&self, bit_count: u8) -> Result<u64> {
-        if bit_count > 64 {
-            return Err(AuraError::InvalidValue("huffman code"));
-        }
-        let mut out = 0u64;
-        let mut byte_index = self.byte_index;
-        let mut used_bits = self.used_bits;
-        let mut remaining = bit_count;
-        while remaining > 0 {
-            let available = 8 - used_bits;
-            let take = remaining.min(available);
-            let byte = self.bytes.get(byte_index).copied().unwrap_or(0);
-            let shift = available - take;
-            let mask = ((1u16 << take) - 1) << shift;
-            let bits = u64::from((u16::from(byte) & mask) >> shift);
-            out = (out << take) | bits;
-            used_bits += take;
-            remaining -= take;
-            if used_bits == 8 {
-                byte_index += 1;
-                used_bits = 0;
-            }
-        }
-        Ok(out)
-    }
-
-    fn consume_bits(&mut self, bit_count: u8) -> Result<()> {
-        let available_bits = self
-            .bytes
-            .len()
-            .saturating_sub(self.byte_index)
-            .checked_mul(8)
-            .and_then(|bits| bits.checked_sub(usize::from(self.used_bits)))
-            .ok_or(AuraError::UnexpectedEof)?;
-        if usize::from(bit_count) > available_bits {
-            return Err(AuraError::UnexpectedEof);
-        }
-        let absolute = usize::from(self.used_bits) + usize::from(bit_count);
-        self.byte_index += absolute / 8;
-        self.used_bits = (absolute % 8) as u8;
-        Ok(())
     }
 }
 
