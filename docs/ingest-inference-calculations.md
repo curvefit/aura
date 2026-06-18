@@ -395,9 +395,9 @@ store a tree.
 The prototype tested an order-0 rANS-style candidate. It beat Huffman by:
 
 ```text
-Grimoire: 586 bytes
-OHLCV:    3655 bytes
-Tick:     5 bytes
+Orderbook repeated data: 586 bytes
+OHLCV:                   3655 bytes
+Tick:                    5 bytes
 ```
 
 That is not enough to justify production complexity yet. Production should
@@ -518,7 +518,7 @@ flag      -> constant
 UUID      -> constant-mask packed variable bits
 ```
 
-### Grimoire/Orderbook-Like Repeated Data
+### Orderbook-Like Repeated Data
 
 Header evidence:
 
@@ -585,7 +585,7 @@ execute the stamped footer instructions.
 The ingestor must not:
 
 ```text
-hardcode OHLCV, tick, orderbook, Bybit, Binance, OKX, or Grimoire schemas
+hardcode OHLCV, tick, orderbook, Bybit, Binance, or OKX schemas
 force parent deltas just because a parent byte exists
 perform arithmetic on opaque 255 streams
 silently downcast i128 or opaque fields to i64

@@ -436,7 +436,7 @@ the observed rows and repeated scope. The stamped footer decides exact storage
 units, widths, bitpacking, varints, packed dictionaries, and whether each
 candidate actually wins.
 
-On the Grimoire Bybit 15-minute fixture, this relationship shape stamps a
+On the 15-minute orderbook fixture, this relationship shape stamps a
 generic footer with partition run lengths, grouped event-value streams,
 segmented price deltas, a multi-slot presence map, sparse nonzero quantity
 streams, packed dictionaries for those quantity values, and a presence-derived
