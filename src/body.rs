@@ -8,6 +8,9 @@ use crate::bytes::{put_i64_le, put_u32_le, put_u8, ByteReader};
 use crate::instructions::{GenericStreamInstruction, GenericStreamOp};
 use crate::{varint, AuraError, Result};
 
+const HUFFMAN_BOUNDED_ROOT_BITS: u8 = 12;
+const HUFFMAN_BOUNDED_MAX_SUBTABLE_BITS: u8 = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenericStreamBodyValue {
     I64(Vec<i64>),
@@ -728,6 +731,14 @@ fn decode_huffman_dictionary(
         .max()
         .ok_or(AuraError::InvalidValue("huffman code lengths"))?;
     let code_bytes = reader.read_exact(reader.remaining())?;
+    if let Ok(decode_table) = huffman_bounded_value_decode_table(
+        &canonical_codes,
+        &decoded_entries,
+        max_len.min(HUFFMAN_BOUNDED_ROOT_BITS),
+    ) {
+        return decode_huffman_values_with_bounded_table(&decode_table, code_bytes, value_count);
+    }
+
     if max_len <= 20 {
         let decode_table = huffman_value_decode_table(&canonical_codes, &decoded_entries, max_len)?;
         let mut bit_reader = HuffmanTableBitReader::new(code_bytes);
@@ -1289,6 +1300,24 @@ struct HuffmanValueDecodeEntry {
     bit_len: u8,
 }
 
+#[derive(Clone)]
+enum BoundedHuffmanRootSlot {
+    Empty,
+    Leaf(HuffmanValueDecodeEntry),
+    Subtable(usize),
+}
+
+struct BoundedHuffmanSubtable {
+    bits: u8,
+    slots: Vec<Option<HuffmanValueDecodeEntry>>,
+}
+
+struct BoundedHuffmanValueDecodeTable {
+    root_bits: u8,
+    root: Vec<BoundedHuffmanRootSlot>,
+    subtables: Vec<BoundedHuffmanSubtable>,
+}
+
 fn huffman_value_decode_table(
     codes: &[Option<HuffmanCode>],
     values: &[i64],
@@ -1331,6 +1360,198 @@ fn huffman_value_decode_table(
         }
     }
     Ok(table)
+}
+
+fn huffman_bounded_value_decode_table(
+    codes: &[Option<HuffmanCode>],
+    values: &[i64],
+    root_bits: u8,
+) -> Result<BoundedHuffmanValueDecodeTable> {
+    if root_bits == 0 || root_bits > 64 || codes.len() != values.len() {
+        return Err(AuraError::InvalidValue("huffman code lengths"));
+    }
+    let root_len = 1usize
+        .checked_shl(u32::from(root_bits))
+        .ok_or(AuraError::InvalidValue("huffman code lengths"))?;
+    let mut root = vec![BoundedHuffmanRootSlot::Empty; root_len];
+    let mut long_codes = BTreeMap::<usize, Vec<(usize, HuffmanCode)>>::new();
+
+    for (symbol, code) in codes.iter().enumerate() {
+        let Some(code) = code else {
+            continue;
+        };
+        if code.bit_len == 0 || code.bit_len > 64 {
+            return Err(AuraError::InvalidValue("huffman code lengths"));
+        }
+        if code.bit_len <= root_bits {
+            let suffix_bits = root_bits - code.bit_len;
+            let start = usize::try_from(code.bits)
+                .map_err(|_| AuraError::InvalidValue("huffman code"))?
+                .checked_shl(u32::from(suffix_bits))
+                .ok_or(AuraError::InvalidValue("huffman code"))?;
+            let span = 1usize
+                .checked_shl(u32::from(suffix_bits))
+                .ok_or(AuraError::InvalidValue("huffman code"))?;
+            let value = *values
+                .get(symbol)
+                .ok_or(AuraError::InvalidValue("dictionary code"))?;
+            fill_bounded_root_slots(
+                &mut root,
+                start,
+                span,
+                BoundedHuffmanRootSlot::Leaf(HuffmanValueDecodeEntry {
+                    value,
+                    bit_len: code.bit_len,
+                }),
+            )?;
+        } else {
+            let prefix = usize::try_from(code.bits >> (code.bit_len - root_bits))
+                .map_err(|_| AuraError::InvalidValue("huffman code"))?;
+            long_codes.entry(prefix).or_default().push((symbol, *code));
+        }
+    }
+
+    let mut subtables = Vec::new();
+    for (prefix, codes_for_prefix) in long_codes {
+        if prefix >= root.len() {
+            return Err(AuraError::InvalidValue("huffman code"));
+        }
+        if !matches!(root[prefix], BoundedHuffmanRootSlot::Empty) {
+            return Err(AuraError::InvalidValue("huffman code"));
+        }
+        let subtable_bits = codes_for_prefix
+            .iter()
+            .map(|(_, code)| code.bit_len - root_bits)
+            .max()
+            .ok_or(AuraError::InvalidValue("huffman code lengths"))?;
+        if subtable_bits == 0 || subtable_bits > HUFFMAN_BOUNDED_MAX_SUBTABLE_BITS {
+            return Err(AuraError::InvalidValue("huffman code lengths"));
+        }
+        let slot_count = 1usize
+            .checked_shl(u32::from(subtable_bits))
+            .ok_or(AuraError::InvalidValue("huffman code"))?;
+        let mut slots = vec![None; slot_count];
+        for (symbol, code) in codes_for_prefix {
+            let suffix_len = code.bit_len - root_bits;
+            let suffix_mask = low_mask(suffix_len)?;
+            let suffix = usize::try_from(code.bits & suffix_mask)
+                .map_err(|_| AuraError::InvalidValue("huffman code"))?;
+            let fill_bits = subtable_bits - suffix_len;
+            let start = suffix
+                .checked_shl(u32::from(fill_bits))
+                .ok_or(AuraError::InvalidValue("huffman code"))?;
+            let span = 1usize
+                .checked_shl(u32::from(fill_bits))
+                .ok_or(AuraError::InvalidValue("huffman code"))?;
+            let value = *values
+                .get(symbol)
+                .ok_or(AuraError::InvalidValue("dictionary code"))?;
+            fill_bounded_subtable_slots(
+                &mut slots,
+                start,
+                span,
+                HuffmanValueDecodeEntry {
+                    value,
+                    bit_len: code.bit_len,
+                },
+            )?;
+        }
+        let subtable_index = subtables.len();
+        subtables.push(BoundedHuffmanSubtable {
+            bits: subtable_bits,
+            slots,
+        });
+        root[prefix] = BoundedHuffmanRootSlot::Subtable(subtable_index);
+    }
+
+    Ok(BoundedHuffmanValueDecodeTable {
+        root_bits,
+        root,
+        subtables,
+    })
+}
+
+fn fill_bounded_root_slots(
+    root: &mut [BoundedHuffmanRootSlot],
+    start: usize,
+    span: usize,
+    entry: BoundedHuffmanRootSlot,
+) -> Result<()> {
+    let end = start
+        .checked_add(span)
+        .ok_or(AuraError::InvalidValue("huffman code"))?;
+    for slot in root
+        .get_mut(start..end)
+        .ok_or(AuraError::InvalidValue("huffman code"))?
+    {
+        if !matches!(slot, BoundedHuffmanRootSlot::Empty) {
+            return Err(AuraError::InvalidValue("huffman code"));
+        }
+        *slot = entry.clone();
+    }
+    Ok(())
+}
+
+fn fill_bounded_subtable_slots(
+    slots: &mut [Option<HuffmanValueDecodeEntry>],
+    start: usize,
+    span: usize,
+    entry: HuffmanValueDecodeEntry,
+) -> Result<()> {
+    let end = start
+        .checked_add(span)
+        .ok_or(AuraError::InvalidValue("huffman code"))?;
+    for slot in slots
+        .get_mut(start..end)
+        .ok_or(AuraError::InvalidValue("huffman code"))?
+    {
+        if slot.is_some() {
+            return Err(AuraError::InvalidValue("huffman code"));
+        }
+        *slot = Some(entry);
+    }
+    Ok(())
+}
+
+fn decode_huffman_values_with_bounded_table(
+    table: &BoundedHuffmanValueDecodeTable,
+    code_bytes: &[u8],
+    value_count: usize,
+) -> Result<Vec<i64>> {
+    let mut bit_reader = HuffmanTableBitReader::new(code_bytes);
+    let mut out = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
+        let key = bit_reader.peek_bits(table.root_bits)? as usize;
+        let entry = match table
+            .root
+            .get(key)
+            .ok_or(AuraError::InvalidValue("huffman code"))?
+        {
+            BoundedHuffmanRootSlot::Empty => return Err(AuraError::InvalidValue("huffman code")),
+            BoundedHuffmanRootSlot::Leaf(entry) => *entry,
+            BoundedHuffmanRootSlot::Subtable(subtable_index) => {
+                let subtable = table
+                    .subtables
+                    .get(*subtable_index)
+                    .ok_or(AuraError::InvalidValue("huffman code"))?;
+                let total_bits = table
+                    .root_bits
+                    .checked_add(subtable.bits)
+                    .ok_or(AuraError::InvalidValue("huffman code"))?;
+                let suffix_mask = low_mask(subtable.bits)?;
+                let suffix = usize::try_from(bit_reader.peek_bits(total_bits)? & suffix_mask)
+                    .map_err(|_| AuraError::InvalidValue("huffman code"))?;
+                subtable
+                    .slots
+                    .get(suffix)
+                    .and_then(|entry| *entry)
+                    .ok_or(AuraError::InvalidValue("huffman code"))?
+            }
+        };
+        bit_reader.consume_bits(entry.bit_len)?;
+        out.push(entry.value);
+    }
+    Ok(out)
 }
 
 fn canonical_huffman_codes(code_lengths: &[u8]) -> Result<Vec<Option<HuffmanCode>>> {
@@ -1653,5 +1874,37 @@ impl<'a> U128BitReader<'a> {
             self.used_bits = 0;
         }
         Ok(bit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_huffman_decode_table_decodes_codes_above_root_width() {
+        let code_lengths = (1u8..=17).chain([17]).collect::<Vec<_>>();
+        let codes = canonical_huffman_codes(&code_lengths).unwrap();
+        let values = (0..code_lengths.len())
+            .map(|index| index as i64 * 10)
+            .collect::<Vec<_>>();
+        let table = huffman_bounded_value_decode_table(&codes, &values, 12).unwrap();
+        let symbols = [0usize, 1, 2, 16, 17, 3, 15, 4];
+        let mut writer = HuffmanBitWriter::new();
+        for symbol in symbols {
+            writer.write_code(codes[symbol].unwrap()).unwrap();
+        }
+
+        let decoded =
+            decode_huffman_values_with_bounded_table(&table, &writer.finish(), symbols.len())
+                .unwrap();
+
+        assert_eq!(
+            symbols
+                .into_iter()
+                .map(|symbol| values[symbol])
+                .collect::<Vec<_>>(),
+            decoded
+        );
     }
 }
