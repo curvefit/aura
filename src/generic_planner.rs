@@ -454,6 +454,29 @@ pub(crate) fn try_encode_generic_i64_aura1_body(
     field_count: usize,
     aura1_plan: &Aura1Plan,
 ) -> Result<Option<Vec<u8>>> {
+    let mut out = Vec::new();
+    if try_write_generic_i64_aura1_body(
+        plan,
+        bytes,
+        record_count,
+        field_count,
+        aura1_plan,
+        &mut out,
+    )? {
+        Ok(Some(out))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn try_write_generic_i64_aura1_body(
+    plan: GenericInstructionPlan,
+    bytes: &[u8],
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+) -> Result<bool> {
     if plan.groups.iter().any(|group| {
         matches!(
             group,
@@ -463,7 +486,7 @@ pub(crate) fn try_encode_generic_i64_aura1_body(
                 | GenericGroupInstruction::ExpressionValue { .. }
         )
     }) {
-        return Ok(None);
+        return Ok(false);
     }
 
     let stream_values = decode_generic_i64_stream_values(&plan, bytes)?;
@@ -487,7 +510,7 @@ pub(crate) fn try_encode_generic_i64_aura1_body(
             return Err(AuraError::InvalidValue("field index"));
         }
         if !sources[slot].is_supported() {
-            return Ok(None);
+            return Ok(false);
         }
         row_width = row_width
             .checked_add(usize::from(field_plan.width.byte_width()))
@@ -495,7 +518,7 @@ pub(crate) fn try_encode_generic_i64_aura1_body(
         field_specs.push((slot, field_plan.width));
     }
 
-    let mut out = Vec::with_capacity(
+    out.reserve(
         record_count
             .checked_mul(row_width)
             .ok_or(AuraError::InvalidValue("body length"))?,
@@ -503,13 +526,13 @@ pub(crate) fn try_encode_generic_i64_aura1_body(
     for row_index in 0..record_count {
         for (slot, width) in &field_specs {
             let value = sources[*slot].value_at(row_index)?;
-            write_direct_i64_width(&mut out, value, *width)?;
+            write_direct_i64_width(out, value, *width)?;
         }
     }
     for source in &mut sources {
         source.finish()?;
     }
-    Ok(Some(out))
+    Ok(true)
 }
 
 pub(crate) fn try_encode_generic_i64_aura1_body_streaming(

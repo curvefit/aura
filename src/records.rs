@@ -10,7 +10,7 @@ use crate::format::SEAL_MAGIC;
 use crate::generic_planner::{
     decode_generic_i64_rows_body, encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan,
     plan_generic_i64_rows, try_decode_generic_i64_columns_body, try_encode_generic_i64_aura1_body,
-    try_encode_generic_i64_aura1_body_streaming,
+    try_encode_generic_i64_aura1_body_streaming, try_write_generic_i64_aura1_body,
 };
 use crate::header::{AuraHeader, LEGACY_HEADER_PREFIX_SIZE};
 use crate::instructions::GenericInstructionPlan;
@@ -275,6 +275,47 @@ fn try_compile_aura0_to_aura1_fast(
         eprintln!("fast footer_us={}", stage_start.elapsed().as_micros());
     }
     let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+    if std::env::var_os("AURA_STREAM_AURA1").is_none()
+        && std::env::var_os("AURA_FORCE_COLUMNS_AURA1").is_none()
+    {
+        let stage_start = Instant::now();
+        let body_capacity = aura1_body_capacity(record_count, &aura1_plan)?;
+        if let Some((out, body_len)) = try_encode_compiled_file_with_body_writer(
+            Profile::Aura1,
+            header.stream_id,
+            header.dictionary_id,
+            header.base_time_ns,
+            header.comment.as_str(),
+            body_capacity,
+            footer.clone(),
+            |out| {
+                try_write_generic_i64_aura1_body(
+                    plan.clone(),
+                    &bytes[header_len..footer_start],
+                    record_count,
+                    field_count,
+                    &aura1_plan,
+                    out,
+                )
+            },
+        )? {
+            if profile {
+                eprintln!(
+                    "fast direct_file_us={} body_bytes={} total_us={}",
+                    stage_start.elapsed().as_micros(),
+                    body_len,
+                    total_start.elapsed().as_micros()
+                );
+            }
+            return Ok(Some(out));
+        }
+        if profile {
+            eprintln!(
+                "fast direct_file_unsupported_us={}",
+                stage_start.elapsed().as_micros()
+            );
+        }
+    }
     let stage_start = Instant::now();
     let body = if std::env::var_os("AURA_STREAM_AURA1").is_some() {
         if let Some(body) = try_encode_generic_i64_aura1_body_streaming(
@@ -836,6 +877,48 @@ fn encode_compiled_file(
     put_u32_le(&mut out, footer_len);
     out.extend_from_slice(SEAL_MAGIC);
     Ok(out)
+}
+
+fn try_encode_compiled_file_with_body_writer<F>(
+    profile: Profile,
+    stream_id: u16,
+    dictionary_id: u16,
+    base_time_ns: i64,
+    header_comment: &str,
+    body_capacity: usize,
+    footer: CompiledFooter,
+    write_body: F,
+) -> Result<Option<(Vec<u8>, usize)>>
+where
+    F: FnOnce(&mut Vec<u8>) -> Result<bool>,
+{
+    let footer_bytes = footer.encode()?;
+    let footer_len =
+        u32::try_from(footer_bytes.len()).map_err(|_| AuraError::InvalidValue("footer length"))?;
+    let header = AuraHeader::new(profile)
+        .with_stream(stream_id, dictionary_id, base_time_ns)
+        .with_schema_mapping(schema_parent_mapping(&footer.schema)?)?
+        .with_derived_expressions(footer.schema.derived_expressions.clone())?
+        .with_comment(header_comment)?;
+    let header_bytes = header.encode()?;
+
+    let mut out = Vec::with_capacity(
+        header_bytes.len()
+            + body_capacity
+            + footer_bytes.len()
+            + FOOTER_LEN_SIZE
+            + SEAL_MAGIC.len(),
+    );
+    out.extend_from_slice(&header_bytes);
+    let body_start = out.len();
+    if !write_body(&mut out)? {
+        return Ok(None);
+    }
+    let body_len = out.len() - body_start;
+    out.extend_from_slice(&footer_bytes);
+    put_u32_le(&mut out, footer_len);
+    out.extend_from_slice(SEAL_MAGIC);
+    Ok(Some((out, body_len)))
 }
 
 fn encode_raw_body(field_count: usize, rows: &[Vec<i64>]) -> Result<Vec<u8>> {
@@ -1833,19 +1916,7 @@ fn encode_aura1_body_from_columns(columns: &[Vec<i64>], plan: &Aura1Plan) -> Res
     {
         return Ok(body);
     }
-    let row_width = plan
-        .fields
-        .iter()
-        .map(|field| usize::from(field.width.byte_width()))
-        .try_fold(0usize, |acc, width| {
-            acc.checked_add(width)
-                .ok_or(AuraError::InvalidValue("body length"))
-        })?;
-    let mut out = Vec::with_capacity(
-        record_count
-            .checked_mul(row_width)
-            .ok_or(AuraError::InvalidValue("body length"))?,
-    );
+    let mut out = Vec::with_capacity(aura1_body_capacity(record_count, plan)?);
     for row_index in 0..record_count {
         for field_plan in &plan.fields {
             write_i64_width(
@@ -1856,6 +1927,20 @@ fn encode_aura1_body_from_columns(columns: &[Vec<i64>], plan: &Aura1Plan) -> Res
         }
     }
     Ok(out)
+}
+
+fn aura1_body_capacity(record_count: usize, plan: &Aura1Plan) -> Result<usize> {
+    let row_width = plan
+        .fields
+        .iter()
+        .map(|field| usize::from(field.width.byte_width()))
+        .try_fold(0usize, |acc, width| {
+            acc.checked_add(width)
+                .ok_or(AuraError::InvalidValue("body length"))
+        })?;
+    record_count
+        .checked_mul(row_width)
+        .ok_or(AuraError::InvalidValue("body length"))
 }
 
 fn encode_aura1_partitioned_sparse_body_from_columns(
