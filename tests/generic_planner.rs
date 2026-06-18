@@ -76,12 +76,23 @@ fn generic_planner_consumes_declared_derived_expressions() {
         .unwrap()
         .with_derived_expressions(expressions)
         .unwrap();
-    let rows = vec![
-        vec![1_000, 100, 103, 99, 101, 10_000],
-        vec![2_000, 102, 106, 101, 104, 10_100],
-        vec![3_000, 103, 105, 100, 102, 10_200],
-        vec![4_000, 102, 108, 101, 107, 10_300],
-    ];
+    let rows = (0..128)
+        .scan(100_000i64, |previous_close, index| {
+            let open = *previous_close;
+            let close = open + (i64::from(index % 7) - 3) * 10;
+            let high = open.max(close) + i64::from(index % 2);
+            let low = open.min(close) - i64::from(index % 3);
+            *previous_close = close;
+            Some(vec![
+                1_000 + i64::from(index) * 1_000,
+                open,
+                high,
+                low,
+                close,
+                10_000 + i64::from(index % 11),
+            ])
+        })
+        .collect::<Vec<_>>();
 
     let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
 
@@ -130,11 +141,23 @@ fn generic_planner_consumes_arithmetic_expression_with_literals() {
         .unwrap()
         .with_derived_expressions(vec![expression])
         .unwrap();
-    let rows = vec![
-        vec![1_000, 10, 2, 2_001],
-        vec![2_000, 11, 3, 3_300],
-        vec![3_000, 12, 4, 4_802],
-    ];
+    let rows = (0..256)
+        .map(|index| {
+            let a = 10_000 + i64::from((index * 37) % 1_000);
+            let b = 2 + i64::from((index * 17) % 13);
+            let residual = if index % 16 == 0 {
+                i64::from(index % 3)
+            } else {
+                0
+            };
+            vec![
+                1_000 + i64::from(index) * 1_000,
+                a,
+                b,
+                a * b * 100 + residual,
+            ]
+        })
+        .collect::<Vec<_>>();
 
     let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
 
@@ -162,11 +185,13 @@ fn generic_planner_omits_stream_for_exact_arithmetic_expression() {
         .unwrap()
         .with_derived_expressions(vec![expression])
         .unwrap();
-    let rows = vec![
-        vec![1_000, 10, 2, 17],
-        vec![2_000, 11, 3, 19],
-        vec![3_000, 12, 4, 21],
-    ];
+    let rows = (0..256)
+        .map(|index| {
+            let a = 10_000 + i64::from((index * 37) % 1_000);
+            let b = 2 + i64::from((index * 17) % 13);
+            vec![1_000 + i64::from(index) * 1_000, a, b, a + b + 5]
+        })
+        .collect::<Vec<_>>();
 
     let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
 
@@ -188,6 +213,71 @@ fn generic_planner_omits_stream_for_exact_arithmetic_expression() {
         matches!(
             group,
             GenericGroupInstruction::ExpressionStream { output_slot: 3, .. }
+        )
+    }));
+}
+
+#[test]
+fn generic_planner_uses_direct_when_declared_expression_overhead_loses() {
+    let expression =
+        DerivedExpression::with_literals(3, 3, DerivedExpressionOp::Add, vec![1, 2], vec![5], 0)
+            .unwrap();
+    let schema = generic_i64_parent_schema("declared_exact_arithmetic_tiny", &[100, 0, 0, 103])
+        .unwrap()
+        .with_derived_expressions(vec![expression])
+        .unwrap();
+    let rows = vec![
+        vec![1_000, 10, 2, 17],
+        vec![2_000, 11, 3, 19],
+        vec![3_000, 12, 4, 21],
+    ];
+
+    let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+
+    assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
+    assert!(encoded
+        .plan
+        .streams
+        .iter()
+        .any(|stream| stream.target_slot == Some(3)));
+    assert!(!encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::ExpressionValue { output_slot: 3, .. }
+                | GenericGroupInstruction::ExpressionStream { output_slot: 3, .. }
+        )
+    }));
+}
+
+#[test]
+fn generic_planner_scores_previous_parent_residuals() {
+    let schema = generic_i64_parent_schema("previous_parent", &[100, 0, 2]).unwrap();
+    let mut previous_parent = 1_000_000i64;
+    let rows = (0..256)
+        .map(|index| {
+            let parent = previous_parent + i64::from((index * 97) % 251) - 125;
+            let child = if index == 0 {
+                parent + 7
+            } else {
+                previous_parent
+            };
+            previous_parent = parent;
+            vec![1_000 + i64::from(index) * 1_000, parent, child]
+        })
+        .collect::<Vec<_>>();
+
+    let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+
+    assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::DerivedStream {
+                output_slot: 2,
+                op: DerivedOp::FirstOffsetThenDelta,
+                input_slots,
+                ..
+            } if input_slots.as_slice() == [1]
         )
     }));
 }

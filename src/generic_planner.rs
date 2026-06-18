@@ -77,6 +77,44 @@ struct SegmentedDeltaCandidate {
     delta_values: Vec<i64>,
 }
 
+enum SlotPlanCandidate {
+    Direct {
+        values: Vec<i64>,
+        score: usize,
+    },
+    Derived {
+        op: DerivedOp,
+        input_slots: Vec<u16>,
+        values: Vec<i64>,
+        score: usize,
+    },
+    Expression {
+        op: DerivedExpressionOp,
+        input_slots: Vec<u16>,
+        literals: Vec<i64>,
+        values: Vec<i64>,
+        score: usize,
+    },
+    ExpressionValue {
+        op: DerivedExpressionOp,
+        input_slots: Vec<u16>,
+        literals: Vec<i64>,
+        residual: i64,
+        score: usize,
+    },
+}
+
+impl SlotPlanCandidate {
+    const fn score(&self) -> usize {
+        match self {
+            Self::Direct { score, .. }
+            | Self::Derived { score, .. }
+            | Self::Expression { score, .. }
+            | Self::ExpressionValue { score, .. } => *score,
+        }
+    }
+}
+
 enum PendingDerivedInstruction<'a> {
     Residual {
         output_slot: u16,
@@ -203,6 +241,36 @@ impl PlannerState {
         });
         self.planned_slots.insert(output_slot);
         Ok(())
+    }
+
+    fn add_slot_candidate(&mut self, output_slot: u16, candidate: SlotPlanCandidate) -> Result<()> {
+        match candidate {
+            SlotPlanCandidate::Direct { values, .. } => {
+                self.add_stream(Some(output_slot), values)?;
+                self.planned_slots.insert(output_slot);
+                Ok(())
+            }
+            SlotPlanCandidate::Derived {
+                op,
+                input_slots,
+                values,
+                ..
+            } => self.add_derived(output_slot, op, input_slots, values),
+            SlotPlanCandidate::Expression {
+                op,
+                input_slots,
+                literals,
+                values,
+                ..
+            } => self.add_expression(output_slot, op, input_slots, literals, values),
+            SlotPlanCandidate::ExpressionValue {
+                op,
+                input_slots,
+                literals,
+                residual,
+                ..
+            } => self.add_expression_value(output_slot, op, input_slots, literals, residual),
+        }
     }
 
     fn finish(self) -> Result<PlannedI64Rows> {
@@ -1301,25 +1369,8 @@ fn plan_i64_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<Planned
         let values = column_values(rows, field.index)?;
         match field.relation {
             FieldRelation::DeltaFromField(parent_slot) => {
-                let parent_values = column_values(rows, parent_slot)?;
-                let residuals = values
-                    .iter()
-                    .zip(parent_values)
-                    .map(|(value, parent)| checked_delta(*value, parent))
-                    .collect::<Result<Vec<_>>>()?;
-                let direct_size = encoded_i64_len(&values)?;
-                let residual_size = encoded_i64_len(&residuals)?;
-                if residual_size < direct_size {
-                    state.add_derived(
-                        field.index,
-                        DerivedOp::AddResidual,
-                        vec![parent_slot],
-                        residuals,
-                    )?;
-                } else {
-                    state.add_stream(Some(field.index), values)?;
-                    state.planned_slots.insert(field.index);
-                }
+                let candidate = best_parent_candidate(field.index, parent_slot, values, rows)?;
+                state.add_slot_candidate(field.index, candidate)?;
             }
             FieldRelation::None => {
                 state.add_stream(Some(field.index), values)?;
@@ -1343,33 +1394,12 @@ fn add_schema_derived_hints(
         }
         match derived_expression_op(expression)? {
             DeclaredExpressionPlanOp::Residual(op) => {
-                let values = derived_expression_residuals(expression, rows)?;
-                state.add_derived(
-                    expression.output_slot,
-                    op,
-                    expression.input_slots.clone(),
-                    values,
-                )?;
+                let candidate = best_declared_residual_candidate(expression, op, rows)?;
+                state.add_slot_candidate(expression.output_slot, candidate)?;
             }
             DeclaredExpressionPlanOp::Expression(op) => {
-                let values = expression_stream_residuals(expression, rows)?;
-                if let Some(residual) = constant_residual(&values) {
-                    state.add_expression_value(
-                        expression.output_slot,
-                        op,
-                        expression.input_slots.clone(),
-                        expression.literals.clone(),
-                        residual,
-                    )?;
-                } else {
-                    state.add_expression(
-                        expression.output_slot,
-                        op,
-                        expression.input_slots.clone(),
-                        expression.literals.clone(),
-                        values,
-                    )?;
-                }
+                let candidate = best_declared_expression_candidate(expression, op, rows)?;
+                state.add_slot_candidate(expression.output_slot, candidate)?;
             }
         }
     }
@@ -1379,6 +1409,260 @@ fn add_schema_derived_hints(
 fn constant_residual(values: &[i64]) -> Option<i64> {
     let first = values.first().copied().unwrap_or(0);
     values.iter().all(|value| *value == first).then_some(first)
+}
+
+fn best_parent_candidate(
+    output_slot: u16,
+    parent_slot: u16,
+    values: Vec<i64>,
+    rows: &[Vec<i64>],
+) -> Result<SlotPlanCandidate> {
+    let mut candidates = vec![direct_candidate(values.clone())?];
+    let parent_values = column_values(rows, parent_slot)?;
+    let same_row_residuals = values
+        .iter()
+        .zip(&parent_values)
+        .map(|(value, parent)| checked_delta(*value, *parent))
+        .collect::<Result<Vec<_>>>()?;
+    candidates.push(derived_candidate(
+        output_slot,
+        DerivedOp::AddResidual,
+        vec![parent_slot],
+        same_row_residuals,
+    )?);
+
+    let subtract_residuals = values
+        .iter()
+        .zip(&parent_values)
+        .map(|(value, parent)| checked_delta(*parent, *value))
+        .collect::<Result<Vec<_>>>()?;
+    candidates.push(derived_candidate(
+        output_slot,
+        DerivedOp::SubtractResidual,
+        vec![parent_slot],
+        subtract_residuals,
+    )?);
+
+    if !values.is_empty() {
+        let mut previous_parent_residuals = Vec::with_capacity(values.len());
+        previous_parent_residuals.push(values[0]);
+        for (value, previous_parent) in values.iter().skip(1).zip(parent_values.iter()) {
+            previous_parent_residuals.push(checked_delta(*value, *previous_parent)?);
+        }
+        candidates.push(derived_candidate(
+            output_slot,
+            DerivedOp::FirstOffsetThenDelta,
+            vec![parent_slot],
+            previous_parent_residuals,
+        )?);
+    }
+
+    best_slot_candidate(candidates)
+}
+
+fn best_declared_residual_candidate(
+    expression: &DerivedExpression,
+    op: DerivedOp,
+    rows: &[Vec<i64>],
+) -> Result<SlotPlanCandidate> {
+    let values = column_values(rows, expression.output_slot)?;
+    let residuals = derived_expression_residuals(expression, rows)?;
+    best_slot_candidate(vec![
+        direct_candidate(values)?,
+        derived_candidate(
+            expression.output_slot,
+            op,
+            expression.input_slots.clone(),
+            residuals,
+        )?,
+    ])
+}
+
+fn best_declared_expression_candidate(
+    expression: &DerivedExpression,
+    op: DerivedExpressionOp,
+    rows: &[Vec<i64>],
+) -> Result<SlotPlanCandidate> {
+    let values = column_values(rows, expression.output_slot)?;
+    let residuals = expression_stream_residuals(expression, rows)?;
+    let expression_candidate = if let Some(residual) = constant_residual(&residuals) {
+        expression_value_candidate(
+            expression.output_slot,
+            op,
+            expression.input_slots.clone(),
+            expression.literals.clone(),
+            residual,
+        )?
+    } else {
+        expression_candidate(
+            expression.output_slot,
+            op,
+            expression.input_slots.clone(),
+            expression.literals.clone(),
+            residuals,
+        )?
+    };
+    best_slot_candidate(vec![direct_candidate(values)?, expression_candidate])
+}
+
+fn direct_candidate(values: Vec<i64>) -> Result<SlotPlanCandidate> {
+    Ok(SlotPlanCandidate::Direct {
+        score: encoded_i64_score(&values)?,
+        values,
+    })
+}
+
+fn derived_candidate(
+    output_slot: u16,
+    op: DerivedOp,
+    input_slots: Vec<u16>,
+    values: Vec<i64>,
+) -> Result<SlotPlanCandidate> {
+    let group_score = derived_group_score(output_slot, op, &input_slots)?;
+    Ok(SlotPlanCandidate::Derived {
+        score: encoded_i64_score(&values)?.saturating_add(group_score),
+        op,
+        input_slots,
+        values,
+    })
+}
+
+fn expression_candidate(
+    output_slot: u16,
+    op: DerivedExpressionOp,
+    input_slots: Vec<u16>,
+    literals: Vec<i64>,
+    values: Vec<i64>,
+) -> Result<SlotPlanCandidate> {
+    let group_score = expression_group_score(output_slot, op, &input_slots, &literals)?;
+    Ok(SlotPlanCandidate::Expression {
+        score: encoded_i64_score(&values)?.saturating_add(group_score),
+        op,
+        input_slots,
+        literals,
+        values,
+    })
+}
+
+fn expression_value_candidate(
+    output_slot: u16,
+    op: DerivedExpressionOp,
+    input_slots: Vec<u16>,
+    literals: Vec<i64>,
+    residual: i64,
+) -> Result<SlotPlanCandidate> {
+    let score = expression_value_group_score(output_slot, op, &input_slots, &literals, residual)?;
+    Ok(SlotPlanCandidate::ExpressionValue {
+        score,
+        op,
+        input_slots,
+        literals,
+        residual,
+    })
+}
+
+fn best_slot_candidate(candidates: Vec<SlotPlanCandidate>) -> Result<SlotPlanCandidate> {
+    candidates
+        .into_iter()
+        .min_by_key(|candidate| (candidate.score(), slot_candidate_preference(candidate)))
+        .ok_or(AuraError::InvalidValue("slot candidate"))
+}
+
+fn slot_candidate_preference(candidate: &SlotPlanCandidate) -> u8 {
+    match candidate {
+        SlotPlanCandidate::Direct { .. } => 0,
+        SlotPlanCandidate::ExpressionValue { .. } => 1,
+        SlotPlanCandidate::Derived { .. } => 2,
+        SlotPlanCandidate::Expression { .. } => 3,
+    }
+}
+
+fn encoded_i64_score(values: &[i64]) -> Result<usize> {
+    let op = choose_i64_op(values)?;
+    encoded_i64_score_with_op(&op, values)
+}
+
+fn derived_group_score(output_slot: u16, op: DerivedOp, input_slots: &[u16]) -> Result<usize> {
+    group_score_with_optional_stream(GenericGroupInstruction::DerivedStream {
+        group_id: 0,
+        parent_group_id: None,
+        output_slot,
+        op,
+        input_slots: input_slots.to_vec(),
+        stream_id: 0,
+    })
+}
+
+fn expression_group_score(
+    output_slot: u16,
+    op: DerivedExpressionOp,
+    input_slots: &[u16],
+    literals: &[i64],
+) -> Result<usize> {
+    group_score_with_optional_stream(GenericGroupInstruction::ExpressionStream {
+        group_id: 0,
+        parent_group_id: None,
+        output_slot,
+        op,
+        input_slots: input_slots.to_vec(),
+        literals: literals.to_vec(),
+        stream_id: 0,
+    })
+}
+
+fn expression_value_group_score(
+    output_slot: u16,
+    op: DerivedExpressionOp,
+    input_slots: &[u16],
+    literals: &[i64],
+    residual: i64,
+) -> Result<usize> {
+    group_score(GenericGroupInstruction::ExpressionValue {
+        group_id: 0,
+        parent_group_id: None,
+        output_slot,
+        op,
+        input_slots: input_slots.to_vec(),
+        literals: literals.to_vec(),
+        residual,
+    })
+}
+
+fn group_score_with_optional_stream(group: GenericGroupInstruction) -> Result<usize> {
+    let stream = GenericStreamInstruction {
+        stream_id: 0,
+        target_slot: None,
+        op: GenericStreamOp::FixedStep { base: 0, step: 0 },
+    };
+    let without_group = GenericInstructionPlan {
+        streams: vec![stream.clone()],
+        groups: Vec::new(),
+    }
+    .encode()?
+    .len();
+    let with_group = GenericInstructionPlan {
+        streams: vec![stream],
+        groups: vec![group],
+    }
+    .encode()?
+    .len();
+    Ok(with_group.saturating_sub(without_group))
+}
+
+fn group_score(group: GenericGroupInstruction) -> Result<usize> {
+    let without_group = GenericInstructionPlan {
+        streams: Vec::new(),
+        groups: Vec::new(),
+    }
+    .encode()?
+    .len();
+    let with_group = GenericInstructionPlan {
+        streams: Vec::new(),
+        groups: vec![group],
+    }
+    .encode()?
+    .len();
+    Ok(with_group.saturating_sub(without_group))
 }
 
 enum DeclaredExpressionPlanOp {

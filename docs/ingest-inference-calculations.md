@@ -146,9 +146,10 @@ The writer must reject an ingest path that both supplies a slot externally and
 also marks the same slot as internally computed.
 
 Current Rust decodes and preserves `101-199` expression refs in the compact
-schema map. The full schema-header expression table and planner execution path
-still need to be wired before these refs can drive max/min residual candidates
-automatically.
+schema map, validates the full schema-header expression table, and scores those
+declared expressions as executable Aura0 candidates. The planner may still choose
+direct storage if a declared expression's residual stream plus footer instruction
+overhead is larger than the direct stream.
 
 ### Repeated Groups
 
@@ -415,10 +416,22 @@ expr2: output slot 2 = max(slot 1, slot 4) + residual
 expr3: output slot 3 = min(slot 1, slot 4) - residual
 ```
 
+If the source can legally declare open as a previous-close relationship, the
+generic expression form is:
+
+```text
+100 101 102 103 2 0
+
+expr1: output slot 1 = first value, then slot 1 - previous(slot 4)
+expr2: output slot 2 = max(slot 1, slot 4) + residual
+expr3: output slot 3 = min(slot 1, slot 4) - residual
+```
+
 Ingestor calculations:
 
 ```text
 timestamp fixed step
+open - previous close where declared with first_offset_then_delta
 close - open
 slot2 - max(slot1, slot4)
 min(slot1, slot4) - slot3

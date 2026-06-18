@@ -112,14 +112,30 @@ fn json_positional_rows_accept_derived_expression_schema_header() {
 
     let input = dir.join("binance-klines.json");
     let output = dir.join("binance-derived.aura");
-    fs::write(
-        &input,
-        r#"[
-            [1000, "10.12000000", "10.25000000", "9.75000000", "10.10000000", "1.50001000", 1999, "15.12345670", 3, "1.00001000", "10.12345670", "0"],
-            [2000, "10.10000000", "10.50000000", "10.00000000", "10.25000000", "2.00000000", 2999, "20.50000000", 4, "0.50000000", "5.12500000", "0"]
-        ]"#,
-    )
-    .unwrap();
+    let mut rows_json = String::from("[\n");
+    let mut previous_close = 10_000i64;
+    for index in 0..128 {
+        let open_time = 1_704_067_200_000i64 + i64::from(index) * 60_000;
+        let open = previous_close;
+        let close = open + (i64::from(index % 7) - 3) * 10;
+        let high = open.max(close) + i64::from(index % 2);
+        let low = open.min(close) - i64::from(index % 3);
+        let volume = 1_000 + i64::from((index * 13) % 200);
+        let close_time = open_time + 59_999;
+        let quote_volume = volume * close;
+        let trade_count = 100 + i64::from(index % 17);
+        let taker_buy_base = volume / 3;
+        let taker_buy_quote = quote_volume * taker_buy_base / volume;
+        previous_close = close;
+        rows_json.push_str(&format!(
+            "  [{open_time}, \"{open}.00\", \"{high}.00\", \"{low}.00\", \"{close}.00\", \"{volume}.00000\", {close_time}, \"{quote_volume}.0000000\", {trade_count}, \"{taker_buy_base}.00000\", \"{taker_buy_quote}.0000000\", \"0\"]"
+        ));
+        if index + 1 != 128 {
+            rows_json.push_str(",\n");
+        }
+    }
+    rows_json.push_str("\n]");
+    fs::write(&input, rows_json).unwrap();
 
     let output_result = Command::new(bin)
         .arg("--schema")
