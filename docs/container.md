@@ -88,11 +88,12 @@ entry:
   literals      literal_count * i64
 ```
 
-The current planner consumes the residual expression family that maps directly
-to stamped generic footer instructions: add residual, subtract residual,
-max-plus residual, min-minus residual, and first-offset-then-delta. Arithmetic
-definition opcodes are reserved in the table for generic expression definitions,
-but they are rejected by the planner until a matching footer instruction exists.
+The current planner consumes both expression families. Arithmetic definitions
+(`add`, `sub`, `mul`, `div`, `min`, `max`) stamp an expression residual footer
+instruction carrying the op, input slots, literals, and residual stream. Shape
+definitions (`add_residual`, `subtract_residual`, `max_plus_residual`,
+`min_minus_residual`, `first_offset_then_delta`) stamp the smaller dedicated
+derived-stream footer instruction.
 
 Constants, residual streams, and physical coding choices remain in the
 footer/body. Decimal scale metadata is stamped in the footer schema field table,

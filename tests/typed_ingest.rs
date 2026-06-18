@@ -2,7 +2,10 @@ use aura_codec::footer::AuraFooter;
 use aura_codec::schema::{
     generic_i64_parent_schema, FieldRelation, FieldRole, FieldTransform, FieldType, SchemaBuilder,
 };
-use aura_codec::{records, AuraError, AuraTypedValue, AuraTypedWriter, IngestStats, Profile};
+use aura_codec::{
+    records, AuraError, AuraTypedValue, AuraTypedWriter, DerivedExpression, DerivedExpressionOp,
+    DerivedExpressionSource, IngestStats, Profile,
+};
 
 fn typed_wide_schema() -> aura_codec::SchemaDescriptor {
     SchemaBuilder::new("typed_wide_v1")
@@ -122,6 +125,32 @@ fn derived_slot_rejects_double_population() {
         Some("remove supplied value or disable internal derivation"),
         diagnostic.suggested_upgrade
     );
+}
+
+#[test]
+fn internally_derived_expression_is_materialized_from_short_rows() {
+    let expression = DerivedExpression::new(3, 3, DerivedExpressionOp::Mul, vec![1, 2])
+        .unwrap()
+        .with_source(DerivedExpressionSource::Internal)
+        .unwrap();
+    let schema = generic_i64_parent_schema("typed_internal_expression", &[100, 0, 0, 103])
+        .unwrap()
+        .with_derived_expressions(vec![expression])
+        .unwrap();
+    let mut writer = AuraTypedWriter::new(schema);
+    writer
+        .extend_rows([
+            vec![1_000.into(), 10.into(), 20.into()],
+            vec![2_000.into(), 11.into(), 30.into()],
+        ])
+        .unwrap();
+
+    let ingest = writer.finish().unwrap();
+    let aura0 = records::compile_i64_file(&ingest, Profile::Aura0).unwrap();
+    let rows = vec![vec![1_000, 10, 20, 200], vec![2_000, 11, 30, 330]];
+
+    assert_eq!(rows, records::decode_i64_file(&ingest).unwrap().rows);
+    assert_eq!(rows, records::decode_i64_file(&aura0).unwrap().rows);
 }
 
 #[test]

@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u8, ByteReader};
+use crate::header::DerivedExpressionOp;
 use crate::{AuraError, Result};
 
 const MAGIC: &[u8; 4] = b"AURI";
@@ -129,6 +130,11 @@ impl GenericInstructionPlan {
                     ensure_stream_ref(&stream_ids, *stream_id)?;
                 }
                 GenericGroupInstruction::DerivedStream {
+                    parent_group_id,
+                    stream_id,
+                    ..
+                }
+                | GenericGroupInstruction::ExpressionStream {
                     parent_group_id,
                     stream_id,
                     ..
@@ -644,6 +650,15 @@ pub enum GenericGroupInstruction {
         input_slots: Vec<u16>,
         stream_id: u16,
     },
+    ExpressionStream {
+        group_id: u16,
+        parent_group_id: Option<u16>,
+        output_slot: u16,
+        op: DerivedExpressionOp,
+        input_slots: Vec<u16>,
+        literals: Vec<i64>,
+        stream_id: u16,
+    },
     SparseStream {
         group_id: u16,
         parent_group_id: u16,
@@ -672,6 +687,7 @@ impl GenericGroupInstruction {
             | Self::GroupValueStream { group_id, .. }
             | Self::PresenceMap { group_id, .. }
             | Self::DerivedStream { group_id, .. }
+            | Self::ExpressionStream { group_id, .. }
             | Self::SparseStream { group_id, .. }
             | Self::PresenceValue { group_id, .. } => group_id,
         }
@@ -776,6 +792,24 @@ impl GenericGroupInstruction {
                 put_u16_le(out, *output_slot);
                 put_u8(out, *op as u8);
                 put_u16_vec(out, input_slots, "input slots")?;
+                put_u16_le(out, *stream_id);
+            }
+            Self::ExpressionStream {
+                group_id,
+                parent_group_id,
+                output_slot,
+                op,
+                input_slots,
+                literals,
+                stream_id,
+            } => {
+                put_u8(out, 9);
+                put_u16_le(out, *group_id);
+                put_u16_le(out, encode_optional_group(*parent_group_id));
+                put_u16_le(out, *output_slot);
+                put_u8(out, *op as u8);
+                put_u16_vec(out, input_slots, "input slots")?;
+                put_i64_vec(out, literals, "expression literals")?;
                 put_u16_le(out, *stream_id);
             }
             Self::SparseStream {
@@ -889,6 +923,15 @@ impl GenericGroupInstruction {
                 output_slot: reader.read_u16_le()?,
                 stream_id: reader.read_u16_le()?,
             },
+            9 => Self::ExpressionStream {
+                group_id: reader.read_u16_le()?,
+                parent_group_id: decode_optional_group(reader.read_u16_le()?),
+                output_slot: reader.read_u16_le()?,
+                op: DerivedExpressionOp::from_code(reader.read_u8()?)?,
+                input_slots: read_u16_vec(reader)?,
+                literals: read_i64_vec(reader)?,
+                stream_id: reader.read_u16_le()?,
+            },
             _ => return Err(AuraError::InvalidValue("group instruction op")),
         };
         group.validate()?;
@@ -916,6 +959,12 @@ impl GenericGroupInstruction {
                     return Err(AuraError::InvalidValue("input slots"));
                 }
             }
+            Self::ExpressionStream {
+                op,
+                input_slots,
+                literals,
+                ..
+            } => validate_expression_terms(*op, input_slots, literals)?,
             Self::SparseStream { .. } | Self::PresenceValue { .. } => {}
             Self::PartitionRuns { .. } => {}
             Self::PartitionRunLengths { .. }
@@ -1029,6 +1078,54 @@ fn read_u16_vec(reader: &mut ByteReader<'_>) -> Result<Vec<u16>> {
         values.push(reader.read_u16_le()?);
     }
     Ok(values)
+}
+
+fn put_i64_vec(out: &mut Vec<u8>, values: &[i64], name: &'static str) -> Result<()> {
+    put_u16_len(out, values.len(), name)?;
+    for value in values {
+        put_i64_le(out, *value);
+    }
+    Ok(())
+}
+
+fn read_i64_vec(reader: &mut ByteReader<'_>) -> Result<Vec<i64>> {
+    let len = reader.read_u16_le()? as usize;
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(reader.read_i64_le()?);
+    }
+    Ok(values)
+}
+
+fn validate_expression_terms(
+    op: DerivedExpressionOp,
+    input_slots: &[u16],
+    literals: &[i64],
+) -> Result<()> {
+    let term_count = input_slots.len().saturating_add(literals.len());
+    match op {
+        DerivedExpressionOp::Add
+        | DerivedExpressionOp::Mul
+        | DerivedExpressionOp::Min
+        | DerivedExpressionOp::Max => {
+            if term_count == 0 {
+                return Err(AuraError::InvalidValue("expression terms"));
+            }
+        }
+        DerivedExpressionOp::Sub | DerivedExpressionOp::Div => {
+            if input_slots.is_empty() {
+                return Err(AuraError::InvalidValue("expression terms"));
+            }
+        }
+        DerivedExpressionOp::AddResidual
+        | DerivedExpressionOp::SubtractResidual
+        | DerivedExpressionOp::MaxPlusResidual
+        | DerivedExpressionOp::MinMinusResidual
+        | DerivedExpressionOp::FirstOffsetThenDelta => {
+            return Err(AuraError::InvalidValue("expression op"));
+        }
+    }
+    Ok(())
 }
 
 fn put_u16_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> {

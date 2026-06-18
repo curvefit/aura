@@ -307,11 +307,12 @@ streams, partition run lengths, grouped event-value streams, segmented child
 deltas, and repeated-slot grouping. Parent relationships are scored as
 transform candidates, not forced deltas; if a candidate body is larger than a
 direct stream, the writer keeps the direct stream. The instruction layer can
-round-trip header-declared residual expression streams when stamped, and the v2
-front header carries the expression table referenced by `101-199`. The schema
-footer archives the same expression table, validates dependency cycles and map
-agreement, and stores per-field decimal scales. The planner uses relationships,
-scope bytes, and declared expression IDs, not field names.
+round-trip header-declared arithmetic and residual expression streams when
+stamped, and the v2 front header carries the expression table referenced by
+`101-199`. The schema footer archives the same expression table, validates
+dependency cycles and map agreement, and stores per-field decimal scales. The
+planner uses relationships, scope bytes, and declared expression IDs, not field
+names.
 
 The `.aura` ingest footer now stamps a generic Aura0 plan alongside the legacy
 field program candidates. `.aura -> .aura0` conversion follows that stamped

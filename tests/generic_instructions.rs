@@ -1,6 +1,7 @@
 use aura_codec::{
-    decode_generic_stream_body, encode_generic_stream_body, DerivedOp, GenericGroupInstruction,
-    GenericInstructionPlan, GenericStreamBodyValue, GenericStreamInstruction, GenericStreamOp,
+    decode_generic_stream_body, encode_generic_stream_body, DerivedExpressionOp, DerivedOp,
+    GenericGroupInstruction, GenericInstructionPlan, GenericStreamBodyValue,
+    GenericStreamInstruction, GenericStreamOp,
 };
 
 #[test]
@@ -220,6 +221,35 @@ fn generic_instruction_plan_round_trips_grouped_curvefit_shape() {
                 value: 1,
             },
         ],
+    };
+
+    let encoded = plan.encode().unwrap();
+    let decoded = GenericInstructionPlan::decode(&encoded).unwrap();
+
+    assert_eq!(plan, decoded);
+}
+
+#[test]
+fn generic_instruction_plan_round_trips_expression_stream() {
+    let plan = GenericInstructionPlan {
+        streams: vec![GenericStreamInstruction {
+            stream_id: 0,
+            target_slot: None,
+            op: GenericStreamOp::BaseBitpack {
+                base: 0,
+                unit: 1,
+                bit_width: 3,
+            },
+        }],
+        groups: vec![GenericGroupInstruction::ExpressionStream {
+            group_id: 0,
+            parent_group_id: None,
+            output_slot: 3,
+            op: DerivedExpressionOp::Mul,
+            input_slots: vec![1, 2],
+            literals: vec![100],
+            stream_id: 0,
+        }],
     };
 
     let encoded = plan.encode().unwrap();

@@ -266,6 +266,39 @@ fn derived_expression_table_round_trips_through_header_and_footer() {
 }
 
 #[test]
+fn arithmetic_expression_footer_instruction_round_trips_profiles() {
+    let expression =
+        DerivedExpression::with_literals(3, 3, DerivedExpressionOp::Add, vec![1, 2], vec![5], 0)
+            .unwrap();
+    let schema = generic_i64_parent_schema("declared_sum_expr", &[100, 0, 0, 103])
+        .unwrap()
+        .with_derived_expressions(vec![expression.clone()])
+        .unwrap();
+    let rows = vec![
+        vec![1_000, 10, 20, 35],
+        vec![2_000, 11, 22, 39],
+        vec![3_000, 12, 24, 42],
+    ];
+
+    let ingest = records::encode_ingest_i64_file(records::I64FileInput {
+        schema,
+        rows: rows.clone(),
+        stream_id: 3,
+        dictionary_id: 9,
+        header_comment: None,
+    })
+    .unwrap();
+    let decoded = records::decode_i64_file(&ingest).unwrap();
+    let aura0 = records::compile_i64_file(&ingest, Profile::Aura0).unwrap();
+    let decoded_aura0 = records::decode_i64_file(&aura0).unwrap();
+
+    assert_eq!(rows, decoded.rows);
+    assert_eq!(rows, decoded_aura0.rows);
+    assert_eq!(vec![expression.clone()], decoded.header.derived_expressions);
+    assert_eq!(vec![expression], decoded_aura0.schema.derived_expressions);
+}
+
+#[test]
 fn internal_derived_expression_rejects_supplied_i64_rows() {
     let expression = DerivedExpression::new(1, 1, DerivedExpressionOp::AddResidual, vec![0])
         .unwrap()

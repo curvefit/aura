@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use crate::bitpack::{signed_bitpack_width_for_range, unsigned_bitpack_width};
 use crate::body::{decode_generic_stream_body, encode_generic_stream_body, GenericStreamBodyValue};
 use crate::bytes::{put_u16_le, put_u32_le, put_u64_le, ByteReader};
-use crate::header::{DerivedExpression, DerivedExpressionOp, DerivedExpressionSource};
+use crate::header::{DerivedExpression, DerivedExpressionOp};
 use crate::instructions::{
     DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
     GenericStreamOp,
@@ -77,6 +77,22 @@ struct SegmentedDeltaCandidate {
     delta_values: Vec<i64>,
 }
 
+enum PendingDerivedInstruction<'a> {
+    Residual {
+        output_slot: u16,
+        op: DerivedOp,
+        input_slots: &'a [u16],
+        stream_id: u16,
+    },
+    Expression {
+        output_slot: u16,
+        op: DerivedExpressionOp,
+        input_slots: &'a [u16],
+        literals: &'a [i64],
+        stream_id: u16,
+    },
+}
+
 impl PlannerState {
     fn new() -> Self {
         Self {
@@ -123,6 +139,33 @@ impl PlannerState {
             output_slot,
             op,
             input_slots,
+            stream_id,
+        });
+        self.planned_slots.insert(output_slot);
+        Ok(())
+    }
+
+    fn add_expression(
+        &mut self,
+        output_slot: u16,
+        op: DerivedExpressionOp,
+        input_slots: Vec<u16>,
+        literals: Vec<i64>,
+        values: Vec<i64>,
+    ) -> Result<()> {
+        let stream_id = self.add_stream(None, values)?;
+        let group_id = self.next_group_id;
+        self.next_group_id = self
+            .next_group_id
+            .checked_add(1)
+            .ok_or(AuraError::InvalidValue("group id"))?;
+        self.groups.push(GenericGroupInstruction::ExpressionStream {
+            group_id,
+            parent_group_id: None,
+            output_slot,
+            op,
+            input_slots,
+            literals,
             stream_id,
         });
         self.planned_slots.insert(output_slot);
@@ -372,7 +415,26 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                 input_slots,
                 stream_id,
                 ..
-            } => Some((*output_slot, *op, input_slots.as_slice(), *stream_id)),
+            } => Some(PendingDerivedInstruction::Residual {
+                output_slot: *output_slot,
+                op: *op,
+                input_slots: input_slots.as_slice(),
+                stream_id: *stream_id,
+            }),
+            GenericGroupInstruction::ExpressionStream {
+                output_slot,
+                op,
+                input_slots,
+                literals,
+                stream_id,
+                ..
+            } => Some(PendingDerivedInstruction::Expression {
+                output_slot: *output_slot,
+                op: *op,
+                input_slots: input_slots.as_slice(),
+                literals: literals.as_slice(),
+                stream_id: *stream_id,
+            }),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -380,22 +442,34 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
     for _ in 0..encoded.field_count.saturating_mul(2).saturating_add(1) {
         let mut progress = false;
         for row_index in 0..encoded.record_count {
-            for (output_slot, op, input_slots, stream_id) in &derived {
-                let output_slot = usize::from(*output_slot);
+            for derived in &derived {
+                let (output_slot, stream_id) = match derived {
+                    PendingDerivedInstruction::Residual {
+                        output_slot,
+                        stream_id,
+                        ..
+                    }
+                    | PendingDerivedInstruction::Expression {
+                        output_slot,
+                        stream_id,
+                        ..
+                    } => (*output_slot, *stream_id),
+                };
+                let output_slot = usize::from(output_slot);
                 if output_slot >= encoded.field_count || filled[row_index][output_slot] {
                     continue;
                 }
                 let values = stream_values
-                    .get(stream_id)
+                    .get(&stream_id)
                     .ok_or(AuraError::InvalidValue("stream body"))?;
                 if values.len() != encoded.record_count {
                     return Err(AuraError::InvalidValue("stream value count"));
                 }
-                if !derived_inputs_ready(*op, input_slots, row_index, &filled) {
+                if !pending_derived_inputs_ready(derived, row_index, &filled) {
                     continue;
                 }
                 rows[row_index][output_slot] =
-                    derive_value(*op, input_slots, row_index, values[row_index], &rows)?;
+                    derive_pending_value(derived, row_index, values[row_index], &rows)?;
                 filled[row_index][output_slot] = true;
                 progress = true;
             }
@@ -461,6 +535,30 @@ fn stream_values_for_instruction(
             .enumerate()
             .map(|(row_index, _)| {
                 inverse_derive_value(op, input_slots, output_slot, row_index, rows)
+            })
+            .collect();
+    }
+
+    if let Some((output_slot, op, input_slots, literals)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::ExpressionStream {
+                output_slot,
+                op,
+                input_slots,
+                literals,
+                stream_id,
+                ..
+            } if *stream_id == instruction.stream_id => {
+                Some((*output_slot, *op, input_slots, literals))
+            }
+            _ => None,
+        })
+    {
+        return rows
+            .iter()
+            .enumerate()
+            .map(|(row_index, _)| {
+                inverse_expression_value(op, input_slots, literals, output_slot, row_index, rows)
             })
             .collect();
     }
@@ -1182,37 +1280,62 @@ fn add_schema_derived_hints(
 ) -> Result<()> {
     schema.validate_derived_expressions()?;
     for expression in &schema.derived_expressions {
-        if expression.source() == DerivedExpressionSource::Internal {
-            return Err(AuraError::InvalidValue("derived slot source conflict"));
-        }
         if state.planned_slots.contains(&expression.output_slot) {
             return Err(AuraError::InvalidValue("derived expression output"));
         }
-        let op = derived_expression_op(expression)?;
-        let values = derived_expression_residuals(expression, rows)?;
-        state.add_derived(
-            expression.output_slot,
-            op,
-            expression.input_slots.clone(),
-            values,
-        )?;
+        match derived_expression_op(expression)? {
+            DeclaredExpressionPlanOp::Residual(op) => {
+                let values = derived_expression_residuals(expression, rows)?;
+                state.add_derived(
+                    expression.output_slot,
+                    op,
+                    expression.input_slots.clone(),
+                    values,
+                )?;
+            }
+            DeclaredExpressionPlanOp::Expression(op) => {
+                let values = expression_stream_residuals(expression, rows)?;
+                state.add_expression(
+                    expression.output_slot,
+                    op,
+                    expression.input_slots.clone(),
+                    expression.literals.clone(),
+                    values,
+                )?;
+            }
+        }
     }
     Ok(())
 }
 
-fn derived_expression_op(expression: &DerivedExpression) -> Result<DerivedOp> {
+enum DeclaredExpressionPlanOp {
+    Residual(DerivedOp),
+    Expression(DerivedExpressionOp),
+}
+
+fn derived_expression_op(expression: &DerivedExpression) -> Result<DeclaredExpressionPlanOp> {
     match expression.op {
-        DerivedExpressionOp::AddResidual => Ok(DerivedOp::AddResidual),
-        DerivedExpressionOp::SubtractResidual => Ok(DerivedOp::SubtractResidual),
-        DerivedExpressionOp::MaxPlusResidual => Ok(DerivedOp::MaxPlusResidual),
-        DerivedExpressionOp::MinMinusResidual => Ok(DerivedOp::MinMinusResidual),
-        DerivedExpressionOp::FirstOffsetThenDelta => Ok(DerivedOp::FirstOffsetThenDelta),
+        DerivedExpressionOp::AddResidual => {
+            Ok(DeclaredExpressionPlanOp::Residual(DerivedOp::AddResidual))
+        }
+        DerivedExpressionOp::SubtractResidual => Ok(DeclaredExpressionPlanOp::Residual(
+            DerivedOp::SubtractResidual,
+        )),
+        DerivedExpressionOp::MaxPlusResidual => Ok(DeclaredExpressionPlanOp::Residual(
+            DerivedOp::MaxPlusResidual,
+        )),
+        DerivedExpressionOp::MinMinusResidual => Ok(DeclaredExpressionPlanOp::Residual(
+            DerivedOp::MinMinusResidual,
+        )),
+        DerivedExpressionOp::FirstOffsetThenDelta => Ok(DeclaredExpressionPlanOp::Residual(
+            DerivedOp::FirstOffsetThenDelta,
+        )),
         DerivedExpressionOp::Add
         | DerivedExpressionOp::Sub
         | DerivedExpressionOp::Mul
         | DerivedExpressionOp::Div
         | DerivedExpressionOp::Min
-        | DerivedExpressionOp::Max => Err(AuraError::InvalidValue("derived expression op")),
+        | DerivedExpressionOp::Max => Ok(DeclaredExpressionPlanOp::Expression(expression.op)),
     }
 }
 
@@ -1223,6 +1346,26 @@ fn derived_expression_residuals(
     rows.iter()
         .enumerate()
         .map(|(row_index, _)| inverse_declared_derive_value(expression, row_index, rows))
+        .collect()
+}
+
+fn expression_stream_residuals(
+    expression: &DerivedExpression,
+    rows: &[Vec<i64>],
+) -> Result<Vec<i64>> {
+    rows.iter()
+        .enumerate()
+        .map(|(row_index, _)| {
+            let output = rows[row_index][usize::from(expression.output_slot)];
+            let predicted = evaluate_expression_terms(
+                expression.op,
+                &expression.input_slots,
+                &expression.literals,
+                row_index,
+                rows,
+            )?;
+            checked_delta(output, predicted)
+        })
         .collect()
 }
 
@@ -2500,6 +2643,43 @@ fn derived_inputs_ready(
     }
 }
 
+fn pending_derived_inputs_ready(
+    instruction: &PendingDerivedInstruction<'_>,
+    row_index: usize,
+    filled: &[Vec<bool>],
+) -> bool {
+    match instruction {
+        PendingDerivedInstruction::Residual {
+            op, input_slots, ..
+        } => derived_inputs_ready(*op, input_slots, row_index, filled),
+        PendingDerivedInstruction::Expression { input_slots, .. } => input_slots
+            .iter()
+            .all(|slot| filled[row_index][usize::from(*slot)]),
+    }
+}
+
+fn derive_pending_value(
+    instruction: &PendingDerivedInstruction<'_>,
+    row_index: usize,
+    residual: i64,
+    rows: &[Vec<i64>],
+) -> Result<i64> {
+    match instruction {
+        PendingDerivedInstruction::Residual {
+            op, input_slots, ..
+        } => derive_value(*op, input_slots, row_index, residual, rows),
+        PendingDerivedInstruction::Expression {
+            op,
+            input_slots,
+            literals,
+            ..
+        } => {
+            let predicted = evaluate_expression_terms(*op, input_slots, literals, row_index, rows)?;
+            checked_sum(predicted, residual)
+        }
+    }
+}
+
 fn derive_value(
     op: DerivedOp,
     input_slots: &[u16],
@@ -2541,6 +2721,108 @@ fn derive_value(
             }
         }
     }
+}
+
+fn inverse_expression_value(
+    op: DerivedExpressionOp,
+    input_slots: &[u16],
+    literals: &[i64],
+    output_slot: u16,
+    row_index: usize,
+    rows: &[Vec<i64>],
+) -> Result<i64> {
+    let output = rows
+        .get(row_index)
+        .and_then(|row| row.get(usize::from(output_slot)))
+        .copied()
+        .ok_or(AuraError::InvalidValue("output slot"))?;
+    let predicted = evaluate_expression_terms(op, input_slots, literals, row_index, rows)?;
+    checked_delta(output, predicted)
+}
+
+fn evaluate_expression_terms(
+    op: DerivedExpressionOp,
+    input_slots: &[u16],
+    literals: &[i64],
+    row_index: usize,
+    rows: &[Vec<i64>],
+) -> Result<i64> {
+    let mut terms = input_slots
+        .iter()
+        .map(|slot| {
+            rows.get(row_index)
+                .and_then(|row| row.get(usize::from(*slot)))
+                .copied()
+                .ok_or(AuraError::InvalidValue("input slots"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    terms.extend_from_slice(literals);
+    match op {
+        DerivedExpressionOp::Add => checked_add_terms(&terms),
+        DerivedExpressionOp::Sub => checked_sub_terms(&terms),
+        DerivedExpressionOp::Mul => checked_mul_terms(&terms),
+        DerivedExpressionOp::Div => checked_div_terms(&terms),
+        DerivedExpressionOp::Min => terms
+            .into_iter()
+            .min()
+            .ok_or(AuraError::InvalidValue("expression terms")),
+        DerivedExpressionOp::Max => terms
+            .into_iter()
+            .max()
+            .ok_or(AuraError::InvalidValue("expression terms")),
+        DerivedExpressionOp::AddResidual
+        | DerivedExpressionOp::SubtractResidual
+        | DerivedExpressionOp::MaxPlusResidual
+        | DerivedExpressionOp::MinMinusResidual
+        | DerivedExpressionOp::FirstOffsetThenDelta => {
+            Err(AuraError::InvalidValue("derived expression op"))
+        }
+    }
+}
+
+fn checked_add_terms(terms: &[i64]) -> Result<i64> {
+    let sum = terms.iter().try_fold(0i128, |sum, term| {
+        sum.checked_add(i128::from(*term))
+            .ok_or(AuraError::InvalidValue("expression value"))
+    })?;
+    i64::try_from(sum).map_err(|_| AuraError::InvalidValue("expression value"))
+}
+
+fn checked_sub_terms(terms: &[i64]) -> Result<i64> {
+    let Some((first, rest)) = terms.split_first() else {
+        return Err(AuraError::InvalidValue("expression terms"));
+    };
+    let value = rest.iter().try_fold(i128::from(*first), |value, term| {
+        value
+            .checked_sub(i128::from(*term))
+            .ok_or(AuraError::InvalidValue("expression value"))
+    })?;
+    i64::try_from(value).map_err(|_| AuraError::InvalidValue("expression value"))
+}
+
+fn checked_mul_terms(terms: &[i64]) -> Result<i64> {
+    let value = terms.iter().try_fold(1i128, |value, term| {
+        value
+            .checked_mul(i128::from(*term))
+            .ok_or(AuraError::InvalidValue("expression value"))
+    })?;
+    i64::try_from(value).map_err(|_| AuraError::InvalidValue("expression value"))
+}
+
+fn checked_div_terms(terms: &[i64]) -> Result<i64> {
+    let Some((first, rest)) = terms.split_first() else {
+        return Err(AuraError::InvalidValue("expression terms"));
+    };
+    let value = rest.iter().try_fold(i128::from(*first), |value, term| {
+        let divisor = i128::from(*term);
+        if divisor == 0 {
+            return Err(AuraError::InvalidValue("expression value"));
+        }
+        value
+            .checked_div(divisor)
+            .ok_or(AuraError::InvalidValue("expression value"))
+    })?;
+    i64::try_from(value).map_err(|_| AuraError::InvalidValue("expression value"))
 }
 
 fn validate_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<()> {

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::header::DerivedExpressionSource;
+use crate::header::{DerivedExpression, DerivedExpressionOp, DerivedExpressionSource};
 use crate::records::{self, I64FileInput};
 use crate::schema::{FieldType, SchemaDescriptor};
 use crate::{AuraDiagnostic, AuraError, Profile, Result};
@@ -191,21 +191,13 @@ impl AuraTypedWriter {
     pub fn push_row(&mut self, row: impl Into<Vec<AuraTypedValue>>) -> Result<&mut Self> {
         let row = row.into();
         let row_index = self.rows.len();
-        if row.len() != self.schema.fields.len() {
-            return Err(layout_diagnostic(
-                Some(row_index),
-                None,
-                "row",
-                "row",
-                "field count mismatch",
-                "wrong slot count",
-                None,
-            ));
-        }
-        for (slot_index, value) in row.iter().enumerate() {
-            let slot_index =
-                u16::try_from(slot_index).map_err(|_| AuraError::InvalidValue("field index"))?;
-            if self.internally_derived_slots.contains(&slot_index) {
+        let row = if row.len() == self.schema.fields.len() {
+            if let Some((slot_index, value)) = row.iter().enumerate().find(|(slot_index, _)| {
+                self.internally_derived_slots
+                    .contains(&(*slot_index as u16))
+            }) {
+                let slot_index = u16::try_from(slot_index)
+                    .map_err(|_| AuraError::InvalidValue("field index"))?;
                 return Err(layout_diagnostic(
                     Some(row_index),
                     Some(slot_index),
@@ -218,6 +210,31 @@ impl AuraTypedWriter {
                     Some("remove supplied value or disable internal derivation"),
                 ));
             }
+            row
+        } else if !self.internally_derived_slots.is_empty()
+            && row.len()
+                == self
+                    .schema
+                    .fields
+                    .len()
+                    .saturating_sub(self.internally_derived_slots.len())
+        {
+            self.materialize_internal_row(row_index, row)?
+        } else {
+            return Err(layout_diagnostic(
+                Some(row_index),
+                None,
+                "row",
+                "row",
+                "field count mismatch",
+                "wrong slot count",
+                None,
+            ));
+        };
+
+        for (slot_index, value) in row.iter().enumerate() {
+            let slot_index =
+                u16::try_from(slot_index).map_err(|_| AuraError::InvalidValue("field index"))?;
             validate_typed_value(
                 row_index,
                 slot_index,
@@ -296,7 +313,7 @@ impl AuraTypedWriter {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        encode_i64(I64FileInput {
+        records::encode_ingest_i64_file_inner(I64FileInput {
             schema: self.schema,
             rows,
             stream_id: self.stream_id,
@@ -304,6 +321,207 @@ impl AuraTypedWriter {
             header_comment: self.header_comment,
         })
     }
+
+    fn materialize_internal_row(
+        &self,
+        row_index: usize,
+        row: Vec<AuraTypedValue>,
+    ) -> Result<Vec<AuraTypedValue>> {
+        let mut values = Vec::new();
+        values.resize_with(self.schema.fields.len(), || None);
+        let mut supplied = row.into_iter();
+        for field in &self.schema.fields {
+            if self.internally_derived_slots.contains(&field.index) {
+                continue;
+            }
+            let value = supplied.next().ok_or_else(|| {
+                layout_diagnostic(
+                    Some(row_index),
+                    None,
+                    "row",
+                    "row",
+                    "field count mismatch",
+                    "wrong slot count",
+                    None,
+                )
+            })?;
+            validate_typed_value(row_index, field.index, field.field_type, &value)?;
+            values[usize::from(field.index)] = Some(value);
+        }
+        if supplied.next().is_some() {
+            return Err(layout_diagnostic(
+                Some(row_index),
+                None,
+                "row",
+                "row",
+                "field count mismatch",
+                "wrong slot count",
+                None,
+            ));
+        }
+
+        for slot in &self.internally_derived_slots {
+            if !self
+                .schema
+                .derived_expressions
+                .iter()
+                .any(|expression| expression.output_slot == *slot)
+            {
+                return Err(layout_diagnostic(
+                    Some(row_index),
+                    Some(*slot),
+                    self.schema.fields[usize::from(*slot)].field_type.name(),
+                    "derived",
+                    "derived expression missing",
+                    "internal slot",
+                    Some("declare a derived expression for the internal slot"),
+                ));
+            }
+        }
+
+        for _ in 0..self.internally_derived_slots.len().saturating_add(1) {
+            let mut progress = false;
+            for expression in &self.schema.derived_expressions {
+                if !self
+                    .internally_derived_slots
+                    .contains(&expression.output_slot)
+                    || values[usize::from(expression.output_slot)].is_some()
+                {
+                    continue;
+                }
+                if !expression.input_slots.iter().all(|slot| {
+                    values
+                        .get(usize::from(*slot))
+                        .and_then(Option::as_ref)
+                        .is_some()
+                }) {
+                    continue;
+                }
+                let value = compute_internal_expression(expression, &values)?;
+                validate_typed_value(
+                    row_index,
+                    expression.output_slot,
+                    self.schema.fields[usize::from(expression.output_slot)].field_type,
+                    &value,
+                )?;
+                values[usize::from(expression.output_slot)] = Some(value);
+                progress = true;
+            }
+            if values.iter().all(Option::is_some) {
+                return values
+                    .into_iter()
+                    .map(|value| value.ok_or(AuraError::InvalidValue("derived expression")))
+                    .collect();
+            }
+            if !progress {
+                break;
+            }
+        }
+
+        Err(layout_diagnostic(
+            Some(row_index),
+            None,
+            "derived",
+            "derived",
+            "derived expression dependency",
+            "internal slot",
+            Some("check internal expression inputs and cycles"),
+        ))
+    }
+}
+
+fn compute_internal_expression(
+    expression: &DerivedExpression,
+    values: &[Option<AuraTypedValue>],
+) -> Result<AuraTypedValue> {
+    let mut terms = expression
+        .input_slots
+        .iter()
+        .map(|slot| {
+            let value = values
+                .get(usize::from(*slot))
+                .and_then(Option::as_ref)
+                .ok_or(AuraError::InvalidValue("derived expression input"))?;
+            typed_i64(value)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    terms.extend_from_slice(&expression.literals);
+    let value = match expression.op {
+        DerivedExpressionOp::Add => checked_add_terms(&terms)?,
+        DerivedExpressionOp::Sub => checked_sub_terms(&terms)?,
+        DerivedExpressionOp::Mul => checked_mul_terms(&terms)?,
+        DerivedExpressionOp::Div => checked_div_terms(&terms)?,
+        DerivedExpressionOp::Min => terms
+            .into_iter()
+            .min()
+            .ok_or(AuraError::InvalidValue("derived expression terms"))?,
+        DerivedExpressionOp::Max => terms
+            .into_iter()
+            .max()
+            .ok_or(AuraError::InvalidValue("derived expression terms"))?,
+        DerivedExpressionOp::AddResidual
+        | DerivedExpressionOp::SubtractResidual
+        | DerivedExpressionOp::MaxPlusResidual
+        | DerivedExpressionOp::MinMinusResidual
+        | DerivedExpressionOp::FirstOffsetThenDelta => {
+            return Err(AuraError::InvalidValue("derived expression op"));
+        }
+    };
+    Ok(AuraTypedValue::I64(value))
+}
+
+fn typed_i64(value: &AuraTypedValue) -> Result<i64> {
+    match value {
+        AuraTypedValue::I64(value) => Ok(*value),
+        AuraTypedValue::I128(_) => Err(AuraError::InvalidValue("derived expression input")),
+        AuraTypedValue::Opaque16(_) => Err(AuraError::InvalidValue("derived expression input")),
+    }
+}
+
+fn checked_add_terms(terms: &[i64]) -> Result<i64> {
+    let value = terms.iter().try_fold(0i128, |value, term| {
+        value
+            .checked_add(i128::from(*term))
+            .ok_or(AuraError::InvalidValue("derived expression value"))
+    })?;
+    i64::try_from(value).map_err(|_| AuraError::InvalidValue("derived expression value"))
+}
+
+fn checked_sub_terms(terms: &[i64]) -> Result<i64> {
+    let Some((first, rest)) = terms.split_first() else {
+        return Err(AuraError::InvalidValue("derived expression terms"));
+    };
+    let value = rest.iter().try_fold(i128::from(*first), |value, term| {
+        value
+            .checked_sub(i128::from(*term))
+            .ok_or(AuraError::InvalidValue("derived expression value"))
+    })?;
+    i64::try_from(value).map_err(|_| AuraError::InvalidValue("derived expression value"))
+}
+
+fn checked_mul_terms(terms: &[i64]) -> Result<i64> {
+    let value = terms.iter().try_fold(1i128, |value, term| {
+        value
+            .checked_mul(i128::from(*term))
+            .ok_or(AuraError::InvalidValue("derived expression value"))
+    })?;
+    i64::try_from(value).map_err(|_| AuraError::InvalidValue("derived expression value"))
+}
+
+fn checked_div_terms(terms: &[i64]) -> Result<i64> {
+    let Some((first, rest)) = terms.split_first() else {
+        return Err(AuraError::InvalidValue("derived expression terms"));
+    };
+    let value = rest.iter().try_fold(i128::from(*first), |value, term| {
+        let divisor = i128::from(*term);
+        if divisor == 0 {
+            return Err(AuraError::InvalidValue("derived expression value"));
+        }
+        value
+            .checked_div(divisor)
+            .ok_or(AuraError::InvalidValue("derived expression value"))
+    })?;
+    i64::try_from(value).map_err(|_| AuraError::InvalidValue("derived expression value"))
 }
 
 pub fn encode_i64(input: I64FileInput) -> Result<Vec<u8>> {

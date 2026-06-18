@@ -122,6 +122,38 @@ fn generic_planner_consumes_declared_derived_expressions() {
 }
 
 #[test]
+fn generic_planner_consumes_arithmetic_expression_with_literals() {
+    let expression =
+        DerivedExpression::with_literals(3, 3, DerivedExpressionOp::Mul, vec![1, 2], vec![100], 0)
+            .unwrap();
+    let schema = generic_i64_parent_schema("declared_arithmetic", &[100, 0, 0, 103])
+        .unwrap()
+        .with_derived_expressions(vec![expression])
+        .unwrap();
+    let rows = vec![
+        vec![1_000, 10, 2, 2_001],
+        vec![2_000, 11, 3, 3_300],
+        vec![3_000, 12, 4, 4_802],
+    ];
+
+    let encoded = encode_generic_i64_rows(&schema, &rows).unwrap();
+
+    assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::ExpressionStream {
+                output_slot: 3,
+                op: DerivedExpressionOp::Mul,
+                input_slots,
+                literals,
+                ..
+            } if input_slots.as_slice() == [1, 2] && literals.as_slice() == [100]
+        )
+    }));
+}
+
+#[test]
 fn generic_planner_selects_tick_stream_ops_without_field_names() {
     let schema = generic_i64_parent_schema("ticks", &[100, 0, 0, 0, 0, 0]).unwrap();
     let rows = (0..300)
