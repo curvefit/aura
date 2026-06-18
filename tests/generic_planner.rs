@@ -463,7 +463,17 @@ fn generic_planner_selects_sparse_set_by_total_saved_bytes() {
             GenericGroupInstruction::PresenceMap {
                 slots,
                 ..
-            } if slots.as_slice() == [5, 6]
+            } if slots.as_slice() == [5, 6, 3]
+        )
+    }));
+    assert!(encoded.plan.groups.iter().any(|group| {
+        matches!(
+            group,
+            GenericGroupInstruction::PresenceValue {
+                output_slot: 3,
+                value: 1,
+                ..
+            }
         )
     }));
 }
@@ -638,21 +648,20 @@ fn generic_planner_uses_packed_dictionary_for_repeated_wide_values() {
 }
 
 #[test]
-fn generic_planner_uses_huffman_dictionary_for_large_skewed_values() {
+fn generic_planner_prefers_blocklocal_when_huffman_speed_gate_fails() {
     let schema = generic_i64_parent_schema("large_skewed_repeats", &[0]).unwrap();
-    let buckets = [0, 1_000_000_000_000, 17, 999_999_999_937];
-    let rows = (0..1_024)
+    let rows = (0usize..8_192)
         .map(|index| {
-            let bucket = if index % 97 == 0 {
-                buckets[3]
-            } else if index % 31 == 0 {
-                buckets[2]
-            } else if index % 11 == 0 {
-                buckets[1]
+            let pseudo = ((index as u64)
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407)
+                >> 32) as usize;
+            let bucket = if pseudo % 10 < 8 {
+                0
             } else {
-                buckets[0]
+                1 + ((pseudo / 10) % 389) as i64
             };
-            vec![9_000_000_000_000 + bucket]
+            vec![9_000_000_000_000 + bucket * 1_000_000_003]
         })
         .collect::<Vec<_>>();
 
@@ -660,6 +669,9 @@ fn generic_planner_uses_huffman_dictionary_for_large_skewed_values() {
 
     assert_eq!(rows, decode_generic_i64_rows(&encoded).unwrap());
     assert!(encoded.plan.streams.iter().any(|stream| {
+        stream.target_slot == Some(0) && matches!(stream.op, GenericStreamOp::BlockLocal { .. })
+    }));
+    assert!(!encoded.plan.streams.iter().any(|stream| {
         stream.target_slot == Some(0)
             && matches!(stream.op, GenericStreamOp::HuffmanDictionary { .. })
     }));
