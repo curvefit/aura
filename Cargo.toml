@@ -15,6 +15,10 @@ name = "aura-size"
 path = "src/bin/aura_size.rs"
 
 [[bin]]
+name = "aura-bench"
+path = "src/bin/aura_bench.rs"
+
+[[bin]]
 name = "aura-parquet-ohlcv"
 path = "src/bin/parquet_ohlcv.rs"
 
@@ -23,6 +27,7 @@ anyhow = "1"
 arrow = { version = "54", features = ["prettyprint"] }
 parquet = { version = "54", features = ["zstd"] }
 serde_json = "1"
+sha2 = "0.10"
 
 [[bin]]
 name = "aura-json-i64"
