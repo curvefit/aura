@@ -151,11 +151,36 @@ pub(crate) fn compile_i64_file_inner(bytes: &[u8], target_profile: Profile) -> R
     if target_profile == Profile::Ingest {
         return Err(AuraError::InvalidValue("target profile"));
     }
+    let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
+    let total_start = Instant::now();
+    let stage_start = Instant::now();
     if let Some(compiled) = try_compile_i64_fast(bytes, target_profile)? {
         return Ok(compiled);
     }
+    if profile {
+        eprintln!(
+            "compile fallback_probe_us={} target={:?}",
+            stage_start.elapsed().as_micros(),
+            target_profile
+        );
+    }
+    let stage_start = Instant::now();
     let decoded = decode_i64_file_inner(bytes)?;
+    if profile {
+        eprintln!(
+            "compile decode_us={} source={:?} rows={} fields={}",
+            stage_start.elapsed().as_micros(),
+            decoded.header.profile,
+            decoded.rows.len(),
+            decoded.schema.fields.len()
+        );
+    }
+    let stage_start = Instant::now();
     let compiled_footer = decoded.compiled_footer_for_compile()?;
+    if profile {
+        eprintln!("compile footer_us={}", stage_start.elapsed().as_micros());
+    }
+    let stage_start = Instant::now();
     let body = match target_profile {
         Profile::Ingest => unreachable!(),
         Profile::Aura0 => {
@@ -176,8 +201,16 @@ pub(crate) fn compile_i64_file_inner(bytes: &[u8], target_profile: Profile) -> R
             encode_aura1_body(&decoded.rows, &plan)?
         }
     };
+    if profile {
+        eprintln!(
+            "compile body_us={} body_bytes={}",
+            stage_start.elapsed().as_micros(),
+            body.len()
+        );
+    }
 
-    encode_compiled_file(
+    let stage_start = Instant::now();
+    let out = encode_compiled_file(
         target_profile,
         decoded.header.stream_id,
         decoded.header.dictionary_id,
@@ -185,7 +218,15 @@ pub(crate) fn compile_i64_file_inner(bytes: &[u8], target_profile: Profile) -> R
         decoded.header.comment.as_str(),
         body,
         compiled_footer,
-    )
+    )?;
+    if profile {
+        eprintln!(
+            "compile file_us={} total_us={}",
+            stage_start.elapsed().as_micros(),
+            total_start.elapsed().as_micros()
+        );
+    }
+    Ok(out)
 }
 
 fn try_compile_i64_fast(bytes: &[u8], target_profile: Profile) -> Result<Option<Vec<u8>>> {

@@ -1018,6 +1018,103 @@ fn encode_i64_op(op: &GenericStreamOp, values: &[i64]) -> Result<Vec<u8>> {
     }
 }
 
+fn encoded_i64_op_len(op: &GenericStreamOp, values: &[i64]) -> Result<usize> {
+    match *op {
+        GenericStreamOp::FixedStep { base, step } => {
+            for (index, value) in values.iter().enumerate() {
+                if *value != fixed_step_value(base, step, index)? {
+                    return Err(AuraError::InvalidValue("fixed step body"));
+                }
+            }
+            Ok(0)
+        }
+        GenericStreamOp::BaseBitpack {
+            base,
+            unit,
+            bit_width,
+        } => {
+            for value in values {
+                let scaled = scaled_unsigned_offset(*value, base, unit)?;
+                ensure_unsigned_width(scaled, bit_width, "bitpacked value")?;
+            }
+            bitpacked_len(values.len(), bit_width)
+        }
+        GenericStreamOp::PrevDelta {
+            base,
+            unit,
+            bit_width,
+        } => {
+            if values.is_empty() {
+                return Ok(0);
+            }
+            if values[0] != base {
+                return Err(AuraError::InvalidValue("previous delta base"));
+            }
+            for pair in values.windows(2) {
+                let delta = scaled_signed_delta(pair[1], pair[0], unit)?;
+                ensure_signed_width(delta, bit_width, "bitpacked value")?;
+            }
+            bitpacked_len(values.len() - 1, bit_width)
+        }
+        GenericStreamOp::PatchedBitpack {
+            base,
+            unit,
+            low_width,
+            high_width,
+            exception_count,
+        } => {
+            let mask = low_mask(low_width)?;
+            let exception_count = usize::try_from(exception_count)
+                .map_err(|_| AuraError::InvalidValue("exception count"))?;
+            let mut actual_exception_count = 0usize;
+            for value in values {
+                let residual = scaled_unsigned_offset(*value, base, unit)?;
+                let high = if low_width == 64 {
+                    0
+                } else {
+                    residual >> low_width
+                };
+                ensure_unsigned_width(residual & mask, low_width, "bitpacked value")?;
+                if high != 0 {
+                    actual_exception_count += 1;
+                    ensure_unsigned_width(high, high_width, "bitpacked value")?;
+                }
+            }
+            if actual_exception_count != exception_count {
+                return Err(AuraError::InvalidValue("exception count"));
+            }
+            Ok(bitpacked_len(values.len(), low_width)?
+                + bitpacked_len(exception_count, index_width(values.len()))?
+                + bitpacked_len(exception_count, high_width)?)
+        }
+        GenericStreamOp::Rle {
+            base,
+            unit,
+            bit_width,
+            run_count,
+        } => {
+            let residuals = values
+                .iter()
+                .map(|value| scaled_unsigned_offset(*value, base, unit))
+                .collect::<Result<Vec<_>>>()?;
+            for residual in &residuals {
+                ensure_unsigned_width(*residual, bit_width, "bitpacked value")?;
+            }
+            let runs = runs_for(&residuals);
+            if runs.len() != run_count as usize {
+                return Err(AuraError::InvalidValue("run count"));
+            }
+            let run_value_bytes = bitpacked_len(runs.len(), bit_width)?;
+            let run_length_bytes = runs
+                .iter()
+                .map(|(_, len)| varint_u64_len(*len as u64))
+                .sum::<usize>();
+            Ok(run_value_bytes + run_length_bytes)
+        }
+        _ => Ok(encode_i64_op(op, values)?.len()),
+    }
+}
+
 fn decode_i64_op(
     op: &GenericStreamOp,
     reader: &mut ByteReader<'_>,
@@ -1747,7 +1844,7 @@ fn choose_local_op(values: &[i64]) -> Result<GenericStreamOp> {
     candidates
         .into_iter()
         .map(|op| {
-            let size = local_op_header_len(&op) + encode_i64_op(&op, values)?.len();
+            let size = local_op_header_len(&op) + encoded_i64_op_len(&op, values)?;
             Ok((size, op))
         })
         .collect::<Result<Vec<_>>>()?
@@ -1864,7 +1961,7 @@ fn derive_patched_bitpack(values: &[i64]) -> Result<GenericStreamOp> {
             exception_count: u32::try_from(exception_count)
                 .map_err(|_| AuraError::InvalidValue("exception count"))?,
         };
-        let size = local_op_header_len(&op) + encode_i64_op(&op, values)?.len();
+        let size = local_op_header_len(&op) + encoded_i64_op_len(&op, values)?;
         if best.as_ref().is_none_or(|(best_size, _)| size < *best_size) {
             best = Some((size, op));
         }
@@ -2177,6 +2274,50 @@ fn ensure_unsigned_width(value: u64, bit_width: u8, name: &'static str) -> Resul
     } else {
         Err(AuraError::InvalidValue(name))
     }
+}
+
+fn ensure_signed_width(value: i64, bit_width: u8, name: &'static str) -> Result<()> {
+    if bit_width > 64 {
+        return Err(AuraError::InvalidValue("bit width"));
+    }
+    if bit_width == 0 {
+        return if value == 0 {
+            Ok(())
+        } else {
+            Err(AuraError::InvalidValue(name))
+        };
+    }
+    if bit_width == 64 {
+        return Ok(());
+    }
+    let shift = u32::from(bit_width - 1);
+    let lower = -(1i128 << shift);
+    let upper = (1i128 << shift) - 1;
+    let value = i128::from(value);
+    if value < lower || value > upper {
+        Err(AuraError::InvalidValue(name))
+    } else {
+        Ok(())
+    }
+}
+
+fn bitpacked_len(value_count: usize, bit_width: u8) -> Result<usize> {
+    if bit_width > 64 {
+        return Err(AuraError::InvalidValue("bit width"));
+    }
+    let value_count =
+        u64::try_from(value_count).map_err(|_| AuraError::InvalidValue("bitpacked length"))?;
+    usize::try_from(bitpacked_byte_len(value_count, bit_width))
+        .map_err(|_| AuraError::InvalidValue("bitpacked length"))
+}
+
+fn varint_u64_len(mut value: u64) -> usize {
+    let mut len = 1usize;
+    while value >= 0x80 {
+        len += 1;
+        value >>= 7;
+    }
+    len
 }
 
 fn runs_for<T: Copy + Eq>(values: &[T]) -> Vec<(T, usize)> {
@@ -2818,5 +2959,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             decoded
         );
+    }
+
+    #[test]
+    fn local_op_length_matches_encoded_body_len() {
+        let cases = [
+            (
+                GenericStreamOp::FixedStep { base: 10, step: 2 },
+                vec![10, 12, 14, 16],
+            ),
+            (
+                GenericStreamOp::BaseBitpack {
+                    base: 10,
+                    unit: 1,
+                    bit_width: 4,
+                },
+                vec![10, 11, 12, 20],
+            ),
+            (
+                GenericStreamOp::PrevDelta {
+                    base: 10,
+                    unit: 1,
+                    bit_width: 3,
+                },
+                vec![10, 11, 13, 12],
+            ),
+            (
+                GenericStreamOp::PatchedBitpack {
+                    base: 10,
+                    unit: 1,
+                    low_width: 2,
+                    high_width: 3,
+                    exception_count: 1,
+                },
+                vec![10, 11, 12, 30],
+            ),
+            (
+                GenericStreamOp::Rle {
+                    base: 10,
+                    unit: 1,
+                    bit_width: 3,
+                    run_count: 3,
+                },
+                vec![10, 10, 11, 11, 11, 12],
+            ),
+        ];
+
+        for (op, values) in cases {
+            assert_eq!(
+                encode_i64_op(&op, &values).unwrap().len(),
+                encoded_i64_op_len(&op, &values).unwrap()
+            );
+        }
     }
 }

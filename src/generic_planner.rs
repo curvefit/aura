@@ -311,24 +311,51 @@ pub fn encode_generic_i64_rows_with_plan(
     rows: &[Vec<i64>],
     plan: GenericInstructionPlan,
 ) -> Result<GenericEncodedI64Rows> {
+    let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
+    let total_start = Instant::now();
+    let stage_start = Instant::now();
     validate_rows(schema, rows)?;
     let _encoded_plan = plan.encode()?;
-    let streams = plan
-        .streams
-        .iter()
-        .map(|instruction| {
-            let values = stream_values_for_instruction(schema, rows, &plan, instruction)?;
-            let body = encode_generic_stream_body(
-                instruction,
-                &GenericStreamBodyValue::I64(values.clone()),
-            )?;
-            Ok(GenericEncodedStream {
-                stream_id: instruction.stream_id,
-                value_count: values.len(),
-                body,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    if profile {
+        eprintln!(
+            "generic encode_validate_plan_us={} rows={} fields={} streams={}",
+            stage_start.elapsed().as_micros(),
+            rows.len(),
+            schema.fields.len(),
+            plan.streams.len()
+        );
+    }
+    let mut streams = Vec::with_capacity(plan.streams.len());
+    for instruction in &plan.streams {
+        let stage_start = Instant::now();
+        let values = stream_values_for_instruction(schema, rows, &plan, instruction)?;
+        let values_us = stage_start.elapsed().as_micros();
+        let stage_start = Instant::now();
+        let body =
+            encode_generic_stream_body(instruction, &GenericStreamBodyValue::I64(values.clone()))?;
+        if profile {
+            eprintln!(
+                "generic encode_stream id={} values={} op={} values_us={} body_us={} body_bytes={}",
+                instruction.stream_id,
+                values.len(),
+                generic_op_name(&instruction.op),
+                values_us,
+                stage_start.elapsed().as_micros(),
+                body.len()
+            );
+        }
+        streams.push(GenericEncodedStream {
+            stream_id: instruction.stream_id,
+            value_count: values.len(),
+            body,
+        });
+    }
+    if profile {
+        eprintln!(
+            "generic encode_total_us={}",
+            total_start.elapsed().as_micros()
+        );
+    }
 
     Ok(GenericEncodedI64Rows {
         plan,
