@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use aura_codec::{records, writer, Profile};
+use records::{DirectAura1TranscodeStats, DirectAura1TranscodeTimings, OutputGuardMode};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -99,6 +100,16 @@ impl CacheMode {
     }
 }
 
+fn parse_guard_mode(value: &str) -> Result<OutputGuardMode> {
+    match value {
+        "no_guard" => Ok(OutputGuardMode::NoGuard),
+        "fused_output_guard" => Ok(OutputGuardMode::FusedOutputGuard),
+        "old_post_output_guard" => Ok(OutputGuardMode::OldPostOutputGuard),
+        "block_batched_output_guard" => Ok(OutputGuardMode::BlockBatchedOutputGuard),
+        other => bail!("unknown guard mode: {other}"),
+    }
+}
+
 #[derive(Debug)]
 struct Config {
     operation: Operation,
@@ -109,6 +120,7 @@ struct Config {
     format: OutputFormat,
     output: Option<PathBuf>,
     cache_mode: CacheMode,
+    guard_mode: OutputGuardMode,
 }
 
 impl Config {
@@ -122,6 +134,7 @@ impl Config {
         let mut format = OutputFormat::Json;
         let mut output = None;
         let mut cache_mode = CacheMode::Warm;
+        let mut guard_mode = OutputGuardMode::NoGuard;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -162,6 +175,10 @@ impl Config {
                     cache_mode =
                         CacheMode::parse(&args.next().context("missing --cache-mode value")?)?;
                 }
+                "--guard-mode" => {
+                    guard_mode =
+                        parse_guard_mode(&args.next().context("missing --guard-mode value")?)?;
+                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -183,6 +200,7 @@ impl Config {
             format,
             output,
             cache_mode,
+            guard_mode,
         })
     }
 }
@@ -192,8 +210,12 @@ struct RunOutcome {
     record_count: usize,
     output_bytes: usize,
     guard: u64,
+    canonical_hash: Option<u64>,
     guard_mode: &'static str,
+    output_byte_guard: Option<u64>,
     post_process_duration: Duration,
+    timings: Option<DirectAura1TranscodeTimings>,
+    stats: Option<DirectAura1TranscodeStats>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,12 +246,18 @@ fn run_benchmark(config: &Config) -> Result<String> {
     for _ in 0..config.warmups {
         match config.cache_mode {
             CacheMode::Warm => {
-                let outcome = run_operation(config.operation, &input_bytes, record_count_hint)?;
+                let outcome = run_operation(
+                    config.operation,
+                    &input_bytes,
+                    record_count_hint,
+                    config.guard_mode,
+                )?;
                 black_box(outcome.guard);
             }
             CacheMode::Cold => {
                 let bytes = fs::read(&config.input)?;
-                let outcome = run_operation(config.operation, &bytes, record_count_hint)?;
+                let outcome =
+                    run_operation(config.operation, &bytes, record_count_hint, config.guard_mode)?;
                 black_box(outcome.guard);
             }
         }
@@ -239,12 +267,18 @@ fn run_benchmark(config: &Config) -> Result<String> {
     for _ in 0..config.iterations {
         let measurement = match config.cache_mode {
             CacheMode::Warm => {
-                measure_operation(config.operation, &input_bytes, record_count_hint)?
+                measure_operation(
+                    config.operation,
+                    &input_bytes,
+                    record_count_hint,
+                    config.guard_mode,
+                )?
             }
             CacheMode::Cold => {
                 let start = Instant::now();
                 let bytes = fs::read(&config.input)?;
-                let outcome = run_operation(config.operation, &bytes, record_count_hint)?;
+                let outcome =
+                    run_operation(config.operation, &bytes, record_count_hint, config.guard_mode)?;
                 let total_duration = start.elapsed();
                 let operation_duration =
                     measured_operation_duration(total_duration, outcome.post_process_duration);
@@ -283,6 +317,7 @@ fn run_benchmark(config: &Config) -> Result<String> {
         measurement.outcome.post_process_duration
     });
     let runtime_ns = median_ns;
+    let representative = representative_measurement(&measurements, runtime_ns);
     let seconds = runtime_ns as f64 / 1_000_000_000.0;
     let records_per_sec = if seconds > 0.0 {
         first.record_count as f64 / seconds
@@ -291,6 +326,11 @@ fn run_benchmark(config: &Config) -> Result<String> {
     };
     let mb_per_sec = if seconds > 0.0 {
         input_len as f64 / (1024.0 * 1024.0) / seconds
+    } else {
+        0.0
+    };
+    let output_mb_per_sec = if seconds > 0.0 && first.output_bytes > 0 {
+        first.output_bytes as f64 / (1024.0 * 1024.0) / seconds
     } else {
         0.0
     };
@@ -320,9 +360,16 @@ fn run_benchmark(config: &Config) -> Result<String> {
                 "median_post_process_runtime_ns": median_post_process_ns,
                 "p95_post_process_runtime_ns": p95_post_process_ns,
                 "post_process_note": "post-process time is output guard/checksum work after the measured operation; runtime_ns excludes it",
+                "canonical_hash": first.canonical_hash,
+                "guard_mode_requested": config.guard_mode.as_str(),
                 "guard_mode": first.guard_mode,
+                "output_byte_guard": first.output_byte_guard,
+                "stage_timings_ns": stage_timings_json(representative.outcome.timings.as_ref()),
+                "decode_stats": decode_stats_json(representative.outcome.stats.as_ref()),
+                "writer_stats": writer_stats_json(representative.outcome.stats.as_ref()),
                 "records_per_sec": records_per_sec,
                 "mb_per_sec": mb_per_sec,
+                "output_mb_per_sec": output_mb_per_sec,
                 "compression_ratio": compression_ratio,
                 "source_format": config.operation.source_format(),
                 "target_format": config.operation.target_format(),
@@ -350,6 +397,7 @@ fn run_benchmark(config: &Config) -> Result<String> {
             p95_post_process_ns,
             records_per_sec,
             mb_per_sec,
+            output_mb_per_sec,
             compression_ratio,
             &command_used,
             &machine_info,
@@ -361,9 +409,10 @@ fn measure_operation(
     operation: Operation,
     bytes: &[u8],
     record_count_hint: usize,
+    guard_mode: OutputGuardMode,
 ) -> Result<Measurement> {
     let start = Instant::now();
-    let outcome = run_operation(operation, bytes, record_count_hint)?;
+    let outcome = run_operation(operation, bytes, record_count_hint, guard_mode)?;
     let total_duration = start.elapsed();
     let operation_duration =
         measured_operation_duration(total_duration, outcome.post_process_duration);
@@ -378,16 +427,167 @@ fn measured_operation_duration(total: Duration, post_process: Duration) -> Durat
     total.checked_sub(post_process).unwrap_or(total)
 }
 
+fn duration_from_ns(ns: u128) -> Duration {
+    Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
+}
+
+fn representative_measurement(measurements: &[Measurement], median_ns: u128) -> &Measurement {
+    measurements
+        .iter()
+        .min_by_key(|measurement| {
+            let ns = measurement.operation_duration.as_nanos();
+            ns.abs_diff(median_ns)
+        })
+        .expect("missing benchmark measurement")
+}
+
+fn ns_u64(ns: u128) -> u64 {
+    u64::try_from(ns).unwrap_or(u64::MAX)
+}
+
+fn stage_timings_json(timings: Option<&DirectAura1TranscodeTimings>) -> serde_json::Value {
+    let Some(timings) = timings else {
+        return json!({
+            "decode_input_streams": empty_decode_timing_json(),
+            "partitioned_sparse_writer": empty_writer_timing_json(),
+        });
+    };
+    json!({
+        "metadata": ns_u64(timings.metadata_ns),
+        "allocate_header": ns_u64(timings.allocate_header_ns),
+        "trailer": ns_u64(timings.trailer_ns),
+        "post_output_guard": ns_u64(timings.post_output_guard_ns),
+        "total": ns_u64(timings.total_ns),
+        "decode_input_streams": {
+            "total": ns_u64(timings.decode_input_streams.total_ns),
+            "compressed_input_read": ns_u64(timings.decode_input_streams.compressed_input_read_ns),
+            "huffman_entropy_decode": ns_u64(timings.decode_input_streams.huffman_entropy_decode_ns),
+            "delta_reconstruction": ns_u64(timings.decode_input_streams.delta_reconstruction_ns),
+            "dictionary_symbol_reconstruction": ns_u64(timings.decode_input_streams.dictionary_symbol_reconstruction_ns),
+            "validity_presence_bitmap_decode": ns_u64(timings.decode_input_streams.validity_presence_bitmap_decode_ns),
+            "record_type_branching": ns_u64(timings.decode_input_streams.record_type_branching_ns),
+            "integer_scaling_sign_extension": ns_u64(timings.decode_input_streams.integer_scaling_sign_extension_ns),
+            "temporary_buffer_writes": ns_u64(timings.decode_input_streams.temporary_buffer_writes_ns),
+            "checksum_hash_work": ns_u64(timings.decode_input_streams.checksum_hash_work_ns),
+            "bounds_validation": ns_u64(timings.decode_input_streams.bounds_validation_ns),
+            "allocation_reuse": ns_u64(timings.decode_input_streams.allocation_reuse_ns),
+            "unclassified": ns_u64(timings.decode_input_streams.unclassified_ns),
+        },
+        "partitioned_sparse_writer": {
+            "total": ns_u64(timings.partitioned_sparse_writer.total_ns),
+            "sparse_partition_traversal": ns_u64(timings.partitioned_sparse_writer.sparse_partition_traversal_ns),
+            "output_offset_calculation": ns_u64(timings.partitioned_sparse_writer.output_offset_calculation_ns),
+            "field_reconstruction_packing": ns_u64(timings.partitioned_sparse_writer.field_reconstruction_packing_ns),
+            "output_byte_stores": ns_u64(timings.partitioned_sparse_writer.output_byte_stores_ns),
+            "guard_hash_update": ns_u64(timings.partitioned_sparse_writer.guard_hash_update_ns),
+            "bounds_checks": ns_u64(timings.partitioned_sparse_writer.bounds_checks_ns),
+            "branch_record_type_handling": ns_u64(timings.partitioned_sparse_writer.branch_record_type_handling_ns),
+            "copy_cost": ns_u64(timings.partitioned_sparse_writer.copy_cost_ns),
+            "buffer_slicing_view_creation": ns_u64(timings.partitioned_sparse_writer.buffer_slicing_view_creation_ns),
+            "partition_finalization": ns_u64(timings.partitioned_sparse_writer.partition_finalization_ns),
+            "allocation_reuse": ns_u64(timings.partitioned_sparse_writer.allocation_reuse_ns),
+            "unclassified": ns_u64(timings.partitioned_sparse_writer.unclassified_ns),
+        },
+    })
+}
+
+fn empty_decode_timing_json() -> serde_json::Value {
+    json!({
+        "total": 0,
+        "compressed_input_read": 0,
+        "huffman_entropy_decode": 0,
+        "delta_reconstruction": 0,
+        "dictionary_symbol_reconstruction": 0,
+        "validity_presence_bitmap_decode": 0,
+        "record_type_branching": 0,
+        "integer_scaling_sign_extension": 0,
+        "temporary_buffer_writes": 0,
+        "checksum_hash_work": 0,
+        "bounds_validation": 0,
+        "allocation_reuse": 0,
+        "unclassified": 0,
+    })
+}
+
+fn empty_writer_timing_json() -> serde_json::Value {
+    json!({
+        "total": 0,
+        "sparse_partition_traversal": 0,
+        "output_offset_calculation": 0,
+        "field_reconstruction_packing": 0,
+        "output_byte_stores": 0,
+        "guard_hash_update": 0,
+        "bounds_checks": 0,
+        "branch_record_type_handling": 0,
+        "copy_cost": 0,
+        "buffer_slicing_view_creation": 0,
+        "partition_finalization": 0,
+        "allocation_reuse": 0,
+        "unclassified": 0,
+    })
+}
+
+fn writer_stats_json(stats: Option<&DirectAura1TranscodeStats>) -> serde_json::Value {
+    let Some(stats) = stats else {
+        return json!({});
+    };
+    json!({
+        "partition_count": stats.writer.partition_count,
+        "records_per_partition_min": stats.writer.records_per_partition_min,
+        "records_per_partition_max": stats.writer.records_per_partition_max,
+        "output_slices": stats.writer.output_slices,
+        "non_contiguous_writes": stats.writer.non_contiguous_writes,
+        "guard_update_calls": stats.writer.guard_update_calls,
+        "guard_update_bytes": stats.writer.guard_update_bytes,
+        "average_guard_update_size": if stats.writer.guard_update_calls > 0 {
+            stats.writer.guard_update_bytes as f64 / stats.writer.guard_update_calls as f64
+        } else {
+            0.0
+        },
+        "output_offset_calculations": stats.writer.output_offset_calculations,
+        "bounds_checks": stats.writer.bounds_checks,
+        "temporary_buffer_bytes": stats.writer.temporary_buffer_bytes,
+        "copied_bytes": stats.writer.copied_bytes,
+        "allocation_count": stats.writer.allocation_count,
+    })
+}
+
+fn decode_stats_json(stats: Option<&DirectAura1TranscodeStats>) -> serde_json::Value {
+    let Some(stats) = stats else {
+        return json!({
+            "stream_count": 0,
+            "stream_value_count": 0,
+            "materialized_stream_count": 0,
+            "materialized_value_count": 0,
+            "direct_cursor_stream_count": 0,
+            "direct_cursor_value_count": 0,
+        });
+    };
+    json!({
+        "stream_count": stats.decode.stream_count,
+        "stream_value_count": stats.decode.stream_value_count,
+        "materialized_stream_count": stats.decode.materialized_stream_count,
+        "materialized_value_count": stats.decode.materialized_value_count,
+        "direct_cursor_stream_count": stats.decode.direct_cursor_stream_count,
+        "direct_cursor_value_count": stats.decode.direct_cursor_value_count,
+    })
+}
+
 fn run_operation(
     operation: Operation,
     bytes: &[u8],
     record_count_hint: usize,
+    guard_mode: OutputGuardMode,
 ) -> Result<RunOutcome> {
     match operation {
         Operation::ParseAura1 => parse_aura1(bytes),
         Operation::DecodeAura0 => decode_aura0(bytes),
-        Operation::TranscodeAura1ToAura0 => transcode(bytes, Profile::Aura0, record_count_hint),
-        Operation::TranscodeAura0ToAura1 => transcode(bytes, Profile::Aura1, record_count_hint),
+        Operation::TranscodeAura1ToAura0 => {
+            transcode(bytes, Profile::Aura0, record_count_hint, guard_mode)
+        }
+        Operation::TranscodeAura0ToAura1 => {
+            transcode(bytes, Profile::Aura1, record_count_hint, guard_mode)
+        }
     }
 }
 
@@ -416,8 +616,12 @@ fn parse_aura1(bytes: &[u8]) -> Result<RunOutcome> {
         record_count,
         output_bytes: 0,
         guard,
+        canonical_hash: Some(guard),
         guard_mode: "inline_parse",
+        output_byte_guard: None,
         post_process_duration: Duration::ZERO,
+        timings: None,
+        stats: None,
     })
 }
 
@@ -435,26 +639,54 @@ fn decode_aura0(bytes: &[u8]) -> Result<RunOutcome> {
         record_count: decoded.rows.len(),
         output_bytes: 0,
         guard,
+        canonical_hash: Some(guard),
         guard_mode: "inline_decode",
+        output_byte_guard: None,
         post_process_duration: Duration::ZERO,
+        timings: None,
+        stats: None,
     })
 }
 
-fn transcode(bytes: &[u8], target: Profile, record_count: usize) -> Result<RunOutcome> {
-    if let Some(output) = records::try_compile_i64_file_with_fused_output_guard(bytes, target)? {
+fn transcode(
+    bytes: &[u8],
+    target: Profile,
+    record_count: usize,
+    guard_mode: OutputGuardMode,
+) -> Result<RunOutcome> {
+    if let Some(output) = records::try_compile_i64_file_profiled(bytes, target, guard_mode)? {
         let output_bytes = output.bytes.len();
         black_box(&output.bytes);
+        let guard = output.output_byte_guard.unwrap_or(output_bytes as u64);
+        let post_process_duration = duration_from_ns(output.timings.post_output_guard_ns);
         return Ok(RunOutcome {
             record_count,
             output_bytes,
-            guard: output.guard,
-            guard_mode: "fused_output",
-            post_process_duration: Duration::ZERO,
+            guard,
+            canonical_hash: None,
+            guard_mode: output.guard_mode.as_str(),
+            output_byte_guard: output.output_byte_guard,
+            post_process_duration,
+            timings: Some(output.timings),
+            stats: Some(output.stats),
         });
     }
 
     let output = writer::compile_i64(bytes, target)?;
     black_box(&output);
+    if guard_mode == OutputGuardMode::NoGuard {
+        return Ok(RunOutcome {
+            record_count,
+            output_bytes: output.len(),
+            guard: output.len() as u64,
+            canonical_hash: None,
+            guard_mode: guard_mode.as_str(),
+            output_byte_guard: None,
+            post_process_duration: Duration::ZERO,
+            timings: None,
+            stats: None,
+        });
+    }
     let post_process_start = Instant::now();
     let guard = bytes_guard(&output);
     let post_process_duration = post_process_start.elapsed();
@@ -462,8 +694,12 @@ fn transcode(bytes: &[u8], target: Profile, record_count: usize) -> Result<RunOu
         record_count,
         output_bytes: output.len(),
         guard,
+        canonical_hash: None,
         guard_mode: "post_process_output",
+        output_byte_guard: Some(guard),
         post_process_duration,
+        timings: None,
+        stats: None,
     })
 }
 
@@ -567,6 +803,7 @@ fn csv_report(
     p95_post_process_ns: u128,
     records_per_sec: f64,
     mb_per_sec: f64,
+    output_mb_per_sec: f64,
     compression_ratio: Option<f64>,
     command_used: &str,
     machine_info: &serde_json::Value,
@@ -591,6 +828,7 @@ fn csv_report(
         "guard_mode",
         "records_per_sec",
         "mb_per_sec",
+        "output_mb_per_sec",
         "compression_ratio",
         "source_format",
         "target_format",
@@ -622,6 +860,7 @@ fn csv_report(
         outcome.guard_mode.to_owned(),
         format!("{records_per_sec:.6}"),
         format!("{mb_per_sec:.6}"),
+        format!("{output_mb_per_sec:.6}"),
         compression_ratio
             .map(|ratio| format!("{ratio:.6}"))
             .unwrap_or_default(),
@@ -659,6 +898,6 @@ fn csv_escape(field: &str) -> String {
 
 fn print_usage() {
     eprintln!(
-        "usage: aura-bench --operation <parse-aura1|decode-aura0|transcode-aura1-to-aura0|transcode-aura0-to-aura1> --dataset <name> --input <path> [--iterations N] [--warmups N] [--format json|csv] [--output path] [--cache-mode warm|cold]"
+        "usage: aura-bench --operation <parse-aura1|decode-aura0|transcode-aura1-to-aura0|transcode-aura0-to-aura1> --dataset <name> --input <path> [--iterations N] [--warmups N] [--format json|csv] [--output path] [--cache-mode warm|cold] [--guard-mode no_guard|fused_output_guard|old_post_output_guard|block_batched_output_guard]"
     );
 }
