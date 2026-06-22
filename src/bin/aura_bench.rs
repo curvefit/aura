@@ -192,11 +192,13 @@ struct RunOutcome {
     record_count: usize,
     output_bytes: usize,
     guard: u64,
+    post_process_duration: Duration,
 }
 
 #[derive(Debug, Clone)]
 struct Measurement {
-    duration: Duration,
+    operation_duration: Duration,
+    total_duration: Duration,
     outcome: RunOutcome,
 }
 
@@ -242,8 +244,12 @@ fn run_benchmark(config: &Config) -> Result<String> {
                 let start = Instant::now();
                 let bytes = fs::read(&config.input)?;
                 let outcome = run_operation(config.operation, &bytes, record_count_hint)?;
+                let total_duration = start.elapsed();
+                let operation_duration =
+                    measured_operation_duration(total_duration, outcome.post_process_duration);
                 Measurement {
-                    duration: start.elapsed(),
+                    operation_duration,
+                    total_duration,
                     outcome,
                 }
             }
@@ -257,8 +263,24 @@ fn run_benchmark(config: &Config) -> Result<String> {
         .context("missing benchmark measurement")?
         .outcome
         .clone();
-    let median_ns = percentile_ns(&measurements, 0.50);
-    let p95_ns = percentile_ns(&measurements, 0.95);
+    let median_ns = percentile_ns(&measurements, 0.50, |measurement| {
+        measurement.operation_duration
+    });
+    let p95_ns = percentile_ns(&measurements, 0.95, |measurement| {
+        measurement.operation_duration
+    });
+    let median_total_ns = percentile_ns(&measurements, 0.50, |measurement| {
+        measurement.total_duration
+    });
+    let p95_total_ns = percentile_ns(&measurements, 0.95, |measurement| {
+        measurement.total_duration
+    });
+    let median_post_process_ns = percentile_ns(&measurements, 0.50, |measurement| {
+        measurement.outcome.post_process_duration
+    });
+    let p95_post_process_ns = percentile_ns(&measurements, 0.95, |measurement| {
+        measurement.outcome.post_process_duration
+    });
     let runtime_ns = median_ns;
     let seconds = runtime_ns as f64 / 1_000_000_000.0;
     let records_per_sec = if seconds > 0.0 {
@@ -290,6 +312,13 @@ fn run_benchmark(config: &Config) -> Result<String> {
                 "runtime_ns": runtime_ns,
                 "median_runtime_ns": median_ns,
                 "p95_runtime_ns": p95_ns,
+                "total_runtime_ns": median_total_ns,
+                "median_total_runtime_ns": median_total_ns,
+                "p95_total_runtime_ns": p95_total_ns,
+                "post_process_runtime_ns": median_post_process_ns,
+                "median_post_process_runtime_ns": median_post_process_ns,
+                "p95_post_process_runtime_ns": p95_post_process_ns,
+                "post_process_note": "post-process time is output guard/checksum work after the measured operation; runtime_ns excludes it",
                 "records_per_sec": records_per_sec,
                 "mb_per_sec": mb_per_sec,
                 "compression_ratio": compression_ratio,
@@ -313,6 +342,10 @@ fn run_benchmark(config: &Config) -> Result<String> {
             runtime_ns,
             median_ns,
             p95_ns,
+            median_total_ns,
+            p95_total_ns,
+            median_post_process_ns,
+            p95_post_process_ns,
             records_per_sec,
             mb_per_sec,
             compression_ratio,
@@ -329,10 +362,18 @@ fn measure_operation(
 ) -> Result<Measurement> {
     let start = Instant::now();
     let outcome = run_operation(operation, bytes, record_count_hint)?;
+    let total_duration = start.elapsed();
+    let operation_duration =
+        measured_operation_duration(total_duration, outcome.post_process_duration);
     Ok(Measurement {
-        duration: start.elapsed(),
+        operation_duration,
+        total_duration,
         outcome,
     })
+}
+
+fn measured_operation_duration(total: Duration, post_process: Duration) -> Duration {
+    total.checked_sub(post_process).unwrap_or(total)
 }
 
 fn run_operation(
@@ -373,6 +414,7 @@ fn parse_aura1(bytes: &[u8]) -> Result<RunOutcome> {
         record_count,
         output_bytes: 0,
         guard,
+        post_process_duration: Duration::ZERO,
     })
 }
 
@@ -390,22 +432,30 @@ fn decode_aura0(bytes: &[u8]) -> Result<RunOutcome> {
         record_count: decoded.rows.len(),
         output_bytes: 0,
         guard,
+        post_process_duration: Duration::ZERO,
     })
 }
 
 fn transcode(bytes: &[u8], target: Profile, record_count: usize) -> Result<RunOutcome> {
     let output = writer::compile_i64(bytes, target)?;
+    let post_process_start = Instant::now();
+    let guard = bytes_guard(&output);
+    let post_process_duration = post_process_start.elapsed();
     Ok(RunOutcome {
         record_count,
         output_bytes: output.len(),
-        guard: bytes_guard(&output),
+        guard,
+        post_process_duration,
     })
 }
 
-fn percentile_ns(measurements: &[Measurement], percentile: f64) -> u128 {
+fn percentile_ns<F>(measurements: &[Measurement], percentile: f64, mut duration: F) -> u128
+where
+    F: FnMut(&Measurement) -> Duration,
+{
     let mut values = measurements
         .iter()
-        .map(|measurement| measurement.duration.as_nanos())
+        .map(|measurement| duration(measurement).as_nanos())
         .collect::<Vec<_>>();
     values.sort_unstable();
     let index = ((values.len() - 1) as f64 * percentile).ceil() as usize;
@@ -493,6 +543,10 @@ fn csv_report(
     runtime_ns: u128,
     median_ns: u128,
     p95_ns: u128,
+    median_total_ns: u128,
+    p95_total_ns: u128,
+    median_post_process_ns: u128,
+    p95_post_process_ns: u128,
     records_per_sec: f64,
     mb_per_sec: f64,
     compression_ratio: Option<f64>,
@@ -509,6 +563,13 @@ fn csv_report(
         "runtime_ns",
         "median_runtime_ns",
         "p95_runtime_ns",
+        "total_runtime_ns",
+        "median_total_runtime_ns",
+        "p95_total_runtime_ns",
+        "post_process_runtime_ns",
+        "median_post_process_runtime_ns",
+        "p95_post_process_runtime_ns",
+        "post_process_note",
         "records_per_sec",
         "mb_per_sec",
         "compression_ratio",
@@ -532,6 +593,13 @@ fn csv_report(
         runtime_ns.to_string(),
         median_ns.to_string(),
         p95_ns.to_string(),
+        median_total_ns.to_string(),
+        median_total_ns.to_string(),
+        p95_total_ns.to_string(),
+        median_post_process_ns.to_string(),
+        median_post_process_ns.to_string(),
+        p95_post_process_ns.to_string(),
+        "post-process time is output guard/checksum work after the measured operation; runtime_ns excludes it".to_owned(),
         format!("{records_per_sec:.6}"),
         format!("{mb_per_sec:.6}"),
         compression_ratio

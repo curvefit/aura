@@ -933,6 +933,9 @@ fn try_encode_compiled_file_with_body_writer<F>(
 where
     F: FnOnce(&mut Vec<u8>) -> Result<bool>,
 {
+    let profile_fast = std::env::var_os("AURA_PROFILE_FAST").is_some();
+    let total_start = profile_fast.then(Instant::now);
+    let stage_start = profile_fast.then(Instant::now);
     let footer_bytes = footer.encode()?;
     let footer_len =
         u32::try_from(footer_bytes.len()).map_err(|_| AuraError::InvalidValue("footer length"))?;
@@ -942,7 +945,16 @@ where
         .with_derived_expressions(footer.schema.derived_expressions.clone())?
         .with_comment(header_comment)?;
     let header_bytes = header.encode()?;
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "compiled_file metadata_us={} header_bytes={} footer_bytes={}",
+            stage_start.elapsed().as_micros(),
+            header_bytes.len(),
+            footer_bytes.len()
+        );
+    }
 
+    let stage_start = profile_fast.then(Instant::now);
     let mut out = Vec::with_capacity(
         header_bytes.len()
             + body_capacity
@@ -951,14 +963,42 @@ where
             + SEAL_MAGIC.len(),
     );
     out.extend_from_slice(&header_bytes);
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "compiled_file allocate_header_us={} capacity={}",
+            stage_start.elapsed().as_micros(),
+            out.capacity()
+        );
+    }
+
+    let stage_start = profile_fast.then(Instant::now);
     let body_start = out.len();
     if !write_body(&mut out)? {
         return Ok(None);
     }
     let body_len = out.len() - body_start;
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "compiled_file body_writer_us={} body_bytes={}",
+            stage_start.elapsed().as_micros(),
+            body_len
+        );
+    }
+
+    let stage_start = profile_fast.then(Instant::now);
     out.extend_from_slice(&footer_bytes);
     put_u32_le(&mut out, footer_len);
     out.extend_from_slice(SEAL_MAGIC);
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "compiled_file trailer_us={} out_bytes={} total_us={}",
+            stage_start.elapsed().as_micros(),
+            out.len(),
+            total_start
+                .map(|start| start.elapsed().as_micros())
+                .unwrap_or(0)
+        );
+    }
     Ok(Some((out, body_len)))
 }
 

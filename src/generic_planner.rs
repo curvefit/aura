@@ -1230,6 +1230,8 @@ pub(crate) fn try_write_generic_i64_aura1_body(
     aura1_plan: &Aura1Plan,
     out: &mut Vec<u8>,
 ) -> Result<bool> {
+    let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
+    let total_start = profile.then(Instant::now);
     if plan.groups.iter().any(|group| {
         matches!(
             group,
@@ -1242,7 +1244,17 @@ pub(crate) fn try_write_generic_i64_aura1_body(
         return Ok(false);
     }
 
+    let stage_start = profile.then(Instant::now);
     let stream_values = decode_generic_i64_stream_values(&plan, bytes)?;
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 decode_streams_us={} streams={}",
+            stage_start.elapsed().as_micros(),
+            plan.streams.len()
+        );
+    }
+
+    let stage_start = profile.then(Instant::now);
     if try_write_partitioned_sparse_i64_aura1_body(
         &plan,
         &stream_values,
@@ -1251,11 +1263,38 @@ pub(crate) fn try_write_generic_i64_aura1_body(
         aura1_plan,
         out,
     )? {
+        if let Some(stage_start) = stage_start {
+            eprintln!(
+                "direct_aura1 partitioned_sparse_write_us={} total_us={}",
+                stage_start.elapsed().as_micros(),
+                total_start
+                    .map(|start| start.elapsed().as_micros())
+                    .unwrap_or(0)
+            );
+        }
         return Ok(true);
     }
+
+    let stage_start = profile.then(Instant::now);
     let partition_runs =
         partition_run_lengths_from_streams(&plan, &stream_values, record_count, field_count)?;
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 partition_runs_us={}",
+            stage_start.elapsed().as_micros()
+        );
+    }
+
+    let stage_start = profile.then(Instant::now);
     let presence_maps = presence_maps_by_group(&plan, &stream_values, record_count)?;
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 presence_maps_us={}",
+            stage_start.elapsed().as_micros()
+        );
+    }
+
+    let stage_start = profile.then(Instant::now);
     let mut sources = direct_aura1_slot_sources(
         &plan,
         &stream_values,
@@ -1264,7 +1303,14 @@ pub(crate) fn try_write_generic_i64_aura1_body(
         record_count,
         field_count,
     )?;
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 sources_us={}",
+            stage_start.elapsed().as_micros()
+        );
+    }
 
+    let stage_start = profile.then(Instant::now);
     let mut field_specs = Vec::with_capacity(aura1_plan.fields.len());
     let mut row_width = 0usize;
     for field_plan in &aura1_plan.fields {
@@ -1280,20 +1326,56 @@ pub(crate) fn try_write_generic_i64_aura1_body(
             .ok_or(AuraError::InvalidValue("body length"))?;
         field_specs.push((slot, field_plan.width));
     }
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 field_specs_us={} row_width={} fields={}",
+            stage_start.elapsed().as_micros(),
+            row_width,
+            field_specs.len()
+        );
+    }
 
+    let stage_start = profile.then(Instant::now);
     out.reserve(
         record_count
             .checked_mul(row_width)
             .ok_or(AuraError::InvalidValue("body length"))?,
     );
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 reserve_us={} reserved_body_bytes={}",
+            stage_start.elapsed().as_micros(),
+            record_count.saturating_mul(row_width)
+        );
+    }
+
+    let stage_start = profile.then(Instant::now);
     for row_index in 0..record_count {
         for (slot, width) in &field_specs {
             let value = sources[*slot].value_at(row_index)?;
             write_direct_i64_width(out, value, *width)?;
         }
     }
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 emit_rows_us={} rows={}",
+            stage_start.elapsed().as_micros(),
+            record_count
+        );
+    }
+
+    let stage_start = profile.then(Instant::now);
     for source in &mut sources {
         source.finish()?;
+    }
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 finish_us={} total_us={}",
+            stage_start.elapsed().as_micros(),
+            total_start
+                .map(|start| start.elapsed().as_micros())
+                .unwrap_or(0)
+        );
     }
     Ok(true)
 }

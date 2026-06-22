@@ -107,6 +107,22 @@ fn aura_bench_reports_required_json_fields_for_core_operations() {
         assert!(json["runtime_ns"].as_u64().unwrap() > 0);
         assert!(json["median_runtime_ns"].as_u64().unwrap() > 0);
         assert!(json["p95_runtime_ns"].as_u64().unwrap() > 0);
+        assert!(json["total_runtime_ns"].as_u64().unwrap() >= json["runtime_ns"].as_u64().unwrap());
+        assert!(
+            json["median_total_runtime_ns"].as_u64().unwrap()
+                >= json["median_runtime_ns"].as_u64().unwrap()
+        );
+        assert!(
+            json["p95_total_runtime_ns"].as_u64().unwrap()
+                >= json["p95_runtime_ns"].as_u64().unwrap()
+        );
+        assert!(json["post_process_runtime_ns"].as_u64().is_some());
+        assert!(json["median_post_process_runtime_ns"].as_u64().is_some());
+        assert!(json["p95_post_process_runtime_ns"].as_u64().is_some());
+        assert!(json["post_process_note"]
+            .as_str()
+            .unwrap()
+            .contains("runtime_ns excludes it"));
         assert!(json["records_per_sec"].as_f64().unwrap() > 0.0);
         assert!(json["mb_per_sec"].as_f64().unwrap() > 0.0);
         assert!(json["command_used"].as_str().unwrap().contains(operation));
