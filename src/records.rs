@@ -4,13 +4,14 @@ use crate::bitpack::{
     bitpacked_byte_len, pack_signed_values, pack_unsigned_values, unpack_signed_values,
     unpack_unsigned_values,
 };
-use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, ByteReader};
+use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, ByteGuard, ByteReader};
 use crate::footer::AuraFooter;
 use crate::format::SEAL_MAGIC;
 use crate::generic_planner::{
     decode_generic_i64_rows_body, encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan,
     plan_generic_i64_rows, try_decode_generic_i64_columns_body, try_encode_generic_i64_aura1_body,
     try_encode_generic_i64_aura1_body_streaming, try_write_generic_i64_aura1_body,
+    try_write_generic_i64_aura1_body_guarded,
 };
 use crate::header::{AuraHeader, LEGACY_HEADER_PREFIX_SIZE};
 use crate::instructions::GenericInstructionPlan;
@@ -63,6 +64,12 @@ pub struct DecodedTypedFile {
     pub ingest_footer: Option<AuraFooter>,
     pub compiled_footer: Option<CompiledFooter>,
     pub rows: Vec<Vec<AuraTypedValue>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedCompileOutput {
+    pub bytes: Vec<u8>,
+    pub guard: u64,
 }
 
 pub fn encode_ingest_i64_file(input: I64FileInput) -> Result<Vec<u8>> {
@@ -145,6 +152,45 @@ pub(crate) fn encode_ingest_i64_file_inner(input: I64FileInput) -> Result<Vec<u8
 
 pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
     crate::writer::compile_i64(bytes, target_profile)
+}
+
+pub fn try_compile_i64_file_with_fused_output_guard(
+    bytes: &[u8],
+    target_profile: Profile,
+) -> Result<Option<GuardedCompileOutput>> {
+    if target_profile != Profile::Aura1 {
+        return Ok(None);
+    }
+    if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+        return Ok(None);
+    }
+    let seal_offset = bytes.len() - SEAL_MAGIC.len();
+    if &bytes[seal_offset..] != SEAL_MAGIC {
+        return Ok(None);
+    }
+    let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
+    let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
+    let header_len = AuraHeader::encoded_len(bytes)?;
+    if header_len > footer_len_offset {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let header = AuraHeader::decode(&bytes[..header_len])?;
+    if header.profile != Profile::Aura0 {
+        return Ok(None);
+    }
+    let footer_start = footer_len_offset
+        .checked_sub(footer_len)
+        .ok_or(AuraError::UnexpectedEof)?;
+    if footer_start < header_len {
+        return Err(AuraError::UnexpectedEof);
+    }
+    try_compile_aura0_to_aura1_fast_guarded(
+        bytes,
+        header,
+        header_len,
+        footer_start,
+        footer_len_offset,
+    )
 }
 
 pub(crate) fn compile_i64_file_inner(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
@@ -474,6 +520,63 @@ fn try_compile_aura0_to_aura1_fast(
         );
     }
     Ok(Some(out))
+}
+
+fn try_compile_aura0_to_aura1_fast_guarded(
+    bytes: &[u8],
+    header: AuraHeader,
+    header_len: usize,
+    footer_start: usize,
+    footer_len_offset: usize,
+) -> Result<Option<GuardedCompileOutput>> {
+    if std::env::var_os("AURA_STREAM_AURA1").is_some()
+        || std::env::var_os("AURA_FORCE_COLUMNS_AURA1").is_some()
+    {
+        return Ok(None);
+    }
+
+    let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+    validate_header_schema_agreement(&header, &footer.schema)?;
+    if schema_has_wide_fields(&footer.schema) {
+        return Err(AuraError::InvalidValue("i64 schema"));
+    }
+    let Some(plan) = footer.generic_aura0_plan.clone() else {
+        return Ok(None);
+    };
+    let record_count = usize::try_from(footer.record_count)
+        .map_err(|_| AuraError::InvalidValue("record count"))?;
+    let field_count = footer.schema.fields.len();
+    let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+    let body_capacity = aura1_body_capacity(record_count, &aura1_plan)?;
+    let mut guard = ByteGuard::new();
+    let Some((bytes, _body_len)) = try_encode_compiled_file_with_body_writer_guarded(
+        Profile::Aura1,
+        header.stream_id,
+        header.dictionary_id,
+        header.base_time_ns,
+        header.comment.as_str(),
+        body_capacity,
+        footer,
+        &mut guard,
+        |out, output_guard| {
+            try_write_generic_i64_aura1_body_guarded(
+                plan,
+                &bytes[header_len..footer_start],
+                record_count,
+                field_count,
+                &aura1_plan,
+                out,
+                output_guard,
+            )
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(GuardedCompileOutput {
+        bytes,
+        guard: guard.value(),
+    }))
 }
 
 pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
@@ -933,6 +1036,65 @@ fn try_encode_compiled_file_with_body_writer<F>(
 where
     F: FnOnce(&mut Vec<u8>) -> Result<bool>,
 {
+    try_encode_compiled_file_with_body_writer_inner(
+        profile,
+        stream_id,
+        dictionary_id,
+        base_time_ns,
+        header_comment,
+        body_capacity,
+        footer,
+        None,
+        |out, _guard| write_body(out),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_encode_compiled_file_with_body_writer_guarded<F>(
+    profile: Profile,
+    stream_id: u16,
+    dictionary_id: u16,
+    base_time_ns: i64,
+    header_comment: &str,
+    body_capacity: usize,
+    footer: CompiledFooter,
+    output_guard: &mut ByteGuard,
+    write_body: F,
+) -> Result<Option<(Vec<u8>, usize)>>
+where
+    F: FnOnce(&mut Vec<u8>, &mut ByteGuard) -> Result<bool>,
+{
+    try_encode_compiled_file_with_body_writer_inner(
+        profile,
+        stream_id,
+        dictionary_id,
+        base_time_ns,
+        header_comment,
+        body_capacity,
+        footer,
+        Some(output_guard),
+        |out, guard| {
+            let guard = guard.ok_or(AuraError::InvalidValue("output guard"))?;
+            write_body(out, guard)
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_encode_compiled_file_with_body_writer_inner<F>(
+    profile: Profile,
+    stream_id: u16,
+    dictionary_id: u16,
+    base_time_ns: i64,
+    header_comment: &str,
+    body_capacity: usize,
+    footer: CompiledFooter,
+    mut output_guard: Option<&mut ByteGuard>,
+    write_body: F,
+) -> Result<Option<(Vec<u8>, usize)>>
+where
+    F: FnOnce(&mut Vec<u8>, Option<&mut ByteGuard>) -> Result<bool>,
+{
     let profile_fast = std::env::var_os("AURA_PROFILE_FAST").is_some();
     let total_start = profile_fast.then(Instant::now);
     let stage_start = profile_fast.then(Instant::now);
@@ -962,7 +1124,11 @@ where
             + FOOTER_LEN_SIZE
             + SEAL_MAGIC.len(),
     );
+    let header_start = out.len();
     out.extend_from_slice(&header_bytes);
+    if let Some(output_guard) = output_guard.as_deref_mut() {
+        output_guard.update(&out[header_start..]);
+    }
     if let Some(stage_start) = stage_start {
         eprintln!(
             "compiled_file allocate_header_us={} capacity={}",
@@ -973,7 +1139,7 @@ where
 
     let stage_start = profile_fast.then(Instant::now);
     let body_start = out.len();
-    if !write_body(&mut out)? {
+    if !write_body(&mut out, output_guard.as_deref_mut())? {
         return Ok(None);
     }
     let body_len = out.len() - body_start;
@@ -986,9 +1152,21 @@ where
     }
 
     let stage_start = profile_fast.then(Instant::now);
+    let footer_start = out.len();
     out.extend_from_slice(&footer_bytes);
+    if let Some(output_guard) = output_guard.as_deref_mut() {
+        output_guard.update(&out[footer_start..]);
+    }
+    let footer_len_start = out.len();
     put_u32_le(&mut out, footer_len);
+    if let Some(output_guard) = output_guard.as_deref_mut() {
+        output_guard.update(&out[footer_len_start..]);
+    }
+    let seal_start = out.len();
     out.extend_from_slice(SEAL_MAGIC);
+    if let Some(output_guard) = output_guard.as_deref_mut() {
+        output_guard.update(&out[seal_start..]);
+    }
     if let Some(stage_start) = stage_start {
         eprintln!(
             "compiled_file trailer_us={} out_bytes={} total_us={}",

@@ -192,6 +192,7 @@ struct RunOutcome {
     record_count: usize,
     output_bytes: usize,
     guard: u64,
+    guard_mode: &'static str,
     post_process_duration: Duration,
 }
 
@@ -319,6 +320,7 @@ fn run_benchmark(config: &Config) -> Result<String> {
                 "median_post_process_runtime_ns": median_post_process_ns,
                 "p95_post_process_runtime_ns": p95_post_process_ns,
                 "post_process_note": "post-process time is output guard/checksum work after the measured operation; runtime_ns excludes it",
+                "guard_mode": first.guard_mode,
                 "records_per_sec": records_per_sec,
                 "mb_per_sec": mb_per_sec,
                 "compression_ratio": compression_ratio,
@@ -414,6 +416,7 @@ fn parse_aura1(bytes: &[u8]) -> Result<RunOutcome> {
         record_count,
         output_bytes: 0,
         guard,
+        guard_mode: "inline_parse",
         post_process_duration: Duration::ZERO,
     })
 }
@@ -432,12 +435,26 @@ fn decode_aura0(bytes: &[u8]) -> Result<RunOutcome> {
         record_count: decoded.rows.len(),
         output_bytes: 0,
         guard,
+        guard_mode: "inline_decode",
         post_process_duration: Duration::ZERO,
     })
 }
 
 fn transcode(bytes: &[u8], target: Profile, record_count: usize) -> Result<RunOutcome> {
+    if let Some(output) = records::try_compile_i64_file_with_fused_output_guard(bytes, target)? {
+        let output_bytes = output.bytes.len();
+        black_box(&output.bytes);
+        return Ok(RunOutcome {
+            record_count,
+            output_bytes,
+            guard: output.guard,
+            guard_mode: "fused_output",
+            post_process_duration: Duration::ZERO,
+        });
+    }
+
     let output = writer::compile_i64(bytes, target)?;
+    black_box(&output);
     let post_process_start = Instant::now();
     let guard = bytes_guard(&output);
     let post_process_duration = post_process_start.elapsed();
@@ -445,6 +462,7 @@ fn transcode(bytes: &[u8], target: Profile, record_count: usize) -> Result<RunOu
         record_count,
         output_bytes: output.len(),
         guard,
+        guard_mode: "post_process_output",
         post_process_duration,
     })
 }
@@ -570,6 +588,7 @@ fn csv_report(
         "median_post_process_runtime_ns",
         "p95_post_process_runtime_ns",
         "post_process_note",
+        "guard_mode",
         "records_per_sec",
         "mb_per_sec",
         "compression_ratio",
@@ -600,6 +619,7 @@ fn csv_report(
         median_post_process_ns.to_string(),
         p95_post_process_ns.to_string(),
         "post-process time is output guard/checksum work after the measured operation; runtime_ns excludes it".to_owned(),
+        outcome.guard_mode.to_owned(),
         format!("{records_per_sec:.6}"),
         format!("{mb_per_sec:.6}"),
         compression_ratio

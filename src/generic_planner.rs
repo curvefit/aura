@@ -7,7 +7,7 @@ use crate::body::{
     decode_generic_stream_body, encode_generic_stream_body, try_generic_i64_stream_cursor,
     GenericI64StreamCursor, GenericStreamBodyValue,
 };
-use crate::bytes::{put_u16_le, put_u32_le, put_u64_le, ByteReader};
+use crate::bytes::{put_u16_le, put_u32_le, put_u64_le, ByteGuard, ByteReader};
 use crate::header::{DerivedExpression, DerivedExpressionOp};
 use crate::instructions::{
     DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
@@ -950,6 +950,7 @@ fn try_write_partitioned_sparse_i64_aura1_body(
     field_count: usize,
     aura1_plan: &Aura1Plan,
     out: &mut Vec<u8>,
+    mut output_guard: Option<&mut ByteGuard>,
 ) -> Result<bool> {
     let Some(config) = PartitionedSparseColumnsPlan::from_plan(plan, field_count)? else {
         return Ok(false);
@@ -1114,19 +1115,26 @@ fn try_write_partitioned_sparse_i64_aura1_body(
                     config.presence_value
                 };
                 let offset = body_start + row * ROW_WIDTH;
-                write_partitioned_sparse_aura1_row(
-                    &mut out[offset..offset + ROW_WIDTH],
-                    [
-                        group0,
-                        group1,
-                        group2,
-                        partition_value,
-                        value,
-                        sparse5,
-                        sparse6,
-                        presence_value,
-                    ],
-                )?;
+                let row_end = offset + ROW_WIDTH;
+                let values = [
+                    group0,
+                    group1,
+                    group2,
+                    partition_value,
+                    value,
+                    sparse5,
+                    sparse6,
+                    presence_value,
+                ];
+                if let Some(output_guard) = output_guard.as_deref_mut() {
+                    write_partitioned_sparse_aura1_row_guarded(
+                        &mut out[offset..row_end],
+                        values,
+                        output_guard,
+                    )?;
+                } else {
+                    write_partitioned_sparse_aura1_row(&mut out[offset..row_end], values)?;
+                }
             }
 
             row_index = end;
@@ -1180,6 +1188,44 @@ fn write_partitioned_sparse_aura1_row(row: &mut [u8], values: [i64; 8]) -> Resul
     Ok(())
 }
 
+fn write_partitioned_sparse_aura1_row_guarded(
+    row: &mut [u8],
+    values: [i64; 8],
+    guard: &mut ByteGuard,
+) -> Result<()> {
+    debug_assert_eq!(row.len(), 46);
+    let v2 = i32::try_from(values[2]).map_err(|_| AuraError::InvalidValue("i32 value"))?;
+    let v3 = i8::try_from(values[3]).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+    let v7 = i8::try_from(values[7]).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+
+    write_guarded_i64(row, 0, values[0], guard);
+    write_guarded_i64(row, 8, values[1], guard);
+    write_guarded_i32(row, 16, v2, guard);
+    write_guarded_u8(row, 20, v3 as u8, guard);
+    write_guarded_i64(row, 21, values[4], guard);
+    write_guarded_i64(row, 29, values[5], guard);
+    write_guarded_i64(row, 37, values[6], guard);
+    write_guarded_u8(row, 45, v7 as u8, guard);
+    Ok(())
+}
+
+fn write_guarded_i64(row: &mut [u8], offset: usize, value: i64, guard: &mut ByteGuard) {
+    let bytes = value.to_le_bytes();
+    row[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    guard.update(&bytes);
+}
+
+fn write_guarded_i32(row: &mut [u8], offset: usize, value: i32, guard: &mut ByteGuard) {
+    let bytes = value.to_le_bytes();
+    row[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    guard.update(&bytes);
+}
+
+fn write_guarded_u8(row: &mut [u8], offset: usize, value: u8, guard: &mut ByteGuard) {
+    row[offset] = value;
+    guard.update(&[value]);
+}
+
 fn write_unaligned_i64_le(row: &mut [u8], offset: usize, value: i64) {
     debug_assert!(offset + std::mem::size_of::<i64>() <= row.len());
     unsafe {
@@ -1230,6 +1276,46 @@ pub(crate) fn try_write_generic_i64_aura1_body(
     aura1_plan: &Aura1Plan,
     out: &mut Vec<u8>,
 ) -> Result<bool> {
+    try_write_generic_i64_aura1_body_inner(
+        plan,
+        bytes,
+        record_count,
+        field_count,
+        aura1_plan,
+        out,
+        None,
+    )
+}
+
+pub(crate) fn try_write_generic_i64_aura1_body_guarded(
+    plan: GenericInstructionPlan,
+    bytes: &[u8],
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+    output_guard: &mut ByteGuard,
+) -> Result<bool> {
+    try_write_generic_i64_aura1_body_inner(
+        plan,
+        bytes,
+        record_count,
+        field_count,
+        aura1_plan,
+        out,
+        Some(output_guard),
+    )
+}
+
+fn try_write_generic_i64_aura1_body_inner(
+    plan: GenericInstructionPlan,
+    bytes: &[u8],
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+    mut output_guard: Option<&mut ByteGuard>,
+) -> Result<bool> {
     let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
     let total_start = profile.then(Instant::now);
     if plan.groups.iter().any(|group| {
@@ -1262,6 +1348,7 @@ pub(crate) fn try_write_generic_i64_aura1_body(
         field_count,
         aura1_plan,
         out,
+        output_guard.as_deref_mut(),
     )? {
         if let Some(stage_start) = stage_start {
             eprintln!(
@@ -1353,7 +1440,11 @@ pub(crate) fn try_write_generic_i64_aura1_body(
     for row_index in 0..record_count {
         for (slot, width) in &field_specs {
             let value = sources[*slot].value_at(row_index)?;
-            write_direct_i64_width(out, value, *width)?;
+            if let Some(output_guard) = output_guard.as_deref_mut() {
+                write_direct_i64_width_guarded(out, value, *width, output_guard)?;
+            } else {
+                write_direct_i64_width(out, value, *width)?;
+            }
         }
     }
     if let Some(stage_start) = stage_start {
@@ -2534,6 +2625,56 @@ fn write_direct_i64_width(out: &mut Vec<u8>, value: i64, width: PhysicalWidth) -
         }
         PhysicalWidth::I128 => {
             out.extend_from_slice(&i128::from(value).to_le_bytes());
+            Ok(())
+        }
+    }
+}
+
+fn write_direct_i64_width_guarded(
+    out: &mut Vec<u8>,
+    value: i64,
+    width: PhysicalWidth,
+    guard: &mut ByteGuard,
+) -> Result<()> {
+    match width {
+        PhysicalWidth::Zero => {
+            if value == 0 {
+                Ok(())
+            } else {
+                Err(AuraError::InvalidValue("zero-width value"))
+            }
+        }
+        PhysicalWidth::I8 => {
+            let value = i8::try_from(value).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+            let bytes = [value as u8];
+            out.extend_from_slice(&bytes);
+            guard.update(&bytes);
+            Ok(())
+        }
+        PhysicalWidth::I16 => {
+            let value = i16::try_from(value).map_err(|_| AuraError::InvalidValue("i16 value"))?;
+            let bytes = value.to_le_bytes();
+            out.extend_from_slice(&bytes);
+            guard.update(&bytes);
+            Ok(())
+        }
+        PhysicalWidth::I32 => {
+            let value = i32::try_from(value).map_err(|_| AuraError::InvalidValue("i32 value"))?;
+            let bytes = value.to_le_bytes();
+            out.extend_from_slice(&bytes);
+            guard.update(&bytes);
+            Ok(())
+        }
+        PhysicalWidth::I64 => {
+            let bytes = value.to_le_bytes();
+            out.extend_from_slice(&bytes);
+            guard.update(&bytes);
+            Ok(())
+        }
+        PhysicalWidth::I128 => {
+            let bytes = i128::from(value).to_le_bytes();
+            out.extend_from_slice(&bytes);
+            guard.update(&bytes);
             Ok(())
         }
     }

@@ -53,6 +53,13 @@ fn sample_input() -> I64FileInput {
     }
 }
 
+fn bytes_guard(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325u64, |acc, byte| {
+        acc.wrapping_mul(0x100000001b3)
+            .wrapping_add(u64::from(*byte))
+    })
+}
+
 #[test]
 fn writer_i64_finish_matches_legacy_ingest_helper() {
     let input = sample_input();
@@ -106,6 +113,24 @@ fn experimental_column_decode_matches_rows_without_row_materialization() {
             *column
         );
     }
+}
+
+#[test]
+fn aura0_to_aura1_fused_output_guard_matches_full_scan() {
+    let _guard = AURA_ENV_LOCK.lock().unwrap();
+    let _restore = EnvRestore::capture();
+    std::env::remove_var("AURA_FORCE_COLUMNS_AURA1");
+    std::env::remove_var("AURA_STREAM_AURA1");
+
+    let ingest = writer::encode_i64(sample_input()).unwrap();
+    let aura0 = writer::compile_i64(&ingest, Profile::Aura0).unwrap();
+    let expected = writer::compile_i64(&aura0, Profile::Aura1).unwrap();
+    let guarded = records::try_compile_i64_file_with_fused_output_guard(&aura0, Profile::Aura1)
+        .unwrap()
+        .expect("Aura0 -> Aura1 fused guard");
+
+    assert_eq!(expected, guarded.bytes);
+    assert_eq!(bytes_guard(&expected), guarded.guard);
 }
 
 #[test]

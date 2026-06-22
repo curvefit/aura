@@ -123,6 +123,7 @@ fn aura_bench_reports_required_json_fields_for_core_operations() {
             .as_str()
             .unwrap()
             .contains("runtime_ns excludes it"));
+        assert!(!json["guard_mode"].as_str().unwrap().is_empty());
         assert!(json["records_per_sec"].as_f64().unwrap() > 0.0);
         assert!(json["mb_per_sec"].as_f64().unwrap() > 0.0);
         assert!(json["command_used"].as_str().unwrap().contains(operation));
