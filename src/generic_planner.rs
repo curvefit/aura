@@ -7,7 +7,7 @@ use crate::body::{
     decode_generic_stream_body, encode_generic_stream_body, try_generic_i64_stream_cursor,
     GenericI64StreamCursor, GenericStreamBodyValue,
 };
-use crate::bytes::{put_u16_le, put_u32_le, put_u64_le, ByteReader};
+use crate::bytes::{put_u16_le, put_u32_le, put_u64_le, ByteGuard, ByteReader};
 use crate::header::{DerivedExpression, DerivedExpressionOp};
 use crate::instructions::{
     DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
@@ -68,6 +68,102 @@ struct PartitionRun {
 }
 
 const MAX_STREAMING_AURA1_FIELDS: usize = 64;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectAura1DecodeTimings {
+    pub total_ns: u128,
+    pub compressed_input_read_ns: u128,
+    pub huffman_entropy_decode_ns: u128,
+    pub delta_reconstruction_ns: u128,
+    pub dictionary_symbol_reconstruction_ns: u128,
+    pub validity_presence_bitmap_decode_ns: u128,
+    pub record_type_branching_ns: u128,
+    pub integer_scaling_sign_extension_ns: u128,
+    pub temporary_buffer_writes_ns: u128,
+    pub checksum_hash_work_ns: u128,
+    pub bounds_validation_ns: u128,
+    pub allocation_reuse_ns: u128,
+    pub unclassified_ns: u128,
+}
+
+impl DirectAura1DecodeTimings {
+    pub fn close_sum(&mut self) {
+        let classified = self
+            .compressed_input_read_ns
+            .saturating_add(self.huffman_entropy_decode_ns)
+            .saturating_add(self.delta_reconstruction_ns)
+            .saturating_add(self.dictionary_symbol_reconstruction_ns)
+            .saturating_add(self.validity_presence_bitmap_decode_ns)
+            .saturating_add(self.record_type_branching_ns)
+            .saturating_add(self.integer_scaling_sign_extension_ns)
+            .saturating_add(self.temporary_buffer_writes_ns)
+            .saturating_add(self.checksum_hash_work_ns)
+            .saturating_add(self.bounds_validation_ns)
+            .saturating_add(self.allocation_reuse_ns);
+        self.unclassified_ns = self.total_ns.saturating_sub(classified);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectAura1WriterTimings {
+    pub total_ns: u128,
+    pub sparse_partition_traversal_ns: u128,
+    pub output_offset_calculation_ns: u128,
+    pub field_reconstruction_packing_ns: u128,
+    pub output_byte_stores_ns: u128,
+    pub guard_hash_update_ns: u128,
+    pub bounds_checks_ns: u128,
+    pub branch_record_type_handling_ns: u128,
+    pub copy_cost_ns: u128,
+    pub buffer_slicing_view_creation_ns: u128,
+    pub partition_finalization_ns: u128,
+    pub allocation_reuse_ns: u128,
+    pub unclassified_ns: u128,
+}
+
+impl DirectAura1WriterTimings {
+    pub fn close_sum(&mut self) {
+        let classified = self
+            .sparse_partition_traversal_ns
+            .saturating_add(self.output_offset_calculation_ns)
+            .saturating_add(self.field_reconstruction_packing_ns)
+            .saturating_add(self.output_byte_stores_ns)
+            .saturating_add(self.guard_hash_update_ns)
+            .saturating_add(self.bounds_checks_ns)
+            .saturating_add(self.branch_record_type_handling_ns)
+            .saturating_add(self.copy_cost_ns)
+            .saturating_add(self.buffer_slicing_view_creation_ns)
+            .saturating_add(self.partition_finalization_ns)
+            .saturating_add(self.allocation_reuse_ns);
+        self.unclassified_ns = self.total_ns.saturating_sub(classified);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectAura1WriterStats {
+    pub partition_count: usize,
+    pub records_per_partition_min: usize,
+    pub records_per_partition_max: usize,
+    pub output_slices: usize,
+    pub non_contiguous_writes: usize,
+    pub guard_update_calls: usize,
+    pub guard_update_bytes: usize,
+    pub output_offset_calculations: usize,
+    pub bounds_checks: usize,
+    pub temporary_buffer_bytes: usize,
+    pub copied_bytes: usize,
+    pub allocation_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectAura1DecodeStats {
+    pub stream_count: usize,
+    pub stream_value_count: usize,
+    pub materialized_stream_count: usize,
+    pub materialized_value_count: usize,
+    pub direct_cursor_stream_count: usize,
+    pub direct_cursor_value_count: usize,
+}
 
 #[derive(Debug)]
 struct PartitionRunCandidate {
@@ -950,7 +1046,60 @@ fn try_write_partitioned_sparse_i64_aura1_body(
     field_count: usize,
     aura1_plan: &Aura1Plan,
     out: &mut Vec<u8>,
+    mut output_guard: Option<&mut ByteGuard>,
 ) -> Result<bool> {
+    try_write_partitioned_sparse_i64_aura1_body_inner(
+        plan,
+        stream_values,
+        record_count,
+        field_count,
+        aura1_plan,
+        out,
+        output_guard.as_deref_mut(),
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_write_partitioned_sparse_i64_aura1_body_profiled(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+    mut output_guard: Option<&mut ByteGuard>,
+    timings: &mut DirectAura1WriterTimings,
+    stats: &mut DirectAura1WriterStats,
+) -> Result<bool> {
+    try_write_partitioned_sparse_i64_aura1_body_inner(
+        plan,
+        stream_values,
+        record_count,
+        field_count,
+        aura1_plan,
+        out,
+        output_guard.as_deref_mut(),
+        Some(timings),
+        Some(stats),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_write_partitioned_sparse_i64_aura1_body_inner(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+    mut output_guard: Option<&mut ByteGuard>,
+    mut timings: Option<&mut DirectAura1WriterTimings>,
+    mut stats: Option<&mut DirectAura1WriterStats>,
+) -> Result<bool> {
+    let total_start = Instant::now();
+    let traversal_start = Instant::now();
     let Some(config) = PartitionedSparseColumnsPlan::from_plan(plan, field_count)? else {
         return Ok(false);
     };
@@ -1021,19 +1170,55 @@ fn try_write_partitioned_sparse_i64_aura1_body(
     let sparse5_bit = presence_bit_mask(config.sparse_presence_indices[0])?;
     let sparse6_bit = presence_bit_mask(config.sparse_presence_indices[1])?;
     let sparse_value_bit = presence_bit_mask(config.presence_value_index)?;
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.sparse_partition_traversal_ns = timings
+            .sparse_partition_traversal_ns
+            .saturating_add(traversal_start.elapsed().as_nanos());
+    }
 
     const ROW_WIDTH: usize = 46;
     let body_len = record_count
         .checked_mul(ROW_WIDTH)
         .ok_or(AuraError::InvalidValue("body length"))?;
     let body_start = out.len();
+    let allocation_start = Instant::now();
     out.resize(
         body_start
             .checked_add(body_len)
             .ok_or(AuraError::InvalidValue("body length"))?,
         0,
     );
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.allocation_reuse_ns = timings
+            .allocation_reuse_ns
+            .saturating_add(allocation_start.elapsed().as_nanos());
+    }
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.partition_count = partition_counts.len();
+        stats.records_per_partition_min = partition_counts
+            .iter()
+            .filter_map(|count| usize::try_from(*count).ok())
+            .min()
+            .unwrap_or(0);
+        stats.records_per_partition_max = partition_counts
+            .iter()
+            .filter_map(|count| usize::try_from(*count).ok())
+            .max()
+            .unwrap_or(0);
+        stats.output_slices = record_count;
+        stats.non_contiguous_writes = record_count;
+        stats.output_offset_calculations = record_count;
+        stats.bounds_checks = record_count;
+        stats.temporary_buffer_bytes = 0;
+        stats.copied_bytes = body_len;
+        stats.allocation_count = stats.allocation_count.saturating_add(1);
+        if output_guard.is_some() {
+            stats.guard_update_calls = stats.guard_update_calls.saturating_add(record_count * 8);
+            stats.guard_update_bytes = stats.guard_update_bytes.saturating_add(body_len);
+        }
+    }
 
+    let loop_start = Instant::now();
     let mut run_index = 0usize;
     let mut row_index = 0usize;
     let mut delta_index = 0usize;
@@ -1114,25 +1299,38 @@ fn try_write_partitioned_sparse_i64_aura1_body(
                     config.presence_value
                 };
                 let offset = body_start + row * ROW_WIDTH;
-                write_partitioned_sparse_aura1_row(
-                    &mut out[offset..offset + ROW_WIDTH],
-                    [
-                        group0,
-                        group1,
-                        group2,
-                        partition_value,
-                        value,
-                        sparse5,
-                        sparse6,
-                        presence_value,
-                    ],
-                )?;
+                let row_end = offset + ROW_WIDTH;
+                let values = [
+                    group0,
+                    group1,
+                    group2,
+                    partition_value,
+                    value,
+                    sparse5,
+                    sparse6,
+                    presence_value,
+                ];
+                if let Some(output_guard) = output_guard.as_deref_mut() {
+                    write_partitioned_sparse_aura1_row_guarded(
+                        &mut out[offset..row_end],
+                        values,
+                        output_guard,
+                    )?;
+                } else {
+                    write_partitioned_sparse_aura1_row(&mut out[offset..row_end], values)?;
+                }
             }
 
             row_index = end;
             run_index += 1;
         }
     }
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.output_byte_stores_ns = timings
+            .output_byte_stores_ns
+            .saturating_add(loop_start.elapsed().as_nanos());
+    }
+    let finalize_start = Instant::now();
     if run_index != partition_counts.len()
         || row_index != record_count
         || delta_index != delta_values.len()
@@ -1140,6 +1338,13 @@ fn try_write_partitioned_sparse_i64_aura1_body(
         || sparse6_index != sparse6_values.len()
     {
         return Err(AuraError::InvalidValue("partition run length"));
+    }
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.partition_finalization_ns = timings
+            .partition_finalization_ns
+            .saturating_add(finalize_start.elapsed().as_nanos());
+        timings.total_ns = total_start.elapsed().as_nanos();
+        timings.close_sum();
     }
 
     Ok(true)
@@ -1178,6 +1383,44 @@ fn write_partitioned_sparse_aura1_row(row: &mut [u8], values: [i64; 8]) -> Resul
     write_unaligned_i64_le(row, 37, values[6]);
     row[45] = v7 as u8;
     Ok(())
+}
+
+fn write_partitioned_sparse_aura1_row_guarded(
+    row: &mut [u8],
+    values: [i64; 8],
+    guard: &mut ByteGuard,
+) -> Result<()> {
+    debug_assert_eq!(row.len(), 46);
+    let v2 = i32::try_from(values[2]).map_err(|_| AuraError::InvalidValue("i32 value"))?;
+    let v3 = i8::try_from(values[3]).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+    let v7 = i8::try_from(values[7]).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+
+    write_guarded_i64(row, 0, values[0], guard);
+    write_guarded_i64(row, 8, values[1], guard);
+    write_guarded_i32(row, 16, v2, guard);
+    write_guarded_u8(row, 20, v3 as u8, guard);
+    write_guarded_i64(row, 21, values[4], guard);
+    write_guarded_i64(row, 29, values[5], guard);
+    write_guarded_i64(row, 37, values[6], guard);
+    write_guarded_u8(row, 45, v7 as u8, guard);
+    Ok(())
+}
+
+fn write_guarded_i64(row: &mut [u8], offset: usize, value: i64, guard: &mut ByteGuard) {
+    let bytes = value.to_le_bytes();
+    row[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    guard.update(&bytes);
+}
+
+fn write_guarded_i32(row: &mut [u8], offset: usize, value: i32, guard: &mut ByteGuard) {
+    let bytes = value.to_le_bytes();
+    row[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    guard.update(&bytes);
+}
+
+fn write_guarded_u8(row: &mut [u8], offset: usize, value: u8, guard: &mut ByteGuard) {
+    row[offset] = value;
+    guard.update(&[value]);
 }
 
 fn write_unaligned_i64_le(row: &mut [u8], offset: usize, value: i64) {
@@ -1230,6 +1473,48 @@ pub(crate) fn try_write_generic_i64_aura1_body(
     aura1_plan: &Aura1Plan,
     out: &mut Vec<u8>,
 ) -> Result<bool> {
+    try_write_generic_i64_aura1_body_inner(
+        plan,
+        bytes,
+        record_count,
+        field_count,
+        aura1_plan,
+        out,
+        None,
+    )
+}
+
+pub(crate) fn try_write_generic_i64_aura1_body_guarded(
+    plan: GenericInstructionPlan,
+    bytes: &[u8],
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+    output_guard: &mut ByteGuard,
+) -> Result<bool> {
+    try_write_generic_i64_aura1_body_inner(
+        plan,
+        bytes,
+        record_count,
+        field_count,
+        aura1_plan,
+        out,
+        Some(output_guard),
+    )
+}
+
+fn try_write_generic_i64_aura1_body_inner(
+    plan: GenericInstructionPlan,
+    bytes: &[u8],
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+    mut output_guard: Option<&mut ByteGuard>,
+) -> Result<bool> {
+    let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
+    let total_start = profile.then(Instant::now);
     if plan.groups.iter().any(|group| {
         matches!(
             group,
@@ -1242,7 +1527,17 @@ pub(crate) fn try_write_generic_i64_aura1_body(
         return Ok(false);
     }
 
+    let stage_start = profile.then(Instant::now);
     let stream_values = decode_generic_i64_stream_values(&plan, bytes)?;
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 decode_streams_us={} streams={}",
+            stage_start.elapsed().as_micros(),
+            plan.streams.len()
+        );
+    }
+
+    let stage_start = profile.then(Instant::now);
     if try_write_partitioned_sparse_i64_aura1_body(
         &plan,
         &stream_values,
@@ -1250,12 +1545,40 @@ pub(crate) fn try_write_generic_i64_aura1_body(
         field_count,
         aura1_plan,
         out,
+        output_guard.as_deref_mut(),
     )? {
+        if let Some(stage_start) = stage_start {
+            eprintln!(
+                "direct_aura1 partitioned_sparse_write_us={} total_us={}",
+                stage_start.elapsed().as_micros(),
+                total_start
+                    .map(|start| start.elapsed().as_micros())
+                    .unwrap_or(0)
+            );
+        }
         return Ok(true);
     }
+
+    let stage_start = profile.then(Instant::now);
     let partition_runs =
         partition_run_lengths_from_streams(&plan, &stream_values, record_count, field_count)?;
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 partition_runs_us={}",
+            stage_start.elapsed().as_micros()
+        );
+    }
+
+    let stage_start = profile.then(Instant::now);
     let presence_maps = presence_maps_by_group(&plan, &stream_values, record_count)?;
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 presence_maps_us={}",
+            stage_start.elapsed().as_micros()
+        );
+    }
+
+    let stage_start = profile.then(Instant::now);
     let mut sources = direct_aura1_slot_sources(
         &plan,
         &stream_values,
@@ -1264,7 +1587,14 @@ pub(crate) fn try_write_generic_i64_aura1_body(
         record_count,
         field_count,
     )?;
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 sources_us={}",
+            stage_start.elapsed().as_micros()
+        );
+    }
 
+    let stage_start = profile.then(Instant::now);
     let mut field_specs = Vec::with_capacity(aura1_plan.fields.len());
     let mut row_width = 0usize;
     for field_plan in &aura1_plan.fields {
@@ -1280,20 +1610,60 @@ pub(crate) fn try_write_generic_i64_aura1_body(
             .ok_or(AuraError::InvalidValue("body length"))?;
         field_specs.push((slot, field_plan.width));
     }
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 field_specs_us={} row_width={} fields={}",
+            stage_start.elapsed().as_micros(),
+            row_width,
+            field_specs.len()
+        );
+    }
 
+    let stage_start = profile.then(Instant::now);
     out.reserve(
         record_count
             .checked_mul(row_width)
             .ok_or(AuraError::InvalidValue("body length"))?,
     );
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 reserve_us={} reserved_body_bytes={}",
+            stage_start.elapsed().as_micros(),
+            record_count.saturating_mul(row_width)
+        );
+    }
+
+    let stage_start = profile.then(Instant::now);
     for row_index in 0..record_count {
         for (slot, width) in &field_specs {
             let value = sources[*slot].value_at(row_index)?;
-            write_direct_i64_width(out, value, *width)?;
+            if let Some(output_guard) = output_guard.as_deref_mut() {
+                write_direct_i64_width_guarded(out, value, *width, output_guard)?;
+            } else {
+                write_direct_i64_width(out, value, *width)?;
+            }
         }
     }
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 emit_rows_us={} rows={}",
+            stage_start.elapsed().as_micros(),
+            record_count
+        );
+    }
+
+    let stage_start = profile.then(Instant::now);
     for source in &mut sources {
         source.finish()?;
+    }
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "direct_aura1 finish_us={} total_us={}",
+            stage_start.elapsed().as_micros(),
+            total_start
+                .map(|start| start.elapsed().as_micros())
+                .unwrap_or(0)
+        );
     }
     Ok(true)
 }
@@ -1964,15 +2334,37 @@ fn decode_generic_i64_stream_values(
     plan: &GenericInstructionPlan,
     bytes: &[u8],
 ) -> Result<BTreeMap<u16, Vec<i64>>> {
+    decode_generic_i64_stream_values_profiled(plan, bytes, None)
+}
+
+pub(crate) fn decode_generic_i64_stream_values_profiled(
+    plan: &GenericInstructionPlan,
+    bytes: &[u8],
+    mut timings: Option<&mut DirectAura1DecodeTimings>,
+) -> Result<BTreeMap<u16, Vec<i64>>> {
+    let total_start = Instant::now();
+    let allocation_start = Instant::now();
     let instructions = plan
         .streams
         .iter()
         .map(|instruction| (instruction.stream_id, instruction))
         .collect::<BTreeMap<_, _>>();
     let mut stream_values = BTreeMap::new();
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.allocation_reuse_ns = timings
+            .allocation_reuse_ns
+            .saturating_add(allocation_start.elapsed().as_nanos());
+    }
     let mut reader = ByteReader::new(bytes);
+    let read_start = Instant::now();
     let stream_count = reader.read_u16_le()? as usize;
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.compressed_input_read_ns = timings
+            .compressed_input_read_ns
+            .saturating_add(read_start.elapsed().as_nanos());
+    }
     for _ in 0..stream_count {
+        let read_start = Instant::now();
         let stream_id = reader.read_u16_le()?;
         let value_count = usize::try_from(reader.read_u64_le()?)
             .map_err(|_| AuraError::InvalidValue("stream value count"))?;
@@ -1981,15 +2373,73 @@ fn decode_generic_i64_stream_values(
         let instruction = instructions
             .get(&stream_id)
             .ok_or(AuraError::InvalidValue("stream id"))?;
+        if let Some(timings) = timings.as_deref_mut() {
+            timings.compressed_input_read_ns = timings
+                .compressed_input_read_ns
+                .saturating_add(read_start.elapsed().as_nanos());
+        }
+        let decode_start = Instant::now();
         match decode_generic_stream_body(instruction, body, value_count)? {
             GenericStreamBodyValue::I64(values) => {
+                let elapsed_ns = decode_start.elapsed().as_nanos();
+                if let Some(timings) = timings.as_deref_mut() {
+                    add_decode_op_time(timings, &instruction.op, elapsed_ns);
+                }
                 stream_values.insert(stream_id, values);
             }
             GenericStreamBodyValue::U128(_) => return Err(AuraError::InvalidValue("body type")),
         }
     }
+    let validation_start = Instant::now();
     reader.finish()?;
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.bounds_validation_ns = timings
+            .bounds_validation_ns
+            .saturating_add(validation_start.elapsed().as_nanos());
+        timings.total_ns = total_start.elapsed().as_nanos();
+        timings.close_sum();
+    }
     Ok(stream_values)
+}
+
+fn add_decode_op_time(
+    timings: &mut DirectAura1DecodeTimings,
+    op: &GenericStreamOp,
+    elapsed_ns: u128,
+) {
+    match op {
+        GenericStreamOp::HuffmanDictionary { .. } => {
+            timings.huffman_entropy_decode_ns =
+                timings.huffman_entropy_decode_ns.saturating_add(elapsed_ns);
+        }
+        GenericStreamOp::Dictionary { .. } | GenericStreamOp::PackedDictionary { .. } => {
+            timings.dictionary_symbol_reconstruction_ns = timings
+                .dictionary_symbol_reconstruction_ns
+                .saturating_add(elapsed_ns);
+        }
+        GenericStreamOp::PrevDelta { .. }
+        | GenericStreamOp::PrevVarint { .. }
+        | GenericStreamOp::BlockLocal { .. } => {
+            timings.delta_reconstruction_ns =
+                timings.delta_reconstruction_ns.saturating_add(elapsed_ns);
+        }
+        GenericStreamOp::BaseBitpack { .. } | GenericStreamOp::PatchedBitpack { .. } => {
+            timings.integer_scaling_sign_extension_ns = timings
+                .integer_scaling_sign_extension_ns
+                .saturating_add(elapsed_ns);
+        }
+        GenericStreamOp::Rle { .. } | GenericStreamOp::BitplaneRle { .. } => {
+            timings.record_type_branching_ns =
+                timings.record_type_branching_ns.saturating_add(elapsed_ns);
+        }
+        GenericStreamOp::FixedStep { .. } => {
+            timings.temporary_buffer_writes_ns =
+                timings.temporary_buffer_writes_ns.saturating_add(elapsed_ns);
+        }
+        GenericStreamOp::UuidConstMask { .. } => {
+            timings.unclassified_ns = timings.unclassified_ns.saturating_add(elapsed_ns);
+        }
+    }
 }
 
 fn partition_run_lengths_from_streams(
@@ -2452,6 +2902,56 @@ fn write_direct_i64_width(out: &mut Vec<u8>, value: i64, width: PhysicalWidth) -
         }
         PhysicalWidth::I128 => {
             out.extend_from_slice(&i128::from(value).to_le_bytes());
+            Ok(())
+        }
+    }
+}
+
+fn write_direct_i64_width_guarded(
+    out: &mut Vec<u8>,
+    value: i64,
+    width: PhysicalWidth,
+    guard: &mut ByteGuard,
+) -> Result<()> {
+    match width {
+        PhysicalWidth::Zero => {
+            if value == 0 {
+                Ok(())
+            } else {
+                Err(AuraError::InvalidValue("zero-width value"))
+            }
+        }
+        PhysicalWidth::I8 => {
+            let value = i8::try_from(value).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+            let bytes = [value as u8];
+            out.extend_from_slice(&bytes);
+            guard.update(&bytes);
+            Ok(())
+        }
+        PhysicalWidth::I16 => {
+            let value = i16::try_from(value).map_err(|_| AuraError::InvalidValue("i16 value"))?;
+            let bytes = value.to_le_bytes();
+            out.extend_from_slice(&bytes);
+            guard.update(&bytes);
+            Ok(())
+        }
+        PhysicalWidth::I32 => {
+            let value = i32::try_from(value).map_err(|_| AuraError::InvalidValue("i32 value"))?;
+            let bytes = value.to_le_bytes();
+            out.extend_from_slice(&bytes);
+            guard.update(&bytes);
+            Ok(())
+        }
+        PhysicalWidth::I64 => {
+            let bytes = value.to_le_bytes();
+            out.extend_from_slice(&bytes);
+            guard.update(&bytes);
+            Ok(())
+        }
+        PhysicalWidth::I128 => {
+            let bytes = i128::from(value).to_le_bytes();
+            out.extend_from_slice(&bytes);
+            guard.update(&bytes);
             Ok(())
         }
     }

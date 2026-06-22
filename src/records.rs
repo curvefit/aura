@@ -4,13 +4,17 @@ use crate::bitpack::{
     bitpacked_byte_len, pack_signed_values, pack_unsigned_values, unpack_signed_values,
     unpack_unsigned_values,
 };
-use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, ByteReader};
+use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, ByteGuard, ByteReader};
 use crate::footer::AuraFooter;
 use crate::format::SEAL_MAGIC;
 use crate::generic_planner::{
     decode_generic_i64_rows_body, encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan,
-    plan_generic_i64_rows, try_decode_generic_i64_columns_body, try_encode_generic_i64_aura1_body,
-    try_encode_generic_i64_aura1_body_streaming, try_write_generic_i64_aura1_body,
+    decode_generic_i64_stream_values_profiled, plan_generic_i64_rows,
+    try_decode_generic_i64_columns_body,
+    try_encode_generic_i64_aura1_body, try_encode_generic_i64_aura1_body_streaming,
+    try_write_generic_i64_aura1_body, try_write_generic_i64_aura1_body_guarded,
+    try_write_partitioned_sparse_i64_aura1_body_profiled, DirectAura1DecodeTimings,
+    DirectAura1DecodeStats, DirectAura1WriterStats, DirectAura1WriterTimings,
 };
 use crate::header::{AuraHeader, LEGACY_HEADER_PREFIX_SIZE};
 use crate::instructions::GenericInstructionPlan;
@@ -63,6 +67,57 @@ pub struct DecodedTypedFile {
     pub ingest_footer: Option<AuraFooter>,
     pub compiled_footer: Option<CompiledFooter>,
     pub rows: Vec<Vec<AuraTypedValue>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedCompileOutput {
+    pub bytes: Vec<u8>,
+    pub guard: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputGuardMode {
+    NoGuard,
+    FusedOutputGuard,
+    OldPostOutputGuard,
+    BlockBatchedOutputGuard,
+}
+
+impl OutputGuardMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoGuard => "no_guard",
+            Self::FusedOutputGuard => "fused_output_guard",
+            Self::OldPostOutputGuard => "old_post_output_guard",
+            Self::BlockBatchedOutputGuard => "block_batched_output_guard",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectAura1TranscodeTimings {
+    pub metadata_ns: u128,
+    pub allocate_header_ns: u128,
+    pub decode_input_streams: DirectAura1DecodeTimings,
+    pub partitioned_sparse_writer: DirectAura1WriterTimings,
+    pub trailer_ns: u128,
+    pub post_output_guard_ns: u128,
+    pub total_ns: u128,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectAura1TranscodeStats {
+    pub decode: DirectAura1DecodeStats,
+    pub writer: DirectAura1WriterStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfiledCompileOutput {
+    pub bytes: Vec<u8>,
+    pub output_byte_guard: Option<u64>,
+    pub guard_mode: OutputGuardMode,
+    pub timings: DirectAura1TranscodeTimings,
+    pub stats: DirectAura1TranscodeStats,
 }
 
 pub fn encode_ingest_i64_file(input: I64FileInput) -> Result<Vec<u8>> {
@@ -145,6 +200,86 @@ pub(crate) fn encode_ingest_i64_file_inner(input: I64FileInput) -> Result<Vec<u8
 
 pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
     crate::writer::compile_i64(bytes, target_profile)
+}
+
+pub fn try_compile_i64_file_with_fused_output_guard(
+    bytes: &[u8],
+    target_profile: Profile,
+) -> Result<Option<GuardedCompileOutput>> {
+    if target_profile != Profile::Aura1 {
+        return Ok(None);
+    }
+    if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+        return Ok(None);
+    }
+    let seal_offset = bytes.len() - SEAL_MAGIC.len();
+    if &bytes[seal_offset..] != SEAL_MAGIC {
+        return Ok(None);
+    }
+    let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
+    let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
+    let header_len = AuraHeader::encoded_len(bytes)?;
+    if header_len > footer_len_offset {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let header = AuraHeader::decode(&bytes[..header_len])?;
+    if header.profile != Profile::Aura0 {
+        return Ok(None);
+    }
+    let footer_start = footer_len_offset
+        .checked_sub(footer_len)
+        .ok_or(AuraError::UnexpectedEof)?;
+    if footer_start < header_len {
+        return Err(AuraError::UnexpectedEof);
+    }
+    try_compile_aura0_to_aura1_fast_guarded(
+        bytes,
+        header,
+        header_len,
+        footer_start,
+        footer_len_offset,
+    )
+}
+
+pub fn try_compile_i64_file_profiled(
+    bytes: &[u8],
+    target_profile: Profile,
+    guard_mode: OutputGuardMode,
+) -> Result<Option<ProfiledCompileOutput>> {
+    if target_profile != Profile::Aura1 {
+        return Ok(None);
+    }
+    if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+        return Ok(None);
+    }
+    let seal_offset = bytes.len() - SEAL_MAGIC.len();
+    if &bytes[seal_offset..] != SEAL_MAGIC {
+        return Ok(None);
+    }
+    let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
+    let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
+    let header_len = AuraHeader::encoded_len(bytes)?;
+    if header_len > footer_len_offset {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let header = AuraHeader::decode(&bytes[..header_len])?;
+    if header.profile != Profile::Aura0 {
+        return Ok(None);
+    }
+    let footer_start = footer_len_offset
+        .checked_sub(footer_len)
+        .ok_or(AuraError::UnexpectedEof)?;
+    if footer_start < header_len {
+        return Err(AuraError::UnexpectedEof);
+    }
+    try_compile_aura0_to_aura1_fast_profiled(
+        bytes,
+        header,
+        header_len,
+        footer_start,
+        footer_len_offset,
+        guard_mode,
+    )
 }
 
 pub(crate) fn compile_i64_file_inner(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
@@ -474,6 +609,229 @@ fn try_compile_aura0_to_aura1_fast(
         );
     }
     Ok(Some(out))
+}
+
+fn try_compile_aura0_to_aura1_fast_guarded(
+    bytes: &[u8],
+    header: AuraHeader,
+    header_len: usize,
+    footer_start: usize,
+    footer_len_offset: usize,
+) -> Result<Option<GuardedCompileOutput>> {
+    if std::env::var_os("AURA_STREAM_AURA1").is_some()
+        || std::env::var_os("AURA_FORCE_COLUMNS_AURA1").is_some()
+    {
+        return Ok(None);
+    }
+
+    let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+    validate_header_schema_agreement(&header, &footer.schema)?;
+    if schema_has_wide_fields(&footer.schema) {
+        return Err(AuraError::InvalidValue("i64 schema"));
+    }
+    let Some(plan) = footer.generic_aura0_plan.clone() else {
+        return Ok(None);
+    };
+    let record_count = usize::try_from(footer.record_count)
+        .map_err(|_| AuraError::InvalidValue("record count"))?;
+    let field_count = footer.schema.fields.len();
+    let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+    let body_capacity = aura1_body_capacity(record_count, &aura1_plan)?;
+    let mut guard = ByteGuard::new();
+    let Some((bytes, _body_len)) = try_encode_compiled_file_with_body_writer_guarded(
+        Profile::Aura1,
+        header.stream_id,
+        header.dictionary_id,
+        header.base_time_ns,
+        header.comment.as_str(),
+        body_capacity,
+        footer,
+        &mut guard,
+        |out, output_guard| {
+            try_write_generic_i64_aura1_body_guarded(
+                plan,
+                &bytes[header_len..footer_start],
+                record_count,
+                field_count,
+                &aura1_plan,
+                out,
+                output_guard,
+            )
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(GuardedCompileOutput {
+        bytes,
+        guard: guard.value(),
+    }))
+}
+
+fn try_compile_aura0_to_aura1_fast_profiled(
+    bytes: &[u8],
+    header: AuraHeader,
+    header_len: usize,
+    footer_start: usize,
+    footer_len_offset: usize,
+    guard_mode: OutputGuardMode,
+) -> Result<Option<ProfiledCompileOutput>> {
+    if std::env::var_os("AURA_STREAM_AURA1").is_some()
+        || std::env::var_os("AURA_FORCE_COLUMNS_AURA1").is_some()
+    {
+        return Ok(None);
+    }
+
+    let total_start = Instant::now();
+    let mut timings = DirectAura1TranscodeTimings::default();
+    let mut stats = DirectAura1TranscodeStats::default();
+
+    let metadata_start = Instant::now();
+    let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+    validate_header_schema_agreement(&header, &footer.schema)?;
+    if schema_has_wide_fields(&footer.schema) {
+        return Err(AuraError::InvalidValue("i64 schema"));
+    }
+    let Some(plan) = footer.generic_aura0_plan.clone() else {
+        return Ok(None);
+    };
+    let record_count = usize::try_from(footer.record_count)
+        .map_err(|_| AuraError::InvalidValue("record count"))?;
+    let field_count = footer.schema.fields.len();
+    let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+    let body_capacity = aura1_body_capacity(record_count, &aura1_plan)?;
+    let footer_bytes = footer.encode()?;
+    let footer_len =
+        u32::try_from(footer_bytes.len()).map_err(|_| AuraError::InvalidValue("footer length"))?;
+    let header_out = AuraHeader::new(Profile::Aura1)
+        .with_stream(
+            header.stream_id,
+            header.dictionary_id,
+            header.base_time_ns,
+        )
+        .with_schema_mapping(schema_parent_mapping(&footer.schema)?)?
+        .with_derived_expressions(footer.schema.derived_expressions.clone())?
+        .with_comment(header.comment.as_str())?;
+    let header_bytes = header_out.encode()?;
+    timings.metadata_ns = metadata_start.elapsed().as_nanos();
+
+    let allocate_start = Instant::now();
+    let mut out = Vec::with_capacity(
+        header_bytes.len()
+            + body_capacity
+            + footer_bytes.len()
+            + FOOTER_LEN_SIZE
+            + SEAL_MAGIC.len(),
+    );
+    out.extend_from_slice(&header_bytes);
+    timings.allocate_header_ns = allocate_start.elapsed().as_nanos();
+
+    let mut guard = ByteGuard::new();
+    let mut output_byte_guard = None;
+    let guard_active = matches!(
+        guard_mode,
+        OutputGuardMode::FusedOutputGuard | OutputGuardMode::BlockBatchedOutputGuard
+    );
+    if guard_active {
+        guard.update(&header_bytes);
+    }
+
+    let stream_values = decode_generic_i64_stream_values_profiled(
+        &plan,
+        &bytes[header_len..footer_start],
+        Some(&mut timings.decode_input_streams),
+    )?;
+    stats.decode.stream_count = stream_values.len();
+    stats.decode.stream_value_count = stream_values.values().map(Vec::len).sum();
+    stats.decode.materialized_stream_count = stats.decode.stream_count;
+    stats.decode.materialized_value_count = stats.decode.stream_value_count;
+
+    let body_start = out.len();
+    let writer_supported = match guard_mode {
+        OutputGuardMode::FusedOutputGuard => try_write_partitioned_sparse_i64_aura1_body_profiled(
+            &plan,
+            &stream_values,
+            record_count,
+            field_count,
+            &aura1_plan,
+            &mut out,
+            Some(&mut guard),
+            &mut timings.partitioned_sparse_writer,
+            &mut stats.writer,
+        )?,
+        OutputGuardMode::NoGuard
+        | OutputGuardMode::OldPostOutputGuard
+        | OutputGuardMode::BlockBatchedOutputGuard => {
+            try_write_partitioned_sparse_i64_aura1_body_profiled(
+                &plan,
+                &stream_values,
+                record_count,
+                field_count,
+                &aura1_plan,
+                &mut out,
+                None,
+                &mut timings.partitioned_sparse_writer,
+                &mut stats.writer,
+            )?
+        }
+    };
+    if !writer_supported {
+        return Ok(None);
+    }
+    let body_end = out.len();
+    if guard_mode == OutputGuardMode::BlockBatchedOutputGuard {
+        let guard_start = Instant::now();
+        guard.update(&out[body_start..body_end]);
+        let guard_ns = guard_start.elapsed().as_nanos();
+        timings.partitioned_sparse_writer.guard_hash_update_ns = timings
+            .partitioned_sparse_writer
+            .guard_hash_update_ns
+            .saturating_add(guard_ns);
+        timings.partitioned_sparse_writer.total_ns = timings
+            .partitioned_sparse_writer
+            .total_ns
+            .saturating_add(guard_ns);
+        timings.partitioned_sparse_writer.close_sum();
+        stats.writer.guard_update_calls = stats.writer.guard_update_calls.saturating_add(1);
+        stats.writer.guard_update_bytes = stats
+            .writer
+            .guard_update_bytes
+            .saturating_add(body_end - body_start);
+    }
+
+    let trailer_start = Instant::now();
+    out.extend_from_slice(&footer_bytes);
+    if guard_active {
+        guard.update(&footer_bytes);
+    }
+    let footer_len_bytes = footer_len.to_le_bytes();
+    out.extend_from_slice(&footer_len_bytes);
+    if guard_active {
+        guard.update(&footer_len_bytes);
+    }
+    out.extend_from_slice(SEAL_MAGIC);
+    if guard_active {
+        guard.update(SEAL_MAGIC);
+        output_byte_guard = Some(guard.value());
+    }
+    timings.trailer_ns = trailer_start.elapsed().as_nanos();
+
+    if guard_mode == OutputGuardMode::OldPostOutputGuard {
+        let guard_start = Instant::now();
+        let mut post_guard = ByteGuard::new();
+        post_guard.update(&out);
+        timings.post_output_guard_ns = guard_start.elapsed().as_nanos();
+        output_byte_guard = Some(post_guard.value());
+    }
+
+    timings.total_ns = total_start.elapsed().as_nanos();
+    Ok(Some(ProfiledCompileOutput {
+        bytes: out,
+        output_byte_guard,
+        guard_mode,
+        timings,
+        stats,
+    }))
 }
 
 pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
@@ -933,6 +1291,68 @@ fn try_encode_compiled_file_with_body_writer<F>(
 where
     F: FnOnce(&mut Vec<u8>) -> Result<bool>,
 {
+    try_encode_compiled_file_with_body_writer_inner(
+        profile,
+        stream_id,
+        dictionary_id,
+        base_time_ns,
+        header_comment,
+        body_capacity,
+        footer,
+        None,
+        |out, _guard| write_body(out),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_encode_compiled_file_with_body_writer_guarded<F>(
+    profile: Profile,
+    stream_id: u16,
+    dictionary_id: u16,
+    base_time_ns: i64,
+    header_comment: &str,
+    body_capacity: usize,
+    footer: CompiledFooter,
+    output_guard: &mut ByteGuard,
+    write_body: F,
+) -> Result<Option<(Vec<u8>, usize)>>
+where
+    F: FnOnce(&mut Vec<u8>, &mut ByteGuard) -> Result<bool>,
+{
+    try_encode_compiled_file_with_body_writer_inner(
+        profile,
+        stream_id,
+        dictionary_id,
+        base_time_ns,
+        header_comment,
+        body_capacity,
+        footer,
+        Some(output_guard),
+        |out, guard| {
+            let guard = guard.ok_or(AuraError::InvalidValue("output guard"))?;
+            write_body(out, guard)
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_encode_compiled_file_with_body_writer_inner<F>(
+    profile: Profile,
+    stream_id: u16,
+    dictionary_id: u16,
+    base_time_ns: i64,
+    header_comment: &str,
+    body_capacity: usize,
+    footer: CompiledFooter,
+    mut output_guard: Option<&mut ByteGuard>,
+    write_body: F,
+) -> Result<Option<(Vec<u8>, usize)>>
+where
+    F: FnOnce(&mut Vec<u8>, Option<&mut ByteGuard>) -> Result<bool>,
+{
+    let profile_fast = std::env::var_os("AURA_PROFILE_FAST").is_some();
+    let total_start = profile_fast.then(Instant::now);
+    let stage_start = profile_fast.then(Instant::now);
     let footer_bytes = footer.encode()?;
     let footer_len =
         u32::try_from(footer_bytes.len()).map_err(|_| AuraError::InvalidValue("footer length"))?;
@@ -942,7 +1362,16 @@ where
         .with_derived_expressions(footer.schema.derived_expressions.clone())?
         .with_comment(header_comment)?;
     let header_bytes = header.encode()?;
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "compiled_file metadata_us={} header_bytes={} footer_bytes={}",
+            stage_start.elapsed().as_micros(),
+            header_bytes.len(),
+            footer_bytes.len()
+        );
+    }
 
+    let stage_start = profile_fast.then(Instant::now);
     let mut out = Vec::with_capacity(
         header_bytes.len()
             + body_capacity
@@ -950,15 +1379,59 @@ where
             + FOOTER_LEN_SIZE
             + SEAL_MAGIC.len(),
     );
+    let header_start = out.len();
     out.extend_from_slice(&header_bytes);
+    if let Some(output_guard) = output_guard.as_deref_mut() {
+        output_guard.update(&out[header_start..]);
+    }
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "compiled_file allocate_header_us={} capacity={}",
+            stage_start.elapsed().as_micros(),
+            out.capacity()
+        );
+    }
+
+    let stage_start = profile_fast.then(Instant::now);
     let body_start = out.len();
-    if !write_body(&mut out)? {
+    if !write_body(&mut out, output_guard.as_deref_mut())? {
         return Ok(None);
     }
     let body_len = out.len() - body_start;
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "compiled_file body_writer_us={} body_bytes={}",
+            stage_start.elapsed().as_micros(),
+            body_len
+        );
+    }
+
+    let stage_start = profile_fast.then(Instant::now);
+    let footer_start = out.len();
     out.extend_from_slice(&footer_bytes);
+    if let Some(output_guard) = output_guard.as_deref_mut() {
+        output_guard.update(&out[footer_start..]);
+    }
+    let footer_len_start = out.len();
     put_u32_le(&mut out, footer_len);
+    if let Some(output_guard) = output_guard.as_deref_mut() {
+        output_guard.update(&out[footer_len_start..]);
+    }
+    let seal_start = out.len();
     out.extend_from_slice(SEAL_MAGIC);
+    if let Some(output_guard) = output_guard.as_deref_mut() {
+        output_guard.update(&out[seal_start..]);
+    }
+    if let Some(stage_start) = stage_start {
+        eprintln!(
+            "compiled_file trailer_us={} out_bytes={} total_us={}",
+            stage_start.elapsed().as_micros(),
+            out.len(),
+            total_start
+                .map(|start| start.elapsed().as_micros())
+                .unwrap_or(0)
+        );
+    }
     Ok(Some((out, body_len)))
 }
 

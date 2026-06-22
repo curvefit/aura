@@ -86,6 +86,32 @@ pub fn put_i64_le(out: &mut Vec<u8>, value: i64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ByteGuard {
+    value: u64,
+}
+
+impl ByteGuard {
+    pub(crate) const SEED: u64 = 0xcbf29ce484222325;
+
+    pub(crate) const fn new() -> Self {
+        Self { value: Self::SEED }
+    }
+
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.value = self
+                .value
+                .wrapping_mul(0x100000001b3)
+                .wrapping_add(u64::from(*byte));
+        }
+    }
+
+    pub(crate) const fn value(self) -> u64 {
+        self.value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +137,19 @@ mod tests {
         assert_eq!(1025, reader.read_u32_le().unwrap());
         assert_eq!(-9, reader.read_i64_le().unwrap());
         assert_eq!(Ok(()), reader.finish());
+    }
+
+    #[test]
+    fn byte_guard_matches_incremental_updates() {
+        let bytes = b"aura output bytes";
+        let mut one_shot = ByteGuard::new();
+        one_shot.update(bytes);
+
+        let mut incremental = ByteGuard::new();
+        incremental.update(&bytes[..4]);
+        incremental.update(&bytes[4..11]);
+        incremental.update(&bytes[11..]);
+
+        assert_eq!(one_shot, incremental);
     }
 }
