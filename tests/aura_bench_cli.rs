@@ -1243,3 +1243,86 @@ fn aura_bench_reports_real_aura0_byte_lane_profile() {
 
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn aura_bench_runs_sdk_generic_fixture_smoke_matrix() {
+    let Some(bench_bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
+        panic!("missing aura-bench binary");
+    };
+    let Some(fixture_bin) = option_env!("CARGO_BIN_EXE_aura-fixture-gen") else {
+        panic!("missing aura-fixture-gen binary");
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "aura-sdk-generic-bench-smoke-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let fixture_output = Command::new(fixture_bin)
+        .arg("--output-dir")
+        .arg(&dir)
+        .arg("--zstd-level")
+        .arg("3")
+        .output()
+        .unwrap();
+    assert!(
+        fixture_output.status.success(),
+        "fixture stdout:\n{}\nfixture stderr:\n{}",
+        String::from_utf8_lossy(&fixture_output.stdout),
+        String::from_utf8_lossy(&fixture_output.stderr)
+    );
+
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("fixtures.json")).unwrap()).unwrap();
+    let sdk_tiny = metadata
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|fixture| fixture["dataset_name"] == "sdk-tiny")
+        .expect("sdk-tiny fixture");
+    let aura0_path = sdk_tiny["paths"]["aura0"].as_str().unwrap();
+    let aura1_path = sdk_tiny["paths"]["aura1"].as_str().unwrap();
+
+    let output = Command::new(bench_bin)
+        .arg("--operation")
+        .arg("aura0-to-aura1-bytes")
+        .arg("--dataset")
+        .arg("sdk-tiny")
+        .arg("--input")
+        .arg(aura0_path)
+        .arg("--reference-aura0")
+        .arg(aura0_path)
+        .arg("--reference-aura1")
+        .arg(aura1_path)
+        .arg("--iterations")
+        .arg("1")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "bench stdout:\n{}\nbench stderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!("sdk-tiny", json["dataset_name"]);
+    assert_eq!("aura0-to-aura1-bytes", json["operation"]);
+    assert_eq!("aura0", json["source_format"]);
+    assert_eq!("aura1", json["target_format"]);
+    assert_eq!("memory_vec", json["output_sink"]);
+    assert!(json["conversion_plan_hash"].as_u64().unwrap() > 0);
+    assert_eq!(true, json["compiled_plan_used"]);
+    assert!(json["record_count"].as_u64().unwrap() > 0);
+    assert!(json["output_bytes"].as_u64().unwrap() > 0);
+
+    let smoke: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("sdk_bench_smoke.json")).unwrap()).unwrap();
+    assert_eq!("sdk-generic-smoke", smoke["matrix_kind"]);
+    assert!(smoke["entries"].as_array().unwrap().len() >= 21);
+
+    fs::remove_dir_all(&dir).unwrap();
+}

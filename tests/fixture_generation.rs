@@ -41,6 +41,13 @@ fn aura_fixture_gen_writes_compatible_fixture_matrix() {
             "dense-few-symbol",
             "sparse-many-symbol",
             "huff",
+            "sdk-tiny",
+            "sdk-narrow",
+            "sdk-wide",
+            "sdk-reordered",
+            "sdk-dense",
+            "sdk-sparse",
+            "sdk-edge-case",
             "nohuff",
             "larger"
         ]
@@ -61,6 +68,13 @@ fn aura_fixture_gen_writes_compatible_fixture_matrix() {
         let aura1_zst_path = fixture["paths"]["aura1_zst"].as_str().unwrap();
         assert_eq!(true, fixture["row_equality_verified"]);
         assert!(fixture["record_count"].as_u64().unwrap() > 0);
+        assert!(fixture["schema_hash"].as_u64().unwrap() > 0);
+        assert!(fixture["schema_name"].as_str().unwrap().len() > 0);
+        assert_eq!(
+            fixture["field_count"].as_u64().unwrap() as usize,
+            fixture["field_names"].as_array().unwrap().len()
+        );
+        assert!(fixture["record_width"].as_u64().unwrap() > 0);
         assert_eq!(64, fixture["aura0_sha256"].as_str().unwrap().len());
         assert_eq!(64, fixture["aura1_sha256"].as_str().unwrap().len());
         assert_eq!(64, fixture["aura1_zst_sha256"].as_str().unwrap().len());
@@ -85,4 +99,21 @@ fn aura_fixture_gen_writes_compatible_fixture_matrix() {
         .find(|fixture| fixture["dataset_name"] == "nohuff")
         .unwrap();
     assert_eq!(0, nohuff["huffman_stream_count"].as_u64().unwrap());
+
+    let smoke_path = dir.join("sdk_bench_smoke.json");
+    let smoke: Value = serde_json::from_slice(&fs::read(&smoke_path).unwrap()).unwrap();
+    assert_eq!("sdk-generic-smoke", smoke["matrix_kind"]);
+    let entries = smoke["entries"].as_array().unwrap();
+    assert!(entries.len() >= 21);
+    assert!(entries
+        .iter()
+        .any(|entry| entry["dataset_kind"] == "sdk-reordered"
+            && entry["operation"] == "aura0-to-aura1-bytes"));
+    for entry in entries {
+        assert!(entry["dataset_kind"].as_str().unwrap().starts_with("sdk-"));
+        assert!(entry["schema_hash"].as_u64().unwrap() > 0);
+        assert!(entry["field_count"].as_u64().unwrap() > 0);
+        assert!(entry["record_width"].as_u64().unwrap() > 0);
+        assert!(entry["command"].as_array().unwrap().len() > 8);
+    }
 }

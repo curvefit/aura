@@ -59,6 +59,18 @@ pub struct DecodedI64File {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedI64FileMetadata {
+    pub header: AuraHeader,
+    pub schema: SchemaDescriptor,
+    pub ingest_footer: Option<AuraFooter>,
+    pub compiled_footer: Option<CompiledFooter>,
+    pub record_count: usize,
+    pub header_len: usize,
+    pub footer_start: usize,
+    pub footer_len_offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedI64ColumnsFile {
     pub header: AuraHeader,
     pub schema: SchemaDescriptor,
@@ -1524,6 +1536,71 @@ pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
     crate::reader::decode_i64(bytes)
 }
 
+pub fn decode_i64_file_metadata(bytes: &[u8]) -> Result<DecodedI64FileMetadata> {
+    if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let seal_offset = bytes.len() - SEAL_MAGIC.len();
+    if &bytes[seal_offset..] != SEAL_MAGIC {
+        return Err(AuraError::InvalidMagic {
+            expected: "sealed:)",
+        });
+    }
+    let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
+    let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
+    let header_len = AuraHeader::encoded_len(bytes)?;
+    if header_len > footer_len_offset {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let header = AuraHeader::decode(&bytes[..header_len])?;
+    let footer_start = footer_len_offset
+        .checked_sub(footer_len)
+        .ok_or(AuraError::UnexpectedEof)?;
+    if footer_start < header_len {
+        return Err(AuraError::UnexpectedEof);
+    }
+    match header.profile {
+        Profile::Ingest => {
+            let footer = AuraFooter::decode(&bytes[footer_start..footer_len_offset])?;
+            validate_header_schema_agreement(&header, &footer.schema)?;
+            if schema_has_wide_fields(&footer.schema) {
+                return Err(AuraError::InvalidValue("i64 schema"));
+            }
+            let record_count = usize::try_from(footer.stats.record_count)
+                .map_err(|_| AuraError::InvalidValue("record count"))?;
+            Ok(DecodedI64FileMetadata {
+                header,
+                schema: footer.schema.clone(),
+                ingest_footer: Some(footer),
+                compiled_footer: None,
+                record_count,
+                header_len,
+                footer_start,
+                footer_len_offset,
+            })
+        }
+        Profile::Aura0 | Profile::Aura1 => {
+            let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+            validate_header_schema_agreement(&header, &footer.schema)?;
+            if schema_has_wide_fields(&footer.schema) {
+                return Err(AuraError::InvalidValue("i64 schema"));
+            }
+            let record_count = usize::try_from(footer.record_count)
+                .map_err(|_| AuraError::InvalidValue("record count"))?;
+            Ok(DecodedI64FileMetadata {
+                header,
+                schema: footer.schema.clone(),
+                ingest_footer: None,
+                compiled_footer: Some(footer),
+                record_count,
+                header_len,
+                footer_start,
+                footer_len_offset,
+            })
+        }
+    }
+}
+
 pub fn decode_i64_columns_file(bytes: &[u8]) -> Result<Option<DecodedI64ColumnsFile>> {
     if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
         return Err(AuraError::UnexpectedEof);
@@ -1671,6 +1748,79 @@ where
         &bytes[header_len..footer_start],
         &compiled_plan.aura1_plan,
         compiled_plan.record_count,
+        compiled_plan.field_count,
+        &mut visitor,
+    )
+}
+
+pub fn visit_i64_rows_file_range<F>(
+    bytes: &[u8],
+    start_row: usize,
+    max_rows: usize,
+    mut visitor: F,
+) -> Result<usize>
+where
+    F: FnMut(&[i64]) -> Result<()>,
+{
+    if max_rows == 0 {
+        return Ok(0);
+    }
+    if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let seal_offset = bytes.len() - SEAL_MAGIC.len();
+    if &bytes[seal_offset..] != SEAL_MAGIC {
+        return Err(AuraError::InvalidMagic {
+            expected: "sealed:)",
+        });
+    }
+    let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
+    let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
+    let header_len = AuraHeader::encoded_len(bytes)?;
+    if header_len > footer_len_offset {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let header = AuraHeader::decode(&bytes[..header_len])?;
+    let footer_start = footer_len_offset
+        .checked_sub(footer_len)
+        .ok_or(AuraError::UnexpectedEof)?;
+    if footer_start < header_len {
+        return Err(AuraError::UnexpectedEof);
+    }
+    if header.profile != Profile::Aura1 {
+        return Err(AuraError::InvalidValue("aura1 visitor profile"));
+    }
+
+    let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+    validate_header_schema_agreement(&header, &footer.schema)?;
+    if schema_has_wide_fields(&footer.schema) {
+        return Err(AuraError::InvalidValue("i64 schema"));
+    }
+    let compiled_plan = CompiledAuraPlan::from_footer(&footer)?;
+    if start_row > compiled_plan.record_count {
+        return Err(AuraError::InvalidValue("row range"));
+    }
+    let rows_to_visit = max_rows.min(compiled_plan.record_count - start_row);
+    if rows_to_visit == 0 {
+        return Ok(0);
+    }
+    let body = &bytes[header_len..footer_start];
+    let byte_start = start_row
+        .checked_mul(compiled_plan.aura1_record_width)
+        .ok_or(AuraError::InvalidValue("row range"))?;
+    let byte_len = rows_to_visit
+        .checked_mul(compiled_plan.aura1_record_width)
+        .ok_or(AuraError::InvalidValue("row range"))?;
+    let byte_end = byte_start
+        .checked_add(byte_len)
+        .ok_or(AuraError::InvalidValue("row range"))?;
+    let range = body
+        .get(byte_start..byte_end)
+        .ok_or(AuraError::UnexpectedEof)?;
+    visit_aura1_body(
+        range,
+        &compiled_plan.aura1_plan,
+        rows_to_visit,
         compiled_plan.field_count,
         &mut visitor,
     )

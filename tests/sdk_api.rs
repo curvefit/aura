@@ -187,7 +187,49 @@ fn write_aura0_compact_generic_schema_roundtrip() {
     let rows = market_rows();
     let aura0 = write_with_options(schema.clone(), rows.clone(), WriterOptions::aura0_compact());
 
+    let mut reader = AuraReader::open(Cursor::new(&aura0)).unwrap();
+    let open_stats = reader.stats();
+    assert_eq!(0, open_stats.open_decoded_row_count);
+    assert!(!open_stats.full_file_materialized);
+    assert!(open_stats.streaming_reader_used);
+    assert_eq!(
+        rows.len(),
+        reader.next_batch(16).unwrap().unwrap().row_count()
+    );
+    let batch_stats = reader.stats();
+    assert!(!batch_stats.full_file_materialized);
+    assert_eq!(rows.len(), batch_stats.rows_decoded_in_last_batch);
+    assert_eq!(rows.len(), batch_stats.max_rows_materialized_at_once);
+
     assert_roundtrip(&aura0, &schema, &rows);
+}
+
+#[test]
+fn reader_streaming_batches_aura0_fast_profile_without_full_row_materialization() {
+    let schema = market_schema();
+    let rows = market_rows();
+    let aura0_fast = write_with_options(
+        schema.clone(),
+        rows.clone(),
+        WriterOptions::aura0_compact().profile(AuraProfile::Fast),
+    );
+
+    let mut reader = AuraReader::open(Cursor::new(&aura0_fast)).unwrap();
+    let open_stats = reader.stats();
+    assert_eq!(0, open_stats.open_decoded_row_count);
+    assert!(!open_stats.full_file_materialized);
+    assert!(open_stats.streaming_reader_used);
+
+    let first = reader.next_batch(2).unwrap().unwrap();
+    assert_eq!(&rows[..2], first.rows());
+    let first_stats = reader.stats();
+    assert_eq!(2, first_stats.rows_decoded_in_last_batch);
+    assert_eq!(2, first_stats.max_rows_materialized_at_once);
+    assert!(!first_stats.full_file_materialized);
+
+    let second = reader.next_batch(2).unwrap().unwrap();
+    assert_eq!(&rows[2..], second.rows());
+    assert!(reader.next_batch(2).unwrap().is_none());
 }
 
 #[test]
@@ -324,7 +366,15 @@ fn reader_streaming_batches_match_read_batches_and_replay() {
     let mut reader = AuraReader::open(Cursor::new(&aura1)).unwrap();
 
     assert_eq!(schema.fields(), reader.schema().fields());
+    let open_stats = reader.stats();
+    assert_eq!(0, open_stats.open_decoded_row_count);
+    assert!(!open_stats.full_file_materialized);
+    assert!(open_stats.streaming_reader_used);
     let first = reader.next_batch(2).unwrap().unwrap();
+    let first_stats = reader.stats();
+    assert_eq!(2, first_stats.rows_decoded_in_last_batch);
+    assert_eq!(2, first_stats.max_rows_materialized_at_once);
+    assert!(!first_stats.full_file_materialized);
     let second = reader.next_batch(2).unwrap().unwrap();
     assert!(reader.next_batch(2).unwrap().is_none());
     assert_eq!(&rows[..2], first.rows());

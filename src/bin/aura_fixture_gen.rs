@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use aura_codec::instructions::GenericStreamOp;
 use aura_codec::records::{self, I64FileInput};
-use aura_codec::schema::{generic_i64_parent_schema, ohlcv_schema, SchemaDescriptor};
+use aura_codec::schema::{
+    generic_i64_parent_schema, ohlcv_schema, AuraSchema, AuraType, SchemaDescriptor,
+};
 use aura_codec::Profile;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -43,8 +45,15 @@ fn main() -> Result<()> {
     let metadata_path = args.output_dir.join("fixtures.json");
     fs::write(&metadata_path, serde_json::to_vec_pretty(&metadata)?)
         .with_context(|| format!("write {}", metadata_path.display()))?;
+    let smoke_path = args.output_dir.join("sdk_bench_smoke.json");
+    fs::write(
+        &smoke_path,
+        serde_json::to_vec_pretty(&sdk_bench_smoke_matrix(&metadata, args.zstd_level)?)?,
+    )
+    .with_context(|| format!("write {}", smoke_path.display()))?;
     println!("fixtures={}", metadata.len());
     println!("metadata={}", metadata_path.display());
+    println!("sdk_bench_smoke={}", smoke_path.display());
     Ok(())
 }
 
@@ -114,6 +123,55 @@ fn fixture_inputs() -> Result<Vec<FixtureInput>> {
             )?,
             rows: sparse_many_symbol_rows(256),
             symbol_count: 256,
+            expected_huffman: None,
+        },
+        FixtureInput {
+            name: "sdk-tiny",
+            schema: sdk_tiny_schema(),
+            rows: sdk_tiny_rows(),
+            symbol_count: 2,
+            expected_huffman: None,
+        },
+        FixtureInput {
+            name: "sdk-narrow",
+            schema: sdk_narrow_schema(),
+            rows: sdk_narrow_rows(64),
+            symbol_count: 4,
+            expected_huffman: None,
+        },
+        FixtureInput {
+            name: "sdk-wide",
+            schema: sdk_wide_schema(),
+            rows: sdk_wide_rows(512),
+            symbol_count: 32,
+            expected_huffman: None,
+        },
+        FixtureInput {
+            name: "sdk-reordered",
+            schema: sdk_reordered_schema(),
+            rows: sdk_reordered_rows(256),
+            symbol_count: 16,
+            expected_huffman: None,
+        },
+        FixtureInput {
+            name: "sdk-dense",
+            schema: sdk_dense_schema(),
+            rows: sdk_dense_rows(4096, 4),
+            symbol_count: 4,
+            expected_huffman: None,
+        },
+        FixtureInput {
+            name: "sdk-sparse",
+            schema: sdk_sparse_schema(),
+            rows: sdk_sparse_rows(2048, 512),
+            symbol_count: 512,
+            expected_huffman: None,
+        },
+        FixtureInput {
+            name: "sdk-edge-case",
+            schema: sdk_edge_schema(),
+            rows: sdk_edge_rows(),
+            symbol_count: 3,
             expected_huffman: None,
         },
         FixtureInput {
@@ -215,6 +273,11 @@ fn write_fixture(
 
     Ok(json!({
         "dataset_name": fixture.name,
+        "schema_name": fixture.schema.name,
+        "schema_hash": fixture.schema.schema_id,
+        "field_names": fixture.schema.fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(),
+        "field_physical_types": fixture.schema.fields.iter().map(|field| field.field_type.name()).collect::<Vec<_>>(),
+        "record_width": schema_record_width(&fixture.schema),
         "paths": {
             "aura": aura_path,
             "aura0": aura0_path,
@@ -238,6 +301,78 @@ fn write_fixture(
         "huffman_stream_count": huffman_stream_count,
         "row_equality_verified": true,
     }))
+}
+
+fn sdk_bench_smoke_matrix(
+    fixtures: &[serde_json::Value],
+    zstd_level: i32,
+) -> Result<serde_json::Value> {
+    let mut entries = Vec::new();
+    for fixture in fixtures {
+        let Some(name) = fixture["dataset_name"].as_str() else {
+            continue;
+        };
+        if !name.starts_with("sdk-") {
+            continue;
+        }
+        let aura0 = fixture["paths"]["aura0"]
+            .as_str()
+            .context("sdk fixture aura0 path")?;
+        let aura1 = fixture["paths"]["aura1"]
+            .as_str()
+            .context("sdk fixture aura1 path")?;
+        for operation in [
+            "aura0-to-aura1-bytes",
+            "aura0-to-aura1-bytes-verify",
+            "zstd-aura1-to-aura1-bytes",
+        ] {
+            entries.push(json!({
+                "dataset_kind": name,
+                "operation": operation,
+                "schema_hash": fixture["schema_hash"],
+                "schema_name": fixture["schema_name"],
+                "field_count": fixture["field_count"],
+                "field_names": fixture["field_names"],
+                "field_physical_types": fixture["field_physical_types"],
+                "record_width": fixture["record_width"],
+                "record_count": fixture["record_count"],
+                "compiled_plan_used": true,
+                "command": [
+                    "target/release/aura-bench",
+                    "--operation", operation,
+                    "--dataset", name,
+                    "--input", if operation.starts_with("zstd") { aura1 } else { aura0 },
+                    "--reference-aura0", aura0,
+                    "--reference-aura1", aura1,
+                    "--zstd-level", zstd_level.to_string(),
+                    "--iterations", "1",
+                    "--warmups", "0",
+                    "--format", "json"
+                ]
+            }));
+        }
+    }
+    Ok(json!({
+        "matrix_kind": "sdk-generic-smoke",
+        "zstd_level": zstd_level,
+        "entries": entries,
+    }))
+}
+
+fn schema_record_width(schema: &SchemaDescriptor) -> usize {
+    schema
+        .fields
+        .iter()
+        .map(|field| match field.field_type {
+            aura_codec::FieldType::I8 | aura_codec::FieldType::U8 => 1,
+            aura_codec::FieldType::I16 | aura_codec::FieldType::U16 => 2,
+            aura_codec::FieldType::I32 | aura_codec::FieldType::U32 => 4,
+            aura_codec::FieldType::I64
+            | aura_codec::FieldType::U64
+            | aura_codec::FieldType::TimestampNs => 8,
+            aura_codec::FieldType::I128 | aura_codec::FieldType::Opaque16 => 16,
+        })
+        .sum()
 }
 
 fn dense_ohlcv_rows(count: usize, symbol_mod: i64) -> Vec<Vec<i64>> {
@@ -303,6 +438,190 @@ fn nohuff_rows() -> Vec<Vec<i64>> {
         .take(30)
         .map(|bucket| vec![9_000_000_000_000 + bucket])
         .collect()
+}
+
+fn sdk_tiny_schema() -> SchemaDescriptor {
+    AuraSchema::named("sdk_tiny_schema")
+        .field("event_time", AuraType::TimestampNanos)
+        .field("venue", AuraType::U16)
+        .field("quantity", AuraType::I32)
+        .build()
+        .unwrap()
+        .into_descriptor()
+}
+
+fn sdk_tiny_rows() -> Vec<Vec<i64>> {
+    vec![
+        vec![1_000, 1, 10],
+        vec![2_000, 1, -3],
+        vec![3_000, 2, 0],
+        vec![4_000, 2, 99],
+    ]
+}
+
+fn sdk_narrow_schema() -> SchemaDescriptor {
+    AuraSchema::named("sdk_narrow_schema")
+        .field("micro_time", AuraType::TimestampMicros)
+        .field("signed_qty", AuraType::I16)
+        .build()
+        .unwrap()
+        .into_descriptor()
+}
+
+fn sdk_narrow_rows(count: usize) -> Vec<Vec<i64>> {
+    (0..count)
+        .map(|index| {
+            let index = i64::try_from(index).unwrap();
+            vec![10_000 + index * 250, (index % 17) - 8]
+        })
+        .collect()
+}
+
+fn sdk_wide_schema() -> SchemaDescriptor {
+    AuraSchema::named("sdk_wide_schema")
+        .field("alpha_ts", AuraType::TimestampNanos)
+        .field("beta_id", AuraType::U16)
+        .field("gamma_price", AuraType::PriceI64Scaled { scale: 4 })
+        .field("delta_qty", AuraType::U32)
+        .field("epsilon_active", AuraType::Bool)
+        .field("zeta_flags", AuraType::FlagsU32)
+        .field("eta_change", AuraType::I16)
+        .field("theta_side", AuraType::EnumU8)
+        .field("iota_count", AuraType::U8)
+        .build()
+        .unwrap()
+        .into_descriptor()
+}
+
+fn sdk_wide_rows(count: usize) -> Vec<Vec<i64>> {
+    (0..count)
+        .map(|index| {
+            let index = i64::try_from(index).unwrap();
+            vec![
+                1_700_000_000_000_000_000 + index * 1_000_000,
+                index % 32,
+                100_000 + (index % 1_000) - 500,
+                10 + index % 500,
+                i64::from(index % 2 == 0),
+                index % 16,
+                (index % 31) - 15,
+                index % 3,
+                index % 250,
+            ]
+        })
+        .collect()
+}
+
+fn sdk_reordered_schema() -> SchemaDescriptor {
+    AuraSchema::named("sdk_reordered_schema")
+        .field("flags", AuraType::FlagsU32)
+        .field("side", AuraType::EnumU8)
+        .field("px", AuraType::I64Scaled { scale: 4 })
+        .field("ts", AuraType::TimestampNanos)
+        .build()
+        .unwrap()
+        .into_descriptor()
+}
+
+fn sdk_reordered_rows(count: usize) -> Vec<Vec<i64>> {
+    (0..count)
+        .map(|index| {
+            let index = i64::try_from(index).unwrap();
+            vec![
+                index % 4,
+                index % 2 + 1,
+                10_000 + index % 97,
+                1_000_000 + index,
+            ]
+        })
+        .collect()
+}
+
+fn sdk_dense_schema() -> SchemaDescriptor {
+    AuraSchema::named("sdk_dense_schema")
+        .field("ts_event", AuraType::TimestampNanos)
+        .field("symbol_id", AuraType::U32)
+        .field("price", AuraType::PriceI64Scaled { scale: 9 })
+        .field("size", AuraType::U64)
+        .field("side", AuraType::EnumU8)
+        .field("flags", AuraType::FlagsU32)
+        .build()
+        .unwrap()
+        .into_descriptor()
+}
+
+fn sdk_dense_rows(count: usize, symbols: i64) -> Vec<Vec<i64>> {
+    (0..count)
+        .map(|index| {
+            let index = i64::try_from(index).unwrap();
+            let symbol = index % symbols.max(1);
+            vec![
+                1_700_000_000_000_000_000 + index * 1_000_000,
+                symbol,
+                101_000_000_000 + symbol * 10_000_000 + index % 257,
+                1 + index % 100,
+                index % 2 + 1,
+                index % 8,
+            ]
+        })
+        .collect()
+}
+
+fn sdk_sparse_schema() -> SchemaDescriptor {
+    AuraSchema::named("sdk_sparse_schema")
+        .field("ts_event", AuraType::TimestampNanos)
+        .field("symbol_id", AuraType::U32)
+        .field("price_tick", AuraType::I64)
+        .field("quantity", AuraType::U32)
+        .field("condition", AuraType::EnumU8)
+        .build()
+        .unwrap()
+        .into_descriptor()
+}
+
+fn sdk_sparse_rows(count: usize, symbols: i64) -> Vec<Vec<i64>> {
+    (0..count)
+        .map(|index| {
+            let index = i64::try_from(index).unwrap();
+            let symbol = (index * 37) % symbols.max(1);
+            vec![
+                1_700_100_000_000_000_000 + (index / 3) * 1_000_000,
+                symbol,
+                2_000_000 + symbol * 3 + index % 13,
+                if index % 7 == 0 { 0 } else { 1 + index % 20 },
+                index % 5,
+            ]
+        })
+        .collect()
+}
+
+fn sdk_edge_schema() -> SchemaDescriptor {
+    AuraSchema::named("sdk_edge_schema")
+        .field("ts_event", AuraType::TimestampNanos)
+        .field("min_i32", AuraType::I32)
+        .field("max_u32", AuraType::U32)
+        .field("small_i8", AuraType::I8)
+        .build()
+        .unwrap()
+        .into_descriptor()
+}
+
+fn sdk_edge_rows() -> Vec<Vec<i64>> {
+    vec![
+        vec![
+            1_700_000_000_000_000_000,
+            i64::from(i32::MIN),
+            0,
+            i64::from(i8::MIN),
+        ],
+        vec![1_700_000_000_000_000_000, -1, i64::from(u32::MAX), 0],
+        vec![
+            1_700_000_000_999_000_000,
+            i64::from(i32::MAX),
+            42,
+            i64::from(i8::MAX),
+        ],
+    ]
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

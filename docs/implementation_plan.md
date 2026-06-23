@@ -15,12 +15,14 @@ Expose Aura as a reusable Rust library for dynamic fixed-width market-data schem
 Implemented:
 
 - `AuraSchema`, `AuraSchemaBuilder`, `AuraField`, and `AuraType`
-- `AuraRecordBatch` and `AuraValue`
+- `AuraRecordBatch`, `AuraColumnBatch`, `AuraColumn`, and `AuraValue`
 - `AuraWriter`
 - `AuraReader`
 - `convert_aura`
 - `WriterOptions`, `ReaderOptions`, and `ConvertOptions`
-- examples for writing, reading, and conversion
+- public `CompiledAuraPlan`
+- examples for writing, columnar writing, reading, batch iteration, replay, and conversion
+- generic SDK fixture generation and smoke benchmark metadata
 
 Supported through the SDK:
 
@@ -32,6 +34,7 @@ Supported through the SDK:
 - Aura0 compact output
 - Aura1 fixed-width output
 - cross-format conversion through the existing generic i64 engine
+- schema name, schema ID, field metadata, schema hash, and plan hash preservation for SDK writes/conversions
 
 Explicitly rejected for now:
 
@@ -45,6 +48,8 @@ Explicitly rejected for now:
 The public SDK facade is schema-generic, but it still targets the existing generic i64 physical engine internally. This is deliberate for the first library milestone: unsupported physical types fail before encoding instead of silently corrupting values.
 
 The current SDK does not make `aura-bench` the product API. Benchmark code remains a consumer of lower-level record helpers.
+
+The reader now exposes batch iteration and replay APIs. Current v1 limitation: `AuraReader` still decodes through the in-memory generic row engine before serving batches. The API is streaming-shaped, but the implementation is not yet zero-copy or block-streaming.
 
 ## Verification Plan
 
@@ -61,8 +66,7 @@ Required local checks:
 
 ## Remaining Work
 
-- Replace the SDK's row-oriented `Vec<Vec<AuraValue>>` batch with typed column arrays for large writes.
-- Make `CompiledAuraPlan` the public SDK plan type rather than exposing only the lower-level compiled footer through the reader.
-- Add generic benchmark matrix operations for generated schemas.
-- Add property-based generators for broader dynamic schema coverage.
+- Replace the reader's internal whole-file decode with true block streaming.
+- Expand the generated SDK smoke matrix into full repeated benchmark sweeps.
+- Add property-based random generators beyond the deterministic fixture families.
 - Implement nullable/variable-width support only after the binary layout has explicit presence and offset encoding for those types.

@@ -8,16 +8,39 @@ use crate::records::{self, DecodedI64File, DecodedTypedFile};
 use crate::schema::{AuraSchema, SchemaDescriptor};
 use crate::{AuraError, AuraRecordBatch, AuraTypedValue, Profile, Result};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuraReaderState {
+    Aura1Fixed,
+    Aura0Columns { columns: Option<Vec<Vec<i64>>> },
+    Aura0ByteLane { aura1: Option<Vec<u8>> },
+    LazyRows { rows: Option<Vec<Vec<i64>>> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuraReaderStats {
+    pub open_decoded_row_count: usize,
+    pub full_file_materialized: bool,
+    pub batches_read: usize,
+    pub rows_decoded_in_last_batch: usize,
+    pub max_rows_materialized_at_once: usize,
+    pub source_bytes_read_at_open: usize,
+    pub source_bytes_read_total: usize,
+    pub streaming_reader_used: bool,
+}
+
 /// Public SDK reader for Aura files with dynamic schemas.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuraReader {
     bytes: Vec<u8>,
     schema: AuraSchema,
     profile: Profile,
-    rows: Vec<Vec<i64>>,
     compiled_footer: Option<CompiledFooter>,
     compiled_plan: Option<CompiledAuraPlan>,
     cursor: usize,
+    record_count: usize,
+    state: AuraReaderState,
+    stats: AuraReaderStats,
+    use_byte_lane: crate::Aura0ByteLaneUse,
 }
 
 impl AuraReader {
@@ -30,11 +53,11 @@ impl AuraReader {
         input
             .read_to_end(&mut bytes)
             .map_err(|_| crate::AuraError::InvalidValue("reader input"))?;
-        let decoded = records::decode_i64_file(&bytes)?;
-        if decoded.header.profile == Profile::Aura0 {
+        let metadata = records::decode_i64_file_metadata(&bytes)?;
+        if metadata.header.profile == Profile::Aura0 {
             match options.use_byte_lane {
                 crate::Aura0ByteLaneUse::Always => {
-                    let Some(footer) = decoded.compiled_footer.as_ref() else {
+                    let Some(footer) = metadata.compiled_footer.as_ref() else {
                         return Err(AuraError::InvalidValue("aura0 byte lane"));
                     };
                     if footer.aura1_byte_lanes.is_empty() {
@@ -44,19 +67,36 @@ impl AuraReader {
                 crate::Aura0ByteLaneUse::Auto | crate::Aura0ByteLaneUse::Never => {}
             }
         }
-        let compiled_plan = decoded
+        let compiled_plan = metadata
             .compiled_footer
             .as_ref()
             .map(CompiledAuraPlan::from_footer)
             .transpose()?;
+        let state = match metadata.header.profile {
+            Profile::Aura1 => AuraReaderState::Aura1Fixed,
+            Profile::Aura0 => AuraReaderState::Aura0Columns { columns: None },
+            Profile::Ingest => AuraReaderState::LazyRows { rows: None },
+        };
         Ok(Self {
+            stats: AuraReaderStats {
+                open_decoded_row_count: 0,
+                full_file_materialized: false,
+                batches_read: 0,
+                rows_decoded_in_last_batch: 0,
+                max_rows_materialized_at_once: 0,
+                source_bytes_read_at_open: bytes.len(),
+                source_bytes_read_total: bytes.len(),
+                streaming_reader_used: true,
+            },
             bytes,
-            schema: AuraSchema::from(decoded.schema.clone()),
-            profile: decoded.header.profile,
-            rows: decoded.rows,
-            compiled_footer: decoded.compiled_footer,
+            schema: AuraSchema::from(metadata.schema.clone()),
+            profile: metadata.header.profile,
+            compiled_footer: metadata.compiled_footer,
             compiled_plan,
             cursor: 0,
+            record_count: metadata.record_count,
+            state,
+            use_byte_lane: options.use_byte_lane,
         })
     }
 
@@ -85,22 +125,35 @@ impl AuraReader {
     }
 
     pub fn read_batches(&self) -> Result<Vec<AuraRecordBatch>> {
-        Ok(vec![AuraRecordBatch::from_i64_decoded(
-            self.schema.clone(),
-            self.rows.clone(),
-        )?])
+        let mut reader = self.clone();
+        reader.reset_batches();
+        let batch_size = reader.record_count.max(1);
+        let mut batches = Vec::new();
+        while let Some(batch) = reader.next_batch(batch_size)? {
+            batches.push(batch);
+        }
+        Ok(batches)
     }
 
     pub fn next_batch(&mut self, batch_size: usize) -> Result<Option<AuraRecordBatch>> {
         if batch_size == 0 {
             return Err(AuraError::InvalidValue("batch size"));
         }
-        if self.cursor >= self.rows.len() {
+        if self.cursor >= self.record_count {
             return Ok(None);
         }
-        let end = self.cursor.saturating_add(batch_size).min(self.rows.len());
-        let rows = self.rows[self.cursor..end].to_vec();
+        let rows_to_read = batch_size.min(self.record_count - self.cursor);
+        let end = self.cursor.saturating_add(rows_to_read);
+        let rows = match self.profile {
+            Profile::Aura1 => self.read_aura1_batch(rows_to_read)?,
+            Profile::Aura0 => self.read_aura0_batch(rows_to_read)?,
+            Profile::Ingest => self.read_lazy_rows_batch(rows_to_read)?,
+        };
         self.cursor = end;
+        self.stats.batches_read = self.stats.batches_read.saturating_add(1);
+        self.stats.rows_decoded_in_last_batch = rows.len();
+        self.stats.max_rows_materialized_at_once =
+            self.stats.max_rows_materialized_at_once.max(rows.len());
         Ok(Some(AuraRecordBatch::from_i64_decoded(
             self.schema.clone(),
             rows,
@@ -109,16 +162,19 @@ impl AuraReader {
 
     pub fn reset_batches(&mut self) {
         self.cursor = 0;
+        self.stats.rows_decoded_in_last_batch = 0;
     }
 
     pub fn batches(&self, batch_size: usize) -> Result<AuraBatchIter<'_>> {
         if batch_size == 0 {
             return Err(AuraError::InvalidValue("batch size"));
         }
+        let mut reader = self.clone();
+        reader.reset_batches();
         Ok(AuraBatchIter {
-            reader: self,
+            reader,
             batch_size,
-            cursor: 0,
+            _marker: std::marker::PhantomData,
         })
     }
 
@@ -126,49 +182,155 @@ impl AuraReader {
     where
         F: FnMut(&[i64]) -> Result<()>,
     {
-        for row in &self.rows {
-            visitor(row)?;
+        match self.profile {
+            Profile::Aura1 => records::visit_i64_rows_file(&self.bytes, visitor),
+            Profile::Aura0 | Profile::Ingest => {
+                let mut reader = self.clone();
+                reader.reset_batches();
+                let mut count = 0usize;
+                while let Some(batch) = reader.next_batch(8192)? {
+                    let rows = batch.to_i64_rows()?;
+                    for row in &rows {
+                        visitor(row)?;
+                        count = count.saturating_add(1);
+                    }
+                }
+                Ok(count)
+            }
         }
-        Ok(self.rows.len())
     }
 
-    pub fn rows_i64(&self) -> &[Vec<i64>] {
-        &self.rows
+    pub fn stats(&self) -> AuraReaderStats {
+        self.stats
     }
 
-    pub fn into_rows_i64(self) -> Vec<Vec<i64>> {
-        self.rows
+    pub fn rows_i64(&self) -> Result<Vec<Vec<i64>>> {
+        let mut rows = Vec::new();
+        self.replay_i64(|row| {
+            rows.push(row.to_vec());
+            Ok(())
+        })?;
+        Ok(rows)
+    }
+
+    pub fn into_rows_i64(self) -> Result<Vec<Vec<i64>>> {
+        self.rows_i64()
     }
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    fn read_aura1_batch(&self, rows_to_read: usize) -> Result<Vec<Vec<i64>>> {
+        let mut rows = Vec::with_capacity(rows_to_read);
+        records::visit_i64_rows_file_range(&self.bytes, self.cursor, rows_to_read, |row| {
+            rows.push(row.to_vec());
+            Ok(())
+        })?;
+        Ok(rows)
+    }
+
+    fn read_aura0_batch(&mut self, rows_to_read: usize) -> Result<Vec<Vec<i64>>> {
+        self.ensure_aura0_columns()?;
+        let end = self.cursor.saturating_add(rows_to_read);
+        match &self.state {
+            AuraReaderState::Aura0Columns {
+                columns: Some(columns),
+            } => rows_from_columns(columns, self.cursor, end),
+            AuraReaderState::Aura0ByteLane { aura1: Some(aura1) } => {
+                let mut rows = Vec::with_capacity(rows_to_read);
+                records::visit_i64_rows_file_range(aura1, self.cursor, rows_to_read, |row| {
+                    rows.push(row.to_vec());
+                    Ok(())
+                })?;
+                Ok(rows)
+            }
+            _ => Err(AuraError::InvalidValue("aura0 stream state")),
+        }
+    }
+
+    fn read_lazy_rows_batch(&mut self, rows_to_read: usize) -> Result<Vec<Vec<i64>>> {
+        self.ensure_lazy_rows()?;
+        let end = self.cursor.saturating_add(rows_to_read);
+        match &self.state {
+            AuraReaderState::LazyRows { rows: Some(rows) } => rows
+                .get(self.cursor..end)
+                .map(<[Vec<i64>]>::to_vec)
+                .ok_or(AuraError::UnexpectedEof),
+            _ => Err(AuraError::InvalidValue("reader row state")),
+        }
+    }
+
+    fn ensure_aura0_columns(&mut self) -> Result<()> {
+        let needs_decode = matches!(
+            self.state,
+            AuraReaderState::Aura0Columns { columns: None }
+                | AuraReaderState::Aura0ByteLane { aura1: None }
+        );
+        if needs_decode {
+            if let Some(decoded) = records::decode_i64_columns_file(&self.bytes)? {
+                self.state = AuraReaderState::Aura0Columns {
+                    columns: Some(decoded.columns),
+                };
+            } else {
+                let aura1 = records::compile_aura0_to_aura1_bytes_with_lane(
+                    &self.bytes,
+                    self.use_byte_lane,
+                    false,
+                )?;
+                self.state = AuraReaderState::Aura0ByteLane { aura1: Some(aura1) };
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_lazy_rows(&mut self) -> Result<()> {
+        let needs_decode = matches!(self.state, AuraReaderState::LazyRows { rows: None });
+        if needs_decode {
+            let decoded = records::decode_i64_file(&self.bytes)?;
+            self.stats.full_file_materialized = true;
+            self.stats.max_rows_materialized_at_once = self
+                .stats
+                .max_rows_materialized_at_once
+                .max(decoded.rows.len());
+            self.state = AuraReaderState::LazyRows {
+                rows: Some(decoded.rows),
+            };
+        }
+        Ok(())
+    }
 }
 
 pub struct AuraBatchIter<'a> {
-    reader: &'a AuraReader,
+    reader: AuraReader,
     batch_size: usize,
-    cursor: usize,
+    _marker: std::marker::PhantomData<&'a AuraReader>,
 }
 
 impl Iterator for AuraBatchIter<'_> {
     type Item = Result<AuraRecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cursor >= self.reader.rows.len() {
-            return None;
-        }
-        let end = self
-            .cursor
-            .saturating_add(self.batch_size)
-            .min(self.reader.rows.len());
-        let rows = self.reader.rows[self.cursor..end].to_vec();
-        self.cursor = end;
-        Some(AuraRecordBatch::from_i64_decoded(
-            self.reader.schema.clone(),
-            rows,
-        ))
+        self.reader.next_batch(self.batch_size).transpose()
     }
+}
+
+fn rows_from_columns(columns: &[Vec<i64>], start: usize, end: usize) -> Result<Vec<Vec<i64>>> {
+    let field_count = columns.len();
+    for column in columns {
+        if end > column.len() {
+            return Err(AuraError::UnexpectedEof);
+        }
+    }
+    let mut rows = Vec::with_capacity(end.saturating_sub(start));
+    for row_index in start..end {
+        let mut row = Vec::with_capacity(field_count);
+        for column in columns {
+            row.push(column[row_index]);
+        }
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// In-memory reader for sealed Aura i64 files.

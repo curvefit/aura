@@ -37,10 +37,11 @@ writer.finish()?;
 ## Public Types
 
 - `AuraSchema`, `AuraSchemaBuilder`, `AuraField`, `AuraType`
-- `AuraRecordBatch`, `AuraValue`
+- `AuraRecordBatch`, `AuraColumnBatch`, `AuraColumn`, `AuraValue`
 - `AuraWriter`, `AuraReader`
 - `WriterOptions`, `ReaderOptions`, `ConvertOptions`
 - `AuraFormat`, `AuraProfile`
+- `CompiledAuraPlan`, `CompiledAuraField`
 - `convert_aura`
 
 ## Supported Schema Types
@@ -77,6 +78,21 @@ Supported output formats:
 
 Aura0 fast and hybrid profiles are available through `WriterOptions::profile`, but compact remains the default SDK Aura0 writer profile.
 
+`write_batch` accepts both row batches and column batches:
+
+```rust
+let batch = aura_codec::AuraColumnBatch::builder(schema.clone())
+    .i64("ts_event", ts_values)
+    .u32("symbol_id", symbol_values)
+    .i64("price", price_values)
+    .u64("size", size_values)
+    .u8("side", side_values)
+    .u32("flags", flag_values)
+    .build()?;
+writer.write_batch(batch)?;
+# Ok::<(), aura_codec::AuraError>(())
+```
+
 ## Reading
 
 Use `AuraReader::open(input)` to detect the sealed profile, recover the schema, and read rows:
@@ -88,7 +104,17 @@ let batches = reader.read_batches()?;
 # Ok::<(), aura_codec::AuraError>(())
 ```
 
-`AuraReader` currently returns one in-memory `AuraRecordBatch`. Streaming batch iteration is a remaining SDK improvement.
+`AuraReader` supports whole-file batches and batch iteration:
+
+```rust
+let mut reader = aura_codec::AuraReader::open(std::io::Cursor::new(bytes))?;
+while let Some(batch) = reader.next_batch(1024)? {
+    println!("rows={}", batch.row_count());
+}
+# Ok::<(), aura_codec::AuraError>(())
+```
+
+The current v1 reader still decodes through the existing in-memory row engine before serving batches. The external API is streaming-shaped; true zero-copy/block streaming remains an implementation gap.
 
 ## Conversion
 
@@ -118,7 +144,22 @@ The SDK tests cover:
 - Aura1 roundtrip
 - Aura0 to Aura1 conversion
 - Aura1 to Aura0 conversion
+- column batches
+- batch iteration
+- schema name and schema hash preservation
+- public compiled plan inspection
 
 The SDK surface does not assume a fixed row width, a fixed field count, grimoire field names, or grimoire field order. Layout still compiles through the existing generic i64 engine, so unsupported physical types reject explicitly.
 
 One current format constraint remains: the legacy compact timestamp-role shortcut only applies when a nanosecond timestamp is field 0. Reordered nanosecond timestamp fields still roundtrip as `TimestampNanos`, but the SDK stores them as normal fixed-width timestamp values instead of using that first-field shortcut.
+
+## Defaults
+
+- Aura0 writer profile: compact
+- Aura1 writer behavior: fixed-width compiled profile
+- Batch API: prefer `AuraColumnBatch` for larger writes; `AuraRecordBatch` remains available for simple examples
+- Reader mode: schema-first reader with batch iteration
+- Conversion: explicit target format through `ConvertOptions`
+- Guard mode: off unless using lower-level strict verification tools
+- Canonical hash mode: off by default at the SDK facade
+- Unsupported types: reject clearly before writing

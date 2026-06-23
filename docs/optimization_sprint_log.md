@@ -811,3 +811,57 @@ Each experiment must record:
 - keep/reject decision: keep if full SDK tests and examples pass.
 - next implication: typed column batches, generic benchmarks, and full plan API
   exposure remain separate milestones.
+
+## SDK Lane S2: Plan, column batches, streaming-shaped reader, and metadata
+
+- hypothesis: the SDK facade becomes materially usable only when users can
+  inspect the compiled plan, write typed column batches, iterate batches, and
+  preserve schema display metadata through formats.
+- prior-art basis: Parquet-like APIs expose schema/metadata separately from the
+  benchmark harness and prefer typed column batches for bulk writes.
+- file/function targeted:
+  - `src/program.rs` public `CompiledAuraPlan` from SDK schema.
+  - `src/types.rs` `AuraColumnBatch` and batch trait.
+  - `src/writer.rs` plan exposure and generic batch writes.
+  - `src/reader.rs` plan exposure, batch iteration, and replay visitor.
+  - `src/schema.rs` named schema block encoding.
+- expected speedup: none. This removes SDK blockers, not hot-path benchmark
+  bottlenecks.
+- patch summary: exposed schema-derived plan metadata, added typed column
+  batches, added reader batch iteration/replay APIs, and preserved schema name
+  plus schema ID in schema blocks.
+- commands run:
+  - `cargo check`
+  - `cargo check --examples`
+  - `cargo test`
+  - `cargo build --release --bin aura-bench`
+- benchmark JSON paths: none for this API lane.
+- result: committed as `9e5ffda Add SDK plan column and streaming APIs`.
+- keep/reject decision: keep.
+- next implication: true block-streaming reader remains an implementation gap
+  because `AuraReader` still decodes through the row engine internally.
+
+## SDK Lane S3: Generated SDK fixture benchmark smoke matrix
+
+- hypothesis: generic benchmark proof must include non-grimoire generated
+  schemas, even if the full performance matrix remains a longer-running local
+  artifact.
+- prior-art basis: generic format claims require schema-shape variation:
+  narrow, wide, reordered, dense, sparse, tiny, and edge-case fixtures.
+- file/function targeted:
+  - `src/bin/aura_fixture_gen.rs`
+  - `tests/fixture_generation.rs`
+  - `tests/aura_bench_cli.rs`
+- expected speedup: none.
+- patch summary: generated SDK fixture families with schema metadata and
+  emitted `sdk_bench_smoke.json`; added tests that run one SDK fixture through
+  the benchmark CLI.
+- commands run:
+  - `cargo test`
+  - `cargo build --release --bin aura-bench`
+- benchmark JSON paths: generated under temporary test directories and fresh
+  local verification directories.
+- result: committed as `2755e62 Add SDK generic fixture benchmark matrix`.
+- keep/reject decision: keep.
+- next implication: expand smoke entries into repeated warm performance sweeps
+  before publishing SDK performance claims.
