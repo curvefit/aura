@@ -865,3 +865,84 @@ Each experiment must record:
 - keep/reject decision: keep.
 - next implication: expand smoke entries into repeated warm performance sweeps
   before publishing SDK performance claims.
+
+## Aura1 Parse Experiment P0: Parse-speed research memo
+
+- hypothesis: the Aura1 replay/batch-read gap is mostly materialization and
+  callback shape, not fixed-width body scan cost.
+- prior-art basis: DBN-style fixed-width replay parses metadata once and avoids
+  per-record allocation; Arrow-style run views can reduce callbacks for repeated
+  keys without changing row bytes.
+- file/function targeted:
+  - `docs/research/aura1_parse_speed_research.md`
+- expected speedup: none directly. The memo ranks implementation experiments.
+- patch summary: documented Aura1 parse modes, grouped replay design,
+  precomputation opportunities, and the experiment order.
+- commands run:
+  - `git diff --check`
+  - `cargo check`
+  - `cargo test`
+- benchmark JSON paths: none for the research-only experiment.
+- result: committed as `66e1092 Research Aura1 parse speed design`.
+- keep/reject decision: keep.
+- next implication: implement columnar batch reads before attempting a borrowed
+  batch view, because columnar reads preserve SDK ownership semantics.
+
+## Aura1 Parse Experiment P1: Direct columnar batch materialization
+
+- hypothesis: row batches are slow because they build `Vec<Vec<i64>>` and then
+  per-cell `AuraValue`; decoding fixed-width Aura1 rows directly into typed
+  columns should close much of the replay/read gap.
+- prior-art basis: columnar readers amortize field dispatch per column and avoid
+  row object allocation when the caller wants scan/analytics access.
+- file/function targeted:
+  - `src/reader.rs` `AuraReader::next_column_batch`
+  - `src/types.rs` `AuraColumnBatch::from_i64_columns`
+  - `src/bin/aura_sdk_bench.rs` `aura1-read-batches-columnar`
+- expected speedup: 2x to 3x over row-batch materialization on larger Aura1
+  files.
+- patch summary: added direct fixed-width Aura1 column batch reads, typed column
+  validation, benchmark operation, and generic-schema tests.
+- commands run:
+  - `cargo test --test sdk_api -- --nocapture`
+  - `cargo test`
+  - `cargo build --release --bin aura_sdk_bench`
+  - `target/release/aura_sdk_bench --fixture-dir /tmp/aura-benchmarks/aura1-parse-20260623T235910Z/fixtures --output-dir /tmp/aura-benchmarks/aura1-parse-20260623T235910Z/targeted-results --iterations 10 --warmups 2 --batch-size 8192 --datasets sdk-dense,sdk-sparse,sdk-larger,repeated-timestamp,repeated-symbol,repeated-timestamp-symbol,high-cardinality,mixed-burst`
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/aura1-parse-20260623T235910Z/targeted-results/sdk_full_matrix_summary.json`
+- result: on `sdk-larger`, row batches measured 66.487 ms and column batches
+  measured 21.054 ms; column reads reported `rows_materialized=0`.
+- keep/reject decision: keep.
+- next implication: a borrowed fixed-width batch view could remove typed column
+  allocation too, but it needs a lifetime-bearing public view API.
+
+## Aura1 Parse Experiment P2: Consecutive-run grouped replay
+
+- hypothesis: repeated timestamp/symbol/event bursts can reduce downstream
+  callback overhead when exposed as consecutive groups selected by dynamic
+  schema fields.
+- prior-art basis: run-end/grouped views avoid repeatedly emitting identical
+  keys while preserving physical order.
+- file/function targeted:
+  - `src/reader.rs` `AuraReader::grouped_replay`
+  - `src/bin/aura_fixture_gen.rs` repeated-key SDK fixtures
+  - `src/bin/aura_sdk_bench.rs` grouped replay operations
+- expected speedup: data dependent; large callback-count reductions on repeated
+  runs and graceful one-row groups on high-cardinality inputs.
+- patch summary: added `GroupBy`, `AuraEventGroup`, `AuraGroupStats`,
+  name/field-id group resolution, repeated-key fixtures, grouped benchmark
+  operations, and generic-schema tests.
+- commands run:
+  - `cargo test --test sdk_api -- --nocapture`
+  - `cargo test --test fixture_generation -- --nocapture`
+  - `cargo build --release --bin aura_sdk_bench`
+  - `target/release/aura_sdk_bench --fixture-dir /tmp/aura-benchmarks/aura1-parse-20260623T235910Z/fixtures --output-dir /tmp/aura-benchmarks/aura1-parse-20260623T235910Z/targeted-results --iterations 10 --warmups 2 --batch-size 8192 --datasets sdk-dense,sdk-sparse,sdk-larger,repeated-timestamp,repeated-symbol,repeated-timestamp-symbol,high-cardinality,mixed-burst`
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/aura1-parse-20260623T235910Z/targeted-results/sdk_full_matrix_summary.json`
+- result: `repeated-timestamp` grouped replay reduced callbacks 32x, and
+  `repeated-timestamp-symbol` pair grouping reduced callbacks 47.98x.
+  `high-cardinality` reported 1.00x reduction and one-row groups.
+- keep/reject decision: keep as an opt-in API; do not make it the default
+  replay mode.
+- next implication: no footer group index is needed for v1. Revisit a footer or
+  sidecar run index only if on-the-fly group detection becomes the bottleneck.

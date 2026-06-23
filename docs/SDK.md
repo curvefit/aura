@@ -116,6 +116,37 @@ while let Some(batch) = reader.next_batch(1024)? {
 
 Aura1 reads stream fixed-width rows directly from the Aura1 body. Aura0 compact reads parse metadata during open and lazily build bounded row batches from compact stream columns. `read_batches()` is a convenience collector implemented on top of the batch reader.
 
+For faster Aura1 parsing into SDK batches, use column batches:
+
+```rust
+let mut reader = aura_codec::AuraReader::open(std::io::Cursor::new(bytes))?;
+while let Some(batch) = reader.next_column_batch(8192)? {
+    println!("columns={} rows={}", batch.columns().len(), batch.row_count());
+}
+# Ok::<(), aura_codec::AuraError>(())
+```
+
+`next_column_batch` avoids row-vector materialization and per-cell `AuraValue`
+construction. Use row batches when callers need `AuraRecordBatch`; use column
+batches for scan/analytics-style access.
+
+Aura1 grouped replay is available for consecutive runs:
+
+```rust
+let stats = reader.grouped_replay(
+    &aura_codec::GroupBy::fields(["ts_event"]),
+    |group| {
+        println!("run rows={}", group.row_count());
+        Ok(())
+    },
+)?;
+# Ok::<(), aura_codec::AuraError>(())
+```
+
+Grouped replay is opt-in and does not change row semantics. It is most useful
+for repeated timestamp, symbol, or event-type bursts; high-cardinality data
+falls back to one callback per row.
+
 ## Conversion
 
 Use `convert_aura(input, output, ConvertOptions::new(target_format))`.
@@ -146,6 +177,8 @@ The SDK tests cover:
 - Aura1 to Aura0 conversion
 - column batches
 - batch iteration
+- columnar read batches
+- grouped Aura1 replay
 - streaming reader stats
 - schema name and schema hash preservation
 - public compiled plan inspection

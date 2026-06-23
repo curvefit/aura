@@ -49,6 +49,11 @@ fn aura_fixture_gen_writes_compatible_fixture_matrix() {
             "sdk-sparse",
             "sdk-edge-case",
             "sdk-larger",
+            "repeated-timestamp",
+            "repeated-symbol",
+            "repeated-timestamp-symbol",
+            "high-cardinality",
+            "mixed-burst",
             "nohuff",
             "larger"
         ]

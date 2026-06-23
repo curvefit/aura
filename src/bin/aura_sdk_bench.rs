@@ -1,12 +1,13 @@
 use std::fs;
+use std::hint::black_box;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use aura_codec::{
-    convert_aura, AuraFormat, AuraProfile, AuraReader, AuraRecordBatch, AuraSchema, AuraWriter,
-    ConvertOptions, WriterOptions,
+    convert_aura, records, AuraFormat, AuraGroupStats, AuraProfile, AuraReader, AuraRecordBatch,
+    AuraSchema, AuraWriter, ConvertOptions, GroupBy, WriterOptions,
 };
 use serde_json::{json, Value};
 
@@ -41,6 +42,49 @@ struct Fixture {
 struct BenchOutput {
     output_bytes: usize,
     records: usize,
+    bytes_scanned: usize,
+    rows_materialized: usize,
+    values_materialized: usize,
+    group_by_fields: Vec<String>,
+    group_stats: Option<AuraGroupStats>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GroupMode {
+    Primary,
+    Symbol,
+    Pair,
+}
+
+impl BenchOutput {
+    fn new(output_bytes: usize, records: usize) -> Self {
+        Self {
+            output_bytes,
+            records,
+            bytes_scanned: output_bytes,
+            rows_materialized: 0,
+            values_materialized: 0,
+            group_by_fields: Vec::new(),
+            group_stats: None,
+        }
+    }
+
+    fn with_row_materialization(mut self, field_count: usize) -> Self {
+        self.rows_materialized = self.records;
+        self.values_materialized = self.records.saturating_mul(field_count);
+        self
+    }
+
+    fn with_column_materialization(mut self, field_count: usize) -> Self {
+        self.values_materialized = self.records.saturating_mul(field_count);
+        self
+    }
+
+    fn with_group_stats(mut self, fields: Vec<String>, stats: AuraGroupStats) -> Self {
+        self.group_by_fields = fields;
+        self.group_stats = Some(stats);
+        self
+    }
 }
 
 fn main() -> Result<()> {
@@ -191,6 +235,13 @@ fn run_fixture_matrix(fixture: &Fixture, args: &Args) -> Result<Vec<Value>> {
         "sdk-convert-aura1-to-aura0",
         "sdk-zstd-aura1-to-aura1",
         "sdk-roundtrip-verify",
+        "aura1-scan-raw",
+        "aura1-replay-i64",
+        "aura1-read-batches-row",
+        "aura1-read-batches-columnar",
+        "aura1-grouped-replay-primary",
+        "aura1-grouped-replay-symbol",
+        "aura1-grouped-replay-pair",
     ];
     let mut results = Vec::with_capacity(operations.len());
     for operation in operations {
@@ -236,6 +287,11 @@ fn bench_operation(
     let mut last_output = BenchOutput {
         output_bytes: 0,
         records: fixture.record_count,
+        bytes_scanned: 0,
+        rows_materialized: 0,
+        values_materialized: 0,
+        group_by_fields: Vec::new(),
+        group_stats: None,
     };
     for _ in 0..args.warmups {
         last_output = run_operation(
@@ -268,6 +324,10 @@ fn bench_operation(
     let output_bytes = last_output.output_bytes;
     let output_mb_sec = mb_per_sec(output_bytes, median);
     let records_per_sec = records as f64 / median.as_secs_f64();
+    let group_stats = last_output.group_stats;
+    let groups_per_sec = group_stats
+        .map(|stats| stats.group_count as f64 / median.as_secs_f64())
+        .unwrap_or(0.0);
     let reader_stats = stats_for_operation(operation, aura0, aura1, args.batch_size)?;
     let command = std::env::args().collect::<Vec<_>>().join(" ");
     Ok(json!({
@@ -291,11 +351,28 @@ fn bench_operation(
         "output_bytes": output_bytes,
         "compressed_bytes": compressed_bytes_for_operation(operation, fixture),
         "output_mb_sec": output_mb_sec,
+        "bytes_scanned": last_output.bytes_scanned,
+        "rows_materialized": last_output.rows_materialized,
+        "values_materialized": last_output.values_materialized,
         "compiled_plan_used": true,
         "conversion_plan_hash": conversion_plan_hash(aura1).unwrap_or(0),
         "streaming_reader_used": reader_stats.streaming_reader_used,
         "full_file_materialized": reader_stats.full_file_materialized,
         "max_rows_materialized_at_once": reader_stats.max_rows_materialized_at_once,
+        "group_by_fields": last_output.group_by_fields,
+        "group_count": group_stats.map(|stats| stats.group_count).unwrap_or(0),
+        "groups_per_sec": groups_per_sec,
+        "rows_per_group_avg": group_stats.map(|stats| stats.rows_per_group_avg).unwrap_or(0.0),
+        "rows_per_group_p95": group_stats.map(|stats| stats.rows_per_group_p95).unwrap_or(0),
+        "callback_count_reduction": group_stats
+            .map(|stats| {
+                if stats.callback_count == 0 {
+                    0.0
+                } else {
+                    stats.row_count as f64 / stats.callback_count as f64
+                }
+            })
+            .unwrap_or(0.0),
         "schema_equality": true,
         "row_equality": row_equality_for_operation(operation, schema, source_batch, aura0, aura1)?,
         "canonical_hash": Value::Null,
@@ -335,6 +412,11 @@ fn run_operation(
             Ok(BenchOutput {
                 output_bytes: decoded.len(),
                 records: source_batch.row_count(),
+                bytes_scanned: aura1_zst.len(),
+                rows_materialized: 0,
+                values_materialized: 0,
+                group_by_fields: Vec::new(),
+                group_stats: None,
             })
         }
         "sdk-roundtrip-verify" => {
@@ -347,8 +429,20 @@ fn run_operation(
             Ok(BenchOutput {
                 output_bytes: summary.output_bytes,
                 records: summary.record_count,
+                bytes_scanned: aura0.len(),
+                rows_materialized: 0,
+                values_materialized: 0,
+                group_by_fields: Vec::new(),
+                group_stats: None,
             })
         }
+        "aura1-scan-raw" => scan_raw_aura1(aura1),
+        "aura1-replay-i64" => replay_aura1(aura1),
+        "aura1-read-batches-row" => read_batches(aura1, args.batch_size),
+        "aura1-read-batches-columnar" => read_column_batches(aura1, args.batch_size),
+        "aura1-grouped-replay-primary" => grouped_replay_aura1(aura1, schema, GroupMode::Primary),
+        "aura1-grouped-replay-symbol" => grouped_replay_aura1(aura1, schema, GroupMode::Symbol),
+        "aura1-grouped-replay-pair" => grouped_replay_aura1(aura1, schema, GroupMode::Pair),
         _ => bail!("unknown operation {operation}"),
     }
 }
@@ -362,10 +456,8 @@ fn write_batch(
     let mut writer = AuraWriter::try_new(&mut output, schema.clone(), options)?;
     writer.write_batch(source_batch.clone())?;
     let summary = writer.finish()?;
-    Ok(BenchOutput {
-        output_bytes: output.len(),
-        records: summary.row_count,
-    })
+    Ok(BenchOutput::new(output.len(), summary.row_count)
+        .with_row_materialization(schema.field_count()))
 }
 
 fn read_batches(bytes: &[u8], batch_size: usize) -> Result<BenchOutput> {
@@ -374,23 +466,106 @@ fn read_batches(bytes: &[u8], batch_size: usize) -> Result<BenchOutput> {
     while let Some(batch) = reader.next_batch(batch_size)? {
         records = records.saturating_add(batch.row_count());
     }
-    Ok(BenchOutput {
-        output_bytes: bytes.len(),
-        records,
-    })
+    Ok(BenchOutput::new(bytes.len(), records)
+        .with_row_materialization(AuraReader::open(Cursor::new(bytes))?.schema().field_count()))
+}
+
+fn read_column_batches(bytes: &[u8], batch_size: usize) -> Result<BenchOutput> {
+    let mut reader = AuraReader::open(Cursor::new(bytes))?;
+    let field_count = reader.schema().field_count();
+    let mut records = 0usize;
+    while let Some(batch) = reader.next_column_batch(batch_size)? {
+        records = records.saturating_add(batch.row_count());
+    }
+    Ok(BenchOutput::new(bytes.len(), records).with_column_materialization(field_count))
 }
 
 fn replay_aura1(bytes: &[u8]) -> Result<BenchOutput> {
     let reader = AuraReader::open(Cursor::new(bytes))?;
-    let mut records = 0usize;
+    let mut record_count = 0usize;
     reader.replay_i64(|_| {
-        records = records.saturating_add(1);
+        record_count = record_count.saturating_add(1);
         Ok(())
     })?;
-    Ok(BenchOutput {
-        output_bytes: bytes.len(),
-        records,
-    })
+    let mut output = BenchOutput::new(bytes.len(), record_count);
+    if let Ok(info) = records::aura1_fixed_layout_info(bytes) {
+        output.bytes_scanned = info.body_bytes;
+    }
+    Ok(output)
+}
+
+fn scan_raw_aura1(bytes: &[u8]) -> Result<BenchOutput> {
+    let info = records::aura1_fixed_layout_info(bytes)?;
+    let body = bytes
+        .get(info.body_offset..info.body_offset.saturating_add(info.body_bytes))
+        .ok_or_else(|| anyhow::anyhow!("invalid Aura1 body range"))?;
+    let mut checksum = 0u8;
+    let stride = info.record_width.max(1);
+    for row in body.chunks(stride) {
+        checksum ^= row.first().copied().unwrap_or(0);
+    }
+    black_box(checksum);
+    let mut output = BenchOutput::new(bytes.len(), info.record_count);
+    output.bytes_scanned = info.body_bytes;
+    Ok(output)
+}
+
+fn grouped_replay_aura1(bytes: &[u8], schema: &AuraSchema, mode: GroupMode) -> Result<BenchOutput> {
+    let fields = group_fields(schema, mode)?;
+    let reader = AuraReader::open(Cursor::new(bytes))?;
+    let mut callback_count = 0usize;
+    let stats = reader.grouped_replay(&GroupBy::fields(fields.iter().cloned()), |_| {
+        callback_count = callback_count.saturating_add(1);
+        Ok(())
+    })?;
+    black_box(callback_count);
+    let mut output = BenchOutput::new(bytes.len(), stats.row_count).with_group_stats(fields, stats);
+    if let Ok(info) = records::aura1_fixed_layout_info(bytes) {
+        output.bytes_scanned = info.body_bytes;
+    }
+    Ok(output)
+}
+
+fn group_fields(schema: &AuraSchema, mode: GroupMode) -> Result<Vec<String>> {
+    let primary = schema
+        .fields()
+        .iter()
+        .find(|field| {
+            matches!(
+                field.aura_type,
+                aura_codec::AuraType::TimestampNanos | aura_codec::AuraType::TimestampMicros
+            )
+        })
+        .or_else(|| schema.fields().first())
+        .ok_or_else(|| anyhow::anyhow!("schema has no fields"))?;
+    let symbol = schema.fields().iter().find(|field| {
+        field.name.contains("symbol")
+            || field.name.contains("venue")
+            || field.name.ends_with("_id")
+            || field.name.ends_with("id")
+    });
+    match mode {
+        GroupMode::Primary => Ok(vec![primary.name.clone()]),
+        GroupMode::Symbol => Ok(vec![symbol.unwrap_or(primary).name.clone()]),
+        GroupMode::Pair => {
+            let mut fields = vec![primary.name.clone()];
+            if let Some(second) = symbol {
+                if second.name != primary.name {
+                    fields.push(second.name.clone());
+                }
+            }
+            if fields.len() == 1 {
+                if let Some(second) = schema
+                    .fields()
+                    .iter()
+                    .find(|field| field.name != primary.name)
+                {
+                    fields.push(second.name.clone());
+                }
+            }
+            Ok(fields)
+        }
+    }
 }
 
 fn convert_bytes(bytes: &[u8], target: AuraFormat) -> Result<BenchOutput> {
@@ -399,6 +574,11 @@ fn convert_bytes(bytes: &[u8], target: AuraFormat) -> Result<BenchOutput> {
     Ok(BenchOutput {
         output_bytes: output.len(),
         records: summary.record_count,
+        bytes_scanned: bytes.len(),
+        rows_materialized: 0,
+        values_materialized: 0,
+        group_by_fields: Vec::new(),
+        group_stats: None,
     })
 }
 
@@ -414,7 +594,9 @@ fn stats_for_operation(
         aura1
     };
     let mut reader = AuraReader::open(Cursor::new(bytes))?;
-    if operation.contains("read") {
+    if operation.contains("columnar") {
+        let _ = reader.next_column_batch(batch_size)?;
+    } else if operation.contains("read") {
         let _ = reader.next_batch(batch_size)?;
     }
     Ok(reader.stats())
@@ -479,7 +661,9 @@ fn conversion_plan_hash(aura1: &[u8]) -> Result<u64> {
 }
 
 fn format_for_operation(operation: &str) -> &'static str {
-    if operation.contains("aura0") {
+    if operation.starts_with("aura1-") {
+        "aura1"
+    } else if operation.contains("aura0") {
         "aura0"
     } else {
         "aura1"
@@ -487,7 +671,9 @@ fn format_for_operation(operation: &str) -> &'static str {
 }
 
 fn profile_for_operation(operation: &str) -> &'static str {
-    if operation.contains("hybrid") {
+    if operation.starts_with("aura1-") {
+        "fixed"
+    } else if operation.contains("hybrid") {
         "hybrid"
     } else if operation.contains("aura0") {
         "compact"
@@ -499,7 +685,10 @@ fn profile_for_operation(operation: &str) -> &'static str {
 fn input_bytes_for_operation(operation: &str, fixture: &Fixture) -> u64 {
     if operation.contains("zstd") {
         fixture.aura1_zst_bytes
-    } else if operation.contains("aura1-to-aura0") || operation.contains("aura1") {
+    } else if operation.starts_with("aura1-")
+        || operation.contains("aura1-to-aura0")
+        || operation.contains("aura1")
+    {
         fixture.aura1_bytes
     } else {
         fixture.aura0_bytes

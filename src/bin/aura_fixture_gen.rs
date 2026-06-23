@@ -111,6 +111,7 @@ fn fixture_inputs(sdk_full: bool) -> Result<Vec<FixtureInput>> {
     let sdk_sparse_count = if sdk_full { 100_000 } else { 2048 };
     let sdk_edge_count = if sdk_full { 10_000 } else { 3 };
     let sdk_larger_count = if sdk_full { 500_000 } else { 32_768 };
+    let group_count = if sdk_full { 100_000 } else { 2048 };
     Ok(vec![
         FixtureInput {
             name: "tiny",
@@ -190,6 +191,41 @@ fn fixture_inputs(sdk_full: bool) -> Result<Vec<FixtureInput>> {
             schema: sdk_dense_schema(),
             rows: sdk_dense_rows(sdk_larger_count, 64),
             symbol_count: 64,
+            expected_huffman: None,
+        },
+        FixtureInput {
+            name: "repeated-timestamp",
+            schema: sdk_group_schema(),
+            rows: sdk_group_rows(group_count, GroupPattern::RepeatedTimestamp),
+            symbol_count: 512,
+            expected_huffman: None,
+        },
+        FixtureInput {
+            name: "repeated-symbol",
+            schema: sdk_group_schema(),
+            rows: sdk_group_rows(group_count, GroupPattern::RepeatedSymbol),
+            symbol_count: 64,
+            expected_huffman: None,
+        },
+        FixtureInput {
+            name: "repeated-timestamp-symbol",
+            schema: sdk_group_schema(),
+            rows: sdk_group_rows(group_count, GroupPattern::RepeatedTimestampSymbol),
+            symbol_count: 512,
+            expected_huffman: None,
+        },
+        FixtureInput {
+            name: "high-cardinality",
+            schema: sdk_group_schema(),
+            rows: sdk_group_rows(group_count, GroupPattern::HighCardinality),
+            symbol_count: group_count.min(4096),
+            expected_huffman: None,
+        },
+        FixtureInput {
+            name: "mixed-burst",
+            schema: sdk_group_schema(),
+            rows: sdk_group_rows(group_count, GroupPattern::MixedBurst),
+            symbol_count: 128,
             expected_huffman: None,
         },
         FixtureInput {
@@ -647,6 +683,86 @@ fn sdk_edge_rows(count: usize) -> Vec<Vec<i64>> {
             row
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GroupPattern {
+    RepeatedTimestamp,
+    RepeatedSymbol,
+    RepeatedTimestampSymbol,
+    HighCardinality,
+    MixedBurst,
+}
+
+fn sdk_group_schema() -> SchemaDescriptor {
+    AuraSchema::named("sdk_group_schema")
+        .field("event_time", AuraType::TimestampNanos)
+        .field("symbol_id", AuraType::U32)
+        .field("event_type", AuraType::EnumU8)
+        .field("price", AuraType::PriceI64Scaled { scale: 4 })
+        .field("quantity", AuraType::U32)
+        .build()
+        .unwrap()
+        .into_descriptor()
+}
+
+fn sdk_group_rows(count: usize, pattern: GroupPattern) -> Vec<Vec<i64>> {
+    let mut rows = Vec::with_capacity(count);
+    let mut index = 0usize;
+    while index < count {
+        let run_len = match pattern {
+            GroupPattern::RepeatedTimestamp => 32,
+            GroupPattern::RepeatedSymbol => 32,
+            GroupPattern::RepeatedTimestampSymbol => 48,
+            GroupPattern::HighCardinality => 1,
+            GroupPattern::MixedBurst => match (index / 17) % 5 {
+                0 => 1,
+                1 => 4,
+                2 => 16,
+                3 => 32,
+                _ => 8,
+            },
+        }
+        .min(count - index);
+        let run = index / run_len.max(1);
+        let repeated_ts = matches!(
+            pattern,
+            GroupPattern::RepeatedTimestamp
+                | GroupPattern::RepeatedTimestampSymbol
+                | GroupPattern::MixedBurst
+        );
+        let repeated_symbol = matches!(
+            pattern,
+            GroupPattern::RepeatedSymbol
+                | GroupPattern::RepeatedTimestampSymbol
+                | GroupPattern::MixedBurst
+        );
+        let run_ts = 1_700_200_000_000_000_000 + i64::try_from(run).unwrap() * 1_000_000;
+        let run_symbol = i64::try_from(run % 512).unwrap();
+        for offset in 0..run_len {
+            let row_index = index + offset;
+            let row_index_i64 = i64::try_from(row_index).unwrap();
+            let ts = if repeated_ts {
+                run_ts
+            } else {
+                1_700_200_000_000_000_000 + row_index_i64 * 1_000_000
+            };
+            let symbol = if repeated_symbol {
+                run_symbol
+            } else {
+                row_index_i64 % 4096
+            };
+            rows.push(vec![
+                ts,
+                symbol,
+                row_index_i64 % 5,
+                10_000_000 + symbol * 100 + row_index_i64 % 97,
+                1 + row_index_i64 % 1_000,
+            ]);
+        }
+        index += run_len;
+    }
+    rows
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

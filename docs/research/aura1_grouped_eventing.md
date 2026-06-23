@@ -1,0 +1,79 @@
+# Aura1 Grouped Eventing
+
+Date: 2026-06-23
+
+## Status
+
+Implemented as an SDK opt-in consecutive-run replay API:
+
+```rust
+reader.grouped_replay(&GroupBy::fields(["ts_event", "symbol_id"]), |group| {
+    // one callback per consecutive run
+    Ok(())
+})?;
+```
+
+## Semantics
+
+- Grouping preserves physical row order.
+- Grouping is consecutive-run only; it is not global aggregation.
+- Group fields are selected by field name or field ID.
+- Field lookups are compiled once before replay.
+- Unknown fields reject before replay.
+- Unsupported variable-width fields reject through the v1 schema policy.
+- High-cardinality data degrades to one-row groups.
+- Grouped replay does not change Aura1 file bytes or row semantics.
+
+## Public Types
+
+- `GroupBy`
+- `AuraGroupKey`
+- `AuraEventGroup`
+- `AuraGroupStats`
+
+`AuraEventGroup` exposes:
+
+- `row_start`
+- `row_count`
+- shared key field names
+- shared key values
+
+## Benchmark Interpretation
+
+Grouped replay changes callback semantics. A grouped replay result can be faster
+than per-row replay when callback count falls substantially, but it is not the
+same amount of callback work.
+
+The benchmark JSON reports:
+
+- `group_by_fields`
+- `group_count`
+- `groups_per_sec`
+- `rows_per_group_avg`
+- `rows_per_group_p95`
+- `callback_count_reduction`
+
+## Targeted Evidence
+
+Fresh targeted matrix:
+
+`/tmp/aura-benchmarks/aura1-parse-20260623T235910Z/targeted-results/sdk_full_matrix_summary.json`
+
+Selected rows:
+
+| Dataset | Operation | Median ms | P95 ms | Groups | Callback Reduction | P95 Rows/Group |
+|---|---|---:|---:|---:|---:|---:|
+| `repeated-timestamp` | grouped primary | 4.916 | 5.125 | 3,125 | 32.00x | 32 |
+| `repeated-timestamp-symbol` | grouped pair | 5.207 | 5.296 | 2,084 | 47.98x | 48 |
+| `mixed-burst` | grouped primary | 7.206 | 7.761 | 28,247 | 3.54x | 16 |
+| `high-cardinality` | grouped primary | 12.253 | 12.759 | 100,000 | 1.00x | 1 |
+
+Decision: keep grouped replay as an opt-in API. It helps repeated-run datasets
+and degrades predictably on high-cardinality data.
+
+## Footer Index Decision
+
+No footer group index is implemented in this sprint. On-the-fly grouped replay
+is sufficient to prove the API and semantics. A footer or sidecar run index
+would add format surface area and should only be considered if grouped callback
+cost remains too high for repeated-run workloads.

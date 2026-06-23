@@ -3,7 +3,7 @@ use std::io::Cursor;
 use aura_codec::{
     convert_aura, Aura0ByteLaneCodec, Aura0ByteLaneUse, AuraColumnBatch, AuraFormat, AuraProfile,
     AuraReader, AuraRecordBatch, AuraSchema, AuraType, AuraValue, AuraWriter, CompiledAuraPlan,
-    ConvertOptions, ReaderOptions, WriterOptions,
+    ConvertOptions, GroupBy, ReaderOptions, WriterOptions,
 };
 
 fn market_schema() -> AuraSchema {
@@ -404,6 +404,120 @@ fn reader_streaming_batches_match_read_batches_and_replay() {
             .unwrap(),
         replayed
     );
+}
+
+#[test]
+fn reader_next_column_batch_matches_row_batches() {
+    let schema = market_schema();
+    let rows = market_rows();
+    let aura1 = write_with_options(schema.clone(), rows.clone(), WriterOptions::aura1());
+    let mut reader = AuraReader::open(Cursor::new(&aura1)).unwrap();
+
+    let first = reader.next_column_batch(2).unwrap().unwrap();
+    assert_eq!(2, first.row_count());
+    assert_eq!(
+        &rows[..2],
+        first.clone().into_record_batch().unwrap().rows()
+    );
+    let stats = reader.stats();
+    assert_eq!(2, stats.rows_decoded_in_last_batch);
+    assert_eq!(0, stats.max_rows_materialized_at_once);
+
+    let second = reader.next_column_batch(2).unwrap().unwrap();
+    assert_eq!(1, second.row_count());
+    assert_eq!(&rows[2..], second.into_record_batch().unwrap().rows());
+    assert!(reader.next_column_batch(2).unwrap().is_none());
+
+    let row_reader = AuraReader::open(Cursor::new(&aura1)).unwrap();
+    let row_batches = row_reader.read_batches().unwrap();
+    let all_rows = first
+        .into_record_batch()
+        .unwrap()
+        .rows()
+        .iter()
+        .cloned()
+        .chain(rows[2..].iter().cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(row_batches[0].rows(), all_rows.as_slice());
+}
+
+#[test]
+fn grouped_replay_uses_generic_field_names_and_preserves_runs() {
+    let schema = AuraSchema::named("grouped_non_grimoire")
+        .field("venue", AuraType::U16)
+        .field("px", AuraType::I64Scaled { scale: 4 })
+        .field("event_time", AuraType::TimestampNanos)
+        .field("symbol_code", AuraType::U32)
+        .build()
+        .unwrap();
+    let rows = vec![
+        vec![1_u64.into(), 100_i64.into(), 1_000_i64.into(), 7_u64.into()],
+        vec![1_u64.into(), 101_i64.into(), 1_000_i64.into(), 7_u64.into()],
+        vec![1_u64.into(), 102_i64.into(), 2_000_i64.into(), 8_u64.into()],
+        vec![2_u64.into(), 103_i64.into(), 3_000_i64.into(), 8_u64.into()],
+        vec![2_u64.into(), 104_i64.into(), 3_000_i64.into(), 8_u64.into()],
+        vec![2_u64.into(), 105_i64.into(), 3_000_i64.into(), 9_u64.into()],
+    ];
+    let aura1 = write_with_options(schema.clone(), rows, WriterOptions::aura1());
+    let reader = AuraReader::open(Cursor::new(&aura1)).unwrap();
+
+    let mut groups = Vec::new();
+    let stats = reader
+        .grouped_replay(&GroupBy::fields(["event_time"]), |group| {
+            groups.push((
+                group.row_start(),
+                group.row_count(),
+                group.key().field_names().to_vec(),
+                group.key().values().to_vec(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(6, stats.row_count);
+    assert_eq!(3, stats.group_count);
+    assert_eq!(3, stats.rows_per_group_p95);
+    assert_eq!(
+        vec![2, 1, 3],
+        groups.iter().map(|group| group.1).collect::<Vec<_>>()
+    );
+    assert_eq!(vec!["event_time".to_string()], groups[0].2);
+    assert_eq!(vec![AuraValue::I64(1_000)], groups[0].3);
+    assert_eq!(0, groups[0].0);
+    assert_eq!(3, groups[2].0);
+
+    let mut pair_counts = Vec::new();
+    reader
+        .grouped_replay(&GroupBy::fields(["event_time", "symbol_code"]), |group| {
+            pair_counts.push(group.row_count());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(vec![2, 1, 2, 1], pair_counts);
+
+    let mut id_counts = Vec::new();
+    reader
+        .grouped_replay(&GroupBy::field_ids([2]), |group| {
+            id_counts.push(group.row_count());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(vec![2, 1, 3], id_counts);
+
+    let mut high_cardinality = 0usize;
+    let stats = reader
+        .grouped_replay(&GroupBy::fields(["px"]), |group| {
+            assert_eq!(1, group.row_count());
+            high_cardinality = high_cardinality.saturating_add(1);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(6, high_cardinality);
+    assert_eq!(6, stats.group_count);
+
+    let error = reader
+        .grouped_replay(&GroupBy::fields(["missing_field"]), |_| Ok(()))
+        .unwrap_err();
+    assert!(error.to_string().contains("group field"));
 }
 
 #[test]

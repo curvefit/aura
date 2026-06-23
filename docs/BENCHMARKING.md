@@ -182,3 +182,28 @@ target/release/aura_sdk_bench --fixture-dir /tmp/aura-sdk-fixtures --output-dir 
 ```
 
 The runner writes one JSON result per dataset/operation and a `sdk_full_matrix_summary.json` aggregate. Results include schema metadata, p95, median, records/sec, streaming flags, materialization counters, command, git commit, and dirty status.
+
+## Aura1 Parse Matrix
+
+`aura_sdk_bench` also emits Aura1 parse-speed rows:
+
+- `aura1-scan-raw`: fixed body byte scan, no value decode.
+- `aura1-replay-i64`: visitor replay over fixed-width rows.
+- `aura1-read-batches-row`: row-oriented `AuraRecordBatch` materialization.
+- `aura1-read-batches-columnar`: direct `AuraColumnBatch` materialization.
+- `aura1-grouped-replay-primary`: consecutive-run grouped replay by the first
+  timestamp field, or the first field if no timestamp exists.
+- `aura1-grouped-replay-symbol`: consecutive-run grouped replay by the first
+  symbol/id-like field when present.
+- `aura1-grouped-replay-pair`: grouped replay by timestamp plus a symbol/id-like
+  field when present.
+
+The generated fixture matrix includes repeated timestamp, repeated symbol,
+timestamp+symbol, high-cardinality, and mixed-burst datasets. JSON rows report
+`rows_materialized`, `values_materialized`, `group_count`,
+`rows_per_group_avg`, `rows_per_group_p95`, and
+`callback_count_reduction`.
+
+Do not compare grouped replay directly to row replay unless the callback
+semantics are labeled: grouped replay invokes one callback per consecutive run,
+not one callback per row.

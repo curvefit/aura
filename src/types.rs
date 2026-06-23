@@ -260,6 +260,63 @@ impl AuraColumn {
             Self::I64(values) => AuraValue::I64(values[index]),
         }
     }
+
+    pub(crate) fn from_i64_values_for_type(values: Vec<i64>, aura_type: AuraType) -> Result<Self> {
+        match aura_type {
+            AuraType::Bool => values
+                .into_iter()
+                .map(|value| match value {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    _ => Err(AuraError::InvalidValue("bool value")),
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(Self::Bool),
+            AuraType::U8 | AuraType::EnumU8 => values
+                .into_iter()
+                .map(|value| u8::try_from(value).map_err(|_| AuraError::InvalidValue("u8 value")))
+                .collect::<Result<Vec<_>>>()
+                .map(Self::U8),
+            AuraType::U16 => values
+                .into_iter()
+                .map(|value| u16::try_from(value).map_err(|_| AuraError::InvalidValue("u16 value")))
+                .collect::<Result<Vec<_>>>()
+                .map(Self::U16),
+            AuraType::U32 | AuraType::FlagsU32 => values
+                .into_iter()
+                .map(|value| u32::try_from(value).map_err(|_| AuraError::InvalidValue("u32 value")))
+                .collect::<Result<Vec<_>>>()
+                .map(Self::U32),
+            AuraType::U64 => values
+                .into_iter()
+                .map(|value| u64::try_from(value).map_err(|_| AuraError::InvalidValue("u64 value")))
+                .collect::<Result<Vec<_>>>()
+                .map(Self::U64),
+            AuraType::I8 => values
+                .into_iter()
+                .map(|value| i8::try_from(value).map_err(|_| AuraError::InvalidValue("i8 value")))
+                .collect::<Result<Vec<_>>>()
+                .map(Self::I8),
+            AuraType::I16 => values
+                .into_iter()
+                .map(|value| i16::try_from(value).map_err(|_| AuraError::InvalidValue("i16 value")))
+                .collect::<Result<Vec<_>>>()
+                .map(Self::I16),
+            AuraType::I32 => values
+                .into_iter()
+                .map(|value| i32::try_from(value).map_err(|_| AuraError::InvalidValue("i32 value")))
+                .collect::<Result<Vec<_>>>()
+                .map(Self::I32),
+            AuraType::I64
+            | AuraType::TimestampNanos
+            | AuraType::TimestampMicros
+            | AuraType::I64Scaled { .. }
+            | AuraType::PriceI64Scaled { .. } => Ok(Self::I64(values)),
+            AuraType::F32 | AuraType::F64 | AuraType::Binary | AuraType::Utf8 => {
+                Err(AuraError::InvalidValue("unsupported aura type"))
+            }
+        }
+    }
 }
 
 /// Public SDK columnar batch.
@@ -308,6 +365,28 @@ impl AuraColumnBatch {
             })
             .collect::<Vec<_>>();
         AuraRecordBatch::new(self.schema, rows)
+    }
+
+    pub(crate) fn from_i64_columns(schema: AuraSchema, columns: Vec<Vec<i64>>) -> Result<Self> {
+        if columns.len() != schema.field_count() {
+            return Err(AuraError::InvalidValue("column count"));
+        }
+        let row_count = columns.first().map_or(0, Vec::len);
+        let mut typed_columns = Vec::with_capacity(columns.len());
+        for (values, field) in columns.into_iter().zip(schema.fields()) {
+            if values.len() != row_count {
+                return Err(AuraError::InvalidValue("column length"));
+            }
+            typed_columns.push(AuraColumn::from_i64_values_for_type(
+                values,
+                field.aura_type,
+            )?);
+        }
+        Ok(Self {
+            schema,
+            columns: typed_columns,
+            row_count,
+        })
     }
 }
 
