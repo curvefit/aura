@@ -33,6 +33,11 @@ Do not compare guarded and unguarded runs as speedups.
 direct paths. They are not yet unconditional defaults because wider fixture
 coverage and remaining materialization decisions are still open.
 
+Materialized transcode paths remain reference/correctness fallbacks. They may
+emit `compiled_plan_used=false` and `conversion_plan_hash=null`; this is
+intentional for reference-only paths and should not be treated as final fast
+path evidence.
+
 ## Canonical Hash
 
 `--canonical-hash-mode verify` computes a logical i64 row hash for verification.

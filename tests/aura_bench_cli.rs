@@ -265,6 +265,8 @@ fn aura_bench_reports_aura0_to_aura1_guard_modes_and_stage_tree() {
         let materialized_value_count = decode_stats["materialized_value_count"].as_u64().unwrap();
         let profiled_path = json["stage_timings_ns"]["total"].as_u64().unwrap_or(0) > 0;
         if profiled_path {
+            assert_eq!(true, json["compiled_plan_used"]);
+            assert!(json["conversion_plan_hash"].as_u64().unwrap() > 0);
             assert!(stream_count > 0);
             assert!(stream_value_count > 0);
             assert!(materialized_stream_count > 0);
@@ -372,6 +374,8 @@ fn aura_bench_reports_aura1_to_aura0_direct_transcode_path() {
     assert_eq!("direct", json["transcode_path"]);
     assert_eq!("transcode-aura1-to-aura0", json["operation"]);
     assert_eq!(expected_record_count, json["record_count"]);
+    assert_eq!(true, json["compiled_plan_used"]);
+    assert!(json["conversion_plan_hash"].as_u64().unwrap() > 0);
 
     let timings = &json["stage_timings_ns"]["aura1_to_aura0"];
     assert!(timings["total"].as_u64().unwrap() > 0);
@@ -724,6 +728,8 @@ fn aura_bench_reports_aura1_replay_operations() {
         assert_eq!(operation, json["operation"]);
         assert_eq!("aura1", json["source_format"]);
         assert_eq!("none", json["target_format"]);
+        assert_eq!(true, json["compiled_plan_used"]);
+        assert!(json["conversion_plan_hash"].as_u64().unwrap() > 0);
         assert!(json["record_count"].as_u64().unwrap() > 0);
         assert!(json["records_per_sec"].as_f64().unwrap() > 0.0);
         assert!(json["replay_stats"]["record_width"].as_u64().unwrap() > 0);
@@ -745,6 +751,56 @@ fn aura_bench_reports_aura1_replay_operations() {
             );
         }
     }
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn aura_bench_reports_compiled_plan_for_aura1_canonical_scan() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
+        panic!("missing aura-bench binary");
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "aura-bench-plan-canonical-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let (_, aura1) = partitioned_sparse_fixture_profiles();
+    let aura1_path = dir.join("fixture.aura1");
+    fs::write(&aura1_path, aura1).unwrap();
+
+    let output = Command::new(bin)
+        .arg("--operation")
+        .arg("parse-aura1")
+        .arg("--dataset")
+        .arg("unit-fixture")
+        .arg("--input")
+        .arg(&aura1_path)
+        .arg("--iterations")
+        .arg("1")
+        .arg("--format")
+        .arg("json")
+        .arg("--canonical-hash-mode")
+        .arg("verify")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(true, json["compiled_plan_used"]);
+    assert_eq!("compiled", json["plan_mode"]);
+    assert!(json["conversion_plan_hash"].as_u64().unwrap() > 0);
+    assert!(json["plan_setup_time_ms"].as_f64().unwrap() >= 0.0);
+    assert!(json["canonical_hash"].as_u64().unwrap() > 0);
 
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -799,6 +855,83 @@ fn aura_bench_reports_zstd_baselines() {
         assert!(json["decompressed_output_bytes"].as_u64().unwrap() > 0);
         assert!(json["work_included"].as_str().unwrap().contains("zstd"));
         assert!(json["records_per_sec"].as_f64().unwrap() >= 0.0);
+    }
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn aura_bench_reports_fair_aura0_vs_zstd_bytes_benchmarks() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
+        panic!("missing aura-bench binary");
+    };
+
+    let dir =
+        std::env::temp_dir().join(format!("aura-bench-fair-zstd-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let (aura0, aura1) = partitioned_sparse_fixture_profiles();
+    let aura0_path = dir.join("fixture.aura0");
+    let aura1_path = dir.join("fixture.aura1");
+    fs::write(&aura0_path, aura0).unwrap();
+    fs::write(&aura1_path, aura1).unwrap();
+
+    for (operation, input) in [
+        ("aura0-to-aura1-bytes", &aura0_path),
+        ("aura0-to-aura1-bytes-verify", &aura0_path),
+        ("zstd-aura1-to-aura1-bytes", &aura1_path),
+        ("zstd-aura1-to-aura1-bytes-verify", &aura1_path),
+    ] {
+        let output = Command::new(bin)
+            .arg("--operation")
+            .arg(operation)
+            .arg("--dataset")
+            .arg("unit-fixture")
+            .arg("--input")
+            .arg(input)
+            .arg("--reference-aura0")
+            .arg(&aura0_path)
+            .arg("--reference-aura1")
+            .arg(&aura1_path)
+            .arg("--iterations")
+            .arg("1")
+            .arg("--format")
+            .arg("json")
+            .arg("--zstd-level")
+            .arg("1")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "operation: {operation}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(operation, json["operation"]);
+        assert_eq!("memory_vec", json["output_sink"]);
+        assert_eq!("no_guard", json["guard_mode"]);
+        assert_eq!("none", json["canonical_hash_mode"]);
+        assert_eq!(1, json["zstd_level"]);
+        assert!(json["dataset_sha256_aura0"].as_str().unwrap().len() == 64);
+        assert!(json["dataset_sha256_aura1"].as_str().unwrap().len() == 64);
+        assert!(json["dataset_sha256_aura1_zst"].as_str().unwrap().len() == 64);
+        assert!(json["aura0_compressed_bytes"].as_u64().unwrap() > 0);
+        assert!(json["aura1_zstd_compressed_bytes"].as_u64().unwrap() > 0);
+        assert!(json["aura1_uncompressed_bytes"].as_u64().unwrap() > 0);
+        assert!(json["compressed_input_mb_sec"].as_f64().unwrap() > 0.0);
+        assert!(json["uncompressed_output_mb_sec"].as_f64().unwrap() > 0.0);
+
+        if operation.ends_with("-verify") {
+            assert_eq!(true, json["output_bytes_equal"]);
+            assert!(json["output_byte_hash"].as_u64().unwrap() > 0);
+        } else {
+            assert!(json["output_bytes_equal"].is_null());
+            assert!(json["output_byte_hash"].is_null());
+        }
     }
 
     fs::remove_dir_all(&dir).unwrap();

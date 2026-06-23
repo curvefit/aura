@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use std::fmt::Write as _;
 use std::fs;
@@ -28,6 +28,10 @@ enum Operation {
     ZstdDecompressPlusParse,
     ZstdDecompressPlusReplay,
     ZstdDecompressPlusAura1Output,
+    Aura0ToAura1Bytes,
+    Aura0ToAura1BytesVerify,
+    ZstdAura1ToAura1Bytes,
+    ZstdAura1ToAura1BytesVerify,
 }
 
 impl Operation {
@@ -44,6 +48,10 @@ impl Operation {
             "zstd-decompress-plus-parse" => Ok(Self::ZstdDecompressPlusParse),
             "zstd-decompress-plus-replay" => Ok(Self::ZstdDecompressPlusReplay),
             "zstd-decompress-plus-aura1-output" => Ok(Self::ZstdDecompressPlusAura1Output),
+            "aura0-to-aura1-bytes" => Ok(Self::Aura0ToAura1Bytes),
+            "aura0-to-aura1-bytes-verify" => Ok(Self::Aura0ToAura1BytesVerify),
+            "zstd-aura1-to-aura1-bytes" => Ok(Self::ZstdAura1ToAura1Bytes),
+            "zstd-aura1-to-aura1-bytes-verify" => Ok(Self::ZstdAura1ToAura1BytesVerify),
             other => bail!("unknown operation: {other}"),
         }
     }
@@ -61,6 +69,10 @@ impl Operation {
             Self::ZstdDecompressPlusParse => "zstd-decompress-plus-parse",
             Self::ZstdDecompressPlusReplay => "zstd-decompress-plus-replay",
             Self::ZstdDecompressPlusAura1Output => "zstd-decompress-plus-aura1-output",
+            Self::Aura0ToAura1Bytes => "aura0-to-aura1-bytes",
+            Self::Aura0ToAura1BytesVerify => "aura0-to-aura1-bytes-verify",
+            Self::ZstdAura1ToAura1Bytes => "zstd-aura1-to-aura1-bytes",
+            Self::ZstdAura1ToAura1BytesVerify => "zstd-aura1-to-aura1-bytes-verify",
         }
     }
 
@@ -71,11 +83,16 @@ impl Operation {
             | Self::Aura1ScanFixed
             | Self::Aura1ReplayCallback
             | Self::Aura1ParseToRows => "aura1",
-            Self::DecodeAura0 | Self::TranscodeAura0ToAura1 => "aura0",
+            Self::DecodeAura0
+            | Self::TranscodeAura0ToAura1
+            | Self::Aura0ToAura1Bytes
+            | Self::Aura0ToAura1BytesVerify => "aura0",
             Self::ZstdDecompressOnly
             | Self::ZstdDecompressPlusParse
             | Self::ZstdDecompressPlusReplay
-            | Self::ZstdDecompressPlusAura1Output => "zstd",
+            | Self::ZstdDecompressPlusAura1Output
+            | Self::ZstdAura1ToAura1Bytes
+            | Self::ZstdAura1ToAura1BytesVerify => "zstd",
         }
     }
 
@@ -90,8 +107,12 @@ impl Operation {
             | Self::ZstdDecompressPlusParse
             | Self::ZstdDecompressPlusReplay => "none",
             Self::TranscodeAura1ToAura0 => "aura0",
-            Self::TranscodeAura0ToAura1 => "aura1",
-            Self::ZstdDecompressPlusAura1Output => "aura1",
+            Self::TranscodeAura0ToAura1
+            | Self::Aura0ToAura1Bytes
+            | Self::Aura0ToAura1BytesVerify
+            | Self::ZstdDecompressPlusAura1Output
+            | Self::ZstdAura1ToAura1Bytes
+            | Self::ZstdAura1ToAura1BytesVerify => "aura1",
         }
     }
 
@@ -109,6 +130,36 @@ impl Operation {
                 | Self::ZstdDecompressPlusParse
                 | Self::ZstdDecompressPlusReplay
                 | Self::ZstdDecompressPlusAura1Output
+                | Self::ZstdAura1ToAura1Bytes
+                | Self::ZstdAura1ToAura1BytesVerify
+        )
+    }
+
+    const fn uses_zstd_compressed_input(self) -> bool {
+        self.is_zstd_baseline()
+    }
+
+    const fn is_fair_bytes_benchmark(self) -> bool {
+        matches!(
+            self,
+            Self::Aura0ToAura1Bytes
+                | Self::Aura0ToAura1BytesVerify
+                | Self::ZstdAura1ToAura1Bytes
+                | Self::ZstdAura1ToAura1BytesVerify
+        )
+    }
+
+    const fn is_fair_verify(self) -> bool {
+        matches!(
+            self,
+            Self::Aura0ToAura1BytesVerify | Self::ZstdAura1ToAura1BytesVerify
+        )
+    }
+
+    const fn is_fair_zstd(self) -> bool {
+        matches!(
+            self,
+            Self::ZstdAura1ToAura1Bytes | Self::ZstdAura1ToAura1BytesVerify
         )
     }
 }
@@ -226,6 +277,8 @@ struct Config {
     verify_output_decodes: bool,
     canonical_hash_mode: Option<CanonicalHashMode>,
     zstd_level: i32,
+    reference_aura0: Option<PathBuf>,
+    reference_aura1: Option<PathBuf>,
 }
 
 impl Config {
@@ -246,6 +299,8 @@ impl Config {
         let mut verify_output_decodes = false;
         let mut canonical_hash_mode = None;
         let mut zstd_level = 3;
+        let mut reference_aura0 = None;
+        let mut reference_aura1 = None;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -319,6 +374,16 @@ impl Config {
                         .parse()
                         .context("invalid --zstd-level value")?;
                 }
+                "--reference-aura0" => {
+                    reference_aura0 = Some(PathBuf::from(
+                        args.next().context("missing --reference-aura0 value")?,
+                    ));
+                }
+                "--reference-aura1" => {
+                    reference_aura1 = Some(PathBuf::from(
+                        args.next().context("missing --reference-aura1 value")?,
+                    ));
+                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -351,6 +416,8 @@ impl Config {
             verify_output_decodes,
             canonical_hash_mode,
             zstd_level,
+            reference_aura0,
+            reference_aura1,
         })
     }
 }
@@ -375,6 +442,7 @@ struct RunOutcome {
     stats: Option<ProfiledCompileStats>,
     replay_stats: Option<ReplayStats>,
     zstd_stats: Option<ZstdStats>,
+    fair_bytes_stats: Option<FairBytesStats>,
     preserved_output: Option<Vec<u8>>,
 }
 
@@ -421,6 +489,34 @@ struct ZstdStats {
     replay_time: Duration,
 }
 
+#[derive(Debug, Clone)]
+struct FairBytesStats {
+    dataset_sha256_aura0: String,
+    dataset_sha256_aura1: String,
+    dataset_sha256_aura1_zst: String,
+    aura0_compressed_bytes: usize,
+    aura1_zstd_compressed_bytes: usize,
+    aura1_uncompressed_bytes: usize,
+    zstd_level: i32,
+    output_sink: &'static str,
+    compressed_input_bytes: usize,
+    uncompressed_output_bytes: usize,
+    output_bytes_equal: Option<bool>,
+    output_byte_hash: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct FairBytesContext {
+    aura0_bytes: Vec<u8>,
+    aura1_bytes: Vec<u8>,
+    aura1_zst_bytes: Vec<u8>,
+    aura0_sha256: String,
+    aura1_sha256: String,
+    aura1_zst_sha256: String,
+    record_count: usize,
+    zstd_level: i32,
+}
+
 fn main() -> Result<()> {
     let config = Config::parse()?;
     let report = run_benchmark(&config)?;
@@ -437,9 +533,20 @@ fn run_benchmark(config: &Config) -> Result<String> {
     let input_len = input_bytes.len();
     let dataset_sha256 = sha256_hex(&input_bytes);
     let command_used = std::env::args().collect::<Vec<_>>().join(" ");
-    let record_count_hint = inspect_input(config.operation, &input_bytes)?;
+    let fair_context = load_fair_bytes_context(config, &input_bytes)?;
+    let record_count_hint = if let Some(context) = fair_context.as_ref() {
+        context.record_count
+    } else {
+        inspect_input(config.operation, &input_bytes)?
+    };
     let effective_canonical_hash_mode = effective_canonical_hash_mode(config);
-    let benchmark_input = if config.operation.is_zstd_baseline() {
+    let benchmark_input = if config.operation.is_fair_zstd() {
+        fair_context
+            .as_ref()
+            .context("missing fair bytes context")?
+            .aura1_zst_bytes
+            .clone()
+    } else if config.operation.uses_zstd_compressed_input() {
         zstd::stream::encode_all(Cursor::new(input_bytes.as_slice()), config.zstd_level)
             .context("zstd-compress benchmark input")?
     } else {
@@ -461,13 +568,20 @@ fn run_benchmark(config: &Config) -> Result<String> {
                     config.transcode_path,
                     config.encoder_path,
                     effective_canonical_hash_mode,
+                    fair_context.as_ref(),
                     false,
                 )?;
                 black_box(outcome.guard);
             }
             CacheMode::Cold => {
                 let bytes = fs::read(&config.input)?;
-                let bytes = if config.operation.is_zstd_baseline() {
+                let bytes = if config.operation.is_fair_zstd() {
+                    fair_context
+                        .as_ref()
+                        .context("missing fair bytes context")?
+                        .aura1_zst_bytes
+                        .clone()
+                } else if config.operation.uses_zstd_compressed_input() {
                     zstd::stream::encode_all(Cursor::new(bytes.as_slice()), config.zstd_level)
                         .context("zstd-compress cold benchmark input")?
                 } else {
@@ -481,6 +595,7 @@ fn run_benchmark(config: &Config) -> Result<String> {
                     config.transcode_path,
                     config.encoder_path,
                     effective_canonical_hash_mode,
+                    fair_context.as_ref(),
                     false,
                 )?;
                 black_box(outcome.guard);
@@ -499,12 +614,19 @@ fn run_benchmark(config: &Config) -> Result<String> {
                 config.transcode_path,
                 config.encoder_path,
                 effective_canonical_hash_mode,
+                fair_context.as_ref(),
                 should_capture_output,
             )?,
             CacheMode::Cold => {
                 let start = Instant::now();
                 let bytes = fs::read(&config.input)?;
-                let bytes = if config.operation.is_zstd_baseline() {
+                let bytes = if config.operation.is_fair_zstd() {
+                    fair_context
+                        .as_ref()
+                        .context("missing fair bytes context")?
+                        .aura1_zst_bytes
+                        .clone()
+                } else if config.operation.uses_zstd_compressed_input() {
                     zstd::stream::encode_all(Cursor::new(bytes.as_slice()), config.zstd_level)
                         .context("zstd-compress cold benchmark input")?
                 } else {
@@ -518,6 +640,7 @@ fn run_benchmark(config: &Config) -> Result<String> {
                     config.transcode_path,
                     config.encoder_path,
                     effective_canonical_hash_mode,
+                    fair_context.as_ref(),
                     should_capture_output,
                 )?;
                 let total_duration = start.elapsed();
@@ -578,6 +701,21 @@ fn run_benchmark(config: &Config) -> Result<String> {
     };
     let output_mb_per_sec = if seconds > 0.0 && first.output_bytes > 0 {
         first.output_bytes as f64 / (1024.0 * 1024.0) / seconds
+    } else {
+        0.0
+    };
+    let fair_stats = representative.outcome.fair_bytes_stats.as_ref();
+    let compressed_input_mb_sec = if seconds > 0.0 {
+        fair_stats
+            .map(|stats| stats.compressed_input_bytes as f64 / (1024.0 * 1024.0) / seconds)
+            .unwrap_or(mb_per_sec)
+    } else {
+        0.0
+    };
+    let uncompressed_output_mb_sec = if seconds > 0.0 {
+        fair_stats
+            .map(|stats| stats.uncompressed_output_bytes as f64 / (1024.0 * 1024.0) / seconds)
+            .unwrap_or(output_mb_per_sec)
     } else {
         0.0
     };
@@ -660,6 +798,18 @@ fn run_benchmark(config: &Config) -> Result<String> {
                 "work_included": representative.outcome.zstd_stats.as_ref().map(|stats| stats.work_included),
                 "parse_time_ms": representative.outcome.zstd_stats.as_ref().map(|stats| stats.parse_time.as_secs_f64() * 1_000.0),
                 "replay_time_ms": representative.outcome.zstd_stats.as_ref().map(|stats| stats.replay_time.as_secs_f64() * 1_000.0),
+                "dataset_sha256_aura0": fair_stats.map(|stats| stats.dataset_sha256_aura0.as_str()),
+                "dataset_sha256_aura1": fair_stats.map(|stats| stats.dataset_sha256_aura1.as_str()),
+                "dataset_sha256_aura1_zst": fair_stats.map(|stats| stats.dataset_sha256_aura1_zst.as_str()),
+                "aura0_compressed_bytes": fair_stats.map(|stats| stats.aura0_compressed_bytes),
+                "aura1_zstd_compressed_bytes": fair_stats.map(|stats| stats.aura1_zstd_compressed_bytes),
+                "aura1_uncompressed_bytes": fair_stats.map(|stats| stats.aura1_uncompressed_bytes),
+                "zstd_level": fair_stats.map(|stats| stats.zstd_level).unwrap_or(config.zstd_level),
+                "output_sink": fair_stats.map(|stats| stats.output_sink),
+                "compressed_input_mb_sec": compressed_input_mb_sec,
+                "uncompressed_output_mb_sec": uncompressed_output_mb_sec,
+                "output_bytes_equal": fair_stats.and_then(|stats| stats.output_bytes_equal),
+                "output_byte_hash": fair_stats.and_then(|stats| stats.output_byte_hash),
                 "records_per_sec": records_per_sec,
                 "input_mb_per_sec": mb_per_sec,
                 "mb_per_sec": mb_per_sec,
@@ -702,6 +852,63 @@ fn run_benchmark(config: &Config) -> Result<String> {
     }
 }
 
+fn load_fair_bytes_context(
+    config: &Config,
+    input_bytes: &[u8],
+) -> Result<Option<FairBytesContext>> {
+    if !config.operation.is_fair_bytes_benchmark() {
+        return Ok(None);
+    }
+
+    let aura0_path = config
+        .reference_aura0
+        .as_ref()
+        .context("fair bytes benchmark requires --reference-aura0")?;
+    let aura1_path = config
+        .reference_aura1
+        .as_ref()
+        .context("fair bytes benchmark requires --reference-aura1")?;
+    let aura0_bytes = fs::read(aura0_path)
+        .with_context(|| format!("read reference Aura0 {}", aura0_path.display()))?;
+    let aura1_bytes = fs::read(aura1_path)
+        .with_context(|| format!("read reference Aura1 {}", aura1_path.display()))?;
+    let input_sha = sha256_hex(input_bytes);
+    let aura0_sha256 = sha256_hex(&aura0_bytes);
+    let aura1_sha256 = sha256_hex(&aura1_bytes);
+
+    if matches!(
+        config.operation,
+        Operation::Aura0ToAura1Bytes | Operation::Aura0ToAura1BytesVerify
+    ) && input_sha != aura0_sha256
+    {
+        bail!("--input must match --reference-aura0 for Aura0 fair bytes benchmark");
+    }
+    if matches!(
+        config.operation,
+        Operation::ZstdAura1ToAura1Bytes | Operation::ZstdAura1ToAura1BytesVerify
+    ) && input_sha != aura1_sha256
+    {
+        bail!("--input must match --reference-aura1 for zstd fair bytes benchmark");
+    }
+
+    let aura1_zst_bytes =
+        zstd::stream::encode_all(Cursor::new(aura1_bytes.as_slice()), config.zstd_level)
+            .context("zstd-compress reference Aura1")?;
+    let aura1_zst_sha256 = sha256_hex(&aura1_zst_bytes);
+    let record_count = records::visit_i64_rows_file(&aura1_bytes, |_| Ok(()))?;
+
+    Ok(Some(FairBytesContext {
+        aura0_bytes,
+        aura1_bytes,
+        aura1_zst_bytes,
+        aura0_sha256,
+        aura1_sha256,
+        aura1_zst_sha256,
+        record_count,
+        zstd_level: config.zstd_level,
+    }))
+}
+
 fn measure_operation(
     operation: Operation,
     bytes: &[u8],
@@ -710,6 +917,7 @@ fn measure_operation(
     transcode_path: TranscodePath,
     encoder_path: Aura0EncoderPath,
     canonical_hash_mode: CanonicalHashMode,
+    fair_context: Option<&FairBytesContext>,
     capture_output: bool,
 ) -> Result<Measurement> {
     let start = Instant::now();
@@ -721,6 +929,7 @@ fn measure_operation(
         transcode_path,
         encoder_path,
         canonical_hash_mode,
+        fair_context,
         capture_output,
     )?;
     let total_duration = start.elapsed();
@@ -1114,6 +1323,7 @@ fn run_operation(
     transcode_path: TranscodePath,
     encoder_path: Aura0EncoderPath,
     canonical_hash_mode: CanonicalHashMode,
+    fair_context: Option<&FairBytesContext>,
     capture_output: bool,
 ) -> Result<RunOutcome> {
     match operation {
@@ -1128,6 +1338,14 @@ fn run_operation(
         | Operation::ZstdDecompressPlusAura1Output => {
             zstd_baseline(operation, bytes, record_count_hint, canonical_hash_mode)
         }
+        Operation::Aura0ToAura1Bytes
+        | Operation::Aura0ToAura1BytesVerify
+        | Operation::ZstdAura1ToAura1Bytes
+        | Operation::ZstdAura1ToAura1BytesVerify => fair_aura1_bytes_operation(
+            operation,
+            bytes,
+            fair_context.context("missing fair bytes context")?,
+        ),
         Operation::TranscodeAura1ToAura0 => transcode(
             bytes,
             Profile::Aura0,
@@ -1161,16 +1379,22 @@ fn inspect_input(operation: Operation, bytes: &[u8]) -> Result<usize> {
         | Operation::ZstdDecompressOnly
         | Operation::ZstdDecompressPlusParse
         | Operation::ZstdDecompressPlusReplay
-        | Operation::ZstdDecompressPlusAura1Output => {
+        | Operation::ZstdDecompressPlusAura1Output
+        | Operation::ZstdAura1ToAura1Bytes
+        | Operation::ZstdAura1ToAura1BytesVerify => {
             Ok(records::visit_i64_rows_file(bytes, |_| Ok(()))?)
         }
-        Operation::DecodeAura0 | Operation::TranscodeAura0ToAura1 => {
-            Ok(records::decode_i64_file(bytes)?.rows.len())
-        }
+        Operation::DecodeAura0
+        | Operation::TranscodeAura0ToAura1
+        | Operation::Aura0ToAura1Bytes
+        | Operation::Aura0ToAura1BytesVerify => Ok(records::decode_i64_file(bytes)?.rows.len()),
     }
 }
 
 fn parse_aura1(bytes: &[u8], canonical_hash_mode: CanonicalHashMode) -> Result<RunOutcome> {
+    let plan_start = Instant::now();
+    let layout = records::aura1_fixed_layout_info(bytes)?;
+    let plan_setup_time = plan_start.elapsed();
     let mut guard = canonical_hash_init();
     let record_count = records::visit_i64_rows_file(bytes, |row| {
         update_canonical_hash_row(&mut guard, row);
@@ -1186,15 +1410,16 @@ fn parse_aura1(bytes: &[u8], canonical_hash_mode: CanonicalHashMode) -> Result<R
         guard_mode: "inline_parse",
         transcode_path: "none",
         encoder_path: "none",
-        conversion_plan_hash: None,
+        conversion_plan_hash: Some(layout.conversion_plan_hash),
         compiled_plan_used: true,
-        plan_setup_time: Duration::ZERO,
+        plan_setup_time,
         output_byte_guard: None,
         post_process_duration: Duration::ZERO,
         timings: None,
         stats: None,
         replay_stats: None,
         zstd_stats: None,
+        fair_bytes_stats: None,
         preserved_output: None,
     })
 }
@@ -1222,6 +1447,7 @@ fn decode_aura0(bytes: &[u8], canonical_hash_mode: CanonicalHashMode) -> Result<
         stats: None,
         replay_stats: None,
         zstd_stats: None,
+        fair_bytes_stats: None,
         preserved_output: None,
     })
 }
@@ -1341,6 +1567,7 @@ fn transcode(
             stats: Some(stats),
             replay_stats: None,
             zstd_stats: None,
+            fair_bytes_stats: None,
             preserved_output,
         });
     }
@@ -1385,6 +1612,7 @@ fn transcode(
             stats: None,
             replay_stats: None,
             zstd_stats: None,
+            fair_bytes_stats: None,
             preserved_output,
         });
     }
@@ -1425,6 +1653,7 @@ fn transcode(
         stats: None,
         replay_stats: None,
         zstd_stats: None,
+        fair_bytes_stats: None,
         preserved_output,
     })
 }
@@ -1475,6 +1704,7 @@ fn aura1_scan_fixed(bytes: &[u8], canonical_hash_mode: CanonicalHashMode) -> Res
             allocations: Some(0),
         }),
         zstd_stats: None,
+        fair_bytes_stats: None,
         preserved_output: None,
     })
 }
@@ -1534,6 +1764,7 @@ fn aura1_replay_callback(
             allocations: Some(0),
         }),
         zstd_stats: None,
+        fair_bytes_stats: None,
         preserved_output: None,
     })
 }
@@ -1582,6 +1813,91 @@ fn aura1_parse_to_rows(bytes: &[u8], canonical_hash_mode: CanonicalHashMode) -> 
             allocations: None,
         }),
         zstd_stats: None,
+        fair_bytes_stats: None,
+        preserved_output: None,
+    })
+}
+
+fn fair_aura1_bytes_operation(
+    operation: Operation,
+    bytes: &[u8],
+    context: &FairBytesContext,
+) -> Result<RunOutcome> {
+    let verify = operation.is_fair_verify();
+    let is_zstd = operation.is_fair_zstd();
+    let mut timings = None;
+    let mut stats = None;
+    let mut conversion_plan_hash = None;
+    let mut compiled_plan_used = false;
+
+    let output = if is_zstd {
+        zstd::stream::decode_all(Cursor::new(bytes)).context("zstd-decompress Aura1 bytes")?
+    } else if let Some(profiled) = records::try_compile_i64_file_profiled(
+        bytes,
+        Profile::Aura1,
+        OutputGuardMode::NoGuard,
+        TranscodePath::Auto,
+        Aura0EncoderPath::Materialized,
+    )? {
+        conversion_plan_hash = profiled.conversion_plan_hash;
+        compiled_plan_used = conversion_plan_hash.is_some();
+        timings = Some(profiled.timings);
+        stats = Some(profiled.stats);
+        profiled.bytes
+    } else {
+        writer::compile_i64(bytes, Profile::Aura1)?
+    };
+
+    black_box(&output);
+    let output_bytes_equal = verify.then_some(output == context.aura1_bytes);
+    let output_byte_hash = verify.then_some(bytes_guard(&output));
+    let compressed_input_bytes = if is_zstd {
+        context.aura1_zst_bytes.len()
+    } else {
+        context.aura0_bytes.len()
+    };
+    let output_len = output.len();
+
+    Ok(RunOutcome {
+        record_count: context.record_count,
+        output_bytes: output_len,
+        guard: output_byte_hash.unwrap_or(output_len as u64),
+        canonical_hash: None,
+        canonical_hash_time: Duration::ZERO,
+        canonical_hash_equality: None,
+        guard_mode: "no_guard",
+        transcode_path: if is_zstd { "none" } else { "auto" },
+        encoder_path: "none",
+        conversion_plan_hash,
+        compiled_plan_used,
+        plan_setup_time: Duration::ZERO,
+        output_byte_guard: output_byte_hash,
+        post_process_duration: Duration::ZERO,
+        timings,
+        stats,
+        replay_stats: None,
+        zstd_stats: is_zstd.then_some(ZstdStats {
+            compressed_input_bytes: context.aura1_zst_bytes.len(),
+            decompressed_output_bytes: output_len,
+            logical_record_count: context.record_count,
+            work_included: "zstd Aura1.zst -> Aura1 bytes",
+            parse_time: Duration::ZERO,
+            replay_time: Duration::ZERO,
+        }),
+        fair_bytes_stats: Some(FairBytesStats {
+            dataset_sha256_aura0: context.aura0_sha256.clone(),
+            dataset_sha256_aura1: context.aura1_sha256.clone(),
+            dataset_sha256_aura1_zst: context.aura1_zst_sha256.clone(),
+            aura0_compressed_bytes: context.aura0_bytes.len(),
+            aura1_zstd_compressed_bytes: context.aura1_zst_bytes.len(),
+            aura1_uncompressed_bytes: context.aura1_bytes.len(),
+            zstd_level: context.zstd_level,
+            output_sink: "memory_vec",
+            compressed_input_bytes,
+            uncompressed_output_bytes: output_len,
+            output_bytes_equal,
+            output_byte_hash,
+        }),
         preserved_output: None,
     })
 }
@@ -1680,6 +1996,7 @@ fn zstd_baseline(
             parse_time,
             replay_time,
         }),
+        fair_bytes_stats: None,
         preserved_output: None,
     })
 }
@@ -1888,6 +2205,6 @@ fn csv_escape(field: &str) -> String {
 
 fn print_usage() {
     eprintln!(
-        "usage: aura-bench --operation <parse-aura1|decode-aura0|transcode-aura1-to-aura0|transcode-aura0-to-aura1|aura1-scan-fixed|aura1-replay-callback|aura1-parse-to-rows|zstd-decompress-only|zstd-decompress-plus-parse|zstd-decompress-plus-replay|zstd-decompress-plus-aura1-output> --dataset <name> --input <path> [--iterations N] [--warmups N] [--format json|csv] [--output path] [--cache-mode warm|cold] [--guard-mode no_guard|fused_output_guard|old_post_output_guard|block_batched_output_guard] [--transcode-path auto|materialized|direct] [--encoder-path materialized|direct-streams] [--canonical-hash-mode none|verify] [--zstd-level N] [--preserve-output path] [--verify-output-decodes]"
+        "usage: aura-bench --operation <parse-aura1|decode-aura0|transcode-aura1-to-aura0|transcode-aura0-to-aura1|aura1-scan-fixed|aura1-replay-callback|aura1-parse-to-rows|zstd-decompress-only|zstd-decompress-plus-parse|zstd-decompress-plus-replay|zstd-decompress-plus-aura1-output|aura0-to-aura1-bytes|aura0-to-aura1-bytes-verify|zstd-aura1-to-aura1-bytes|zstd-aura1-to-aura1-bytes-verify> --dataset <name> --input <path> [--iterations N] [--warmups N] [--format json|csv] [--output path] [--cache-mode warm|cold] [--guard-mode no_guard|fused_output_guard|old_post_output_guard|block_batched_output_guard] [--transcode-path auto|materialized|direct] [--encoder-path materialized|direct-streams] [--canonical-hash-mode none|verify] [--zstd-level N] [--reference-aura0 path] [--reference-aura1 path] [--preserve-output path] [--verify-output-decodes]"
     );
 }
