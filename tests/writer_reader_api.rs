@@ -1,8 +1,10 @@
 use aura_codec::reader;
-use aura_codec::records::{self, I64FileInput};
+use aura_codec::records::{
+    self, Aura0ByteLaneCodec, Aura0ByteLaneUse, Aura0FileProfile, I64FileInput,
+};
 use aura_codec::schema::{generic_i64_parent_schema, ohlcv_schema};
 use aura_codec::writer;
-use aura_codec::{AuraI64Reader, AuraI64Writer, Profile};
+use aura_codec::{AuraHeader, AuraI64Reader, AuraI64Writer, Profile};
 use std::ffi::OsString;
 use std::sync::Mutex;
 
@@ -153,6 +155,108 @@ fn aura0_to_aura1_default_fast_path_matches_column_fallback() {
     let decoded = reader::decode_i64(&direct).unwrap();
     assert_eq!(Profile::Aura1, decoded.header.profile);
     assert_eq!(rows, decoded.rows);
+}
+
+#[test]
+fn aura0_fast_lz4_byte_lane_round_trips_to_aura1_bytes() {
+    let ingest = writer::encode_i64(sample_input()).unwrap();
+    let aura1 = writer::compile_i64(&ingest, Profile::Aura1).unwrap();
+    for codec in [Aura0ByteLaneCodec::Lz4, Aura0ByteLaneCodec::Zstd3] {
+        let fast =
+            records::compile_i64_file_with_aura0_profile(&aura1, Aura0FileProfile::Fast, codec)
+                .unwrap();
+
+        let expanded =
+            records::compile_aura0_to_aura1_bytes_with_lane(&fast, Aura0ByteLaneUse::Always, true)
+                .unwrap();
+
+        assert_eq!(aura1, expanded);
+        assert_eq!(
+            reader::decode_i64(&aura1).unwrap().rows,
+            reader::decode_i64(&expanded).unwrap().rows
+        );
+    }
+}
+
+#[test]
+fn aura0_hybrid_lz4_byte_lane_keeps_semantic_fallback() {
+    let ingest = writer::encode_i64(sample_input()).unwrap();
+    let aura1 = writer::compile_i64(&ingest, Profile::Aura1).unwrap();
+    let hybrid = records::compile_i64_file_with_aura0_profile(
+        &aura1,
+        Aura0FileProfile::Hybrid,
+        Aura0ByteLaneCodec::Lz4,
+    )
+    .unwrap();
+
+    let byte_lane =
+        records::compile_aura0_to_aura1_bytes_with_lane(&hybrid, Aura0ByteLaneUse::Always, true)
+            .unwrap();
+    let semantic =
+        records::compile_aura0_to_aura1_bytes_with_lane(&hybrid, Aura0ByteLaneUse::Never, false)
+            .unwrap();
+
+    assert_eq!(aura1, byte_lane);
+    assert_eq!(
+        reader::decode_i64(&aura1).unwrap().rows,
+        reader::decode_i64(&semantic).unwrap().rows
+    );
+}
+
+#[test]
+fn forcing_byte_lane_on_compact_aura0_fails_clearly() {
+    let ingest = writer::encode_i64(sample_input()).unwrap();
+    let compact = writer::compile_i64(&ingest, Profile::Aura0).unwrap();
+
+    let err =
+        records::compile_aura0_to_aura1_bytes_with_lane(&compact, Aura0ByteLaneUse::Always, false)
+            .unwrap_err();
+
+    assert!(err.to_string().contains("byte lane"));
+}
+
+#[test]
+fn corrupt_aura0_byte_lane_payload_rejects_in_verify_mode() {
+    let ingest = writer::encode_i64(sample_input()).unwrap();
+    let aura1 = writer::compile_i64(&ingest, Profile::Aura1).unwrap();
+    let mut fast = records::compile_i64_file_with_aura0_profile(
+        &aura1,
+        Aura0FileProfile::Fast,
+        Aura0ByteLaneCodec::Raw,
+    )
+    .unwrap();
+    let header_len = AuraHeader::encoded_len(&fast).unwrap();
+    fast[header_len + 8] ^= 0x7f;
+
+    let err =
+        records::compile_aura0_to_aura1_bytes_with_lane(&fast, Aura0ByteLaneUse::Always, true)
+            .unwrap_err();
+
+    assert!(err.to_string().contains("byte lane checksum"));
+}
+
+#[test]
+fn unsupported_aura0_byte_lane_codec_rejects() {
+    let ingest = writer::encode_i64(sample_input()).unwrap();
+    let aura1 = writer::compile_i64(&ingest, Profile::Aura1).unwrap();
+    let mut fast = records::compile_i64_file_with_aura0_profile(
+        &aura1,
+        Aura0FileProfile::Fast,
+        Aura0ByteLaneCodec::Raw,
+    )
+    .unwrap();
+    let footer_extension = fast
+        .windows(4)
+        .position(|window| window == b"AUBL")
+        .expect("byte-lane footer extension");
+    let codec_id_offset = footer_extension + 4 + 4 + 1;
+    fast[codec_id_offset] = 99;
+
+    let err =
+        records::compile_aura0_to_aura1_bytes_with_lane(&fast, Aura0ByteLaneUse::Always, false)
+            .unwrap_err();
+
+    assert!(err.to_string().contains("byte lane codec"));
 }
 
 #[test]

@@ -60,6 +60,7 @@ Aura0 decode program
 Aura1 decode program
 optional generic Aura0 instruction plan
 chunk descriptors
+optional Aura1 byte-lane descriptor table (`AUBL`)
 ```
 
 Unsupported versions reject during footer decode.
@@ -77,6 +78,22 @@ payloads referenced by that plan. Current stream operations include fixed-step,
 delta, varint, bitpack, RLE, dictionary, packed dictionary, block-local, and
 Huffman dictionary variants. The current direct paths preserve the footer plan
 and do not change binary layout.
+
+Aura0 can now be written with three profiles:
+
+- `compact`: semantic stream lane only. This is the smallest current profile
+  and keeps the full semantic decode path.
+- `fast`: Aura1 byte lane only. The body contains compressed Aura1-compatible
+  bytes and the compiled footer carries an `AUBL` descriptor table.
+- `hybrid`: semantic stream lane followed by an Aura1 byte lane. Readers can
+  use the byte lane for byte-output expansion or force the semantic lane for
+  verification/fallback.
+
+The first implemented byte lane is single-block and stores full Aura1 file
+bytes. Descriptor fields include lane version, codec id/level, row range,
+Aura1 output offset, uncompressed length, compressed body offset/length,
+checksum kind, checksum, and flags. Implemented codecs are raw, lz4, zstd1,
+zstd3, and zstd9.
 
 ## Compiled Plan
 
@@ -149,12 +166,12 @@ not a claim that the format has reached its final speed limit.
 - Canonical hash: keep `--canonical-hash-mode none` by default and enable
   `verify` only for correctness checks.
 
-The fair product benchmark currently shows `.aura0 -> .aura1` bytes losing to
-`.aura1.zst -> .aura1` bytes on the grimoire huff/nohuff artifacts:
+The fair product benchmark shows compact semantic `.aura0 -> .aura1` bytes
+losing to `.aura1.zst -> .aura1` bytes on the grimoire huff/nohuff artifacts:
 
 ```text
-grimoire-50mb-huff:   Aura0 81.971 ms, zstd L3 62.132 ms
-grimoire-50mb-nohuff: Aura0 107.088 ms, zstd L3 61.590 ms
+grimoire-50mb-huff:   compact Aura0 80.608 ms, zstd L3 61.386 ms
+grimoire-50mb-nohuff: compact Aura0 104.173 ms, zstd L3 62.798 ms
 ```
 
 The current Aura0 stream layout is compact but requires stream decode, semantic
@@ -163,7 +180,18 @@ Whole-file zstd inflates already-formed Aura1 bytes. Until the product
 benchmark is reversed, AURA0 should be documented as a compact cold format, not
 as faster than zstd for the cold decode-to-Aura1 byte path.
 
-The next format candidate for this product target is an optional Aura1 byte
-lane in Aura0: per-block Aura1-compatible byte slices compressed with zstd or
-lz4, described in the compiled footer and used for byte-output expansion while
-the existing semantic streams remain available for canonical decode.
+The speed target is reversed by real Aura0 fast/hybrid byte-lane files expanded
+through the production Aura0 reader path into the same `memory_vec` sink as the
+zstd baseline.
+
+```text
+grimoire-50mb-huff:   fast raw 24.753 ms, fast lz4 44.373 ms, hybrid lz4 43.761 ms
+grimoire-50mb-nohuff: fast raw 25.271 ms, fast lz4 43.281 ms, hybrid lz4 44.058 ms
+```
+
+Raw is a copy-only speed limit and stores the full Aura1 byte payload. The lz4
+lane is the current compressed speed-profile candidate: it beats zstd L3 on the
+tested datasets but is larger than `.aura1.zst` and much larger than compact
+semantic Aura0. The default recommendation is hybrid + lz4 for users who want
+both compact semantic interchange and faster-than-zstd byte expansion; compact
+remains the smallest archival profile.

@@ -7,7 +7,10 @@ use aura_codec::instructions::{
 };
 use aura_codec::plan::{Aura0Plan, Aura1Plan};
 use aura_codec::program::COMPILED_FOOTER_MAGIC;
-use aura_codec::program::{CompiledAuraPlan, CompiledFooter, DecodeProgram};
+use aura_codec::program::{
+    Aura1ByteLaneDescriptor, CompiledAuraPlan, CompiledFooter, DecodeProgram,
+    BYTE_LANE_CHECKSUM_BYTE_GUARD, BYTE_LANE_CODEC_LZ4,
+};
 use aura_codec::schema::generic_i64_parent_schema;
 use aura_codec::{records, DerivedExpressionOp, IngestStats, Profile};
 
@@ -427,6 +430,49 @@ fn generic_instruction_footer_preserves_all_stream_and_group_variants() {
 
     let decoded_compiled = CompiledFooter::decode(&compiled.encode().unwrap()).unwrap();
     assert_eq!(Some(&plan), decoded_compiled.generic_aura0_plan.as_ref());
+}
+
+#[test]
+fn compiled_footer_preserves_aura1_byte_lane_descriptors() {
+    let schema = generic_i64_parent_schema("byte_lane_footer", &[100, 0, 0, 204, 0, 0, 0]).unwrap();
+    let mut stats = IngestStats::new_for_schema(&schema).unwrap();
+    stats
+        .observe_i64_record(&schema, &[1_000, 10, 20, 0, 100, 5, 1])
+        .unwrap();
+    let aura0_plan = Aura0Plan::from_schema_stats(&schema, &stats).unwrap();
+    let aura1_plan = Aura1Plan::from_stats(&stats, 4);
+    let descriptor = Aura1ByteLaneDescriptor {
+        lane_version: 1,
+        codec_id: BYTE_LANE_CODEC_LZ4,
+        codec_level: 0,
+        block_index: 0,
+        row_start: 0,
+        row_count: stats.record_count as u32,
+        aura1_output_offset: 0,
+        uncompressed_len: 128,
+        compressed_offset: body_bytes(
+            &records::compile_i64_file(&encoded_ingest(), Profile::Aura0).unwrap(),
+        )
+        .len() as u64,
+        compressed_len: 64,
+        checksum_kind: BYTE_LANE_CHECKSUM_BYTE_GUARD,
+        checksum: 123,
+        flags: 0,
+    };
+
+    let compiled = CompiledFooter::new(
+        schema.clone(),
+        stats.record_count,
+        aura1_plan.block_capacity,
+        DecodeProgram::from_aura0_plan(&aura0_plan, schema.fields.len()).unwrap(),
+        DecodeProgram::from_aura1_plan(&aura1_plan, schema.fields.len()).unwrap(),
+    )
+    .unwrap()
+    .with_aura1_byte_lanes(vec![descriptor.clone()]);
+
+    let decoded = CompiledFooter::decode(&compiled.encode().unwrap()).unwrap();
+
+    assert_eq!(vec![descriptor], decoded.aura1_byte_lanes);
 }
 
 #[test]

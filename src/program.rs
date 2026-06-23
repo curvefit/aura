@@ -9,6 +9,13 @@ use crate::stats::PhysicalWidth;
 use crate::{AuraError, Result};
 
 pub const COMPILED_FOOTER_MAGIC: &[u8; 4] = b"AURP";
+pub const AURA1_BYTE_LANE_MAGIC: &[u8; 4] = b"AUBL";
+pub const AURA1_BYTE_LANE_VERSION: u8 = 1;
+pub const BYTE_LANE_CODEC_RAW: u8 = 0;
+pub const BYTE_LANE_CODEC_LZ4: u8 = 1;
+pub const BYTE_LANE_CODEC_ZSTD: u8 = 2;
+pub const BYTE_LANE_CHECKSUM_NONE: u8 = 0;
+pub const BYTE_LANE_CHECKSUM_BYTE_GUARD: u8 = 1;
 pub const FIELD_AUX_EXTENDED: u8 = 7;
 
 const OP_MASK: u16 = 0b1_1111;
@@ -537,6 +544,23 @@ fn plan_hash_bytes(bytes: &[u8]) -> u64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Aura1ByteLaneDescriptor {
+    pub lane_version: u8,
+    pub codec_id: u8,
+    pub codec_level: u8,
+    pub block_index: u32,
+    pub row_start: u64,
+    pub row_count: u32,
+    pub aura1_output_offset: u64,
+    pub uncompressed_len: u64,
+    pub compressed_offset: u64,
+    pub compressed_len: u64,
+    pub checksum_kind: u8,
+    pub checksum: u64,
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledFooter {
     pub schema: SchemaDescriptor,
     pub compression: CompressionDescriptor,
@@ -546,6 +570,7 @@ pub struct CompiledFooter {
     pub aura1_program: DecodeProgram,
     pub generic_aura0_plan: Option<GenericInstructionPlan>,
     pub chunks: Vec<ChunkDescriptor>,
+    pub aura1_byte_lanes: Vec<Aura1ByteLaneDescriptor>,
 }
 
 impl CompiledFooter {
@@ -565,11 +590,17 @@ impl CompiledFooter {
             aura1_program,
             generic_aura0_plan: None,
             chunks: Vec::new(),
+            aura1_byte_lanes: Vec::new(),
         })
     }
 
     pub fn with_generic_aura0_plan(mut self, plan: GenericInstructionPlan) -> Self {
         self.generic_aura0_plan = Some(plan);
+        self
+    }
+
+    pub fn with_aura1_byte_lanes(mut self, lanes: Vec<Aura1ByteLaneDescriptor>) -> Self {
+        self.aura1_byte_lanes = lanes;
         self
     }
 
@@ -586,6 +617,7 @@ impl CompiledFooter {
         self.aura1_program.encode_to(&mut out)?;
         encode_generic_plan(&self.generic_aura0_plan, &mut out)?;
         encode_chunks(&self.chunks, &mut out)?;
+        encode_aura1_byte_lanes(&self.aura1_byte_lanes, &mut out)?;
         Ok(out)
     }
 
@@ -609,6 +641,7 @@ impl CompiledFooter {
         let aura1_program = DecodeProgram::decode_from(&mut reader)?;
         let generic_aura0_plan = decode_generic_plan(&mut reader)?;
         let chunks = decode_chunks(&mut reader)?;
+        let aura1_byte_lanes = decode_aura1_byte_lanes(&mut reader)?;
         reader.finish()?;
         Ok(Self {
             schema,
@@ -619,8 +652,69 @@ impl CompiledFooter {
             aura1_program,
             generic_aura0_plan,
             chunks,
+            aura1_byte_lanes,
         })
     }
+}
+
+fn encode_aura1_byte_lanes(lanes: &[Aura1ByteLaneDescriptor], out: &mut Vec<u8>) -> Result<()> {
+    if lanes.is_empty() {
+        return Ok(());
+    }
+    out.extend_from_slice(AURA1_BYTE_LANE_MAGIC);
+    put_u32_len(out, lanes.len(), "byte lane count")?;
+    for lane in lanes {
+        put_u8(out, lane.lane_version);
+        put_u8(out, lane.codec_id);
+        put_u8(out, lane.codec_level);
+        put_u8(out, lane.checksum_kind);
+        put_u32_le(out, lane.block_index);
+        put_u64_le(out, lane.row_start);
+        put_u32_le(out, lane.row_count);
+        put_u64_le(out, lane.aura1_output_offset);
+        put_u64_le(out, lane.uncompressed_len);
+        put_u64_le(out, lane.compressed_offset);
+        put_u64_le(out, lane.compressed_len);
+        put_u64_le(out, lane.checksum);
+        put_u32_le(out, lane.flags);
+    }
+    Ok(())
+}
+
+fn decode_aura1_byte_lanes(reader: &mut ByteReader<'_>) -> Result<Vec<Aura1ByteLaneDescriptor>> {
+    if reader.remaining() == 0 {
+        return Ok(Vec::new());
+    }
+    if reader.read_exact(4)? != AURA1_BYTE_LANE_MAGIC {
+        return Err(AuraError::InvalidMagic { expected: "AUBL" });
+    }
+    let lane_count = reader.read_u32_le()? as usize;
+    let mut lanes = Vec::with_capacity(lane_count);
+    for _ in 0..lane_count {
+        let lane_version = reader.read_u8()?;
+        if lane_version != AURA1_BYTE_LANE_VERSION {
+            return Err(AuraError::UnsupportedVersion(u16::from(lane_version)));
+        }
+        let codec_id = reader.read_u8()?;
+        let codec_level = reader.read_u8()?;
+        let checksum_kind = reader.read_u8()?;
+        lanes.push(Aura1ByteLaneDescriptor {
+            lane_version,
+            codec_id,
+            codec_level,
+            checksum_kind,
+            block_index: reader.read_u32_le()?,
+            row_start: reader.read_u64_le()?,
+            row_count: reader.read_u32_le()?,
+            aura1_output_offset: reader.read_u64_le()?,
+            uncompressed_len: reader.read_u64_le()?,
+            compressed_offset: reader.read_u64_le()?,
+            compressed_len: reader.read_u64_le()?,
+            checksum: reader.read_u64_le()?,
+            flags: reader.read_u32_le()?,
+        });
+    }
+    Ok(lanes)
 }
 
 fn encode_generic_plan(plan: &Option<GenericInstructionPlan>, out: &mut Vec<u8>) -> Result<()> {

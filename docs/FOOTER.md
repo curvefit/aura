@@ -36,6 +36,7 @@ Aura0 decode program
 Aura1 decode program
 generic Aura0 instruction plan
 chunk descriptors
+optional Aura1 byte-lane descriptor table
 ```
 
 `CompiledAuraPlan` is built from `AURP` once per file in profiled direct paths
@@ -46,25 +47,51 @@ Invalid magic, unsupported version, invalid field counts, invalid field indexes,
 wide i64-incompatible schema fields, and header/schema disagreement reject before
 hot-loop decoding.
 
-## Missing Metadata For The Zstd-Speed Byte Target
+## Aura0-Fast Byte Lane
 
-The current compiled footer describes semantic decode/reconstruct programs. It
-does not contain an Aura1 byte lane: compressed Aura1-compatible body slices
-with per-block offsets and validation metadata. That is why current Aura0 byte
-expansion must decode streams and rebuild rows, while `.aura1.zst` can inflate
-already-formed Aura1 bytes.
+The compiled footer can end with an optional `AUBL` extension. Empty compact
+files omit the extension entirely, so current compact files keep their existing
+footer shape. New readers decode old compact files normally.
 
-A future byte-lane footer extension would need at least:
+Current descriptor layout:
 
 ```text
-byte-lane codec and level
-row range per compressed block
-uncompressed Aura1 offset and length
-compressed body offset and length
-per-block checksum or output-byte guard
-optional codec dictionary id
-compatibility flag: acceleration cache vs authoritative payload
+magic "AUBL"
+descriptor count u32
+for each descriptor:
+  lane_version u8
+  codec_id u8          # raw=0, lz4=1, zstd=2
+  codec_level u8       # raw/lz4=0, zstd=1|3|9
+  checksum_kind u8     # none=0, output byte guard=1
+  block_index u32
+  row_start u64
+  row_count u32
+  aura1_output_offset u64
+  uncompressed_len u64
+  compressed_offset u64
+  compressed_len u64
+  checksum u64
+  flags u32
 ```
 
-Until those fields exist and are tested, AURA0 should not claim zstd-beating
-decode-to-Aura1 byte speed for the fair product target.
+The first production implementation writes a single descriptor for full Aura1
+file bytes. `aura0-fast` stores only this byte lane. `aura0-hybrid` stores the
+semantic stream lane first and appends the byte-lane payload; descriptor
+`compressed_offset` points at the appended payload.
+
+Reader selection:
+
+```text
+auto:   use byte lane when present, otherwise semantic lane
+always: require byte lane or reject clearly
+never:  force semantic lane
+```
+
+Production timing validates descriptor structure and lengths but does not scan
+the output guard. Verify/strict mode validates the output-byte guard and output
+equality when a reference is supplied.
+
+Compatibility caveat: old readers that require `AURP` to end immediately after
+chunk descriptors will reject new byte-lane footer extensions as trailing bytes.
+This is an intentional forward-versioning boundary for the fast/hybrid profiles;
+new readers still read old compact files.

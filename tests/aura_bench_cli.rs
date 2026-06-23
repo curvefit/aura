@@ -1083,3 +1083,110 @@ fn aura_bench_reports_fair_aura0_vs_zstd_bytes_benchmarks() {
 
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn aura_bench_reports_real_aura0_byte_lane_profile() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
+        panic!("missing aura-bench binary");
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "aura-bench-byte-lane-speed-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let (aura0, aura1) = partitioned_sparse_fixture_profiles();
+    let aura0_path = dir.join("fixture.aura0");
+    let aura1_path = dir.join("fixture.aura1");
+    fs::write(&aura0_path, aura0).unwrap();
+    fs::write(&aura1_path, aura1).unwrap();
+
+    for codec in ["raw", "lz4"] {
+        let output = Command::new(bin)
+            .arg("--operation")
+            .arg("aura0-byte-lane-to-aura1-bytes")
+            .arg("--dataset")
+            .arg("unit-fixture")
+            .arg("--input")
+            .arg(&aura0_path)
+            .arg("--reference-aura0")
+            .arg(&aura0_path)
+            .arg("--reference-aura1")
+            .arg(&aura1_path)
+            .arg("--iterations")
+            .arg("1")
+            .arg("--format")
+            .arg("json")
+            .arg("--byte-lane-codec")
+            .arg(codec)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "codec: {codec}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!("aura0-byte-lane-to-aura1-bytes", json["operation"]);
+        assert_eq!("memory_vec", json["output_sink"]);
+        assert_eq!("no_guard", json["guard_mode"]);
+        assert_eq!("none", json["canonical_hash_mode"]);
+        assert_eq!("fast", json["aura0_profile"]);
+        assert_eq!("fast", json["aura0_profile_requested"]);
+        assert_eq!("auto", json["use_byte_lane"]);
+        assert_eq!(true, json["byte_lane_enabled"]);
+        assert_eq!(codec, json["byte_lane_codec"]);
+        assert_eq!(false, json["byte_lane_guard_validated"]);
+        assert_eq!(1, json["byte_lane_block_count"]);
+        assert_eq!(
+            json["aura1_uncompressed_bytes"].as_u64(),
+            json["byte_lane_uncompressed_bytes"].as_u64()
+        );
+        assert!(json["byte_lane_compressed_bytes"].as_u64().unwrap() > 0);
+        assert!(json["compressed_input_mb_sec"].as_f64().unwrap() > 0.0);
+        assert!(json["uncompressed_output_mb_sec"].as_f64().unwrap() > 0.0);
+        assert!(json["output_bytes_equal"].is_null());
+        assert!(json["output_byte_hash"].is_null());
+    }
+
+    let output = Command::new(bin)
+        .arg("--operation")
+        .arg("aura0-byte-lane-to-aura1-bytes-verify")
+        .arg("--dataset")
+        .arg("unit-fixture")
+        .arg("--input")
+        .arg(&aura0_path)
+        .arg("--reference-aura0")
+        .arg(&aura0_path)
+        .arg("--reference-aura1")
+        .arg(&aura1_path)
+        .arg("--iterations")
+        .arg("1")
+        .arg("--format")
+        .arg("json")
+        .arg("--byte-lane-codec")
+        .arg("zstd1")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!("aura0-byte-lane-to-aura1-bytes-verify", json["operation"]);
+    assert_eq!("zstd1", json["byte_lane_codec"]);
+    assert_eq!(true, json["byte_lane_guard_validated"]);
+    assert_eq!(true, json["output_bytes_equal"]);
+    assert!(json["output_byte_hash"].as_u64().unwrap() > 0);
+
+    fs::remove_dir_all(&dir).unwrap();
+}

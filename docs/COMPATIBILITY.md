@@ -23,6 +23,7 @@ through `.aura`, but compiled i64 paths reject schemas with wide fields.
 | `.aura1` replay | `aura1-scan-fixed` / fixed replay visitor | `aura1-parse-to-rows` materializes rows for comparison only |
 | guard mode | `no_guard` | strict modes for verification only |
 | canonical hash | `none` | `verify` for correctness checks |
+| Aura0 profile | `hybrid` for speed + semantic fallback, `compact` for smallest archive | `fast` for byte-lane-only speed files |
 
 The default candidates are conservative. They are chosen from current test and
 benchmark evidence, not from an assertion that remaining materialization is
@@ -97,21 +98,41 @@ until a repo-native Huffman fixture generator or fixture blob is added.
 
 ## Aura0 Versus Zstd Status
 
-The current fair product comparison is unresolved in favor of zstd:
+The current fair product comparison for compact semantic Aura0 remains in favor
+of zstd:
 
 ```text
 Aura0: .aura0 -> .aura1 uncompressed bytes
 Zstd:  .aura1.zst -> .aura1 uncompressed bytes
 ```
 
-Fresh 10-run warm results after the generic profiled fallback:
+Fresh 10-run warm results after real byte-lane integration:
 
 ```text
-grimoire-50mb-huff:   Aura0 81.971 ms, zstd L3 62.132 ms
-grimoire-50mb-nohuff: Aura0 107.088 ms, zstd L3 61.590 ms
+grimoire-50mb-huff:   compact Aura0 80.608 ms, zstd L3 61.386 ms
+grimoire-50mb-nohuff: compact Aura0 104.173 ms, zstd L3 62.798 ms
 ```
 
-The compatibility recommendation is to keep the current semantic Aura0 stream
-layout as the compact/canonical cold format, and evaluate an optional
-footer-described Aura1 byte lane before claiming a faster-than-zstd cold byte
-expansion path.
+Real Aura0 fast/hybrid byte-lane files reverse that product target:
+
+```text
+grimoire-50mb-huff:   fast raw 24.753 ms, fast lz4 44.373 ms, hybrid lz4 43.761 ms
+grimoire-50mb-nohuff: fast raw 25.271 ms, fast lz4 43.281 ms, hybrid lz4 44.058 ms
+```
+
+Compatibility recommendation:
+
+- Keep the current semantic Aura0 stream layout as the stable compact/canonical
+  cold format.
+- Use Aura0-hybrid + lz4 when the product requirement is faster-than-zstd
+  Aura1 byte expansion while retaining the semantic lane for verification or
+  fallback.
+- Use Aura0-fast + lz4 when byte-output speed and smaller-than-raw size matter
+  more than semantic-lane fallback.
+- Do not claim current compact `.aura0` files are faster than zstd for byte
+  expansion; claim that fast/hybrid byte-lane profiles beat external zstd L3 in
+  the measured huff/nohuff runs.
+
+Old readers may reject new fast/hybrid files because the `AURP` footer has an
+optional trailing `AUBL` extension. New readers read old compact files because
+the extension is omitted when no byte lanes are present.

@@ -21,7 +21,11 @@ use crate::generic_planner::{
 use crate::header::{AuraHeader, LEGACY_HEADER_PREFIX_SIZE};
 use crate::instructions::GenericInstructionPlan;
 use crate::plan::{unpack_ref_divisor, unpack_two_refs, Aura0Plan, Aura1Plan, FieldEncoding};
-use crate::program::{CompiledAuraPlan, CompiledFooter, DecodeProgram};
+use crate::program::{
+    Aura1ByteLaneDescriptor, CompiledAuraPlan, CompiledFooter, DecodeProgram,
+    AURA1_BYTE_LANE_MAGIC, AURA1_BYTE_LANE_VERSION, BYTE_LANE_CHECKSUM_BYTE_GUARD,
+    BYTE_LANE_CHECKSUM_NONE, BYTE_LANE_CODEC_LZ4, BYTE_LANE_CODEC_RAW, BYTE_LANE_CODEC_ZSTD,
+};
 use crate::schema::{schema_parent_mapping, FieldRole, FieldType, SchemaDescriptor};
 use crate::stats::IngestStats;
 use crate::{AuraError, AuraTypedValue, PhysicalWidth, Profile, Result};
@@ -158,6 +162,68 @@ impl Default for Aura0DecodePath {
     fn default() -> Self {
         Self::Materialized
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aura0FileProfile {
+    Compact,
+    Fast,
+    Hybrid,
+}
+
+impl Aura0FileProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Fast => "fast",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aura0ByteLaneCodec {
+    Raw,
+    Lz4,
+    Zstd1,
+    Zstd3,
+    Zstd9,
+}
+
+impl Aura0ByteLaneCodec {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Lz4 => "lz4",
+            Self::Zstd1 => "zstd1",
+            Self::Zstd3 => "zstd3",
+            Self::Zstd9 => "zstd9",
+        }
+    }
+
+    const fn codec_id(self) -> u8 {
+        match self {
+            Self::Raw => BYTE_LANE_CODEC_RAW,
+            Self::Lz4 => BYTE_LANE_CODEC_LZ4,
+            Self::Zstd1 | Self::Zstd3 | Self::Zstd9 => BYTE_LANE_CODEC_ZSTD,
+        }
+    }
+
+    const fn codec_level(self) -> u8 {
+        match self {
+            Self::Raw | Self::Lz4 => 0,
+            Self::Zstd1 => 1,
+            Self::Zstd3 => 3,
+            Self::Zstd9 => 9,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aura0ByteLaneUse {
+    Auto,
+    Always,
+    Never,
 }
 
 impl Aura0DecodePath {
@@ -330,6 +396,114 @@ pub(crate) fn encode_ingest_i64_file_inner(input: I64FileInput) -> Result<Vec<u8
 
 pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
     crate::writer::compile_i64(bytes, target_profile)
+}
+
+pub fn compile_i64_file_with_aura0_profile(
+    bytes: &[u8],
+    profile: Aura0FileProfile,
+    byte_lane_codec: Aura0ByteLaneCodec,
+) -> Result<Vec<u8>> {
+    match profile {
+        Aura0FileProfile::Compact => compile_i64_file_inner(bytes, Profile::Aura0),
+        Aura0FileProfile::Fast | Aura0FileProfile::Hybrid => {
+            let aura1 = if sealed_profile(bytes)? == Profile::Aura1 {
+                bytes.to_vec()
+            } else {
+                compile_i64_file_inner(bytes, Profile::Aura1)?
+            };
+            let aura1_parts = parse_compiled_file_parts(&aura1, Profile::Aura1)?;
+            let (lane_body, lane_descriptor) = encode_aura1_byte_lane_file(
+                byte_lane_codec,
+                &aura1,
+                0,
+                aura1_parts.footer.record_count,
+            )?;
+
+            if profile == Aura0FileProfile::Fast {
+                let footer = aura1_parts
+                    .footer
+                    .clone()
+                    .with_aura1_byte_lanes(vec![lane_descriptor]);
+                return encode_compiled_file(
+                    Profile::Aura0,
+                    aura1_parts.header.stream_id,
+                    aura1_parts.header.dictionary_id,
+                    aura1_parts.header.base_time_ns,
+                    aura1_parts.header.comment.as_str(),
+                    lane_body,
+                    footer,
+                );
+            }
+
+            let compact = compile_i64_file_inner(&aura1, Profile::Aura0)?;
+            let compact_parts = parse_compiled_file_parts(&compact, Profile::Aura0)?;
+            let mut body = compact_parts.body.to_vec();
+            let lane_offset = u64::try_from(body.len())
+                .map_err(|_| AuraError::InvalidValue("byte lane offset"))?;
+            let (lane_body, mut lane_descriptor) = encode_aura1_byte_lane_file(
+                byte_lane_codec,
+                &aura1,
+                lane_offset,
+                compact_parts.footer.record_count,
+            )?;
+            body.extend_from_slice(&lane_body);
+            lane_descriptor.compressed_offset = lane_offset;
+            let footer = compact_parts
+                .footer
+                .clone()
+                .with_aura1_byte_lanes(vec![lane_descriptor]);
+            encode_compiled_file(
+                Profile::Aura0,
+                compact_parts.header.stream_id,
+                compact_parts.header.dictionary_id,
+                compact_parts.header.base_time_ns,
+                compact_parts.header.comment.as_str(),
+                body,
+                footer,
+            )
+        }
+    }
+}
+
+pub fn compile_aura0_to_aura1_bytes_with_lane(
+    bytes: &[u8],
+    use_byte_lane: Aura0ByteLaneUse,
+    verify_byte_lane: bool,
+) -> Result<Vec<u8>> {
+    let offsets = parse_sealed_file_offsets(bytes, Profile::Aura0)?;
+    let body = &bytes[offsets.header_len..offsets.footer_start];
+    let footer_bytes = &bytes[offsets.footer_start..offsets.footer_len_offset];
+    match use_byte_lane {
+        Aura0ByteLaneUse::Auto | Aura0ByteLaneUse::Always => {
+            if let Some(output) =
+                try_decode_aura1_byte_lane_from_footer_tail(body, footer_bytes, verify_byte_lane)?
+            {
+                return Ok(output);
+            }
+            if use_byte_lane == Aura0ByteLaneUse::Always {
+                return Err(AuraError::InvalidValue("aura0 byte lane"));
+            }
+        }
+        Aura0ByteLaneUse::Never => {}
+    }
+
+    let parts = parse_compiled_file_parts(bytes, Profile::Aura0)?;
+    let semantic_len = aura0_semantic_body_len(&parts.footer, parts.body.len())?;
+    if semantic_len == 0 {
+        return Err(AuraError::InvalidValue("aura0 semantic lane"));
+    }
+    let mut footer = parts.footer.clone();
+    footer.aura1_byte_lanes.clear();
+    let compact = encode_compiled_file(
+        Profile::Aura0,
+        parts.header.stream_id,
+        parts.header.dictionary_id,
+        parts.header.base_time_ns,
+        parts.header.comment.as_str(),
+        parts.body[..semantic_len].to_vec(),
+        footer,
+    )?;
+    compile_i64_file_inner(&compact, Profile::Aura1)
 }
 
 pub fn try_compile_i64_file_with_fused_output_guard(
@@ -580,6 +754,20 @@ fn try_compile_aura0_to_aura1_fast(
     let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
     let total_start = Instant::now();
     let stage_start = Instant::now();
+    if let Some(out) = try_decode_aura1_byte_lane_from_footer_tail(
+        &bytes[header_len..footer_start],
+        &bytes[footer_start..footer_len_offset],
+        false,
+    )? {
+        if profile {
+            eprintln!(
+                "fast byte_lane_file_us={} total_us={}",
+                stage_start.elapsed().as_micros(),
+                total_start.elapsed().as_micros()
+            );
+        }
+        return Ok(Some(out));
+    }
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
     validate_header_schema_agreement(&header, &footer.schema)?;
     if schema_has_wide_fields(&footer.schema) {
@@ -768,6 +956,17 @@ fn try_compile_aura0_to_aura1_fast_guarded(
         return Ok(None);
     }
 
+    if let Some(out) = try_decode_aura1_byte_lane_from_footer_tail(
+        &bytes[header_len..footer_start],
+        &bytes[footer_start..footer_len_offset],
+        true,
+    )? {
+        return Ok(Some(GuardedCompileOutput {
+            guard: bytes_guard_value(&out),
+            bytes: out,
+        }));
+    }
+
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
     validate_header_schema_agreement(&header, &footer.schema)?;
     if schema_has_wide_fields(&footer.schema) {
@@ -832,6 +1031,59 @@ fn try_compile_aura0_to_aura1_fast_profiled(
     let mut stats = DirectAura1TranscodeStats::default();
 
     let metadata_start = Instant::now();
+    let byte_lane_start = Instant::now();
+    if let Some(out) = try_decode_aura1_byte_lane_from_footer_tail(
+        &bytes[header_len..footer_start],
+        &bytes[footer_start..footer_len_offset],
+        guard_mode != OutputGuardMode::NoGuard,
+    )? {
+        let byte_lane_ns = byte_lane_start.elapsed().as_nanos();
+        timings.metadata_ns = metadata_start
+            .elapsed()
+            .as_nanos()
+            .saturating_sub(byte_lane_ns);
+        timings.decode_input_streams.total_ns = byte_lane_ns;
+        timings.decode_input_streams.allocation_reuse_ns = byte_lane_ns;
+        timings.decode_input_streams.close_sum();
+        stats.decode.direct_cursor_stream_count = 1;
+        stats.decode.direct_cursor_value_count = out.len();
+        stats.writer.output_slices = 1;
+        stats.writer.non_contiguous_writes = 1;
+        stats.writer.copied_bytes = out.len();
+        stats.writer.guard_update_bytes = if guard_mode == OutputGuardMode::NoGuard {
+            0
+        } else {
+            out.len()
+        };
+        stats.writer.guard_update_calls = if guard_mode == OutputGuardMode::NoGuard {
+            0
+        } else {
+            1
+        };
+        let mut output_byte_guard = None;
+        if guard_mode != OutputGuardMode::NoGuard {
+            let guard_start = Instant::now();
+            output_byte_guard = Some(bytes_guard_value(&out));
+            timings.post_output_guard_ns = guard_start.elapsed().as_nanos();
+        }
+        timings.total_ns = total_start.elapsed().as_nanos();
+        return Ok(Some(ProfiledCompileOutput {
+            bytes: out,
+            output_byte_guard,
+            guard_mode,
+            transcode_path: TranscodePath::Direct,
+            encoder_path: Aura0EncoderPath::Materialized,
+            conversion_plan_hash: None,
+            timings: ProfiledCompileTimings {
+                aura0_to_aura1: Some(timings),
+                aura1_to_aura0: None,
+            },
+            stats: ProfiledCompileStats {
+                aura0_to_aura1: Some(stats),
+                aura1_to_aura0: None,
+            },
+        }));
+    }
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
     validate_header_schema_agreement(&header, &footer.schema)?;
     if schema_has_wide_fields(&footer.schema) {
@@ -1308,9 +1560,13 @@ pub fn decode_i64_columns_file(bytes: &[u8]) -> Result<Option<DecodedI64ColumnsF
     let record_count = usize::try_from(footer.record_count)
         .map_err(|_| AuraError::InvalidValue("record count"))?;
     let field_count = footer.schema.fields.len();
+    let semantic_len = aura0_semantic_body_len(&footer, footer_start - header_len)?;
+    if semantic_len == 0 {
+        return Ok(None);
+    }
     let Some(columns) = try_decode_generic_i64_columns_body(
         plan,
-        &bytes[header_len..footer_start],
+        &bytes[header_len..header_len + semantic_len],
         record_count,
         field_count,
     )?
@@ -1469,17 +1725,21 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
             if schema_has_wide_fields(&footer.schema) {
                 return Err(AuraError::InvalidValue("i64 schema"));
             }
-            let rows = if let Some(plan) = footer.generic_aura0_plan.clone() {
+            let semantic_len = aura0_semantic_body_len(&footer, body.len())?;
+            let rows = if semantic_len == 0 {
+                let aura1 = decode_aura1_byte_lanes_from_body(body, &footer, false)?;
+                return decode_i64_file_inner(&aura1);
+            } else if let Some(plan) = footer.generic_aura0_plan.clone() {
                 decode_generic_i64_rows_body(
                     plan,
-                    body,
+                    &body[..semantic_len],
                     footer.record_count as usize,
                     footer.schema.fields.len(),
                 )?
             } else {
                 let plan = footer.aura0_program.to_aura0_plan()?;
                 decode_aura0_body(
-                    body,
+                    &body[..semantic_len],
                     &plan,
                     footer.record_count as usize,
                     footer.schema.fields.len(),
@@ -1576,6 +1836,314 @@ pub(crate) fn decode_typed_file_inner(bytes: &[u8]) -> Result<DecodedTypedFile> 
 
 const FOOTER_LEN_SIZE: usize = 4;
 const MAX_VISITOR_FIELDS: usize = 64;
+
+struct CompiledFileParts<'a> {
+    header: AuraHeader,
+    body: &'a [u8],
+    footer: CompiledFooter,
+}
+
+struct SealedFileOffsets {
+    header: AuraHeader,
+    header_len: usize,
+    footer_start: usize,
+    footer_len_offset: usize,
+}
+
+fn sealed_profile(bytes: &[u8]) -> Result<Profile> {
+    if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let seal_offset = bytes.len() - SEAL_MAGIC.len();
+    if &bytes[seal_offset..] != SEAL_MAGIC {
+        return Err(AuraError::InvalidMagic {
+            expected: "sealed:)",
+        });
+    }
+    let header_len = AuraHeader::encoded_len(bytes)?;
+    Ok(AuraHeader::decode(&bytes[..header_len])?.profile)
+}
+
+fn parse_compiled_file_parts(
+    bytes: &[u8],
+    expected_profile: Profile,
+) -> Result<CompiledFileParts<'_>> {
+    let offsets = parse_sealed_file_offsets(bytes, expected_profile)?;
+    let footer = CompiledFooter::decode(&bytes[offsets.footer_start..offsets.footer_len_offset])?;
+    validate_header_schema_agreement(&offsets.header, &footer.schema)?;
+    Ok(CompiledFileParts {
+        header: offsets.header,
+        body: &bytes[offsets.header_len..offsets.footer_start],
+        footer,
+    })
+}
+
+fn parse_sealed_file_offsets(bytes: &[u8], expected_profile: Profile) -> Result<SealedFileOffsets> {
+    if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let seal_offset = bytes.len() - SEAL_MAGIC.len();
+    if &bytes[seal_offset..] != SEAL_MAGIC {
+        return Err(AuraError::InvalidMagic {
+            expected: "sealed:)",
+        });
+    }
+    let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
+    let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
+    let header_len = AuraHeader::encoded_len(bytes)?;
+    if header_len > footer_len_offset {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let header = AuraHeader::decode(&bytes[..header_len])?;
+    if header.profile != expected_profile {
+        return Err(AuraError::InvalidValue("profile"));
+    }
+    let footer_start = footer_len_offset
+        .checked_sub(footer_len)
+        .ok_or(AuraError::UnexpectedEof)?;
+    if footer_start < header_len {
+        return Err(AuraError::UnexpectedEof);
+    }
+    Ok(SealedFileOffsets {
+        header,
+        header_len,
+        footer_start,
+        footer_len_offset,
+    })
+}
+
+fn encode_aura1_byte_lane_file(
+    codec: Aura0ByteLaneCodec,
+    aura1_bytes: &[u8],
+    compressed_offset: u64,
+    record_count: u64,
+) -> Result<(Vec<u8>, Aura1ByteLaneDescriptor)> {
+    let bytes = match codec {
+        Aura0ByteLaneCodec::Raw => aura1_bytes.to_vec(),
+        Aura0ByteLaneCodec::Lz4 => lz4_flex::compress_prepend_size(aura1_bytes),
+        Aura0ByteLaneCodec::Zstd1 | Aura0ByteLaneCodec::Zstd3 | Aura0ByteLaneCodec::Zstd9 => {
+            zstd::stream::encode_all(
+                std::io::Cursor::new(aura1_bytes),
+                i32::from(codec.codec_level()),
+            )
+            .map_err(|_| AuraError::InvalidValue("byte lane zstd"))?
+        }
+    };
+    let checksum = bytes_guard_value(aura1_bytes);
+    let row_count =
+        u32::try_from(record_count).map_err(|_| AuraError::InvalidValue("record count"))?;
+    let descriptor = Aura1ByteLaneDescriptor {
+        lane_version: AURA1_BYTE_LANE_VERSION,
+        codec_id: codec.codec_id(),
+        codec_level: codec.codec_level(),
+        block_index: 0,
+        row_start: 0,
+        row_count,
+        aura1_output_offset: 0,
+        uncompressed_len: u64::try_from(aura1_bytes.len())
+            .map_err(|_| AuraError::InvalidValue("byte lane length"))?,
+        compressed_offset,
+        compressed_len: u64::try_from(bytes.len())
+            .map_err(|_| AuraError::InvalidValue("byte lane length"))?,
+        checksum_kind: BYTE_LANE_CHECKSUM_BYTE_GUARD,
+        checksum,
+        flags: 0,
+    };
+    Ok((bytes, descriptor))
+}
+
+fn decode_aura1_byte_lanes_from_body(
+    body: &[u8],
+    footer: &CompiledFooter,
+    validate_checksum: bool,
+) -> Result<Vec<u8>> {
+    decode_aura1_byte_lanes_from_descriptors(body, &footer.aura1_byte_lanes, validate_checksum)
+}
+
+fn decode_aura1_byte_lanes_from_descriptors(
+    body: &[u8],
+    lanes: &[Aura1ByteLaneDescriptor],
+    validate_checksum: bool,
+) -> Result<Vec<u8>> {
+    if lanes.is_empty() {
+        return Err(AuraError::InvalidValue("aura0 byte lane"));
+    }
+
+    if lanes.len() == 1 {
+        let lane = &lanes[0];
+        validate_aura1_byte_lane_descriptor(lane)?;
+        if lane.aura1_output_offset == 0 {
+            let compressed_start = usize::try_from(lane.compressed_offset)
+                .map_err(|_| AuraError::InvalidValue("byte lane offset"))?;
+            let compressed_len = usize::try_from(lane.compressed_len)
+                .map_err(|_| AuraError::InvalidValue("byte lane length"))?;
+            let compressed_end = compressed_start
+                .checked_add(compressed_len)
+                .ok_or(AuraError::UnexpectedEof)?;
+            let compressed = body
+                .get(compressed_start..compressed_end)
+                .ok_or(AuraError::UnexpectedEof)?;
+            let decoded = decode_aura1_byte_lane_payload(lane, compressed)?;
+            let expected_len = usize::try_from(lane.uncompressed_len)
+                .map_err(|_| AuraError::InvalidValue("byte lane length"))?;
+            if decoded.len() != expected_len {
+                return Err(AuraError::InvalidValue("byte lane length"));
+            }
+            if validate_checksum {
+                validate_aura1_byte_lane_checksum(lane, &decoded)?;
+            }
+            return Ok(decoded);
+        }
+    }
+
+    let mut output_len = 0usize;
+    for lane in lanes {
+        validate_aura1_byte_lane_descriptor(lane)?;
+        let start = usize::try_from(lane.aura1_output_offset)
+            .map_err(|_| AuraError::InvalidValue("byte lane offset"))?;
+        let len = usize::try_from(lane.uncompressed_len)
+            .map_err(|_| AuraError::InvalidValue("byte lane length"))?;
+        output_len = output_len.max(start.checked_add(len).ok_or(AuraError::UnexpectedEof)?);
+    }
+    let mut output = vec![0u8; output_len];
+
+    for lane in lanes {
+        let compressed_start = usize::try_from(lane.compressed_offset)
+            .map_err(|_| AuraError::InvalidValue("byte lane offset"))?;
+        let compressed_len = usize::try_from(lane.compressed_len)
+            .map_err(|_| AuraError::InvalidValue("byte lane length"))?;
+        let compressed_end = compressed_start
+            .checked_add(compressed_len)
+            .ok_or(AuraError::UnexpectedEof)?;
+        let compressed = body
+            .get(compressed_start..compressed_end)
+            .ok_or(AuraError::UnexpectedEof)?;
+        let decoded = decode_aura1_byte_lane_payload(lane, compressed)?;
+        let expected_len = usize::try_from(lane.uncompressed_len)
+            .map_err(|_| AuraError::InvalidValue("byte lane length"))?;
+        if decoded.len() != expected_len {
+            return Err(AuraError::InvalidValue("byte lane length"));
+        }
+        if validate_checksum {
+            validate_aura1_byte_lane_checksum(lane, &decoded)?;
+        }
+        let output_start = usize::try_from(lane.aura1_output_offset)
+            .map_err(|_| AuraError::InvalidValue("byte lane offset"))?;
+        let output_end = output_start
+            .checked_add(decoded.len())
+            .ok_or(AuraError::UnexpectedEof)?;
+        output[output_start..output_end].copy_from_slice(&decoded);
+    }
+    Ok(output)
+}
+
+fn decode_aura1_byte_lane_payload(
+    lane: &Aura1ByteLaneDescriptor,
+    compressed: &[u8],
+) -> Result<Vec<u8>> {
+    match (lane.codec_id, lane.codec_level) {
+        (BYTE_LANE_CODEC_RAW, 0) => Ok(compressed.to_vec()),
+        (BYTE_LANE_CODEC_LZ4, 0) => lz4_flex::decompress_size_prepended(compressed)
+            .map_err(|_| AuraError::InvalidValue("byte lane lz4")),
+        (BYTE_LANE_CODEC_ZSTD, 1 | 3 | 9) => {
+            zstd::stream::decode_all(std::io::Cursor::new(compressed))
+                .map_err(|_| AuraError::InvalidValue("byte lane zstd"))
+        }
+        _ => Err(AuraError::InvalidValue("byte lane codec")),
+    }
+}
+
+fn try_decode_aura1_byte_lane_from_footer_tail(
+    body: &[u8],
+    footer_bytes: &[u8],
+    validate_checksum: bool,
+) -> Result<Option<Vec<u8>>> {
+    let Some(extension_offset) = footer_bytes
+        .windows(AURA1_BYTE_LANE_MAGIC.len())
+        .rposition(|window| window == AURA1_BYTE_LANE_MAGIC)
+    else {
+        return Ok(None);
+    };
+    let mut reader = ByteReader::new(&footer_bytes[extension_offset..]);
+    if reader.read_exact(AURA1_BYTE_LANE_MAGIC.len())? != AURA1_BYTE_LANE_MAGIC {
+        return Err(AuraError::InvalidMagic { expected: "AUBL" });
+    }
+    let lane_count = reader.read_u32_le()? as usize;
+    let mut lanes = Vec::with_capacity(lane_count);
+    for _ in 0..lane_count {
+        let lane_version = reader.read_u8()?;
+        let codec_id = reader.read_u8()?;
+        let codec_level = reader.read_u8()?;
+        let checksum_kind = reader.read_u8()?;
+        lanes.push(Aura1ByteLaneDescriptor {
+            lane_version,
+            codec_id,
+            codec_level,
+            checksum_kind,
+            block_index: reader.read_u32_le()?,
+            row_start: reader.read_u64_le()?,
+            row_count: reader.read_u32_le()?,
+            aura1_output_offset: reader.read_u64_le()?,
+            uncompressed_len: reader.read_u64_le()?,
+            compressed_offset: reader.read_u64_le()?,
+            compressed_len: reader.read_u64_le()?,
+            checksum: reader.read_u64_le()?,
+            flags: reader.read_u32_le()?,
+        });
+    }
+    reader.finish()?;
+    Ok(Some(decode_aura1_byte_lanes_from_descriptors(
+        body,
+        &lanes,
+        validate_checksum,
+    )?))
+}
+
+fn validate_aura1_byte_lane_descriptor(lane: &Aura1ByteLaneDescriptor) -> Result<()> {
+    if lane.lane_version != AURA1_BYTE_LANE_VERSION {
+        return Err(AuraError::UnsupportedVersion(u16::from(lane.lane_version)));
+    }
+    match (lane.codec_id, lane.codec_level) {
+        (BYTE_LANE_CODEC_RAW, 0) | (BYTE_LANE_CODEC_LZ4, 0) | (BYTE_LANE_CODEC_ZSTD, 1 | 3 | 9) => {
+        }
+        _ => return Err(AuraError::InvalidValue("byte lane codec")),
+    }
+    match lane.checksum_kind {
+        BYTE_LANE_CHECKSUM_NONE | BYTE_LANE_CHECKSUM_BYTE_GUARD => {}
+        _ => return Err(AuraError::InvalidValue("byte lane checksum")),
+    }
+    Ok(())
+}
+
+fn validate_aura1_byte_lane_checksum(lane: &Aura1ByteLaneDescriptor, bytes: &[u8]) -> Result<()> {
+    match lane.checksum_kind {
+        BYTE_LANE_CHECKSUM_NONE => Ok(()),
+        BYTE_LANE_CHECKSUM_BYTE_GUARD => {
+            if bytes_guard_value(bytes) == lane.checksum {
+                Ok(())
+            } else {
+                Err(AuraError::InvalidValue("byte lane checksum"))
+            }
+        }
+        _ => Err(AuraError::InvalidValue("byte lane checksum")),
+    }
+}
+
+fn bytes_guard_value(bytes: &[u8]) -> u64 {
+    let mut guard = ByteGuard::new();
+    guard.update(bytes);
+    guard.value()
+}
+
+fn aura0_semantic_body_len(footer: &CompiledFooter, body_len: usize) -> Result<usize> {
+    let mut semantic_len = body_len;
+    for lane in &footer.aura1_byte_lanes {
+        let offset = usize::try_from(lane.compressed_offset)
+            .map_err(|_| AuraError::InvalidValue("byte lane offset"))?;
+        semantic_len = semantic_len.min(offset);
+    }
+    Ok(semantic_len)
+}
 
 fn read_trailer_footer_len(bytes: &[u8], offset: usize) -> Result<usize> {
     let end = offset

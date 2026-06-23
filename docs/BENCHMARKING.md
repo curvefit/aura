@@ -39,6 +39,8 @@ aura0-to-aura1-bytes
 aura0-to-aura1-bytes-verify
 zstd-aura1-to-aura1-bytes
 zstd-aura1-to-aura1-bytes-verify
+aura0-byte-lane-to-aura1-bytes
+aura0-byte-lane-to-aura1-bytes-verify
 ```
 
 Important flags:
@@ -52,6 +54,9 @@ Important flags:
 --preserve-output <path>
 --verify-output-decodes
 --zstd-level <level>
+--aura0-profile compact|fast|hybrid
+--byte-lane-codec raw|lz4|zstd1|zstd3|zstd9
+--use-byte-lane auto|always|never
 --reference-aura0 <path>
 --reference-aura1 <path>
 ```
@@ -86,6 +91,20 @@ The fair benchmark previously overstated production time because `Option::then_s
 eagerly evaluated output equality/hash work even when verification was disabled.
 The production path now skips equality/hash work unless a `*-verify` operation
 is selected.
+
+The benchmark harness also exposes real Aura0 fast/hybrid byte-lane profiles:
+
+```text
+aura0-byte-lane-to-aura1-bytes
+aura0-byte-lane-to-aura1-bytes-verify
+```
+
+This operation builds a real Aura0 file outside timed iterations with
+`--aura0-profile fast|hybrid`, then times production Aura0 reader expansion into
+Aura1 bytes. Production mode validates lane structure and lengths but does not
+scan the output guard. Verify mode validates output equality and output-byte
+guard. The byte lane is serialized in the compiled footer as an `AUBL`
+extension.
 
 Materialized paths are retained as reference/correctness fallbacks. Final
 candidate path decisions should use direct/profiled paths that emit
@@ -127,15 +146,29 @@ Fresh resolution artifacts used for the default decision:
 /tmp/aura-benchmarks/final-resolution-lane-c/*.json
 /tmp/aura-benchmarks/final-resolution-lane-d/*.json
 /tmp/aura-benchmarks/final-resolution-fixtures/fixtures.json
+/tmp/aura-benchmarks/real-byte-lane-production-20260623T032512Z/*.json
 ```
 
 Current fair Aura0-vs-zstd product scoreboard:
 
 | Dataset | Aura0 bytes | Aura1.zst L3 bytes | Aura1 bytes | Aura0 -> Aura1 ms | zstd -> Aura1 ms | Winner |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| grimoire-50mb-huff | 1,879,040 | 5,542,945 | 36,410,980 | 81.971 | 62.132 | zstd |
-| grimoire-50mb-nohuff | 2,246,910 | 5,538,275 | 36,403,133 | 107.088 | 61.590 | zstd |
+| grimoire-50mb-huff | 1,879,040 | 5,542,945 | 36,410,980 | 80.608 | 61.386 | zstd |
+| grimoire-50mb-nohuff | 2,246,910 | 5,538,275 | 36,403,133 | 104.173 | 62.798 | zstd |
 
-Use verify-mode JSON from `/tmp/aura-benchmarks/zstd-resolution-lane-4/*verify.json`
-for output equality evidence. Both Aura0 and zstd verify runs reported
-`output_bytes_equal=true` and matching output byte hashes for huff and nohuff.
+Current real Aura0-fast/hybrid byte-lane scoreboard:
+
+| Dataset | Profile | Codec | Aura0 profile bytes | Aura1 bytes | Lane -> Aura1 ms | zstd L3 -> Aura1 ms | Winner |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| grimoire-50mb-huff | fast | raw | 36,419,472 | 36,410,980 | 24.753 | 61.386 | byte lane |
+| grimoire-50mb-huff | fast | lz4 | 9,795,104 | 36,410,980 | 44.373 | 61.386 | byte lane |
+| grimoire-50mb-huff | hybrid | lz4 | 11,665,724 | 36,410,980 | 43.761 | 61.386 | byte lane |
+| grimoire-50mb-nohuff | fast | raw | 36,403,778 | 36,403,133 | 25.271 | 62.798 | byte lane |
+| grimoire-50mb-nohuff | fast | lz4 | 9,781,060 | 36,403,133 | 43.281 | 62.798 | byte lane |
+| grimoire-50mb-nohuff | hybrid | lz4 | 12,027,397 | 36,403,133 | 44.058 | 62.798 | byte lane |
+
+Use verify-mode JSON from
+`/tmp/aura-benchmarks/real-byte-lane-production-20260623T032512Z/*_verify.json`
+for output equality evidence. Fast lz4 verify runs reported
+`output_bytes_equal=true` with output byte hashes
+`12194870092346231300` for huff and `10372430540135078667` for nohuff.
