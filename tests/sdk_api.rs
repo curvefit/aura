@@ -1,0 +1,497 @@
+use std::io::Cursor;
+
+use aura_codec::{
+    convert_aura, Aura0ByteLaneCodec, Aura0ByteLaneUse, AuraColumnBatch, AuraFormat, AuraProfile,
+    AuraReader, AuraRecordBatch, AuraSchema, AuraType, AuraValue, AuraWriter, CompiledAuraPlan,
+    ConvertOptions, ReaderOptions, WriterOptions,
+};
+
+fn market_schema() -> AuraSchema {
+    AuraSchema::builder()
+        .field("ts_event", AuraType::TimestampNanos)
+        .field("symbol_id", AuraType::U32)
+        .field("price", AuraType::PriceI64Scaled { scale: 9 })
+        .field("size", AuraType::U64)
+        .field("side", AuraType::EnumU8)
+        .field("flags", AuraType::FlagsU32)
+        .build()
+        .unwrap()
+}
+
+fn market_rows() -> Vec<Vec<AuraValue>> {
+    vec![
+        vec![
+            1_700_000_000_000_000_000_i64.into(),
+            10_u64.into(),
+            101_000_000_000_i64.into(),
+            25_u64.into(),
+            1_u64.into(),
+            0_u64.into(),
+        ],
+        vec![
+            1_700_000_000_001_000_000_i64.into(),
+            10_u64.into(),
+            101_250_000_000_i64.into(),
+            33_u64.into(),
+            2_u64.into(),
+            4_u64.into(),
+        ],
+        vec![
+            1_700_000_000_002_000_000_i64.into(),
+            22_u64.into(),
+            99_500_000_000_i64.into(),
+            10_u64.into(),
+            1_u64.into(),
+            1_u64.into(),
+        ],
+    ]
+}
+
+fn write_with_options(
+    schema: AuraSchema,
+    rows: Vec<Vec<AuraValue>>,
+    options: WriterOptions,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let batch = AuraRecordBatch::new(schema.clone(), rows).unwrap();
+    let mut writer = AuraWriter::try_new(&mut bytes, schema, options).unwrap();
+    writer.write_batch(batch).unwrap();
+    let summary = writer.finish().unwrap();
+    assert_eq!(summary.output_bytes, bytes.len());
+    bytes
+}
+
+fn assert_roundtrip(bytes: &[u8], schema: &AuraSchema, rows: &[Vec<AuraValue>]) {
+    let reader = AuraReader::open(Cursor::new(bytes)).unwrap();
+    assert_eq!(reader.schema().descriptor().name, schema.descriptor().name);
+    assert_eq!(reader.schema().hash(), schema.hash());
+    assert_eq!(reader.schema().field_count(), schema.field_count());
+    for (actual, expected) in reader.schema().fields().iter().zip(schema.fields()) {
+        assert_eq!(actual.name, expected.name);
+        assert_eq!(actual.aura_type, expected.aura_type);
+        assert_eq!(actual.nullable, expected.nullable);
+    }
+    let batches = reader.read_batches().unwrap();
+    assert_eq!(1, batches.len());
+    assert_eq!(rows, batches[0].rows());
+}
+
+fn column_market_batch(schema: AuraSchema) -> AuraColumnBatch {
+    AuraColumnBatch::builder(schema)
+        .u32("flags", vec![0, 4, 1])
+        .u64("size", vec![25, 33, 10])
+        .u8("side", vec![1, 2, 1])
+        .i64(
+            "price",
+            vec![101_000_000_000, 101_250_000_000, 99_500_000_000],
+        )
+        .u32("symbol_id", vec![10, 10, 22])
+        .i64(
+            "ts_event",
+            vec![
+                1_700_000_000_000_000_000,
+                1_700_000_000_001_000_000,
+                1_700_000_000_002_000_000,
+            ],
+        )
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn schema_builder_accepts_valid_market_data_schema() {
+    let schema = market_schema();
+
+    assert_eq!(6, schema.field_count());
+    assert_eq!("ts_event", schema.fields()[0].name);
+    assert_eq!(AuraType::U32, schema.fields()[1].aura_type);
+    assert_eq!(
+        AuraType::PriceI64Scaled { scale: 9 },
+        schema.fields()[2].aura_type
+    );
+    assert_ne!(0, schema.hash());
+}
+
+#[test]
+fn writer_reader_and_convert_options_defaults_are_stable() {
+    let writer = WriterOptions::default();
+    assert_eq!(AuraFormat::Aura0, writer.format);
+    assert_eq!(AuraProfile::Compact, writer.aura0_profile);
+    assert_eq!(Aura0ByteLaneCodec::Lz4, writer.byte_lane_codec);
+    assert_eq!(0, writer.stream_id);
+    assert_eq!(0, writer.dictionary_id);
+
+    let aura1 = WriterOptions::aura1();
+    assert_eq!(AuraFormat::Aura1, aura1.format);
+    assert_eq!(AuraProfile::Compact, aura1.aura0_profile);
+
+    let reader = ReaderOptions::default();
+    assert_eq!(Aura0ByteLaneUse::Auto, reader.use_byte_lane);
+
+    let convert = ConvertOptions::new(AuraFormat::Aura1);
+    assert_eq!(AuraFormat::Aura1, convert.target_format);
+    assert_eq!(AuraProfile::Compact, convert.aura0_profile);
+    assert_eq!(Aura0ByteLaneUse::Auto, convert.use_byte_lane);
+    assert!(!convert.verify);
+}
+
+#[test]
+fn schema_builder_rejects_duplicate_field_names() {
+    let err = AuraSchema::builder()
+        .field("alpha", AuraType::I64)
+        .field("alpha", AuraType::I64)
+        .build()
+        .unwrap_err();
+
+    assert!(err.to_string().contains("duplicate field name"));
+}
+
+#[test]
+fn schema_builder_rejects_duplicate_field_ids() {
+    let err = AuraSchema::builder()
+        .field_with_id(7, "alpha", AuraType::I64)
+        .field_with_id(7, "beta", AuraType::I64)
+        .build()
+        .unwrap_err();
+
+    assert!(err.to_string().contains("duplicate field id"));
+}
+
+#[test]
+fn schema_builder_rejects_unsupported_type_and_nullability() {
+    let unsupported = AuraSchema::builder()
+        .field("payload", AuraType::Utf8)
+        .build()
+        .unwrap_err();
+    assert!(unsupported.to_string().contains("unsupported aura type"));
+
+    let nullable = AuraSchema::builder()
+        .nullable_field("maybe_price", AuraType::I64)
+        .build()
+        .unwrap_err();
+    assert!(nullable.to_string().contains("nullable field"));
+}
+
+#[test]
+fn write_aura1_generic_schema_roundtrip() {
+    let schema = market_schema();
+    let rows = market_rows();
+    let aura1 = write_with_options(schema.clone(), rows.clone(), WriterOptions::aura1());
+
+    assert_roundtrip(&aura1, &schema, &rows);
+}
+
+#[test]
+fn write_aura0_compact_generic_schema_roundtrip() {
+    let schema = market_schema();
+    let rows = market_rows();
+    let aura0 = write_with_options(schema.clone(), rows.clone(), WriterOptions::aura0_compact());
+
+    assert_roundtrip(&aura0, &schema, &rows);
+}
+
+#[test]
+fn compiled_plan_public_from_schema_and_reader_footer() {
+    let schema = market_schema();
+    let plan = CompiledAuraPlan::from_schema(&schema).unwrap();
+
+    assert_eq!(schema.hash(), plan.schema_hash);
+    assert_eq!(6, plan.field_count);
+    assert_eq!(33, plan.aura1_record_width);
+    assert_eq!(0, plan.aura1_field_offset(0).unwrap().offset);
+    assert_eq!(8, plan.aura1_field_offset(1).unwrap().offset);
+    assert_eq!(12, plan.aura1_field_offset(2).unwrap().offset);
+    assert_eq!(20, plan.aura1_field_offset(3).unwrap().offset);
+    assert_eq!(28, plan.aura1_field_offset(4).unwrap().offset);
+    assert_eq!(29, plan.aura1_field_offset(5).unwrap().offset);
+
+    let rows = market_rows();
+    let mut bytes = Vec::new();
+    let batch = AuraRecordBatch::new(schema.clone(), rows).unwrap();
+    let mut writer =
+        AuraWriter::try_new(&mut bytes, schema.clone(), WriterOptions::aura1()).unwrap();
+    assert_eq!(plan.schema_hash, writer.compiled_plan().schema_hash);
+    writer.write_batch(batch).unwrap();
+    writer.finish().unwrap();
+
+    let reader = AuraReader::open(Cursor::new(&bytes)).unwrap();
+    let read_plan = reader.compiled_plan().expect("compiled plan");
+    assert_eq!(schema.hash(), read_plan.schema_hash);
+    assert!(read_plan.aura1_record_width <= plan.aura1_record_width);
+    assert_ne!(0, read_plan.conversion_plan_hash);
+}
+
+#[test]
+fn schema_name_and_id_roundtrip_through_profiles_and_conversions() {
+    let schema = AuraSchema::named("named_sdk_schema")
+        .field("event_time", AuraType::TimestampNanos)
+        .field("venue_code", AuraType::U16)
+        .field("signed_qty", AuraType::I32)
+        .build()
+        .unwrap();
+    let rows = vec![
+        vec![10_i64.into(), 2_u64.into(), (-1_i64).into()],
+        vec![11_i64.into(), 3_u64.into(), 9_i64.into()],
+    ];
+    let aura1 = write_with_options(schema.clone(), rows.clone(), WriterOptions::aura1());
+    let aura0 = write_with_options(schema.clone(), rows.clone(), WriterOptions::aura0_compact());
+    let mut converted = Vec::new();
+    convert_aura(
+        Cursor::new(&aura0),
+        &mut converted,
+        ConvertOptions::new(AuraFormat::Aura1).verify(true),
+    )
+    .unwrap();
+
+    for bytes in [&aura1, &aura0, &converted] {
+        let reader = AuraReader::open(Cursor::new(bytes)).unwrap();
+        assert_eq!("named_sdk_schema", reader.schema().descriptor().name);
+        assert_eq!(schema.hash(), reader.schema().hash());
+        assert_eq!(schema.fields(), reader.schema().fields());
+    }
+}
+
+#[test]
+fn write_column_batch_roundtrips_and_matches_row_batch() {
+    let schema = market_schema();
+    let rows = market_rows();
+    let row_bytes = write_with_options(schema.clone(), rows.clone(), WriterOptions::aura1());
+    let mut column_bytes = Vec::new();
+    let mut writer =
+        AuraWriter::try_new(&mut column_bytes, schema.clone(), WriterOptions::aura1()).unwrap();
+    writer
+        .write_batch(column_market_batch(schema.clone()))
+        .unwrap();
+    writer.finish().unwrap();
+
+    assert_eq!(row_bytes, column_bytes);
+    assert_roundtrip(&column_bytes, &schema, &rows);
+}
+
+#[test]
+fn column_batch_rejects_length_missing_extra_and_type_mismatches() {
+    let schema = market_schema();
+    let length = AuraColumnBatch::builder(schema.clone())
+        .i64("ts_event", vec![1, 2])
+        .u32("symbol_id", vec![1])
+        .i64("price", vec![10, 11])
+        .u64("size", vec![1, 2])
+        .u8("side", vec![1, 2])
+        .u32("flags", vec![0, 0])
+        .build()
+        .unwrap_err();
+    assert!(length.to_string().contains("column length"));
+
+    let missing = AuraColumnBatch::builder(schema.clone())
+        .i64("ts_event", vec![1])
+        .u32("symbol_id", vec![1])
+        .i64("price", vec![10])
+        .u64("size", vec![1])
+        .u8("side", vec![1])
+        .build()
+        .unwrap_err();
+    assert!(missing.to_string().contains("missing column"));
+
+    let extra = AuraColumnBatch::builder(schema.clone())
+        .i64("ts_event", vec![1])
+        .u32("symbol_id", vec![1])
+        .i64("price", vec![10])
+        .u64("size", vec![1])
+        .u8("side", vec![1])
+        .u32("flags", vec![0])
+        .u32("not_in_schema", vec![0])
+        .build()
+        .unwrap_err();
+    assert!(extra.to_string().contains("extra column"));
+
+    let type_mismatch = AuraColumnBatch::builder(schema)
+        .i64("ts_event", vec![1])
+        .u64("symbol_id", vec![1])
+        .i64("price", vec![10])
+        .u64("size", vec![1])
+        .u8("side", vec![1])
+        .u32("flags", vec![0])
+        .build()
+        .unwrap_err();
+    assert!(type_mismatch.to_string().contains("column type"));
+}
+
+#[test]
+fn reader_streaming_batches_match_read_batches_and_replay() {
+    let schema = market_schema();
+    let rows = market_rows();
+    let aura1 = write_with_options(schema.clone(), rows.clone(), WriterOptions::aura1());
+    let mut reader = AuraReader::open(Cursor::new(&aura1)).unwrap();
+
+    assert_eq!(schema.fields(), reader.schema().fields());
+    let first = reader.next_batch(2).unwrap().unwrap();
+    let second = reader.next_batch(2).unwrap().unwrap();
+    assert!(reader.next_batch(2).unwrap().is_none());
+    assert_eq!(&rows[..2], first.rows());
+    assert_eq!(&rows[2..], second.rows());
+
+    reader.reset_batches();
+    assert_eq!(3, reader.next_batch(3).unwrap().unwrap().row_count());
+    let iter_batches = reader
+        .batches(2)
+        .unwrap()
+        .collect::<aura_codec::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(2, iter_batches.len());
+
+    let mut replayed = Vec::new();
+    let count = reader
+        .replay_i64(|row| {
+            replayed.push(row.to_vec());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(rows.len(), count);
+    assert_eq!(
+        AuraRecordBatch::new(schema, rows)
+            .unwrap()
+            .to_i64_rows()
+            .unwrap(),
+        replayed
+    );
+}
+
+#[test]
+fn convert_aura0_to_aura1_generic_schema_preserves_rows() {
+    let schema = market_schema();
+    let rows = market_rows();
+    let aura0 = write_with_options(schema.clone(), rows.clone(), WriterOptions::aura0_compact());
+    let mut aura1 = Vec::new();
+
+    let summary = convert_aura(
+        Cursor::new(&aura0),
+        &mut aura1,
+        ConvertOptions::new(AuraFormat::Aura1).verify(true),
+    )
+    .unwrap();
+
+    assert!(summary.verified);
+    assert_eq!(AuraFormat::Aura0, summary.source_format);
+    assert_eq!(AuraFormat::Aura1, summary.target_format);
+    assert_roundtrip(&aura1, &schema, &rows);
+}
+
+#[test]
+fn convert_aura1_to_aura0_generic_schema_preserves_rows() {
+    let schema = market_schema();
+    let rows = market_rows();
+    let aura1 = write_with_options(schema.clone(), rows.clone(), WriterOptions::aura1());
+    let mut aura0 = Vec::new();
+
+    let summary = convert_aura(
+        Cursor::new(&aura1),
+        &mut aura0,
+        ConvertOptions::new(AuraFormat::Aura0).verify(true),
+    )
+    .unwrap();
+
+    assert!(summary.verified);
+    assert_eq!(AuraFormat::Aura1, summary.source_format);
+    assert_eq!(AuraFormat::Aura0, summary.target_format);
+    assert_roundtrip(&aura0, &schema, &rows);
+}
+
+#[test]
+fn generated_reordered_wide_and_narrow_schemas_roundtrip() {
+    let cases = vec![
+        (
+            AuraSchema::named("narrow")
+                .field("event_time", AuraType::TimestampMicros)
+                .field("quantity", AuraType::I32)
+                .build()
+                .unwrap(),
+            vec![
+                vec![123_000_i64.into(), 10_i64.into()],
+                vec![124_000_i64.into(), (-3_i64).into()],
+            ],
+        ),
+        (
+            AuraSchema::named("reordered")
+                .field("flags", AuraType::FlagsU32)
+                .field("side", AuraType::EnumU8)
+                .field("px", AuraType::I64Scaled { scale: 4 })
+                .field("ts", AuraType::TimestampNanos)
+                .build()
+                .unwrap(),
+            vec![
+                vec![1_u64.into(), 2_u64.into(), 105_000_i64.into(), 9_i64.into()],
+                vec![
+                    0_u64.into(),
+                    1_u64.into(),
+                    104_999_i64.into(),
+                    10_i64.into(),
+                ],
+            ],
+        ),
+        (
+            AuraSchema::named("wide_no_grimoire_names")
+                .field("alpha_ts", AuraType::TimestampNanos)
+                .field("beta_id", AuraType::U16)
+                .field("gamma_px", AuraType::PriceI64Scaled { scale: 2 })
+                .field("delta_qty", AuraType::U32)
+                .field("epsilon_bool", AuraType::Bool)
+                .field("zeta_flags", AuraType::FlagsU32)
+                .field("eta_change", AuraType::I16)
+                .field("theta_code", AuraType::EnumU8)
+                .field("iota_count", AuraType::U8)
+                .build()
+                .unwrap(),
+            vec![
+                vec![
+                    1_000_i64.into(),
+                    7_u64.into(),
+                    123_45_i64.into(),
+                    50_u64.into(),
+                    true.into(),
+                    3_u64.into(),
+                    (-2_i64).into(),
+                    4_u64.into(),
+                    9_u64.into(),
+                ],
+                vec![
+                    2_000_i64.into(),
+                    8_u64.into(),
+                    123_50_i64.into(),
+                    51_u64.into(),
+                    false.into(),
+                    2_u64.into(),
+                    2_i64.into(),
+                    5_u64.into(),
+                    10_u64.into(),
+                ],
+            ],
+        ),
+    ];
+
+    for (schema, rows) in cases {
+        let aura1 = write_with_options(schema.clone(), rows.clone(), WriterOptions::aura1());
+        let aura0 =
+            write_with_options(schema.clone(), rows.clone(), WriterOptions::aura0_compact());
+
+        assert_roundtrip(&aura1, &schema, &rows);
+        assert_roundtrip(&aura0, &schema, &rows);
+    }
+}
+
+#[test]
+fn writer_rejects_out_of_range_values_for_declared_types() {
+    let schema = AuraSchema::builder()
+        .field("side", AuraType::EnumU8)
+        .field("signed", AuraType::I8)
+        .build()
+        .unwrap();
+    let rows = vec![vec![300_u64.into(), 0_i64.into()]];
+    let mut bytes = Vec::new();
+    let mut writer =
+        AuraWriter::try_new(&mut bytes, schema.clone(), WriterOptions::aura1()).unwrap();
+    let err = writer
+        .write_batch(AuraRecordBatch::new(schema, rows).unwrap())
+        .unwrap_err();
+
+    assert!(err.to_string().contains("unsigned value"));
+}

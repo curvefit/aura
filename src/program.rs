@@ -4,7 +4,9 @@ use crate::footer::{CompressionDescriptor, CompressionKind};
 use crate::format::FORMAT_VERSION;
 use crate::instructions::GenericInstructionPlan;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
-use crate::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
+use crate::schema::{
+    decode_schema_block, encode_schema_block, AuraSchema, FieldType, SchemaDescriptor,
+};
 use crate::stats::PhysicalWidth;
 use crate::{AuraError, Result};
 
@@ -466,6 +468,7 @@ impl DecodeProgram {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledAuraPlan {
     pub format_version: u16,
+    pub schema_hash: u32,
     pub record_count: usize,
     pub field_count: usize,
     pub block_capacity: u16,
@@ -476,6 +479,13 @@ pub struct CompiledAuraPlan {
     pub aura1_body_size: usize,
     pub canonical_field_order: Vec<u16>,
     pub conversion_plan_hash: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompiledAuraField {
+    pub field_index: u16,
+    pub offset: usize,
+    pub width: usize,
 }
 
 impl CompiledAuraPlan {
@@ -504,6 +514,7 @@ impl CompiledAuraPlan {
         let footer_bytes = footer.encode()?;
         Ok(Self {
             format_version: FORMAT_VERSION,
+            schema_hash: footer.schema.schema_id,
             record_count,
             field_count,
             block_capacity: footer.block_capacity,
@@ -515,6 +526,97 @@ impl CompiledAuraPlan {
             canonical_field_order,
             conversion_plan_hash: plan_hash_bytes(&footer_bytes),
         })
+    }
+
+    pub fn from_schema(schema: &AuraSchema) -> Result<Self> {
+        let descriptor = schema.descriptor();
+        let field_count = descriptor.fields.len();
+        if field_count == 0 {
+            return Err(AuraError::InvalidValue("schema fields"));
+        }
+        let fields = descriptor
+            .fields
+            .iter()
+            .map(|field| {
+                let width = physical_width_for_field_type(field.field_type)?;
+                Ok(PhysicalFieldPlan {
+                    field_index: field.index,
+                    encoding: FieldEncoding::Absolute,
+                    width,
+                    bit_width: 0,
+                    reference_field_index: None,
+                    base_value: 0,
+                    step: 0,
+                    estimated_bytes: 0,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        validate_plan_fields(&fields, field_count)?;
+        let aura0_plan = Aura0Plan {
+            fields: fields.clone(),
+        };
+        let aura1_plan = Aura1Plan {
+            block_capacity: 1,
+            fields,
+        };
+        let aura1_record_width = aura1_plan
+            .fields
+            .iter()
+            .map(|field| usize::from(field.width.byte_width()))
+            .sum();
+        let canonical_field_order = (0..field_count)
+            .map(|index| u16::try_from(index).map_err(|_| AuraError::InvalidValue("field index")))
+            .collect::<Result<Vec<_>>>()?;
+        let mut schema_bytes = Vec::new();
+        encode_schema_block(descriptor, &mut schema_bytes)?;
+        Ok(Self {
+            format_version: FORMAT_VERSION,
+            schema_hash: descriptor.schema_id,
+            record_count: 0,
+            field_count,
+            block_capacity: 1,
+            aura0_plan,
+            aura1_plan,
+            generic_aura0_plan: None,
+            aura1_record_width,
+            aura1_body_size: 0,
+            canonical_field_order,
+            conversion_plan_hash: plan_hash_bytes(&schema_bytes),
+        })
+    }
+
+    pub fn aura1_field_offsets(&self) -> Vec<CompiledAuraField> {
+        let mut offset = 0usize;
+        self.aura1_plan
+            .fields
+            .iter()
+            .map(|field| {
+                let width = usize::from(field.width.byte_width());
+                let compiled = CompiledAuraField {
+                    field_index: field.field_index,
+                    offset,
+                    width,
+                };
+                offset += width;
+                compiled
+            })
+            .collect()
+    }
+
+    pub fn aura1_field_offset(&self, field_index: u16) -> Option<CompiledAuraField> {
+        self.aura1_field_offsets()
+            .into_iter()
+            .find(|field| field.field_index == field_index)
+    }
+}
+
+fn physical_width_for_field_type(field_type: FieldType) -> Result<PhysicalWidth> {
+    match field_type {
+        FieldType::I8 | FieldType::U8 => Ok(PhysicalWidth::I8),
+        FieldType::I16 | FieldType::U16 => Ok(PhysicalWidth::I16),
+        FieldType::I32 | FieldType::U32 => Ok(PhysicalWidth::I32),
+        FieldType::I64 | FieldType::U64 | FieldType::TimestampNs => Ok(PhysicalWidth::I64),
+        FieldType::I128 | FieldType::Opaque16 => Ok(PhysicalWidth::I128),
     }
 }
 

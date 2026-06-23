@@ -504,8 +504,20 @@ fn generic_i64_parent_schema_uses_length_prefixed_parent_encoding() {
 
     let (schema_len, schema_encoding) = ingest_schema_block(&ingest);
 
-    assert_eq!(10, schema_len);
-    assert_eq!(&[0, 8, 100, 0, 2, 2, 2, 0, 6, 6], schema_encoding);
+    let schema_name = b"dynamic_ohlcv_plus_flow_v1";
+    assert_eq!(1 + 2 + schema_name.len() + 4 + 1 + 8, schema_len);
+    assert_eq!(2, schema_encoding[0]);
+    assert_eq!(
+        schema_name.len() as u16,
+        u16::from_le_bytes(schema_encoding[1..3].try_into().unwrap())
+    );
+    assert_eq!(schema_name, &schema_encoding[3..3 + schema_name.len()]);
+    let slots_start = 3 + schema_name.len() + 4;
+    assert_eq!(8, schema_encoding[slots_start]);
+    assert_eq!(
+        &[100, 0, 2, 2, 2, 0, 6, 6],
+        &schema_encoding[slots_start + 1..]
+    );
 }
 
 #[test]

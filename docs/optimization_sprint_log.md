@@ -783,3 +783,31 @@ Each experiment must record:
   target failed for the current compact layout.
 - next implication: a compact v2 semantic stream layout is required for another
   serious attempt; byte lanes are not a valid answer for this compact sprint.
+
+## SDK Lane S1: Public dynamic-schema facade
+
+- hypothesis: Aura needs a reusable library surface before further format work
+  is useful to non-benchmark callers.
+- prior-art basis: columnar formats expose schema, writer, reader, and
+  conversion APIs independently of their benchmark harnesses.
+- file/function targeted:
+  - `src/schema.rs` dynamic SDK schema facade.
+  - `src/types.rs` SDK record batch/value facade.
+  - `src/writer.rs` public writer facade.
+  - `src/reader.rs` public reader facade.
+  - `src/convert.rs` public conversion helper.
+  - `src/options.rs` public format/options types.
+- expected speedup: none. This is SDK surface area, not a hot-path
+  optimization.
+- patch summary: added schema-generic fixed-width scalar API over the existing
+  generic i64 engine, plus examples, docs, and non-grimoire roundtrip tests.
+- commands run:
+  - `cargo check`
+  - `cargo check --examples`
+  - `cargo test --test sdk_api -- --nocapture`
+  - full verification commands are recorded in the final SDK report.
+- benchmark JSON paths: none for this SDK lane.
+- result: pending full verification at time of entry.
+- keep/reject decision: keep if full SDK tests and examples pass.
+- next implication: typed column batches, generic benchmarks, and full plan API
+  exposure remain separate milestones.
