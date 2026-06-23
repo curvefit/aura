@@ -49,7 +49,7 @@ The public SDK facade is schema-generic, but it still targets the existing gener
 
 The current SDK does not make `aura-bench` the product API. Benchmark code remains a consumer of lower-level record helpers.
 
-The reader now exposes batch iteration and replay APIs. Current v1 limitation: `AuraReader` still decodes through the in-memory generic row engine before serving batches. The API is streaming-shaped, but the implementation is not yet zero-copy or block-streaming.
+The reader now exposes true batch iteration and replay APIs. Aura1 rows are visited from the fixed-width body without full-file row materialization. Aura0 compact opens from metadata and lazily builds bounded row batches from compact stream columns.
 
 ## Verification Plan
 
@@ -66,7 +66,6 @@ Required local checks:
 
 ## Remaining Work
 
-- Replace the reader's internal whole-file decode with true block streaming.
-- Expand the generated SDK smoke matrix into full repeated benchmark sweeps.
+- Add true Aura0 row-group streaming if compact v2 adds row-group stream offsets.
 - Add property-based random generators beyond the deterministic fixture families.
 - Implement nullable/variable-width support only after the binary layout has explicit presence and offset encoding for those types.

@@ -49,7 +49,7 @@ pub use instructions::{
 pub use options::{AuraFormat, AuraProfile, ConvertOptions, ReaderOptions, WriterOptions};
 pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 pub use program::{CompiledAuraField, CompiledAuraPlan};
-pub use reader::{AuraBatchIter, AuraI64Reader, AuraReader, AuraTypedReader};
+pub use reader::{AuraBatchIter, AuraI64Reader, AuraReader, AuraReaderStats, AuraTypedReader};
 pub use records::{
     Aura0ByteLaneCodec, Aura0ByteLaneUse, DecodedI64ColumnsFile, DecodedI64File, DecodedTypedFile,
     I64FileInput, TypedFileInput,

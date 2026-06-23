@@ -19,6 +19,7 @@ const DEFAULT_ZSTD_LEVEL: i32 = 3;
 struct Args {
     output_dir: PathBuf,
     zstd_level: i32,
+    sdk_full: bool,
 }
 
 #[derive(Debug)]
@@ -35,7 +36,7 @@ fn main() -> Result<()> {
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("create {}", args.output_dir.display()))?;
 
-    let fixtures = fixture_inputs()?;
+    let fixtures = fixture_inputs(args.sdk_full)?;
     let mut metadata = Vec::with_capacity(fixtures.len() + 1);
     for fixture in fixtures {
         metadata.push(write_fixture(&args.output_dir, args.zstd_level, fixture)?);
@@ -60,11 +61,13 @@ fn main() -> Result<()> {
 fn parse_args() -> Result<Args> {
     let mut output_dir = None;
     let mut zstd_level = DEFAULT_ZSTD_LEVEL;
+    let mut sdk_full = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--output-dir" => output_dir = Some(next_path(&mut args, "--output-dir")?),
             "--zstd-level" => zstd_level = next_parse(&mut args, "--zstd-level")?,
+            "--sdk-full" => sdk_full = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -75,6 +78,7 @@ fn parse_args() -> Result<Args> {
     Ok(Args {
         output_dir: output_dir.context("missing --output-dir")?,
         zstd_level,
+        sdk_full,
     })
 }
 
@@ -96,10 +100,17 @@ where
 }
 
 fn print_usage() {
-    eprintln!("usage: aura-fixture-gen --output-dir <dir> [--zstd-level N]");
+    eprintln!("usage: aura-fixture-gen --output-dir <dir> [--zstd-level N] [--sdk-full]");
 }
 
-fn fixture_inputs() -> Result<Vec<FixtureInput>> {
+fn fixture_inputs(sdk_full: bool) -> Result<Vec<FixtureInput>> {
+    let sdk_narrow_count = if sdk_full { 10_000 } else { 64 };
+    let sdk_wide_count = if sdk_full { 10_000 } else { 512 };
+    let sdk_reordered_count = if sdk_full { 10_000 } else { 256 };
+    let sdk_dense_count = if sdk_full { 100_000 } else { 4096 };
+    let sdk_sparse_count = if sdk_full { 100_000 } else { 2048 };
+    let sdk_edge_count = if sdk_full { 10_000 } else { 3 };
+    let sdk_larger_count = if sdk_full { 500_000 } else { 32_768 };
     Ok(vec![
         FixtureInput {
             name: "tiny",
@@ -135,43 +146,50 @@ fn fixture_inputs() -> Result<Vec<FixtureInput>> {
         FixtureInput {
             name: "sdk-narrow",
             schema: sdk_narrow_schema(),
-            rows: sdk_narrow_rows(64),
+            rows: sdk_narrow_rows(sdk_narrow_count),
             symbol_count: 4,
             expected_huffman: None,
         },
         FixtureInput {
             name: "sdk-wide",
             schema: sdk_wide_schema(),
-            rows: sdk_wide_rows(512),
+            rows: sdk_wide_rows(sdk_wide_count),
             symbol_count: 32,
             expected_huffman: None,
         },
         FixtureInput {
             name: "sdk-reordered",
             schema: sdk_reordered_schema(),
-            rows: sdk_reordered_rows(256),
+            rows: sdk_reordered_rows(sdk_reordered_count),
             symbol_count: 16,
             expected_huffman: None,
         },
         FixtureInput {
             name: "sdk-dense",
             schema: sdk_dense_schema(),
-            rows: sdk_dense_rows(4096, 4),
+            rows: sdk_dense_rows(sdk_dense_count, 4),
             symbol_count: 4,
             expected_huffman: None,
         },
         FixtureInput {
             name: "sdk-sparse",
             schema: sdk_sparse_schema(),
-            rows: sdk_sparse_rows(2048, 512),
+            rows: sdk_sparse_rows(sdk_sparse_count, 512),
             symbol_count: 512,
             expected_huffman: None,
         },
         FixtureInput {
             name: "sdk-edge-case",
             schema: sdk_edge_schema(),
-            rows: sdk_edge_rows(),
+            rows: sdk_edge_rows(sdk_edge_count),
             symbol_count: 3,
+            expected_huffman: None,
+        },
+        FixtureInput {
+            name: "sdk-larger",
+            schema: sdk_dense_schema(),
+            rows: sdk_dense_rows(sdk_larger_count, 64),
+            symbol_count: 64,
             expected_huffman: None,
         },
         FixtureInput {
@@ -606,22 +624,29 @@ fn sdk_edge_schema() -> SchemaDescriptor {
         .into_descriptor()
 }
 
-fn sdk_edge_rows() -> Vec<Vec<i64>> {
-    vec![
-        vec![
+fn sdk_edge_rows(count: usize) -> Vec<Vec<i64>> {
+    let base = [
+        [
             1_700_000_000_000_000_000,
             i64::from(i32::MIN),
             0,
             i64::from(i8::MIN),
         ],
-        vec![1_700_000_000_000_000_000, -1, i64::from(u32::MAX), 0],
-        vec![
+        [1_700_000_000_000_000_000, -1, i64::from(u32::MAX), 0],
+        [
             1_700_000_000_999_000_000,
             i64::from(i32::MAX),
             42,
             i64::from(i8::MAX),
         ],
-    ]
+    ];
+    (0..count)
+        .map(|index| {
+            let mut row = base[index % base.len()].to_vec();
+            row[0] = row[0].saturating_add(i64::try_from(index).unwrap_or(0));
+            row
+        })
+        .collect()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

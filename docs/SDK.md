@@ -104,7 +104,7 @@ let batches = reader.read_batches()?;
 # Ok::<(), aura_codec::AuraError>(())
 ```
 
-`AuraReader` supports whole-file batches and batch iteration:
+`AuraReader` supports whole-file batches and true batch iteration:
 
 ```rust
 let mut reader = aura_codec::AuraReader::open(std::io::Cursor::new(bytes))?;
@@ -114,7 +114,7 @@ while let Some(batch) = reader.next_batch(1024)? {
 # Ok::<(), aura_codec::AuraError>(())
 ```
 
-The current v1 reader still decodes through the existing in-memory row engine before serving batches. The external API is streaming-shaped; true zero-copy/block streaming remains an implementation gap.
+Aura1 reads stream fixed-width rows directly from the Aura1 body. Aura0 compact reads parse metadata during open and lazily build bounded row batches from compact stream columns. `read_batches()` is a convenience collector implemented on top of the batch reader.
 
 ## Conversion
 
@@ -146,6 +146,7 @@ The SDK tests cover:
 - Aura1 to Aura0 conversion
 - column batches
 - batch iteration
+- streaming reader stats
 - schema name and schema hash preservation
 - public compiled plan inspection
 

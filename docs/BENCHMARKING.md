@@ -172,3 +172,13 @@ Use verify-mode JSON from
 for output equality evidence. Fast lz4 verify runs reported
 `output_bytes_equal=true` with output byte hashes
 `12194870092346231300` for huff and `10372430540135078667` for nohuff.
+# SDK Generic Matrix
+
+For SDK closeout benchmarks, generate fixtures and run the SDK matrix:
+
+```bash
+target/release/aura-fixture-gen --output-dir /tmp/aura-sdk-fixtures --zstd-level 3 --sdk-full
+target/release/aura_sdk_bench --fixture-dir /tmp/aura-sdk-fixtures --output-dir /tmp/aura-sdk-results --iterations 10 --warmups 2 --batch-size 8192
+```
+
+The runner writes one JSON result per dataset/operation and a `sdk_full_matrix_summary.json` aggregate. Results include schema metadata, p95, median, records/sec, streaming flags, materialization counters, command, git commit, and dirty status.

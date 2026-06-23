@@ -21,6 +21,8 @@ Available reader methods:
 - `batches(batch_size)`
 - `replay_i64(visitor)`
 
-Current v1 limitation: `AuraReader` decodes through the existing in-memory i64 row engine, then serves batches. This gives callers a stable streaming-shaped API, but it is not yet a zero-copy or block-streaming decoder.
+Aura1 reads stream fixed-width rows directly from the Aura1 body. Aura0 compact opens by parsing metadata only, then lazily builds bounded row batches from compact stream columns. `read_batches()` is a convenience collector over `next_batch`.
 
 `ReaderOptions::default()` uses byte-lane selection `Auto`. `Aura0ByteLaneUse::Always` rejects compact Aura0 files that do not contain a byte lane.
+
+Use `reader.stats()` in tests or diagnostics to inspect `open_decoded_row_count`, `full_file_materialized`, `rows_decoded_in_last_batch`, and `max_rows_materialized_at_once`.

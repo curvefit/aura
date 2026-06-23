@@ -28,4 +28,6 @@ The generated `sdk_bench_smoke.json` contains smoke benchmark entries for:
 - `aura0-to-aura1-bytes-verify`
 - `zstd-aura1-to-aura1-bytes`
 
-The smoke matrix is intentionally short enough to run in regular verification while still proving the benchmark harness accepts non-grimoire schemas. Full performance sweeps should expand this file into repeated warm runs per operation and dataset.
+The smoke matrix is intentionally short enough to run in regular verification while still proving the benchmark harness accepts non-grimoire schemas.
+
+The full closeout matrix is documented in `docs/research/sdk_full_generic_benchmark_matrix.md` and is produced by `aura_sdk_bench`.

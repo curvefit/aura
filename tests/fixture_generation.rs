@@ -48,6 +48,7 @@ fn aura_fixture_gen_writes_compatible_fixture_matrix() {
             "sdk-dense",
             "sdk-sparse",
             "sdk-edge-case",
+            "sdk-larger",
             "nohuff",
             "larger"
         ]
