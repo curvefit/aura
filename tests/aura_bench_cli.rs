@@ -185,9 +185,13 @@ fn aura_bench_reports_required_json_fields_for_core_operations() {
         } else {
             assert!(json["canonical_hash"].is_null());
         }
+        assert!(json["canonical_hash_mode"].as_str().is_some());
         assert!(!json["guard_mode"].as_str().unwrap().is_empty());
+        assert!(json["working_tree_dirty"].as_bool().is_some());
         assert!(json["records_per_sec"].as_f64().unwrap() > 0.0);
+        assert!(json["input_mb_per_sec"].as_f64().unwrap() > 0.0);
         assert!(json["mb_per_sec"].as_f64().unwrap() > 0.0);
+        assert!(json["result_path"].is_null());
         assert!(json["command_used"].as_str().unwrap().contains(operation));
         assert!(json["git_commit"].as_str().unwrap().len() >= 7);
         assert!(json["machine_info"]["os"].as_str().unwrap().len() > 0);
@@ -317,6 +321,484 @@ fn aura_bench_reports_aura0_to_aura1_guard_modes_and_stage_tree() {
         .map(|field| writer[field].as_u64().unwrap())
         .sum::<u64>();
         assert_eq!(writer_total, writer_children);
+    }
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn aura_bench_reports_aura1_to_aura0_direct_transcode_path() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
+        panic!("missing aura-bench binary");
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "aura-bench-direct-aura0-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let (_, aura1) = partitioned_sparse_fixture_profiles();
+    let expected_record_count = records::decode_i64_file(&aura1).unwrap().rows.len() as u64;
+    let aura1_path = dir.join("fixture.aura1");
+    fs::write(&aura1_path, aura1).unwrap();
+
+    let output = Command::new(bin)
+        .arg("--operation")
+        .arg("transcode-aura1-to-aura0")
+        .arg("--dataset")
+        .arg("unit-fixture")
+        .arg("--input")
+        .arg(&aura1_path)
+        .arg("--iterations")
+        .arg("1")
+        .arg("--format")
+        .arg("json")
+        .arg("--transcode-path")
+        .arg("direct")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!("direct", json["transcode_path_requested"]);
+    assert_eq!("direct", json["transcode_path"]);
+    assert_eq!("transcode-aura1-to-aura0", json["operation"]);
+    assert_eq!(expected_record_count, json["record_count"]);
+
+    let timings = &json["stage_timings_ns"]["aura1_to_aura0"];
+    assert!(timings["total"].as_u64().unwrap() > 0);
+    assert!(timings["fixed_row_scan"].as_u64().unwrap() > 0);
+    assert!(timings["compression_encoding"].as_u64().unwrap() > 0);
+    let child_sum = [
+        "metadata",
+        "fixed_row_scan",
+        "stats_frequency_collection",
+        "direct_stream_construction",
+        "field_extraction",
+        "dictionary_state_update",
+        "delta_stream_construction",
+        "compression_encoding",
+        "writer_finalization",
+        "canonical_hash",
+        "post_output_guard",
+    ]
+    .into_iter()
+    .map(|field| timings[field].as_u64().unwrap())
+    .sum::<u64>();
+    assert!(child_sum <= timings["total"].as_u64().unwrap());
+
+    let stats = &json["aura1_to_aura0_stats"];
+    assert_eq!(
+        expected_record_count,
+        stats["rows_scanned"].as_u64().unwrap()
+    );
+    assert_eq!(0, stats["row_allocations"].as_u64().unwrap());
+    assert!(stats["stream_vector_allocations"].as_u64().unwrap() > 0);
+    assert!(stats["bytes_read"].as_u64().unwrap() > 0);
+    assert!(stats["bytes_written"].as_u64().unwrap() > 0);
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn aura1_to_aura0_direct_path_matches_materialized_output() {
+    let (_, aura1) = partitioned_sparse_fixture_profiles();
+    let materialized = records::compile_i64_file(&aura1, Profile::Aura0).unwrap();
+    let direct = records::try_compile_i64_file_profiled(
+        &aura1,
+        Profile::Aura0,
+        records::OutputGuardMode::OldPostOutputGuard,
+        records::TranscodePath::Direct,
+        records::Aura0EncoderPath::Materialized,
+    )
+    .unwrap()
+    .expect("direct aura1 to aura0 path");
+
+    assert_eq!(records::TranscodePath::Direct, direct.transcode_path);
+    assert!(direct.output_byte_guard.is_some());
+    assert_eq!(materialized, direct.bytes);
+
+    let materialized_rows = records::decode_i64_file(&materialized).unwrap().rows;
+    let direct_rows = records::decode_i64_file(&direct.bytes).unwrap().rows;
+    assert_eq!(materialized_rows, direct_rows);
+
+    let stats = direct.stats.aura1_to_aura0.expect("direct stats");
+    assert_eq!(materialized_rows.len(), stats.rows_scanned);
+    assert_eq!(0, stats.row_allocations);
+    assert!(stats.stream_vector_allocations > 0);
+}
+
+#[test]
+fn aura1_to_aura0_direct_stream_encoder_matches_current_direct_path() {
+    let (_, aura1) = partitioned_sparse_fixture_profiles();
+    let materialized = records::compile_i64_file(&aura1, Profile::Aura0).unwrap();
+    let direct_column = records::try_compile_i64_file_profiled(
+        &aura1,
+        Profile::Aura0,
+        records::OutputGuardMode::OldPostOutputGuard,
+        records::TranscodePath::Direct,
+        records::Aura0EncoderPath::Materialized,
+    )
+    .unwrap()
+    .expect("direct column aura1 to aura0 path");
+    let direct_streams = records::try_compile_i64_file_profiled(
+        &aura1,
+        Profile::Aura0,
+        records::OutputGuardMode::OldPostOutputGuard,
+        records::TranscodePath::Direct,
+        records::Aura0EncoderPath::DirectStreams,
+    )
+    .unwrap()
+    .expect("direct stream aura1 to aura0 path");
+
+    assert_eq!(materialized, direct_column.bytes);
+    assert_eq!(direct_column.bytes, direct_streams.bytes);
+    assert_eq!(
+        direct_column.output_byte_guard,
+        direct_streams.output_byte_guard
+    );
+
+    let reference_rows = records::decode_i64_file(&materialized).unwrap().rows;
+    let direct_stream_rows = records::decode_i64_file(&direct_streams.bytes)
+        .unwrap()
+        .rows;
+    assert_eq!(reference_rows, direct_stream_rows);
+
+    let stats = direct_streams
+        .stats
+        .aura1_to_aura0
+        .expect("direct stream stats");
+    assert!(stats.direct_streams_enabled);
+    assert_eq!(records::Aura0EncoderPath::DirectStreams, stats.encoder_path);
+    assert_eq!(reference_rows.len(), stats.rows_scanned);
+    assert_eq!(0, stats.row_allocations);
+    assert_eq!(0, stats.stream_vector_allocations);
+    assert!(stats.direct_stream_count > 0);
+    assert!(stats.direct_stream_value_count > 0);
+}
+
+#[test]
+fn aura_bench_reports_aura1_to_aura0_direct_stream_encoder_path() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
+        panic!("missing aura-bench binary");
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "aura-bench-direct-streams-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let (_, aura1) = partitioned_sparse_fixture_profiles();
+    let expected_record_count = records::decode_i64_file(&aura1).unwrap().rows.len() as u64;
+    let aura1_path = dir.join("fixture.aura1");
+    fs::write(&aura1_path, aura1).unwrap();
+
+    let output = Command::new(bin)
+        .arg("--operation")
+        .arg("transcode-aura1-to-aura0")
+        .arg("--dataset")
+        .arg("unit-fixture")
+        .arg("--input")
+        .arg(&aura1_path)
+        .arg("--iterations")
+        .arg("1")
+        .arg("--format")
+        .arg("json")
+        .arg("--transcode-path")
+        .arg("direct")
+        .arg("--encoder-path")
+        .arg("direct-streams")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!("direct", json["transcode_path"]);
+    assert_eq!("direct-streams", json["encoder_path_requested"]);
+    assert_eq!("direct-streams", json["encoder_path"]);
+    assert_eq!(true, json["direct_streams_enabled"]);
+    assert_eq!(expected_record_count, json["record_count"]);
+
+    let stats = &json["aura1_to_aura0_stats"];
+    assert_eq!(
+        expected_record_count,
+        stats["rows_scanned"].as_u64().unwrap()
+    );
+    assert_eq!(0, stats["row_allocations"].as_u64().unwrap());
+    assert_eq!(0, stats["stream_vector_allocations"].as_u64().unwrap());
+    assert!(stats["direct_stream_count"].as_u64().unwrap() > 0);
+    assert!(stats["direct_stream_value_count"].as_u64().unwrap() > 0);
+    assert!(stats["bytes_written"].as_u64().unwrap() > 0);
+
+    let timings = &json["stage_timings_ns"]["aura1_to_aura0"];
+    assert!(timings["direct_stream_construction"].as_u64().unwrap() > 0);
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn aura_bench_preserves_and_verifies_transcode_output() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
+        panic!("missing aura-bench binary");
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "aura-bench-preserve-output-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let (_, aura1) = partitioned_sparse_fixture_profiles();
+    let source_rows = records::decode_i64_file(&aura1).unwrap().rows;
+    let aura1_path = dir.join("fixture.aura1");
+    let preserved_path = dir.join("preserved.aura0");
+    fs::write(&aura1_path, aura1).unwrap();
+
+    let output = Command::new(bin)
+        .arg("--operation")
+        .arg("transcode-aura1-to-aura0")
+        .arg("--dataset")
+        .arg("unit-fixture")
+        .arg("--input")
+        .arg(&aura1_path)
+        .arg("--iterations")
+        .arg("1")
+        .arg("--format")
+        .arg("json")
+        .arg("--transcode-path")
+        .arg("direct")
+        .arg("--encoder-path")
+        .arg("direct-streams")
+        .arg("--guard-mode")
+        .arg("old_post_output_guard")
+        .arg("--preserve-output")
+        .arg(&preserved_path)
+        .arg("--verify-output-decodes")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(true, json["output_preserved"]);
+    assert_eq!(preserved_path.display().to_string(), json["output_path"]);
+    assert_eq!(true, json["decoded_row_equality"]);
+    assert_eq!(true, json["record_count_equality"]);
+    assert_eq!(true, json["schema_footer_validation"]);
+    assert_eq!(true, json["output_byte_guard_equality"]);
+    assert!(json["conversion_plan_hash"].as_u64().unwrap() > 0);
+    assert!(json["output_verification_runtime_ns"].as_u64().unwrap() > 0);
+
+    let preserved = fs::read(&preserved_path).unwrap();
+    let preserved_rows = records::decode_i64_file(&preserved).unwrap().rows;
+    assert_eq!(source_rows, preserved_rows);
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn aura_bench_reports_transcode_canonical_hash_verify_mode() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
+        panic!("missing aura-bench binary");
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "aura-bench-canonical-hash-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let (_, aura1) = partitioned_sparse_fixture_profiles();
+    let aura1_path = dir.join("fixture.aura1");
+    let preserved_path = dir.join("canonical.aura0");
+    fs::write(&aura1_path, aura1).unwrap();
+
+    let output = Command::new(bin)
+        .arg("--operation")
+        .arg("transcode-aura1-to-aura0")
+        .arg("--dataset")
+        .arg("unit-fixture")
+        .arg("--input")
+        .arg(&aura1_path)
+        .arg("--iterations")
+        .arg("1")
+        .arg("--format")
+        .arg("json")
+        .arg("--transcode-path")
+        .arg("direct")
+        .arg("--encoder-path")
+        .arg("direct-streams")
+        .arg("--canonical-hash-mode")
+        .arg("verify")
+        .arg("--preserve-output")
+        .arg(&preserved_path)
+        .arg("--verify-output-decodes")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!("verify", json["canonical_hash_mode"]);
+    assert!(json["canonical_hash"].as_u64().unwrap() > 0);
+    assert!(json["canonical_hash_time_ms"].as_f64().unwrap() >= 0.0);
+    assert_eq!(true, json["canonical_hash_equality"]);
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn aura_bench_reports_aura1_replay_operations() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
+        panic!("missing aura-bench binary");
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "aura-bench-aura1-replay-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let (_, aura1) = partitioned_sparse_fixture_profiles();
+    let aura1_path = dir.join("fixture.aura1");
+    fs::write(&aura1_path, aura1).unwrap();
+
+    for operation in [
+        "aura1-scan-fixed",
+        "aura1-replay-callback",
+        "aura1-parse-to-rows",
+    ] {
+        let output = Command::new(bin)
+            .arg("--operation")
+            .arg(operation)
+            .arg("--dataset")
+            .arg("unit-fixture")
+            .arg("--input")
+            .arg(&aura1_path)
+            .arg("--iterations")
+            .arg("1")
+            .arg("--format")
+            .arg("json")
+            .arg("--canonical-hash-mode")
+            .arg("verify")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "operation: {operation}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(operation, json["operation"]);
+        assert_eq!("aura1", json["source_format"]);
+        assert_eq!("none", json["target_format"]);
+        assert!(json["record_count"].as_u64().unwrap() > 0);
+        assert!(json["records_per_sec"].as_f64().unwrap() > 0.0);
+        assert!(json["replay_stats"]["record_width"].as_u64().unwrap() > 0);
+        assert!(json["replay_stats"]["bytes_scanned"].as_u64().unwrap() > 0);
+        assert!(json["canonical_hash"].as_u64().unwrap() > 0);
+        if operation == "aura1-parse-to-rows" {
+            assert!(
+                json["replay_stats"]["materialized_row_count"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+        } else {
+            assert_eq!(
+                0,
+                json["replay_stats"]["materialized_row_count"]
+                    .as_u64()
+                    .unwrap()
+            );
+        }
+    }
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn aura_bench_reports_zstd_baselines() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
+        panic!("missing aura-bench binary");
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "aura-bench-zstd-baseline-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let (_, aura1) = partitioned_sparse_fixture_profiles();
+    let aura1_path = dir.join("fixture.aura1");
+    fs::write(&aura1_path, aura1).unwrap();
+
+    for operation in [
+        "zstd-decompress-only",
+        "zstd-decompress-plus-parse",
+        "zstd-decompress-plus-replay",
+    ] {
+        let output = Command::new(bin)
+            .arg("--operation")
+            .arg(operation)
+            .arg("--dataset")
+            .arg("unit-fixture")
+            .arg("--input")
+            .arg(&aura1_path)
+            .arg("--iterations")
+            .arg("1")
+            .arg("--format")
+            .arg("json")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "operation: {operation}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(operation, json["operation"]);
+        assert_eq!("zstd", json["baseline_kind"]);
+        assert!(json["compressed_input_bytes"].as_u64().unwrap() > 0);
+        assert!(json["decompressed_output_bytes"].as_u64().unwrap() > 0);
+        assert!(json["work_included"].as_str().unwrap().contains("zstd"));
+        assert!(json["records_per_sec"].as_f64().unwrap() >= 0.0);
     }
 
     fs::remove_dir_all(&dir).unwrap();

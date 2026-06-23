@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use crate::bitpack::{signed_bitpack_width_for_range, unsigned_bitpack_width};
 use crate::body::{
-    decode_generic_stream_body, encode_generic_stream_body, try_generic_i64_stream_cursor,
+    decode_generic_stream_body, encode_generic_i64_stream_body_from_emitter,
+    encode_generic_stream_body, try_generic_i64_stream_cursor, GenericI64EmitterEncodeStats,
     GenericI64StreamCursor, GenericStreamBodyValue,
 };
 use crate::bytes::{put_u16_le, put_u32_le, put_u64_le, ByteGuard, ByteReader};
@@ -36,6 +37,23 @@ pub struct GenericEncodedStream {
     pub stream_id: u16,
     pub value_count: usize,
     pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GenericColumnEncodeStats {
+    pub column_vector_count: usize,
+    pub column_value_count: usize,
+    pub stream_count: usize,
+    pub stream_value_count: usize,
+    pub stream_vector_allocations: usize,
+    pub direct_stream_count: usize,
+    pub direct_stream_value_count: usize,
+    pub stream_body_bytes: usize,
+    pub temporary_buffer_bytes: usize,
+    pub encoder_allocations: usize,
+    pub frequency_pass_ns: u128,
+    pub direct_stream_emit_ns: u128,
+    pub compression_encoding_ns: u128,
 }
 
 struct PlannedI64Rows {
@@ -457,6 +475,111 @@ pub fn encode_generic_i64_rows_with_plan(
         plan,
         streams,
         record_count: rows.len(),
+        field_count: schema.fields.len(),
+    })
+}
+
+pub fn encode_generic_i64_columns_with_plan(
+    schema: &SchemaDescriptor,
+    columns: &[Vec<i64>],
+    record_count: usize,
+    plan: GenericInstructionPlan,
+    stats: Option<&mut GenericColumnEncodeStats>,
+) -> Result<GenericEncodedI64Rows> {
+    validate_columns(schema, columns, record_count)?;
+    let _encoded_plan = plan.encode()?;
+    let mut stats = stats;
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.column_vector_count = columns.len();
+        stats.column_value_count = columns.iter().map(Vec::len).sum();
+    }
+    let mut streams = Vec::with_capacity(plan.streams.len());
+    for instruction in &plan.streams {
+        let values = stream_values_for_instruction_from_columns(
+            schema,
+            columns,
+            record_count,
+            &plan,
+            instruction,
+        )?;
+        let value_count = values.len();
+        let body = encode_generic_stream_body(instruction, &GenericStreamBodyValue::I64(values))?;
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.stream_count += 1;
+            stats.stream_value_count += value_count;
+            stats.stream_vector_allocations += 1;
+            stats.stream_body_bytes += body.len();
+        }
+        streams.push(GenericEncodedStream {
+            stream_id: instruction.stream_id,
+            value_count,
+            body,
+        });
+    }
+
+    Ok(GenericEncodedI64Rows {
+        plan,
+        streams,
+        record_count,
+        field_count: schema.fields.len(),
+    })
+}
+
+pub fn encode_generic_i64_columns_with_plan_direct_streams(
+    schema: &SchemaDescriptor,
+    columns: &[Vec<i64>],
+    record_count: usize,
+    plan: GenericInstructionPlan,
+    stats: Option<&mut GenericColumnEncodeStats>,
+) -> Result<GenericEncodedI64Rows> {
+    validate_columns(schema, columns, record_count)?;
+    let _encoded_plan = plan.encode()?;
+    let mut stats = stats;
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.column_vector_count = columns.len();
+        stats.column_value_count = columns.iter().map(Vec::len).sum();
+    }
+
+    let mut streams = Vec::with_capacity(plan.streams.len());
+    for instruction in &plan.streams {
+        let mut stream_stats = GenericI64EmitterEncodeStats::default();
+        let body = encode_generic_i64_stream_body_from_emitter(
+            instruction,
+            |sink| {
+                emit_stream_values_for_instruction_from_columns(
+                    schema,
+                    columns,
+                    record_count,
+                    &plan,
+                    instruction,
+                    sink,
+                )
+            },
+            &mut stream_stats,
+        )?;
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.stream_count += 1;
+            stats.stream_value_count += stream_stats.value_count;
+            stats.direct_stream_count += 1;
+            stats.direct_stream_value_count += stream_stats.value_count;
+            stats.stream_body_bytes += body.len();
+            stats.temporary_buffer_bytes += stream_stats.temporary_buffer_bytes;
+            stats.encoder_allocations += stream_stats.encoder_allocations;
+            stats.frequency_pass_ns += stream_stats.frequency_pass_ns;
+            stats.direct_stream_emit_ns += stream_stats.direct_stream_emit_ns;
+            stats.compression_encoding_ns += stream_stats.compression_encoding_ns;
+        }
+        streams.push(GenericEncodedStream {
+            stream_id: instruction.stream_id,
+            value_count: stream_stats.value_count,
+            body,
+        });
+    }
+
+    Ok(GenericEncodedI64Rows {
+        plan,
+        streams,
+        record_count,
         field_count: schema.fields.len(),
     })
 }
@@ -2433,8 +2556,9 @@ fn add_decode_op_time(
                 timings.record_type_branching_ns.saturating_add(elapsed_ns);
         }
         GenericStreamOp::FixedStep { .. } => {
-            timings.temporary_buffer_writes_ns =
-                timings.temporary_buffer_writes_ns.saturating_add(elapsed_ns);
+            timings.temporary_buffer_writes_ns = timings
+                .temporary_buffer_writes_ns
+                .saturating_add(elapsed_ns);
         }
         GenericStreamOp::UuidConstMask { .. } => {
             timings.unclassified_ns = timings.unclassified_ns.saturating_add(elapsed_ns);
@@ -3497,6 +3621,646 @@ fn stream_values_for_instruction(
     }) {
         let event_slots = group_event_slots(plan, parent_group_id)?;
         return event_group_lengths(rows, &event_slots);
+    }
+
+    let _ = schema;
+    Err(AuraError::InvalidValue("generic stream instruction"))
+}
+
+fn stream_values_for_instruction_from_columns(
+    schema: &SchemaDescriptor,
+    columns: &[Vec<i64>],
+    record_count: usize,
+    plan: &GenericInstructionPlan,
+    instruction: &GenericStreamInstruction,
+) -> Result<Vec<i64>> {
+    if let Some(slot) = instruction.target_slot {
+        return column_values_from_columns(columns, slot, record_count);
+    }
+
+    if let Some((output_slot, op, input_slots)) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::DerivedStream {
+            output_slot,
+            op,
+            input_slots,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some((*output_slot, *op, input_slots)),
+        _ => None,
+    }) {
+        return (0..record_count)
+            .map(|row_index| {
+                inverse_derive_value_from_columns(op, input_slots, output_slot, row_index, columns)
+            })
+            .collect();
+    }
+
+    if let Some((output_slot, op, input_slots, literals)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::ExpressionStream {
+                output_slot,
+                op,
+                input_slots,
+                literals,
+                stream_id,
+                ..
+            } if *stream_id == instruction.stream_id => {
+                Some((*output_slot, *op, input_slots, literals))
+            }
+            _ => None,
+        })
+    {
+        return (0..record_count)
+            .map(|row_index| {
+                inverse_expression_value_from_columns(
+                    op,
+                    input_slots,
+                    literals,
+                    output_slot,
+                    row_index,
+                    columns,
+                )
+            })
+            .collect();
+    }
+
+    if let Some(slots) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::PresenceMap {
+            slots, stream_id, ..
+        } if *stream_id == instruction.stream_id => Some(slots),
+        _ => None,
+    }) {
+        return (0..record_count)
+            .map(|row_index| {
+                slots
+                    .iter()
+                    .enumerate()
+                    .try_fold(0i64, |mask, (index, slot)| {
+                        if column_value(columns, row_index, *slot)? == 0 {
+                            Ok(mask)
+                        } else {
+                            let bit = 1i64
+                                .checked_shl(
+                                    u32::try_from(index)
+                                        .map_err(|_| AuraError::InvalidValue("presence bit"))?,
+                                )
+                                .ok_or(AuraError::InvalidValue("presence bit"))?;
+                            Ok(mask | bit)
+                        }
+                    })
+            })
+            .collect();
+    }
+
+    if let Some(output_slot) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::SparseStream {
+            output_slot,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some(*output_slot),
+        _ => None,
+    }) {
+        let values = column_values_from_columns(columns, output_slot, record_count)?
+            .into_iter()
+            .filter(|value| *value != 0)
+            .collect::<Vec<_>>();
+        return Ok(values);
+    }
+
+    if let Some((parent_group_id, partition_slot, fixed_order, stream_kind)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id,
+                count_stream_id,
+                event_count_stream_id: _,
+                ..
+            } if *value_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 0u8))
+            }
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id: _,
+                count_stream_id,
+                event_count_stream_id: _,
+                ..
+            } if *count_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 1u8))
+            }
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id: _,
+                count_stream_id: _,
+                event_count_stream_id: Some(event_count_stream_id),
+                ..
+            } if *event_count_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 2u8))
+            }
+            _ => None,
+        })
+    {
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        return match stream_kind {
+            0 if fixed_order => fixed_partition_run_order_from_columns(
+                columns,
+                record_count,
+                &event_slots,
+                partition_slot,
+            )?
+            .ok_or(AuraError::InvalidValue("fixed partition order")),
+            0 => Ok(partition_run_ranges_from_columns(
+                columns,
+                record_count,
+                &event_slots,
+                partition_slot,
+            )?
+            .into_iter()
+            .map(|run| run.value)
+            .collect()),
+            1 => partition_run_ranges_from_columns(
+                columns,
+                record_count,
+                &event_slots,
+                partition_slot,
+            )?
+            .into_iter()
+            .map(|run| {
+                i64::try_from(run.end - run.start)
+                    .map_err(|_| AuraError::InvalidValue("run length"))
+            })
+            .collect(),
+            2 => partition_run_event_counts_from_columns(
+                columns,
+                record_count,
+                &event_slots,
+                partition_slot,
+            ),
+            _ => Err(AuraError::InvalidValue("partition stream")),
+        };
+    }
+
+    if let Some((parent_group_id, output_slot, stream_kind, has_base_stream)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id,
+                first_stream_id,
+                delta_stream_id,
+                ..
+            } if base_stream_id == &Some(instruction.stream_id) => {
+                Some((*parent_group_id, *output_slot, 0u8, true))
+            }
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id,
+                first_stream_id,
+                delta_stream_id: _,
+                ..
+            } if *first_stream_id == instruction.stream_id => Some((
+                *parent_group_id,
+                *output_slot,
+                1u8,
+                base_stream_id.is_some(),
+            )),
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id: _,
+                first_stream_id: _,
+                delta_stream_id,
+                ..
+            } if *delta_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *output_slot, 2u8, false))
+            }
+            _ => None,
+        })
+    {
+        let runs =
+            partition_runs_for_group_from_columns(plan, columns, record_count, parent_group_id)?;
+        return match stream_kind {
+            0 => Ok(
+                partition_value_bases_from_columns(columns, &runs, output_slot)?
+                    .into_values()
+                    .collect(),
+            ),
+            1 => {
+                if has_base_stream {
+                    let bases = partition_value_bases_from_columns(columns, &runs, output_slot)?;
+                    runs.iter()
+                        .map(|run| {
+                            let base = bases
+                                .get(&run.value)
+                                .copied()
+                                .ok_or(AuraError::InvalidValue("partition base"))?;
+                            checked_delta(column_value(columns, run.start, output_slot)?, base)
+                        })
+                        .collect()
+                } else {
+                    runs.iter()
+                        .map(|run| column_value(columns, run.start, output_slot))
+                        .collect()
+                }
+            }
+            2 => {
+                let mut deltas = Vec::with_capacity(record_count.saturating_sub(runs.len()));
+                for run in runs {
+                    for row_index in run.start + 1..run.end {
+                        deltas.push(checked_delta(
+                            column_value(columns, row_index, output_slot)?,
+                            column_value(columns, row_index - 1, output_slot)?,
+                        )?);
+                    }
+                }
+                Ok(deltas)
+            }
+            _ => Err(AuraError::InvalidValue("segmented stream")),
+        };
+    }
+
+    if let Some((parent_group_id, output_slot)) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::GroupValueStream {
+            parent_group_id,
+            output_slot,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some((*parent_group_id, *output_slot)),
+        _ => None,
+    }) {
+        let parent_group_id = partition_parent_group_id(plan, parent_group_id)?;
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        return event_group_ranges_from_columns(columns, record_count, &event_slots)?
+            .into_iter()
+            .map(|(start, _)| column_value(columns, start, output_slot))
+            .collect();
+    }
+
+    if let Some(parent_group_id) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::PartitionRuns {
+            parent_group_id,
+            count_stream_id,
+            ..
+        } if *count_stream_id == instruction.stream_id => Some(*parent_group_id),
+        _ => None,
+    }) {
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        return event_group_lengths_from_columns(columns, record_count, &event_slots);
+    }
+
+    let _ = schema;
+    Err(AuraError::InvalidValue("generic stream instruction"))
+}
+
+fn emit_stream_values_for_instruction_from_columns(
+    schema: &SchemaDescriptor,
+    columns: &[Vec<i64>],
+    record_count: usize,
+    plan: &GenericInstructionPlan,
+    instruction: &GenericStreamInstruction,
+    sink: &mut dyn FnMut(i64) -> Result<()>,
+) -> Result<usize> {
+    let mut emitted = 0usize;
+    let mut emit = |value| {
+        sink(value)?;
+        emitted = emitted
+            .checked_add(1)
+            .ok_or(AuraError::InvalidValue("stream value count"))?;
+        Ok(())
+    };
+
+    if let Some(slot) = instruction.target_slot {
+        let values = column_slice(columns, slot)?;
+        if values.len() != record_count {
+            return Err(AuraError::InvalidValue("column length"));
+        }
+        for value in values {
+            emit(*value)?;
+        }
+        return Ok(emitted);
+    }
+
+    if let Some((output_slot, op, input_slots)) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::DerivedStream {
+            output_slot,
+            op,
+            input_slots,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some((*output_slot, *op, input_slots)),
+        _ => None,
+    }) {
+        for row_index in 0..record_count {
+            emit(inverse_derive_value_from_columns(
+                op,
+                input_slots,
+                output_slot,
+                row_index,
+                columns,
+            )?)?;
+        }
+        return Ok(emitted);
+    }
+
+    if let Some((output_slot, op, input_slots, literals)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::ExpressionStream {
+                output_slot,
+                op,
+                input_slots,
+                literals,
+                stream_id,
+                ..
+            } if *stream_id == instruction.stream_id => {
+                Some((*output_slot, *op, input_slots, literals))
+            }
+            _ => None,
+        })
+    {
+        for row_index in 0..record_count {
+            emit(inverse_expression_value_from_columns(
+                op,
+                input_slots,
+                literals,
+                output_slot,
+                row_index,
+                columns,
+            )?)?;
+        }
+        return Ok(emitted);
+    }
+
+    if let Some(slots) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::PresenceMap {
+            slots, stream_id, ..
+        } if *stream_id == instruction.stream_id => Some(slots),
+        _ => None,
+    }) {
+        for row_index in 0..record_count {
+            let mut mask = 0i64;
+            for (index, slot) in slots.iter().enumerate() {
+                if column_value(columns, row_index, *slot)? != 0 {
+                    let bit = 1i64
+                        .checked_shl(
+                            u32::try_from(index)
+                                .map_err(|_| AuraError::InvalidValue("presence bit"))?,
+                        )
+                        .ok_or(AuraError::InvalidValue("presence bit"))?;
+                    mask |= bit;
+                }
+            }
+            emit(mask)?;
+        }
+        return Ok(emitted);
+    }
+
+    if let Some(output_slot) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::SparseStream {
+            output_slot,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some(*output_slot),
+        _ => None,
+    }) {
+        let values = column_slice(columns, output_slot)?;
+        if values.len() != record_count {
+            return Err(AuraError::InvalidValue("column length"));
+        }
+        for value in values.iter().copied().filter(|value| *value != 0) {
+            emit(value)?;
+        }
+        return Ok(emitted);
+    }
+
+    if let Some((parent_group_id, partition_slot, fixed_order, stream_kind)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id,
+                count_stream_id,
+                event_count_stream_id: _,
+                ..
+            } if *value_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 0u8))
+            }
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id: _,
+                count_stream_id,
+                event_count_stream_id: _,
+                ..
+            } if *count_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 1u8))
+            }
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id: _,
+                count_stream_id: _,
+                event_count_stream_id: Some(event_count_stream_id),
+                ..
+            } if *event_count_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 2u8))
+            }
+            _ => None,
+        })
+    {
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        match stream_kind {
+            0 if fixed_order => {
+                let order = fixed_partition_run_order_from_columns(
+                    columns,
+                    record_count,
+                    &event_slots,
+                    partition_slot,
+                )?
+                .ok_or(AuraError::InvalidValue("fixed partition order"))?;
+                for value in order {
+                    emit(value)?;
+                }
+            }
+            0 => {
+                for run in partition_run_ranges_from_columns(
+                    columns,
+                    record_count,
+                    &event_slots,
+                    partition_slot,
+                )? {
+                    emit(run.value)?;
+                }
+            }
+            1 => {
+                for run in partition_run_ranges_from_columns(
+                    columns,
+                    record_count,
+                    &event_slots,
+                    partition_slot,
+                )? {
+                    emit(
+                        i64::try_from(run.end - run.start)
+                            .map_err(|_| AuraError::InvalidValue("run length"))?,
+                    )?;
+                }
+            }
+            2 => {
+                let partition_values = column_slice(columns, partition_slot)?;
+                if partition_values.len() != record_count {
+                    return Err(AuraError::InvalidValue("column length"));
+                }
+                for (group_start, group_end) in
+                    event_group_ranges_from_columns(columns, record_count, &event_slots)?
+                {
+                    if group_start >= group_end {
+                        emit(0)?;
+                        continue;
+                    }
+                    let mut count = 1usize;
+                    let mut value = partition_values[group_start];
+                    for next in partition_values
+                        .iter()
+                        .copied()
+                        .take(group_end)
+                        .skip(group_start + 1)
+                    {
+                        if next != value {
+                            value = next;
+                            count += 1;
+                        }
+                    }
+                    emit(
+                        i64::try_from(count)
+                            .map_err(|_| AuraError::InvalidValue("partition event count"))?,
+                    )?;
+                }
+            }
+            _ => return Err(AuraError::InvalidValue("partition stream")),
+        }
+        return Ok(emitted);
+    }
+
+    if let Some((parent_group_id, output_slot, stream_kind, has_base_stream)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id,
+                first_stream_id,
+                delta_stream_id,
+                ..
+            } if base_stream_id == &Some(instruction.stream_id) => {
+                Some((*parent_group_id, *output_slot, 0u8, true))
+            }
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id,
+                first_stream_id,
+                delta_stream_id: _,
+                ..
+            } if *first_stream_id == instruction.stream_id => Some((
+                *parent_group_id,
+                *output_slot,
+                1u8,
+                base_stream_id.is_some(),
+            )),
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id: _,
+                first_stream_id: _,
+                delta_stream_id,
+                ..
+            } if *delta_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *output_slot, 2u8, false))
+            }
+            _ => None,
+        })
+    {
+        let runs =
+            partition_runs_for_group_from_columns(plan, columns, record_count, parent_group_id)?;
+        match stream_kind {
+            0 => {
+                for value in
+                    partition_value_bases_from_columns(columns, &runs, output_slot)?.into_values()
+                {
+                    emit(value)?;
+                }
+            }
+            1 => {
+                if has_base_stream {
+                    let bases = partition_value_bases_from_columns(columns, &runs, output_slot)?;
+                    for run in runs {
+                        let base = bases
+                            .get(&run.value)
+                            .copied()
+                            .ok_or(AuraError::InvalidValue("partition base"))?;
+                        emit(checked_delta(
+                            column_value(columns, run.start, output_slot)?,
+                            base,
+                        )?)?;
+                    }
+                } else {
+                    for run in runs {
+                        emit(column_value(columns, run.start, output_slot)?)?;
+                    }
+                }
+            }
+            2 => {
+                for run in runs {
+                    for row_index in run.start + 1..run.end {
+                        emit(checked_delta(
+                            column_value(columns, row_index, output_slot)?,
+                            column_value(columns, row_index - 1, output_slot)?,
+                        )?)?;
+                    }
+                }
+            }
+            _ => return Err(AuraError::InvalidValue("segmented stream")),
+        }
+        return Ok(emitted);
+    }
+
+    if let Some((parent_group_id, output_slot)) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::GroupValueStream {
+            parent_group_id,
+            output_slot,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some((*parent_group_id, *output_slot)),
+        _ => None,
+    }) {
+        let parent_group_id = partition_parent_group_id(plan, parent_group_id)?;
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        for (start, _) in event_group_ranges_from_columns(columns, record_count, &event_slots)? {
+            emit(column_value(columns, start, output_slot)?)?;
+        }
+        return Ok(emitted);
+    }
+
+    if let Some(parent_group_id) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::PartitionRuns {
+            parent_group_id,
+            count_stream_id,
+            ..
+        } if *count_stream_id == instruction.stream_id => Some(*parent_group_id),
+        _ => None,
+    }) {
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        for (start, end) in event_group_ranges_from_columns(columns, record_count, &event_slots)? {
+            emit(i64::try_from(end - start).map_err(|_| AuraError::InvalidValue("group length"))?)?;
+        }
+        return Ok(emitted);
     }
 
     let _ = schema;
@@ -6594,6 +7358,357 @@ fn column_values(rows: &[Vec<i64>], field_index: u16) -> Result<Vec<i64>> {
                 .ok_or(AuraError::InvalidValue("field index"))
         })
         .collect()
+}
+
+fn validate_columns(
+    schema: &SchemaDescriptor,
+    columns: &[Vec<i64>],
+    record_count: usize,
+) -> Result<()> {
+    if columns.len() != schema.fields.len() {
+        return Err(AuraError::InvalidValue("column count"));
+    }
+    if columns.iter().any(|column| column.len() != record_count) {
+        return Err(AuraError::InvalidValue("column length"));
+    }
+    Ok(())
+}
+
+fn column_values_from_columns(
+    columns: &[Vec<i64>],
+    field_index: u16,
+    record_count: usize,
+) -> Result<Vec<i64>> {
+    let column = column_slice(columns, field_index)?;
+    if column.len() != record_count {
+        return Err(AuraError::InvalidValue("column length"));
+    }
+    Ok(column.to_vec())
+}
+
+fn column_slice(columns: &[Vec<i64>], field_index: u16) -> Result<&[i64]> {
+    columns
+        .get(usize::from(field_index))
+        .map(Vec::as_slice)
+        .ok_or(AuraError::InvalidValue("field index"))
+}
+
+fn column_value(columns: &[Vec<i64>], row_index: usize, field_index: u16) -> Result<i64> {
+    column_slice(columns, field_index)?
+        .get(row_index)
+        .copied()
+        .ok_or(AuraError::InvalidValue("row index"))
+}
+
+fn inverse_derive_value_from_columns(
+    op: DerivedOp,
+    input_slots: &[u16],
+    output_slot: u16,
+    row_index: usize,
+    columns: &[Vec<i64>],
+) -> Result<i64> {
+    let output = column_value(columns, row_index, output_slot)?;
+    match op {
+        DerivedOp::AddResidual => {
+            let base = column_value(columns, row_index, input_slots[0])?;
+            checked_delta(output, base)
+        }
+        DerivedOp::SubtractResidual => {
+            let base = column_value(columns, row_index, input_slots[0])?;
+            checked_delta(base, output)
+        }
+        DerivedOp::MaxPlusResidual => {
+            let base = input_slots
+                .iter()
+                .map(|slot| column_value(columns, row_index, *slot))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .ok_or(AuraError::InvalidValue("input slots"))?;
+            checked_delta(output, base)
+        }
+        DerivedOp::MinMinusResidual => {
+            let base = input_slots
+                .iter()
+                .map(|slot| column_value(columns, row_index, *slot))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .min()
+                .ok_or(AuraError::InvalidValue("input slots"))?;
+            checked_delta(base, output)
+        }
+        DerivedOp::FirstOffsetThenDelta => {
+            if row_index == 0 {
+                Ok(output)
+            } else {
+                let base = column_value(columns, row_index - 1, input_slots[0])?;
+                checked_delta(output, base)
+            }
+        }
+    }
+}
+
+fn inverse_expression_value_from_columns(
+    op: DerivedExpressionOp,
+    input_slots: &[u16],
+    literals: &[i64],
+    output_slot: u16,
+    row_index: usize,
+    columns: &[Vec<i64>],
+) -> Result<i64> {
+    let output = column_value(columns, row_index, output_slot)?;
+    let predicted =
+        evaluate_expression_terms_from_columns(op, input_slots, literals, row_index, columns)?;
+    checked_delta(output, predicted)
+}
+
+fn evaluate_expression_terms_from_columns(
+    op: DerivedExpressionOp,
+    input_slots: &[u16],
+    literals: &[i64],
+    row_index: usize,
+    columns: &[Vec<i64>],
+) -> Result<i64> {
+    let mut terms = input_slots
+        .iter()
+        .map(|slot| column_value(columns, row_index, *slot))
+        .collect::<Result<Vec<_>>>()?;
+    terms.extend_from_slice(literals);
+    match op {
+        DerivedExpressionOp::Add => checked_add_terms(&terms),
+        DerivedExpressionOp::Sub => checked_sub_terms(&terms),
+        DerivedExpressionOp::Mul => checked_mul_terms(&terms),
+        DerivedExpressionOp::Div => checked_div_terms(&terms),
+        DerivedExpressionOp::Min => terms
+            .into_iter()
+            .min()
+            .ok_or(AuraError::InvalidValue("expression terms")),
+        DerivedExpressionOp::Max => terms
+            .into_iter()
+            .max()
+            .ok_or(AuraError::InvalidValue("expression terms")),
+        DerivedExpressionOp::AddResidual
+        | DerivedExpressionOp::SubtractResidual
+        | DerivedExpressionOp::MaxPlusResidual
+        | DerivedExpressionOp::MinMinusResidual
+        | DerivedExpressionOp::FirstOffsetThenDelta => {
+            Err(AuraError::InvalidValue("derived expression op"))
+        }
+    }
+}
+
+fn partition_runs_for_group_from_columns(
+    plan: &GenericInstructionPlan,
+    columns: &[Vec<i64>],
+    record_count: usize,
+    group_id: u16,
+) -> Result<Vec<PartitionRun>> {
+    let (parent_group_id, partition_slot) = plan
+        .groups
+        .iter()
+        .find_map(|group| match group {
+            GenericGroupInstruction::PartitionRunLengths {
+                group_id: candidate,
+                parent_group_id,
+                partition_slot,
+                ..
+            } if *candidate == group_id => Some((*parent_group_id, *partition_slot)),
+            _ => None,
+        })
+        .ok_or(AuraError::InvalidValue("partition run reference"))?;
+    let event_slots = group_event_slots(plan, parent_group_id)?;
+    partition_run_ranges_from_columns(columns, record_count, &event_slots, partition_slot)
+}
+
+fn partition_value_bases_from_columns(
+    columns: &[Vec<i64>],
+    runs: &[PartitionRun],
+    output_slot: u16,
+) -> Result<BTreeMap<i64, i64>> {
+    let values = column_slice(columns, output_slot)?;
+    let mut bases: BTreeMap<i64, i64> = BTreeMap::new();
+    for run in runs {
+        if run.start >= run.end || run.end > values.len() {
+            return Err(AuraError::InvalidValue("partition run"));
+        }
+        for value in &values[run.start..run.end] {
+            bases
+                .entry(run.value)
+                .and_modify(|base| *base = (*base).min(*value))
+                .or_insert(*value);
+        }
+    }
+    Ok(bases)
+}
+
+fn partition_run_ranges_from_columns(
+    columns: &[Vec<i64>],
+    record_count: usize,
+    event_slots: &[u16],
+    partition_slot: u16,
+) -> Result<Vec<PartitionRun>> {
+    let mut runs = Vec::new();
+    let partition_values = column_slice(columns, partition_slot)?;
+    if partition_values.len() != record_count {
+        return Err(AuraError::InvalidValue("column length"));
+    }
+    for (group_start, group_end) in
+        event_group_ranges_from_columns(columns, record_count, event_slots)?
+    {
+        if group_start >= group_end {
+            continue;
+        }
+        let mut run_start = group_start;
+        let mut value = partition_values[group_start];
+        for (row_index, next) in partition_values
+            .iter()
+            .copied()
+            .enumerate()
+            .take(group_end)
+            .skip(group_start + 1)
+        {
+            if next != value {
+                runs.push(PartitionRun {
+                    start: run_start,
+                    end: row_index,
+                    value,
+                });
+                run_start = row_index;
+                value = next;
+            }
+        }
+        runs.push(PartitionRun {
+            start: run_start,
+            end: group_end,
+            value,
+        });
+    }
+    Ok(runs)
+}
+
+fn partition_run_event_counts_from_columns(
+    columns: &[Vec<i64>],
+    record_count: usize,
+    event_slots: &[u16],
+    partition_slot: u16,
+) -> Result<Vec<i64>> {
+    let partition_values = column_slice(columns, partition_slot)?;
+    if partition_values.len() != record_count {
+        return Err(AuraError::InvalidValue("column length"));
+    }
+    event_group_ranges_from_columns(columns, record_count, event_slots)?
+        .into_iter()
+        .map(|(group_start, group_end)| {
+            if group_start >= group_end {
+                return Ok(0);
+            }
+            let mut count = 1usize;
+            let mut value = partition_values[group_start];
+            for next in partition_values
+                .iter()
+                .copied()
+                .take(group_end)
+                .skip(group_start + 1)
+            {
+                if next != value {
+                    value = next;
+                    count += 1;
+                }
+            }
+            i64::try_from(count).map_err(|_| AuraError::InvalidValue("partition event count"))
+        })
+        .collect()
+}
+
+fn fixed_partition_run_order_from_columns(
+    columns: &[Vec<i64>],
+    record_count: usize,
+    event_slots: &[u16],
+    partition_slot: u16,
+) -> Result<Option<Vec<i64>>> {
+    let groups = event_group_ranges_from_columns(columns, record_count, event_slots)?;
+    if groups.len() < 2 {
+        return Ok(None);
+    }
+    let partition_values = column_slice(columns, partition_slot)?;
+    let mut fixed_order: Option<Vec<i64>> = None;
+    for (group_start, group_end) in groups {
+        let mut order = Vec::new();
+        if group_start >= group_end {
+            continue;
+        }
+        let mut value = partition_values[group_start];
+        order.push(value);
+        for next in partition_values
+            .iter()
+            .copied()
+            .take(group_end)
+            .skip(group_start + 1)
+        {
+            if next != value {
+                value = next;
+                order.push(value);
+            }
+        }
+        if order.is_empty() {
+            return Ok(None);
+        }
+        if let Some(existing) = &fixed_order {
+            if existing != &order {
+                return Ok(None);
+            }
+        } else {
+            fixed_order = Some(order);
+        }
+    }
+    Ok(fixed_order)
+}
+
+fn event_group_lengths_from_columns(
+    columns: &[Vec<i64>],
+    record_count: usize,
+    event_slots: &[u16],
+) -> Result<Vec<i64>> {
+    event_group_ranges_from_columns(columns, record_count, event_slots)?
+        .into_iter()
+        .map(|(start, end)| {
+            i64::try_from(end - start).map_err(|_| AuraError::InvalidValue("group length"))
+        })
+        .collect()
+}
+
+fn event_group_ranges_from_columns(
+    columns: &[Vec<i64>],
+    record_count: usize,
+    event_slots: &[u16],
+) -> Result<Vec<(usize, usize)>> {
+    if record_count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    for index in 1..record_count {
+        if !same_slots_from_columns(columns, start, index, event_slots)? {
+            groups.push((start, index));
+            start = index;
+        }
+    }
+    groups.push((start, record_count));
+    Ok(groups)
+}
+
+fn same_slots_from_columns(
+    columns: &[Vec<i64>],
+    left_row: usize,
+    right_row: usize,
+    slots: &[u16],
+) -> Result<bool> {
+    for slot in slots {
+        if column_value(columns, left_row, *slot)? != column_value(columns, right_row, *slot)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn unsigned_offsets(values: &[i64], base: i64) -> Result<Vec<u64>> {

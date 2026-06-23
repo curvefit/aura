@@ -8,18 +8,19 @@ use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, ByteGuard, By
 use crate::footer::AuraFooter;
 use crate::format::SEAL_MAGIC;
 use crate::generic_planner::{
-    decode_generic_i64_rows_body, encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan,
-    decode_generic_i64_stream_values_profiled, plan_generic_i64_rows,
-    try_decode_generic_i64_columns_body,
-    try_encode_generic_i64_aura1_body, try_encode_generic_i64_aura1_body_streaming,
-    try_write_generic_i64_aura1_body, try_write_generic_i64_aura1_body_guarded,
-    try_write_partitioned_sparse_i64_aura1_body_profiled, DirectAura1DecodeTimings,
-    DirectAura1DecodeStats, DirectAura1WriterStats, DirectAura1WriterTimings,
+    decode_generic_i64_rows_body, decode_generic_i64_stream_values_profiled,
+    encode_generic_i64_columns_with_plan, encode_generic_i64_columns_with_plan_direct_streams,
+    encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan, plan_generic_i64_rows,
+    try_decode_generic_i64_columns_body, try_encode_generic_i64_aura1_body,
+    try_encode_generic_i64_aura1_body_streaming, try_write_generic_i64_aura1_body,
+    try_write_generic_i64_aura1_body_guarded, try_write_partitioned_sparse_i64_aura1_body_profiled,
+    DirectAura1DecodeStats, DirectAura1DecodeTimings, DirectAura1WriterStats,
+    DirectAura1WriterTimings, GenericColumnEncodeStats,
 };
 use crate::header::{AuraHeader, LEGACY_HEADER_PREFIX_SIZE};
 use crate::instructions::GenericInstructionPlan;
 use crate::plan::{unpack_ref_divisor, unpack_two_refs, Aura0Plan, Aura1Plan, FieldEncoding};
-use crate::program::{CompiledFooter, DecodeProgram};
+use crate::program::{CompiledAuraPlan, CompiledFooter, DecodeProgram};
 use crate::schema::{schema_parent_mapping, FieldRole, FieldType, SchemaDescriptor};
 use crate::stats::IngestStats;
 use crate::{AuraError, AuraTypedValue, PhysicalWidth, Profile, Result};
@@ -60,6 +61,18 @@ pub struct DecodedI64ColumnsFile {
     pub columns: Vec<Vec<i64>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Aura1FixedLayoutInfo {
+    pub record_count: usize,
+    pub field_count: usize,
+    pub record_width: usize,
+    pub body_offset: usize,
+    pub body_bytes: usize,
+    pub footer_offset: usize,
+    pub output_size: usize,
+    pub conversion_plan_hash: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedTypedFile {
     pub header: AuraHeader,
@@ -94,6 +107,44 @@ impl OutputGuardMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscodePath {
+    Auto,
+    Materialized,
+    Direct,
+}
+
+impl TranscodePath {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Materialized => "materialized",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aura0EncoderPath {
+    Materialized,
+    DirectStreams,
+}
+
+impl Default for Aura0EncoderPath {
+    fn default() -> Self {
+        Self::Materialized
+    }
+}
+
+impl Aura0EncoderPath {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Materialized => "materialized",
+            Self::DirectStreams => "direct-streams",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirectAura1TranscodeTimings {
     pub metadata_ns: u128,
@@ -111,13 +162,68 @@ pub struct DirectAura1TranscodeStats {
     pub writer: DirectAura1WriterStats,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectAura0TranscodeTimings {
+    pub metadata_ns: u128,
+    pub fixed_row_scan_ns: u128,
+    pub stats_frequency_collection_ns: u128,
+    pub direct_stream_construction_ns: u128,
+    pub field_extraction_ns: u128,
+    pub dictionary_state_update_ns: u128,
+    pub delta_stream_construction_ns: u128,
+    pub compression_encoding_ns: u128,
+    pub writer_finalization_ns: u128,
+    pub canonical_hash_ns: u128,
+    pub post_output_guard_ns: u128,
+    pub total_ns: u128,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectAura0TranscodeStats {
+    pub encoder_path: Aura0EncoderPath,
+    pub direct_streams_enabled: bool,
+    pub column_vector_count: usize,
+    pub column_value_count: usize,
+    pub rows_scanned: usize,
+    pub aura1_scan_passes: usize,
+    pub row_allocations: usize,
+    pub stream_vector_count: usize,
+    pub stream_vector_allocations: usize,
+    pub stream_count: usize,
+    pub stream_value_count: usize,
+    pub direct_stream_count: usize,
+    pub direct_stream_value_count: usize,
+    pub bytes_read: usize,
+    pub bytes_written: usize,
+    pub copied_bytes: usize,
+    pub temporary_buffer_bytes: usize,
+    pub encoder_allocations: usize,
+    pub output_blocks: usize,
+    pub compression_blocks: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfiledCompileTimings {
+    pub aura0_to_aura1: Option<DirectAura1TranscodeTimings>,
+    pub aura1_to_aura0: Option<DirectAura0TranscodeTimings>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfiledCompileStats {
+    pub aura0_to_aura1: Option<DirectAura1TranscodeStats>,
+    pub aura1_to_aura0: Option<DirectAura0TranscodeStats>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfiledCompileOutput {
     pub bytes: Vec<u8>,
     pub output_byte_guard: Option<u64>,
     pub guard_mode: OutputGuardMode,
-    pub timings: DirectAura1TranscodeTimings,
-    pub stats: DirectAura1TranscodeStats,
+    pub transcode_path: TranscodePath,
+    pub encoder_path: Aura0EncoderPath,
+    pub conversion_plan_hash: Option<u64>,
+    pub timings: ProfiledCompileTimings,
+    pub stats: ProfiledCompileStats,
 }
 
 pub fn encode_ingest_i64_file(input: I64FileInput) -> Result<Vec<u8>> {
@@ -245,10 +351,9 @@ pub fn try_compile_i64_file_profiled(
     bytes: &[u8],
     target_profile: Profile,
     guard_mode: OutputGuardMode,
+    transcode_path: TranscodePath,
+    encoder_path: Aura0EncoderPath,
 ) -> Result<Option<ProfiledCompileOutput>> {
-    if target_profile != Profile::Aura1 {
-        return Ok(None);
-    }
     if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
         return Ok(None);
     }
@@ -263,23 +368,36 @@ pub fn try_compile_i64_file_profiled(
         return Err(AuraError::UnexpectedEof);
     }
     let header = AuraHeader::decode(&bytes[..header_len])?;
-    if header.profile != Profile::Aura0 {
-        return Ok(None);
-    }
     let footer_start = footer_len_offset
         .checked_sub(footer_len)
         .ok_or(AuraError::UnexpectedEof)?;
     if footer_start < header_len {
         return Err(AuraError::UnexpectedEof);
     }
-    try_compile_aura0_to_aura1_fast_profiled(
-        bytes,
-        header,
-        header_len,
-        footer_start,
-        footer_len_offset,
-        guard_mode,
-    )
+    match (header.profile, target_profile, transcode_path) {
+        (Profile::Aura0, Profile::Aura1, TranscodePath::Auto | TranscodePath::Direct) => {
+            try_compile_aura0_to_aura1_fast_profiled(
+                bytes,
+                header,
+                header_len,
+                footer_start,
+                footer_len_offset,
+                guard_mode,
+            )
+        }
+        (Profile::Aura1, Profile::Aura0, TranscodePath::Direct) => {
+            try_compile_aura1_to_aura0_direct_profiled(
+                bytes,
+                header,
+                header_len,
+                footer_start,
+                footer_len_offset,
+                guard_mode,
+                encoder_path,
+            )
+        }
+        _ => Ok(None),
+    }
 }
 
 pub(crate) fn compile_i64_file_inner(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
@@ -629,14 +747,14 @@ fn try_compile_aura0_to_aura1_fast_guarded(
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
-    let Some(plan) = footer.generic_aura0_plan.clone() else {
+    let compiled_plan = CompiledAuraPlan::from_footer(&footer)?;
+    let Some(plan) = compiled_plan.generic_aura0_plan.clone() else {
         return Ok(None);
     };
-    let record_count = usize::try_from(footer.record_count)
-        .map_err(|_| AuraError::InvalidValue("record count"))?;
-    let field_count = footer.schema.fields.len();
-    let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
-    let body_capacity = aura1_body_capacity(record_count, &aura1_plan)?;
+    let record_count = compiled_plan.record_count;
+    let field_count = compiled_plan.field_count;
+    let aura1_plan = compiled_plan.aura1_plan.clone();
+    let body_capacity = compiled_plan.aura1_body_size;
     let mut guard = ByteGuard::new();
     let Some((bytes, _body_len)) = try_encode_compiled_file_with_body_writer_guarded(
         Profile::Aura1,
@@ -692,23 +810,19 @@ fn try_compile_aura0_to_aura1_fast_profiled(
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
-    let Some(plan) = footer.generic_aura0_plan.clone() else {
+    let compiled_plan = CompiledAuraPlan::from_footer(&footer)?;
+    let Some(plan) = compiled_plan.generic_aura0_plan.clone() else {
         return Ok(None);
     };
-    let record_count = usize::try_from(footer.record_count)
-        .map_err(|_| AuraError::InvalidValue("record count"))?;
-    let field_count = footer.schema.fields.len();
-    let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
-    let body_capacity = aura1_body_capacity(record_count, &aura1_plan)?;
+    let record_count = compiled_plan.record_count;
+    let field_count = compiled_plan.field_count;
+    let aura1_plan = compiled_plan.aura1_plan.clone();
+    let body_capacity = compiled_plan.aura1_body_size;
     let footer_bytes = footer.encode()?;
     let footer_len =
         u32::try_from(footer_bytes.len()).map_err(|_| AuraError::InvalidValue("footer length"))?;
     let header_out = AuraHeader::new(Profile::Aura1)
-        .with_stream(
-            header.stream_id,
-            header.dictionary_id,
-            header.base_time_ns,
-        )
+        .with_stream(header.stream_id, header.dictionary_id, header.base_time_ns)
         .with_schema_mapping(schema_parent_mapping(&footer.schema)?)?
         .with_derived_expressions(footer.schema.derived_expressions.clone())?
         .with_comment(header.comment.as_str())?;
@@ -829,9 +943,185 @@ fn try_compile_aura0_to_aura1_fast_profiled(
         bytes: out,
         output_byte_guard,
         guard_mode,
-        timings,
-        stats,
+        transcode_path: TranscodePath::Direct,
+        encoder_path: Aura0EncoderPath::Materialized,
+        conversion_plan_hash: Some(compiled_plan.conversion_plan_hash),
+        timings: ProfiledCompileTimings {
+            aura0_to_aura1: Some(timings),
+            aura1_to_aura0: None,
+        },
+        stats: ProfiledCompileStats {
+            aura0_to_aura1: Some(stats),
+            aura1_to_aura0: None,
+        },
     }))
+}
+
+fn try_compile_aura1_to_aura0_direct_profiled(
+    bytes: &[u8],
+    header: AuraHeader,
+    header_len: usize,
+    footer_start: usize,
+    footer_len_offset: usize,
+    guard_mode: OutputGuardMode,
+    encoder_path: Aura0EncoderPath,
+) -> Result<Option<ProfiledCompileOutput>> {
+    let total_start = Instant::now();
+    let mut timings = DirectAura0TranscodeTimings::default();
+    let mut stats = DirectAura0TranscodeStats::default();
+
+    let metadata_start = Instant::now();
+    let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+    validate_header_schema_agreement(&header, &footer.schema)?;
+    if schema_has_wide_fields(&footer.schema) {
+        return Err(AuraError::InvalidValue("i64 schema"));
+    }
+    let compiled_plan = CompiledAuraPlan::from_footer(&footer)?;
+    let Some(plan) = compiled_plan.generic_aura0_plan.clone() else {
+        return Ok(None);
+    };
+    let record_count = compiled_plan.record_count;
+    let field_count = compiled_plan.field_count;
+    let aura1_plan = compiled_plan.aura1_plan.clone();
+    validate_aura1_plan_fields(&aura1_plan, field_count)?;
+    timings.metadata_ns = metadata_start.elapsed().as_nanos();
+
+    let body = &bytes[header_len..footer_start];
+    stats.bytes_read = body.len();
+    let scan_start = Instant::now();
+    let columns = decode_aura1_body_to_columns(body, &aura1_plan, record_count, field_count)?;
+    timings.fixed_row_scan_ns = scan_start.elapsed().as_nanos();
+    stats.rows_scanned = record_count;
+    stats.aura1_scan_passes = 1;
+    stats.encoder_path = encoder_path;
+    stats.direct_streams_enabled = encoder_path == Aura0EncoderPath::DirectStreams;
+    stats.column_vector_count = columns.len();
+    stats.column_value_count = columns.iter().map(Vec::len).sum();
+
+    let encode_start = Instant::now();
+    let mut column_stats = GenericColumnEncodeStats::default();
+    let encoded = match encoder_path {
+        Aura0EncoderPath::Materialized => encode_generic_i64_columns_with_plan(
+            &footer.schema,
+            &columns,
+            record_count,
+            plan,
+            Some(&mut column_stats),
+        )?,
+        Aura0EncoderPath::DirectStreams => encode_generic_i64_columns_with_plan_direct_streams(
+            &footer.schema,
+            &columns,
+            record_count,
+            plan,
+            Some(&mut column_stats),
+        )?,
+    };
+    let body_assembly_start = Instant::now();
+    let aura0_body = encode_generic_i64_rows_body(&encoded)?;
+    let body_assembly_ns = body_assembly_start.elapsed().as_nanos();
+    let encode_total_ns = encode_start.elapsed().as_nanos();
+    timings.stats_frequency_collection_ns = column_stats.frequency_pass_ns;
+    timings.direct_stream_construction_ns = column_stats.direct_stream_emit_ns;
+    timings.compression_encoding_ns = if encoder_path == Aura0EncoderPath::DirectStreams {
+        column_stats
+            .compression_encoding_ns
+            .saturating_add(body_assembly_ns)
+    } else {
+        encode_total_ns
+    };
+    stats.stream_vector_allocations = column_stats.stream_vector_allocations;
+    stats.stream_vector_count = column_stats.stream_vector_allocations;
+    stats.stream_count = column_stats.stream_count;
+    stats.stream_value_count = column_stats.stream_value_count;
+    stats.direct_stream_count = column_stats.direct_stream_count;
+    stats.direct_stream_value_count = column_stats.direct_stream_value_count;
+    stats.temporary_buffer_bytes = column_stats.temporary_buffer_bytes;
+    stats.encoder_allocations = column_stats.encoder_allocations;
+    stats.compression_blocks = column_stats.stream_count;
+    stats.copied_bytes = aura0_body.len();
+
+    let writer_start = Instant::now();
+    let out = encode_compiled_file(
+        Profile::Aura0,
+        header.stream_id,
+        header.dictionary_id,
+        header.base_time_ns,
+        header.comment.as_str(),
+        aura0_body,
+        footer,
+    )?;
+    timings.writer_finalization_ns = writer_start.elapsed().as_nanos();
+    stats.bytes_written = out.len();
+    stats.output_blocks = 1;
+
+    let mut output_byte_guard = None;
+    if guard_mode != OutputGuardMode::NoGuard {
+        let guard_start = Instant::now();
+        let mut guard = ByteGuard::new();
+        guard.update(&out);
+        timings.post_output_guard_ns = guard_start.elapsed().as_nanos();
+        output_byte_guard = Some(guard.value());
+    }
+
+    timings.total_ns = total_start.elapsed().as_nanos();
+    Ok(Some(ProfiledCompileOutput {
+        bytes: out,
+        output_byte_guard,
+        guard_mode,
+        transcode_path: TranscodePath::Direct,
+        encoder_path,
+        conversion_plan_hash: Some(compiled_plan.conversion_plan_hash),
+        timings: ProfiledCompileTimings {
+            aura0_to_aura1: None,
+            aura1_to_aura0: Some(timings),
+        },
+        stats: ProfiledCompileStats {
+            aura0_to_aura1: None,
+            aura1_to_aura0: Some(stats),
+        },
+    }))
+}
+
+fn validate_aura1_plan_fields(plan: &Aura1Plan, field_count: usize) -> Result<()> {
+    if plan.fields.len() != field_count {
+        return Err(AuraError::InvalidValue("program field count"));
+    }
+    let mut seen = vec![false; field_count];
+    for field in &plan.fields {
+        let index = usize::from(field.field_index);
+        if index >= field_count || seen[index] {
+            return Err(AuraError::InvalidValue("field index"));
+        }
+        seen[index] = true;
+    }
+    if seen.iter().any(|seen| !*seen) {
+        return Err(AuraError::InvalidValue("program field count"));
+    }
+    Ok(())
+}
+
+fn decode_aura1_body_to_columns(
+    bytes: &[u8],
+    plan: &Aura1Plan,
+    record_count: usize,
+    field_count: usize,
+) -> Result<Vec<Vec<i64>>> {
+    validate_aura1_plan_fields(plan, field_count)?;
+    let mut reader = ByteReader::new(bytes);
+    let mut columns = (0..field_count)
+        .map(|_| Vec::with_capacity(record_count))
+        .collect::<Vec<_>>();
+    for _ in 0..record_count {
+        for field_plan in &plan.fields {
+            let index = usize::from(field_plan.field_index);
+            columns[index].push(read_i64_width(&mut reader, field_plan.width)?);
+        }
+    }
+    reader.finish()?;
+    if columns.iter().any(|column| column.len() != record_count) {
+        return Err(AuraError::InvalidValue("record count"));
+    }
+    Ok(columns)
 }
 
 pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
@@ -896,6 +1186,51 @@ pub fn decode_i64_columns_file(bytes: &[u8]) -> Result<Option<DecodedI64ColumnsF
     }))
 }
 
+pub fn aura1_fixed_layout_info(bytes: &[u8]) -> Result<Aura1FixedLayoutInfo> {
+    if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let seal_offset = bytes.len() - SEAL_MAGIC.len();
+    if &bytes[seal_offset..] != SEAL_MAGIC {
+        return Err(AuraError::InvalidMagic {
+            expected: "sealed:)",
+        });
+    }
+    let footer_len_offset = seal_offset - FOOTER_LEN_SIZE;
+    let footer_len = read_trailer_footer_len(bytes, footer_len_offset)?;
+    let header_len = AuraHeader::encoded_len(bytes)?;
+    if header_len > footer_len_offset {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let header = AuraHeader::decode(&bytes[..header_len])?;
+    let footer_start = footer_len_offset
+        .checked_sub(footer_len)
+        .ok_or(AuraError::UnexpectedEof)?;
+    if footer_start < header_len {
+        return Err(AuraError::UnexpectedEof);
+    }
+    if header.profile != Profile::Aura1 {
+        return Err(AuraError::InvalidValue("aura1 fixed layout profile"));
+    }
+
+    let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+    validate_header_schema_agreement(&header, &footer.schema)?;
+    if schema_has_wide_fields(&footer.schema) {
+        return Err(AuraError::InvalidValue("i64 schema"));
+    }
+    let compiled_plan = CompiledAuraPlan::from_footer(&footer)?;
+    Ok(Aura1FixedLayoutInfo {
+        record_count: compiled_plan.record_count,
+        field_count: compiled_plan.field_count,
+        record_width: compiled_plan.aura1_record_width,
+        body_offset: header_len,
+        body_bytes: footer_start - header_len,
+        footer_offset: footer_start,
+        output_size: bytes.len(),
+        conversion_plan_hash: compiled_plan.conversion_plan_hash,
+    })
+}
+
 pub fn visit_i64_rows_file<F>(bytes: &[u8], mut visitor: F) -> Result<usize>
 where
     F: FnMut(&[i64]) -> Result<()>,
@@ -931,14 +1266,12 @@ where
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
-    let plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
-    let record_count = usize::try_from(footer.record_count)
-        .map_err(|_| AuraError::InvalidValue("record count"))?;
+    let compiled_plan = CompiledAuraPlan::from_footer(&footer)?;
     visit_aura1_body(
         &bytes[header_len..footer_start],
-        &plan,
-        record_count,
-        footer.schema.fields.len(),
+        &compiled_plan.aura1_plan,
+        compiled_plan.record_count,
+        compiled_plan.field_count,
         &mut visitor,
     )
 }

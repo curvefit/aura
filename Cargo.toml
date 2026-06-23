@@ -28,6 +28,7 @@ arrow = { version = "54", features = ["prettyprint"] }
 parquet = { version = "54", features = ["zstd"] }
 serde_json = "1"
 sha2 = "0.10"
+zstd = "0.13.3"
 
 [[bin]]
 name = "aura-json-i64"

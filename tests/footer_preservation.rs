@@ -7,7 +7,7 @@ use aura_codec::instructions::{
 };
 use aura_codec::plan::{Aura0Plan, Aura1Plan};
 use aura_codec::program::COMPILED_FOOTER_MAGIC;
-use aura_codec::program::{CompiledFooter, DecodeProgram};
+use aura_codec::program::{CompiledAuraPlan, CompiledFooter, DecodeProgram};
 use aura_codec::schema::generic_i64_parent_schema;
 use aura_codec::{records, DerivedExpressionOp, IngestStats, Profile};
 
@@ -427,4 +427,52 @@ fn generic_instruction_footer_preserves_all_stream_and_group_variants() {
 
     let decoded_compiled = CompiledFooter::decode(&compiled.encode().unwrap()).unwrap();
     assert_eq!(Some(&plan), decoded_compiled.generic_aura0_plan.as_ref());
+}
+
+#[test]
+fn compiled_aura_plan_precomputes_footer_conversion_layout() {
+    let schema =
+        generic_i64_parent_schema("compiled_plan_footer", &[100, 0, 0, 204, 0, 0, 0]).unwrap();
+    let mut stats = IngestStats::new_for_schema(&schema).unwrap();
+    stats
+        .observe_i64_record(&schema, &[1_000, 10, 20, 0, 100, 5, 1])
+        .unwrap();
+    stats
+        .observe_i64_record(&schema, &[1_001, 11, 21, 1, 110, 7, 0])
+        .unwrap();
+    let aura0_plan = Aura0Plan::from_schema_stats(&schema, &stats).unwrap();
+    let aura1_plan = Aura1Plan::from_stats(&stats, 4);
+    let generic_plan = all_variant_generic_plan();
+    let compiled = CompiledFooter::new(
+        schema.clone(),
+        stats.record_count,
+        aura1_plan.block_capacity,
+        DecodeProgram::from_aura0_plan(&aura0_plan, schema.fields.len()).unwrap(),
+        DecodeProgram::from_aura1_plan(&aura1_plan, schema.fields.len()).unwrap(),
+    )
+    .unwrap()
+    .with_generic_aura0_plan(generic_plan.clone());
+
+    let decoded = CompiledFooter::decode(&compiled.encode().unwrap()).unwrap();
+    let plan = CompiledAuraPlan::from_footer(&decoded).unwrap();
+    let expected_width = aura1_plan
+        .fields
+        .iter()
+        .map(|field| usize::from(field.width.byte_width()))
+        .sum::<usize>();
+
+    assert_eq!(schema.fields.len(), plan.field_count);
+    assert_eq!(stats.record_count as usize, plan.record_count);
+    assert_eq!(aura1_plan.block_capacity, plan.block_capacity);
+    assert_eq!(expected_width, plan.aura1_record_width);
+    assert_eq!(expected_width * plan.record_count, plan.aura1_body_size);
+    assert_eq!(Some(&generic_plan), plan.generic_aura0_plan.as_ref());
+    assert_eq!(vec![0, 1, 2, 3, 4, 5, 6], plan.canonical_field_order);
+    assert_ne!(0, plan.conversion_plan_hash);
+    assert_eq!(
+        plan.conversion_plan_hash,
+        CompiledAuraPlan::from_footer(&decoded)
+            .unwrap()
+            .conversion_plan_hash
+    );
 }

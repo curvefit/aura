@@ -457,6 +457,86 @@ impl DecodeProgram {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledAuraPlan {
+    pub format_version: u16,
+    pub record_count: usize,
+    pub field_count: usize,
+    pub block_capacity: u16,
+    pub aura0_plan: Aura0Plan,
+    pub aura1_plan: Aura1Plan,
+    pub generic_aura0_plan: Option<GenericInstructionPlan>,
+    pub aura1_record_width: usize,
+    pub aura1_body_size: usize,
+    pub canonical_field_order: Vec<u16>,
+    pub conversion_plan_hash: u64,
+}
+
+impl CompiledAuraPlan {
+    pub fn from_footer(footer: &CompiledFooter) -> Result<Self> {
+        let field_count = footer.schema.fields.len();
+        let record_count = usize::try_from(footer.record_count)
+            .map_err(|_| AuraError::InvalidValue("record count"))?;
+        let aura0_plan = footer.aura0_program.to_aura0_plan()?;
+        let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+        validate_plan_fields(&aura0_plan.fields, field_count)?;
+        validate_plan_fields(&aura1_plan.fields, field_count)?;
+        let aura1_record_width = aura1_plan
+            .fields
+            .iter()
+            .map(|field| usize::from(field.width.byte_width()))
+            .try_fold(0usize, |acc, width| {
+                acc.checked_add(width)
+                    .ok_or(AuraError::InvalidValue("body length"))
+            })?;
+        let aura1_body_size = record_count
+            .checked_mul(aura1_record_width)
+            .ok_or(AuraError::InvalidValue("body length"))?;
+        let canonical_field_order = (0..field_count)
+            .map(|index| u16::try_from(index).map_err(|_| AuraError::InvalidValue("field index")))
+            .collect::<Result<Vec<_>>>()?;
+        let footer_bytes = footer.encode()?;
+        Ok(Self {
+            format_version: FORMAT_VERSION,
+            record_count,
+            field_count,
+            block_capacity: footer.block_capacity,
+            aura0_plan,
+            aura1_plan,
+            generic_aura0_plan: footer.generic_aura0_plan.clone(),
+            aura1_record_width,
+            aura1_body_size,
+            canonical_field_order,
+            conversion_plan_hash: plan_hash_bytes(&footer_bytes),
+        })
+    }
+}
+
+fn validate_plan_fields(fields: &[PhysicalFieldPlan], field_count: usize) -> Result<()> {
+    if fields.len() != field_count {
+        return Err(AuraError::InvalidValue("program field count"));
+    }
+    let mut seen = vec![false; field_count];
+    for field in fields {
+        let index = usize::from(field.field_index);
+        if index >= field_count || seen[index] {
+            return Err(AuraError::InvalidValue("field index"));
+        }
+        seen[index] = true;
+    }
+    if seen.iter().any(|seen| !*seen) {
+        return Err(AuraError::InvalidValue("program field count"));
+    }
+    Ok(())
+}
+
+fn plan_hash_bytes(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325u64, |acc, byte| {
+        acc.wrapping_mul(0x100000001b3)
+            .wrapping_add(u64::from(*byte))
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledFooter {
     pub schema: SchemaDescriptor,
     pub compression: CompressionDescriptor,

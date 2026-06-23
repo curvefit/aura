@@ -288,6 +288,7 @@ dependencies = [
  "parquet",
  "serde_json",
  "sha2",
+ "zstd",
 ]
 
 [[package]]
