@@ -19,6 +19,10 @@ name = "aura-bench"
 path = "src/bin/aura_bench.rs"
 
 [[bin]]
+name = "aura-fixture-gen"
+path = "src/bin/aura_fixture_gen.rs"
+
+[[bin]]
 name = "aura-parquet-ohlcv"
 path = "src/bin/parquet_ohlcv.rs"
 

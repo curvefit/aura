@@ -329,6 +329,72 @@ fn aura_bench_reports_aura0_to_aura1_guard_modes_and_stage_tree() {
 }
 
 #[test]
+fn aura0_to_aura1_cursor_decode_path_declines_unsupported_fixture() {
+    let (aura0, _) = partitioned_sparse_fixture_profiles();
+    let cursor = records::try_compile_i64_file_profiled(
+        &aura0,
+        Profile::Aura1,
+        records::OutputGuardMode::OldPostOutputGuard,
+        records::TranscodePath::Direct,
+        records::Aura0EncoderPath::Materialized,
+        records::Aura0DecodePath::Cursor,
+    )
+    .unwrap();
+
+    assert!(
+        cursor.is_none(),
+        "cursor path must decline unsupported fixture instead of silently falling back"
+    );
+}
+
+#[test]
+fn aura_bench_reports_decode_path_field() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
+        panic!("missing aura-bench binary");
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "aura-bench-decode-path-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let (aura0, _) = fixture_profiles();
+    let aura0_path = dir.join("fixture.aura0");
+    fs::write(&aura0_path, aura0).unwrap();
+
+    let output = Command::new(bin)
+        .arg("--operation")
+        .arg("transcode-aura0-to-aura1")
+        .arg("--dataset")
+        .arg("unit-fixture")
+        .arg("--input")
+        .arg(&aura0_path)
+        .arg("--iterations")
+        .arg("1")
+        .arg("--format")
+        .arg("json")
+        .arg("--decode-path")
+        .arg("materialized")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!("materialized", json["decode_path_requested"]);
+    assert_eq!("materialized", json["decode_path"]);
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn aura_bench_reports_aura1_to_aura0_direct_transcode_path() {
     let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
         panic!("missing aura-bench binary");
@@ -422,6 +488,7 @@ fn aura1_to_aura0_direct_path_matches_materialized_output() {
         records::OutputGuardMode::OldPostOutputGuard,
         records::TranscodePath::Direct,
         records::Aura0EncoderPath::Materialized,
+        records::Aura0DecodePath::Materialized,
     )
     .unwrap()
     .expect("direct aura1 to aura0 path");
@@ -450,6 +517,7 @@ fn aura1_to_aura0_direct_stream_encoder_matches_current_direct_path() {
         records::OutputGuardMode::OldPostOutputGuard,
         records::TranscodePath::Direct,
         records::Aura0EncoderPath::Materialized,
+        records::Aura0DecodePath::Materialized,
     )
     .unwrap()
     .expect("direct column aura1 to aura0 path");
@@ -459,6 +527,7 @@ fn aura1_to_aura0_direct_stream_encoder_matches_current_direct_path() {
         records::OutputGuardMode::OldPostOutputGuard,
         records::TranscodePath::Direct,
         records::Aura0EncoderPath::DirectStreams,
+        records::Aura0DecodePath::Materialized,
     )
     .unwrap()
     .expect("direct stream aura1 to aura0 path");
@@ -552,6 +621,55 @@ fn aura_bench_reports_aura1_to_aura0_direct_stream_encoder_path() {
 
     let timings = &json["stage_timings_ns"]["aura1_to_aura0"];
     assert!(timings["direct_stream_construction"].as_u64().unwrap() > 0);
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn aura_bench_rejects_column_free_encoder_with_current_api_blocker() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
+        panic!("missing aura-bench binary");
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "aura-bench-column-free-reject-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let (_, aura1) = partitioned_sparse_fixture_profiles();
+    let aura1_path = dir.join("fixture.aura1");
+    fs::write(&aura1_path, aura1).unwrap();
+
+    let output = Command::new(bin)
+        .arg("--operation")
+        .arg("transcode-aura1-to-aura0")
+        .arg("--dataset")
+        .arg("unit-fixture")
+        .arg("--input")
+        .arg(&aura1_path)
+        .arg("--iterations")
+        .arg("1")
+        .arg("--format")
+        .arg("json")
+        .arg("--transcode-path")
+        .arg("direct")
+        .arg("--encoder-path")
+        .arg("column-free")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "column-free must fail explicitly until encoder API no longer requires columns"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("column-free encoder rejected")
+            && stderr.contains("requires Aura1 column buffers"),
+        "stderr:\n{stderr}"
+    );
 
     fs::remove_dir_all(&dir).unwrap();
 }

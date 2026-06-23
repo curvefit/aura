@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use aura_codec::{records, writer, Profile};
 use records::{
-    Aura0EncoderPath, OutputGuardMode, ProfiledCompileStats, ProfiledCompileTimings, TranscodePath,
+    Aura0DecodePath, Aura0EncoderPath, OutputGuardMode, ProfiledCompileStats,
+    ProfiledCompileTimings, TranscodePath,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -256,7 +257,16 @@ fn parse_encoder_path(value: &str) -> Result<Aura0EncoderPath> {
     match value {
         "materialized" => Ok(Aura0EncoderPath::Materialized),
         "direct-streams" => Ok(Aura0EncoderPath::DirectStreams),
+        "column-free" => Ok(Aura0EncoderPath::ColumnFree),
         other => bail!("unknown encoder path: {other}"),
+    }
+}
+
+fn parse_decode_path(value: &str) -> Result<Aura0DecodePath> {
+    match value {
+        "materialized" => Ok(Aura0DecodePath::Materialized),
+        "cursor" => Ok(Aura0DecodePath::Cursor),
+        other => bail!("unknown decode path: {other}"),
     }
 }
 
@@ -273,6 +283,7 @@ struct Config {
     guard_mode: OutputGuardMode,
     transcode_path: TranscodePath,
     encoder_path: Aura0EncoderPath,
+    decode_path: Aura0DecodePath,
     preserve_output: Option<PathBuf>,
     verify_output_decodes: bool,
     canonical_hash_mode: Option<CanonicalHashMode>,
@@ -295,6 +306,7 @@ impl Config {
         let mut guard_mode = OutputGuardMode::NoGuard;
         let mut transcode_path = TranscodePath::Auto;
         let mut encoder_path = Aura0EncoderPath::Materialized;
+        let mut decode_path = Aura0DecodePath::Materialized;
         let mut preserve_output = None;
         let mut verify_output_decodes = false;
         let mut canonical_hash_mode = None;
@@ -354,6 +366,10 @@ impl Config {
                     encoder_path =
                         parse_encoder_path(&args.next().context("missing --encoder-path value")?)?;
                 }
+                "--decode-path" => {
+                    decode_path =
+                        parse_decode_path(&args.next().context("missing --decode-path value")?)?;
+                }
                 "--preserve-output" => {
                     preserve_output = Some(PathBuf::from(
                         args.next().context("missing --preserve-output value")?,
@@ -412,6 +428,7 @@ impl Config {
             guard_mode,
             transcode_path,
             encoder_path,
+            decode_path,
             preserve_output,
             verify_output_decodes,
             canonical_hash_mode,
@@ -567,6 +584,7 @@ fn run_benchmark(config: &Config) -> Result<String> {
                     config.guard_mode,
                     config.transcode_path,
                     config.encoder_path,
+                    config.decode_path,
                     effective_canonical_hash_mode,
                     fair_context.as_ref(),
                     false,
@@ -594,6 +612,7 @@ fn run_benchmark(config: &Config) -> Result<String> {
                     config.guard_mode,
                     config.transcode_path,
                     config.encoder_path,
+                    config.decode_path,
                     effective_canonical_hash_mode,
                     fair_context.as_ref(),
                     false,
@@ -613,6 +632,7 @@ fn run_benchmark(config: &Config) -> Result<String> {
                 config.guard_mode,
                 config.transcode_path,
                 config.encoder_path,
+                config.decode_path,
                 effective_canonical_hash_mode,
                 fair_context.as_ref(),
                 should_capture_output,
@@ -639,6 +659,7 @@ fn run_benchmark(config: &Config) -> Result<String> {
                     config.guard_mode,
                     config.transcode_path,
                     config.encoder_path,
+                    config.decode_path,
                     effective_canonical_hash_mode,
                     fair_context.as_ref(),
                     should_capture_output,
@@ -781,6 +802,8 @@ fn run_benchmark(config: &Config) -> Result<String> {
             "guard_mode": first.guard_mode,
             "transcode_path_requested": config.transcode_path.as_str(),
             "transcode_path": first.transcode_path,
+            "decode_path_requested": config.decode_path.as_str(),
+            "decode_path": config.decode_path.as_str(),
             "encoder_path_requested": config.encoder_path.as_str(),
             "encoder_path": first.encoder_path,
             "direct_streams_enabled": first.encoder_path == Aura0EncoderPath::DirectStreams.as_str(),
@@ -916,6 +939,7 @@ fn measure_operation(
     guard_mode: OutputGuardMode,
     transcode_path: TranscodePath,
     encoder_path: Aura0EncoderPath,
+    decode_path: Aura0DecodePath,
     canonical_hash_mode: CanonicalHashMode,
     fair_context: Option<&FairBytesContext>,
     capture_output: bool,
@@ -928,6 +952,7 @@ fn measure_operation(
         guard_mode,
         transcode_path,
         encoder_path,
+        decode_path,
         canonical_hash_mode,
         fair_context,
         capture_output,
@@ -1208,6 +1233,7 @@ fn writer_stats_json(stats: Option<&ProfiledCompileStats>) -> serde_json::Value 
 fn decode_stats_json(stats: Option<&ProfiledCompileStats>) -> serde_json::Value {
     let Some(stats) = stats.and_then(|stats| stats.aura0_to_aura1.as_ref()) else {
         return json!({
+            "cursor_enabled": false,
             "stream_count": 0,
             "stream_value_count": 0,
             "materialized_stream_count": 0,
@@ -1217,6 +1243,7 @@ fn decode_stats_json(stats: Option<&ProfiledCompileStats>) -> serde_json::Value 
         });
     };
     json!({
+        "cursor_enabled": stats.decode.direct_cursor_stream_count > 0,
         "stream_count": stats.decode.stream_count,
         "stream_value_count": stats.decode.stream_value_count,
         "materialized_stream_count": stats.decode.materialized_stream_count,
@@ -1322,6 +1349,7 @@ fn run_operation(
     guard_mode: OutputGuardMode,
     transcode_path: TranscodePath,
     encoder_path: Aura0EncoderPath,
+    decode_path: Aura0DecodePath,
     canonical_hash_mode: CanonicalHashMode,
     fair_context: Option<&FairBytesContext>,
     capture_output: bool,
@@ -1353,6 +1381,7 @@ fn run_operation(
             guard_mode,
             transcode_path,
             encoder_path,
+            decode_path,
             canonical_hash_mode,
             capture_output,
         ),
@@ -1363,6 +1392,7 @@ fn run_operation(
             guard_mode,
             transcode_path,
             encoder_path,
+            decode_path,
             canonical_hash_mode,
             capture_output,
         ),
@@ -1510,6 +1540,7 @@ fn transcode(
     guard_mode: OutputGuardMode,
     transcode_path: TranscodePath,
     encoder_path: Aura0EncoderPath,
+    decode_path: Aura0DecodePath,
     canonical_hash_mode: CanonicalHashMode,
     capture_output: bool,
 ) -> Result<RunOutcome> {
@@ -1519,6 +1550,7 @@ fn transcode(
         guard_mode,
         transcode_path,
         encoder_path,
+        decode_path,
     )? {
         let records::ProfiledCompileOutput {
             bytes: output_bytes_vec,
@@ -1838,6 +1870,7 @@ fn fair_aura1_bytes_operation(
         OutputGuardMode::NoGuard,
         TranscodePath::Auto,
         Aura0EncoderPath::Materialized,
+        Aura0DecodePath::Materialized,
     )? {
         conversion_plan_hash = profiled.conversion_plan_hash;
         compiled_plan_used = conversion_plan_hash.is_some();
@@ -2205,6 +2238,6 @@ fn csv_escape(field: &str) -> String {
 
 fn print_usage() {
     eprintln!(
-        "usage: aura-bench --operation <parse-aura1|decode-aura0|transcode-aura1-to-aura0|transcode-aura0-to-aura1|aura1-scan-fixed|aura1-replay-callback|aura1-parse-to-rows|zstd-decompress-only|zstd-decompress-plus-parse|zstd-decompress-plus-replay|zstd-decompress-plus-aura1-output|aura0-to-aura1-bytes|aura0-to-aura1-bytes-verify|zstd-aura1-to-aura1-bytes|zstd-aura1-to-aura1-bytes-verify> --dataset <name> --input <path> [--iterations N] [--warmups N] [--format json|csv] [--output path] [--cache-mode warm|cold] [--guard-mode no_guard|fused_output_guard|old_post_output_guard|block_batched_output_guard] [--transcode-path auto|materialized|direct] [--encoder-path materialized|direct-streams] [--canonical-hash-mode none|verify] [--zstd-level N] [--reference-aura0 path] [--reference-aura1 path] [--preserve-output path] [--verify-output-decodes]"
+        "usage: aura-bench --operation <parse-aura1|decode-aura0|transcode-aura1-to-aura0|transcode-aura0-to-aura1|aura1-scan-fixed|aura1-replay-callback|aura1-parse-to-rows|zstd-decompress-only|zstd-decompress-plus-parse|zstd-decompress-plus-replay|zstd-decompress-plus-aura1-output|aura0-to-aura1-bytes|aura0-to-aura1-bytes-verify|zstd-aura1-to-aura1-bytes|zstd-aura1-to-aura1-bytes-verify> --dataset <name> --input <path> [--iterations N] [--warmups N] [--format json|csv] [--output path] [--cache-mode warm|cold] [--guard-mode no_guard|fused_output_guard|old_post_output_guard|block_batched_output_guard] [--transcode-path auto|materialized|direct] [--decode-path materialized|cursor] [--encoder-path materialized|direct-streams|column-free] [--canonical-hash-mode none|verify] [--zstd-level N] [--reference-aura0 path] [--reference-aura1 path] [--preserve-output path] [--verify-output-decodes]"
     );
 }

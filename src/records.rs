@@ -128,6 +128,7 @@ impl TranscodePath {
 pub enum Aura0EncoderPath {
     Materialized,
     DirectStreams,
+    ColumnFree,
 }
 
 impl Default for Aura0EncoderPath {
@@ -141,6 +142,28 @@ impl Aura0EncoderPath {
         match self {
             Self::Materialized => "materialized",
             Self::DirectStreams => "direct-streams",
+            Self::ColumnFree => "column-free",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aura0DecodePath {
+    Materialized,
+    Cursor,
+}
+
+impl Default for Aura0DecodePath {
+    fn default() -> Self {
+        Self::Materialized
+    }
+}
+
+impl Aura0DecodePath {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Materialized => "materialized",
+            Self::Cursor => "cursor",
         }
     }
 }
@@ -353,6 +376,7 @@ pub fn try_compile_i64_file_profiled(
     guard_mode: OutputGuardMode,
     transcode_path: TranscodePath,
     encoder_path: Aura0EncoderPath,
+    decode_path: Aura0DecodePath,
 ) -> Result<Option<ProfiledCompileOutput>> {
     if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
         return Ok(None);
@@ -383,6 +407,7 @@ pub fn try_compile_i64_file_profiled(
                 footer_start,
                 footer_len_offset,
                 guard_mode,
+                decode_path,
             )
         }
         (Profile::Aura1, Profile::Aura0, TranscodePath::Direct) => {
@@ -793,6 +818,7 @@ fn try_compile_aura0_to_aura1_fast_profiled(
     footer_start: usize,
     footer_len_offset: usize,
     guard_mode: OutputGuardMode,
+    decode_path: Aura0DecodePath,
 ) -> Result<Option<ProfiledCompileOutput>> {
     if std::env::var_os("AURA_STREAM_AURA1").is_some()
         || std::env::var_os("AURA_FORCE_COLUMNS_AURA1").is_some()
@@ -850,43 +876,98 @@ fn try_compile_aura0_to_aura1_fast_profiled(
         guard.update(&header_bytes);
     }
 
-    let stream_values = decode_generic_i64_stream_values_profiled(
-        &plan,
-        &bytes[header_len..footer_start],
-        Some(&mut timings.decode_input_streams),
-    )?;
-    stats.decode.stream_count = stream_values.len();
-    stats.decode.stream_value_count = stream_values.values().map(Vec::len).sum();
-    stats.decode.materialized_stream_count = stats.decode.stream_count;
-    stats.decode.materialized_value_count = stats.decode.stream_value_count;
-
     let body_start = out.len();
-    let writer_supported = match guard_mode {
-        OutputGuardMode::FusedOutputGuard => try_write_partitioned_sparse_i64_aura1_body_profiled(
-            &plan,
-            &stream_values,
+    let writer_supported = if decode_path == Aura0DecodePath::Cursor {
+        let cursor_start = Instant::now();
+        let body = try_encode_generic_i64_aura1_body_streaming(
+            plan.clone(),
+            &bytes[header_len..footer_start],
             record_count,
             field_count,
             &aura1_plan,
-            &mut out,
-            Some(&mut guard),
-            &mut timings.partitioned_sparse_writer,
-            &mut stats.writer,
-        )?,
-        OutputGuardMode::NoGuard
-        | OutputGuardMode::OldPostOutputGuard
-        | OutputGuardMode::BlockBatchedOutputGuard => {
-            try_write_partitioned_sparse_i64_aura1_body_profiled(
-                &plan,
-                &stream_values,
-                record_count,
-                field_count,
-                &aura1_plan,
-                &mut out,
-                None,
-                &mut timings.partitioned_sparse_writer,
-                &mut stats.writer,
-            )?
+        )?;
+        let cursor_ns = cursor_start.elapsed().as_nanos();
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let body_len = body.len();
+        timings.decode_input_streams.total_ns = 0;
+        timings.decode_input_streams.close_sum();
+        timings.partitioned_sparse_writer.total_ns = cursor_ns;
+        timings.partitioned_sparse_writer.output_byte_stores_ns = cursor_ns;
+        timings.partitioned_sparse_writer.close_sum();
+        out.extend_from_slice(&body);
+        stats.decode.stream_count = plan.streams.len();
+        stats.decode.stream_value_count =
+            stream_value_count_from_body(&bytes[header_len..footer_start])?;
+        stats.decode.direct_cursor_stream_count = stats.decode.stream_count;
+        stats.decode.direct_cursor_value_count = stats.decode.stream_value_count;
+        stats.writer.partition_count = 1;
+        stats.writer.records_per_partition_min = record_count;
+        stats.writer.records_per_partition_max = record_count;
+        stats.writer.output_slices = 1;
+        stats.writer.non_contiguous_writes = 1;
+        stats.writer.temporary_buffer_bytes = body_len;
+        stats.writer.copied_bytes = body_len;
+        stats.writer.allocation_count = 1;
+        if guard_mode == OutputGuardMode::FusedOutputGuard {
+            let guard_start = Instant::now();
+            guard.update(&out[body_start..]);
+            let guard_ns = guard_start.elapsed().as_nanos();
+            timings.partitioned_sparse_writer.guard_hash_update_ns = timings
+                .partitioned_sparse_writer
+                .guard_hash_update_ns
+                .saturating_add(guard_ns);
+            timings.partitioned_sparse_writer.total_ns = timings
+                .partitioned_sparse_writer
+                .total_ns
+                .saturating_add(guard_ns);
+            timings.partitioned_sparse_writer.close_sum();
+            stats.writer.guard_update_calls = stats.writer.guard_update_calls.saturating_add(1);
+            stats.writer.guard_update_bytes =
+                stats.writer.guard_update_bytes.saturating_add(body_len);
+        }
+        true
+    } else {
+        let stream_values = decode_generic_i64_stream_values_profiled(
+            &plan,
+            &bytes[header_len..footer_start],
+            Some(&mut timings.decode_input_streams),
+        )?;
+        stats.decode.stream_count = stream_values.len();
+        stats.decode.stream_value_count = stream_values.values().map(Vec::len).sum();
+        stats.decode.materialized_stream_count = stats.decode.stream_count;
+        stats.decode.materialized_value_count = stats.decode.stream_value_count;
+
+        match guard_mode {
+            OutputGuardMode::FusedOutputGuard => {
+                try_write_partitioned_sparse_i64_aura1_body_profiled(
+                    &plan,
+                    &stream_values,
+                    record_count,
+                    field_count,
+                    &aura1_plan,
+                    &mut out,
+                    Some(&mut guard),
+                    &mut timings.partitioned_sparse_writer,
+                    &mut stats.writer,
+                )?
+            }
+            OutputGuardMode::NoGuard
+            | OutputGuardMode::OldPostOutputGuard
+            | OutputGuardMode::BlockBatchedOutputGuard => {
+                try_write_partitioned_sparse_i64_aura1_body_profiled(
+                    &plan,
+                    &stream_values,
+                    record_count,
+                    field_count,
+                    &aura1_plan,
+                    &mut out,
+                    None,
+                    &mut timings.partitioned_sparse_writer,
+                    &mut stats.writer,
+                )?
+            }
         }
     };
     if !writer_supported {
@@ -957,6 +1038,25 @@ fn try_compile_aura0_to_aura1_fast_profiled(
     }))
 }
 
+fn stream_value_count_from_body(bytes: &[u8]) -> Result<usize> {
+    let mut reader = ByteReader::new(bytes);
+    let stream_count = reader.read_u16_le()? as usize;
+    let mut value_count = 0usize;
+    for _ in 0..stream_count {
+        let _stream_id = reader.read_u16_le()?;
+        value_count = value_count
+            .checked_add(
+                usize::try_from(reader.read_u64_le()?)
+                    .map_err(|_| AuraError::InvalidValue("stream value count"))?,
+            )
+            .ok_or(AuraError::InvalidValue("stream value count"))?;
+        let body_len = reader.read_u32_le()? as usize;
+        let _body = reader.read_exact(body_len)?;
+    }
+    reader.finish()?;
+    Ok(value_count)
+}
+
 fn try_compile_aura1_to_aura0_direct_profiled(
     bytes: &[u8],
     header: AuraHeader,
@@ -985,6 +1085,12 @@ fn try_compile_aura1_to_aura0_direct_profiled(
     let aura1_plan = compiled_plan.aura1_plan.clone();
     validate_aura1_plan_fields(&aura1_plan, field_count)?;
     timings.metadata_ns = metadata_start.elapsed().as_nanos();
+
+    if encoder_path == Aura0EncoderPath::ColumnFree {
+        return Err(AuraError::InvalidValue(
+            "column-free encoder rejected: current Aura1->Aura0 encoder API requires Aura1 column buffers for dictionary/Huffman stream construction",
+        ));
+    }
 
     let body = &bytes[header_len..footer_start];
     stats.bytes_read = body.len();
@@ -1015,6 +1121,7 @@ fn try_compile_aura1_to_aura0_direct_profiled(
             plan,
             Some(&mut column_stats),
         )?,
+        Aura0EncoderPath::ColumnFree => unreachable!("column-free path returns before columns"),
     };
     let body_assembly_start = Instant::now();
     let aura0_body = encode_generic_i64_rows_body(&encoded)?;

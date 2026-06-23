@@ -121,3 +121,31 @@ outputs without materializing CanonicalRecord objects.
 Compiled output is deterministic for the current tested i64 paths when the same
 footer program, encoder path, and guard mode are selected. Direct and
 materialized `.aura1 -> .aura0` outputs are tested for byte equality on fixtures.
+
+## Current Default Recommendations
+
+These defaults are benchmark recommendations for the current implementation,
+not a claim that the format has reached its final speed limit.
+
+- `.aura0 -> .aura1`: use the compiled/profiled materialized decode path
+  (`--transcode-path auto --decode-path materialized`) for production bytes.
+  The cursor decode path removes stream-vector materialization on supported
+  plans, but fresh grimoire huff/nohuff runs were slower, so it remains
+  experimental.
+- `.aura1 -> .aura0`: use the direct fixed-row scanner with the materialized
+  encoder (`--transcode-path direct --encoder-path materialized`) as the current
+  default candidate. It avoids `Vec<Vec<i64>>` row materialization, uses
+  `CompiledAuraPlan`, and was faster than the full materialized fallback. The
+  direct-streams encoder remains behind a flag because fresh huff/nohuff
+  results were mixed.
+- `.aura1` replay: use `aura1-scan-fixed` or the fixed replay visitor.
+  `aura1-parse-to-rows` is a materialization benchmark, not the replay default.
+- Guard mode: use `no_guard` for production timing. Use strict guard modes only
+  for verification/integrity runs and compare them only with other strict runs.
+- Canonical hash: keep `--canonical-hash-mode none` by default and enable
+  `verify` only for correctness checks.
+
+The fair product benchmark currently shows `.aura0 -> .aura1` bytes losing to
+`.aura1.zst -> .aura1` bytes on the grimoire huff/nohuff artifacts. Until that
+is reversed, AURA0 should not be documented as faster than zstd for the cold
+decode-to-Aura1 product path.

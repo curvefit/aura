@@ -14,6 +14,20 @@ return an error instead of falling back silently.
 Current fast benchmark paths are i64-oriented. Typed wide values can round-trip
 through `.aura`, but compiled i64 paths reject schemas with wide fields.
 
+## Default Path Matrix
+
+| Role | Current default candidate | Reference/experimental alternatives |
+| --- | --- | --- |
+| `.aura0 -> .aura1` | `--transcode-path auto --decode-path materialized` | `--decode-path cursor` is correct on huff/nohuff but slower; keep behind flag |
+| `.aura1 -> .aura0` | `--transcode-path direct --encoder-path materialized` | materialized fallback is reference-only; `direct-streams` is mixed; `column-free` is a diagnostic rejection |
+| `.aura1` replay | `aura1-scan-fixed` / fixed replay visitor | `aura1-parse-to-rows` materializes rows for comparison only |
+| guard mode | `no_guard` | strict modes for verification only |
+| canonical hash | `none` | `verify` for correctness checks |
+
+The default candidates are conservative. They are chosen from current test and
+benchmark evidence, not from an assertion that remaining materialization is
+unavoidable.
+
 ## Guard Modes
 
 Default performance benchmarks use `no_guard` unless a strict mode is requested.
@@ -29,9 +43,21 @@ Do not compare guarded and unguarded runs as speedups.
 
 ## Experimental Paths
 
-`--transcode-path direct` and `--encoder-path direct-streams` are benchmarkable
-direct paths. They are not yet unconditional defaults because wider fixture
-coverage and remaining materialization decisions are still open.
+`--transcode-path direct`, `--decode-path cursor`,
+`--encoder-path direct-streams`, and `--encoder-path column-free` are
+benchmarkable or diagnostic direct-path selectors. They are not all
+unconditional defaults because wider fixture coverage and remaining
+materialization decisions are still open.
+
+`--decode-path cursor` currently removes Aura0 stream-vector materialization for
+supported `.aura0 -> .aura1` plans, but measured grimoire runs were slower than
+the materialized/profiled path. Treat it as experimental evidence, not the
+production default.
+
+`--encoder-path column-free` is currently rejected with a specific error. The
+existing `.aura1 -> .aura0` encoder decodes Aura1 into per-field column buffers
+before dictionary/Huffman stream construction, so a real column-free path needs
+a new row/replay emitter or two-pass stream builder.
 
 Materialized transcode paths remain reference/correctness fallbacks. They may
 emit `compiled_plan_used=false` and `conversion_plan_hash=null`; this is
@@ -44,3 +70,13 @@ path evidence.
 It is off by default for transcodes and zstd baselines because it adds extra
 work. Parse/decode operations still emit canonical hashes by default for
 continuity with existing benchmark output.
+
+## Generated Fixture Coverage
+
+`aura-fixture-gen` produces current-format tiny, dense/few-symbol,
+sparse/many-symbol, nohuff, and larger fixture pairs plus `.aura1.zst`
+baselines. The generated `huff` entry is intentionally blocked rather than
+silently mislabeled: the current public writer/planner did not select a
+`HuffmanDictionary` stream for generated rows under the 2x Huffman speed gate.
+Use the external `grimoire-50mb-huff` artifact for Huffman-heavy benchmarking
+until a repo-native Huffman fixture generator or fixture blob is added.
