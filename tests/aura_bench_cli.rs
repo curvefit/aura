@@ -1085,6 +1085,59 @@ fn aura_bench_reports_fair_aura0_vs_zstd_bytes_benchmarks() {
 }
 
 #[test]
+fn aura_bench_applies_decode_path_to_fair_aura0_bytes() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
+        panic!("missing aura-bench binary");
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "aura-bench-fair-decode-path-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let (aura0, aura1) = partitioned_sparse_fixture_profiles();
+    let aura0_path = dir.join("fixture.aura0");
+    let aura1_path = dir.join("fixture.aura1");
+    fs::write(&aura0_path, aura0).unwrap();
+    fs::write(&aura1_path, aura1).unwrap();
+
+    let output = Command::new(bin)
+        .arg("--operation")
+        .arg("aura0-to-aura1-bytes")
+        .arg("--dataset")
+        .arg("unit-fixture")
+        .arg("--input")
+        .arg(&aura0_path)
+        .arg("--reference-aura0")
+        .arg(&aura0_path)
+        .arg("--reference-aura1")
+        .arg(&aura1_path)
+        .arg("--decode-path")
+        .arg("cursor")
+        .arg("--iterations")
+        .arg("1")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!("cursor", json["decode_path_requested"]);
+    assert_eq!("cursor", json["decode_path"]);
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn aura_bench_reports_real_aura0_byte_lane_profile() {
     let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
         panic!("missing aura-bench binary");

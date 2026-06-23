@@ -14,9 +14,10 @@ use crate::generic_planner::{
     try_decode_generic_i64_columns_body, try_encode_generic_i64_aura1_body,
     try_encode_generic_i64_aura1_body_streaming, try_write_generic_i64_aura1_body,
     try_write_generic_i64_aura1_body_from_streams_profiled,
-    try_write_generic_i64_aura1_body_guarded, try_write_partitioned_sparse_i64_aura1_body_profiled,
-    DirectAura1DecodeStats, DirectAura1DecodeTimings, DirectAura1WriterStats,
-    DirectAura1WriterTimings, GenericColumnEncodeStats,
+    try_write_generic_i64_aura1_body_guarded, try_write_generic_i64_aura1_body_streaming,
+    try_write_partitioned_sparse_i64_aura1_body_profiled, DirectAura1DecodeStats,
+    DirectAura1DecodeTimings, DirectAura1WriterStats, DirectAura1WriterTimings,
+    GenericColumnEncodeStats,
 };
 use crate::header::{AuraHeader, LEGACY_HEADER_PREFIX_SIZE};
 use crate::instructions::GenericInstructionPlan;
@@ -1132,24 +1133,25 @@ fn try_compile_aura0_to_aura1_fast_profiled(
     let body_start = out.len();
     let writer_supported = if decode_path == Aura0DecodePath::Cursor {
         let cursor_start = Instant::now();
-        let body = try_encode_generic_i64_aura1_body_streaming(
+        let body_start_len = out.len();
+        let writer_supported = try_write_generic_i64_aura1_body_streaming(
             plan.clone(),
             &bytes[header_len..footer_start],
             record_count,
             field_count,
             &aura1_plan,
+            &mut out,
         )?;
         let cursor_ns = cursor_start.elapsed().as_nanos();
-        let Some(body) = body else {
+        if !writer_supported {
             return Ok(None);
-        };
-        let body_len = body.len();
+        }
+        let body_len = out.len().saturating_sub(body_start_len);
         timings.decode_input_streams.total_ns = 0;
         timings.decode_input_streams.close_sum();
         timings.partitioned_sparse_writer.total_ns = cursor_ns;
         timings.partitioned_sparse_writer.output_byte_stores_ns = cursor_ns;
         timings.partitioned_sparse_writer.close_sum();
-        out.extend_from_slice(&body);
         stats.decode.stream_count = plan.streams.len();
         stats.decode.stream_value_count =
             stream_value_count_from_body(&bytes[header_len..footer_start])?;
@@ -1160,9 +1162,9 @@ fn try_compile_aura0_to_aura1_fast_profiled(
         stats.writer.records_per_partition_max = record_count;
         stats.writer.output_slices = 1;
         stats.writer.non_contiguous_writes = 1;
-        stats.writer.temporary_buffer_bytes = body_len;
-        stats.writer.copied_bytes = body_len;
-        stats.writer.allocation_count = 1;
+        stats.writer.temporary_buffer_bytes = 0;
+        stats.writer.copied_bytes = 0;
+        stats.writer.allocation_count = 0;
         if guard_mode == OutputGuardMode::FusedOutputGuard {
             let guard_start = Instant::now();
             guard.update(&out[body_start..]);

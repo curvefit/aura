@@ -1577,6 +1577,7 @@ fn run_operation(
         | Operation::Aura0ByteLaneToAura1BytesVerify => fair_aura1_bytes_operation(
             operation,
             bytes,
+            decode_path,
             fair_context.context("missing fair bytes context")?,
         ),
         Operation::TranscodeAura1ToAura0 => transcode(
@@ -2114,6 +2115,7 @@ fn aura1_parse_to_rows(bytes: &[u8], canonical_hash_mode: CanonicalHashMode) -> 
 fn fair_aura1_bytes_operation(
     operation: Operation,
     bytes: &[u8],
+    decode_path: Aura0DecodePath,
     context: &FairBytesContext,
 ) -> Result<RunOutcome> {
     let verify = operation.is_fair_verify();
@@ -2150,7 +2152,7 @@ fn fair_aura1_bytes_operation(
                 guard_mode,
                 TranscodePath::Auto,
                 Aura0EncoderPath::Materialized,
-                Aura0DecodePath::Materialized,
+                decode_path,
             )?
             .context("Aura0 byte lane profile did not decode through production Aura0 reader")?;
             conversion_plan_hash = profiled.conversion_plan_hash;
@@ -2166,7 +2168,7 @@ fn fair_aura1_bytes_operation(
         OutputGuardMode::NoGuard,
         TranscodePath::Auto,
         Aura0EncoderPath::Materialized,
-        Aura0DecodePath::Materialized,
+        decode_path,
     )? {
         conversion_plan_hash = profiled.conversion_plan_hash;
         compiled_plan_used = conversion_plan_hash.is_some();

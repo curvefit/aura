@@ -5,6 +5,10 @@ byte expansion for both `grimoire-50mb-huff` and `grimoire-50mb-nohuff`, or
 prove the semantic layout needs a format-level speed lane and implement the
 smallest working prototype that wins.
 
+Current correction: the byte-lane/LZ4 work is not an acceptable answer for the
+compact semantic target. The active target is compact semantic `.aura0 -> .aura1`
+bytes only. Byte lanes remain controls.
+
 Each experiment must record:
 
 - hypothesis
@@ -35,6 +39,231 @@ Each experiment must record:
 - result: clean branch `final-format-resolution` at `4dafd917411fbdd6885f2b6756f46ba434f15d70`; tests and release build passed.
 - keep/reject decision: keep baseline.
 - next implication: proceed with benchmark truth, speed-limit probes, and speed-lane prototype work.
+
+## Compact Experiment C0: Research and Experiment Ranking
+
+- hypothesis: Compact Aura0 loses because it reconstructs semantic fields while
+  zstd inflates already-formed Aura1 bytes; the next patches must remove
+  interpretation/materialization from the compact path.
+- prior-art basis: DBN fixed-width/zero-copy design; zstd frame/block byte
+  inflation; Stream VByte and BP128-style integer decode research.
+- file/function targeted: research only; no production code.
+- expected speedup: none directly; constrains experiments.
+- patch summary: added `docs/research/compact_aura0_decode_research.md`.
+- commands run:
+  - `git status --short --branch`
+  - `git rev-parse HEAD`
+  - `git diff --stat`
+  - `git diff --check`
+  - `cargo test`
+  - `cargo build --release --bin aura-bench`
+- benchmark JSON paths: none.
+- result: ranked compact-only experiments created.
+- keep/reject decision: keep.
+- next implication: run fresh compact materialized/cursor/zstd baseline, then
+  patch the largest measured compact bottleneck.
+
+## Compact Experiment C1: Fresh compact baseline and cursor wiring
+
+- hypothesis: The existing `--decode-path cursor` flag was not measuring the
+  cursor path for fair compact byte-output benchmarks.
+- prior-art basis: the dataflow archaeology found the fair operation hard-coded
+  `Aura0DecodePath::Materialized`.
+- file/function targeted:
+  - `src/bin/aura_bench.rs::fair_aura1_bytes_operation`
+  - `tests/aura_bench_cli.rs::aura_bench_applies_decode_path_to_fair_aura0_bytes`
+- expected speedup: none by itself; makes cursor experiments measurable.
+- patch summary: pass `decode_path` from `run_operation` into the fair byte
+  operation and add a CLI regression test for path plumbing.
+- commands run:
+  - `cargo test --test aura_bench_cli aura_bench_applies_decode_path_to_fair_aura0_bytes -- --nocapture`
+  - `cargo build --release --bin aura-bench`
+  - fresh huff/nohuff materialized/cursor/zstd benchmark commands under the JSON paths below.
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/huff_materialized.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/huff_cursor_after_wiring_probe.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/huff_zstd_l3.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/nohuff_materialized.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/nohuff_cursor.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/nohuff_zstd_l3.json`
+- result: cursor now activates on huff (`direct_cursor_stream_count=12`) but is
+  much slower before writer specialization: huff cursor 176.782 ms vs
+  materialized 81.811 ms and zstd L3 62.313 ms.
+- keep/reject decision: keep harness fix; reject current cursor as default.
+- next implication: optimize cursor writer internals, not benchmark plumbing.
+
+## Compact Experiment C2: Cursor fixed-row writer and direct final output
+
+- hypothesis: Existing cursor mode is slow because it pushes fields generically
+  into a temporary body and copies that body into the final Aura1 file.
+- prior-art basis: DBN/fixed-width lesson: common replay rows should use
+  predictable fixed stores.
+- file/function targeted:
+  - `src/generic_planner.rs::try_encode_generic_i64_aura1_body_streaming`
+  - `src/records.rs::try_compile_aura0_to_aura1_fast_profiled`
+- expected speedup: remove most of the cursor writer gap and eliminate 36.4 MB
+  temp/copy from cursor mode.
+- patch summary: add a cursor writer variant that appends to caller-owned output
+  and use the existing fixed 46-byte row store when the plan matches the
+  partitioned sparse Aura1 layout.
+- commands run:
+  - `cargo test --test aura_bench_cli aura_bench_applies_decode_path_to_fair_aura0_bytes -- --nocapture`
+  - `cargo build --release --bin aura-bench`
+  - huff/nohuff cursor benchmarks below.
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/huff_cursor_fixedrow.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/huff_cursor_directout.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/nohuff_cursor_fixedrow.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/nohuff_cursor_directout.json`
+- result: cursor improved but still loses. Huff cursor: 176.782 -> 132.718
+  fixed-row -> 128.901 direct-output, still slower than 81.811 materialized.
+  Nohuff cursor direct-output: 115.964 ms, still slower than 110.089
+  materialized and far slower than 61.636 zstd L3. Direct-output counters show
+  `temporary_buffer_bytes=0` and `copied_bytes=0`.
+- keep/reject decision: keep behind `--decode-path cursor` only; reject as
+  default compact path.
+- next implication: materialized writer/source path is still the best default.
+
+## Compact Experiment C3: Zero-fill elimination in materialized writers
+
+- hypothesis: materialized writer spends about 20 ms zero-filling the Aura1 body
+  before every byte is overwritten.
+- prior-art basis: fixed-width replay target should avoid redundant passes over
+  output bytes.
+- file/function targeted:
+  - `src/generic_planner.rs::try_write_partitioned_sparse_i64_aura1_body_inner`
+  - `src/generic_planner.rs::try_write_generic_i64_aura1_body_from_streams_inner`
+- expected speedup: 10-20 ms if zero-fill is a real separate pass.
+- patch summary: temporarily replaced fixed-row `resize(..., 0)` with
+  `reserve` + `set_len` after proving each fixed row is overwritten.
+- commands run:
+  - `cargo test --test writer_reader_api aura0_to_aura1_default_fast_path_matches_column_fallback -- --nocapture`
+  - `cargo test --test writer_reader_api aura0_to_aura1_fused_output_guard_matches_full_scan -- --nocapture`
+  - huff/nohuff materialized benchmarks below.
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/huff_materialized_nozerofill_both.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/nohuff_materialized_nozerofill_both.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/huff_materialized_nozerofill_verify.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/nohuff_materialized_nozerofill_verify.json`
+- result: correctness passed and verify output equality was true, but performance
+  was mixed. Huff 81.811 -> 80.082 ms with p95 83.222 -> 95.169 ms. Nohuff
+  110.089 -> 104.263 ms with p95 117.403 -> 121.806 ms.
+- keep/reject decision: rejected and reverted for default path because p95
+  regressed and median did not come close to zstd.
+- next implication: remove interpretation/source dispatch rather than only
+  output initialization.
+
+## Compact Experiment C4: Materialized streaming-config writer
+
+- hypothesis: the no-Huffman fixture loses extra time in
+  `DirectAura1SlotSource::value_at` dispatch and source construction after
+  streams are already materialized.
+- prior-art basis: DBN-style replay keeps row packing table-driven; fixed
+  layout rows should not call a generic source state machine for every field.
+- file/function targeted:
+  - `src/generic_planner.rs::try_write_generic_i64_aura1_body_from_streams_inner`
+  - `src/generic_planner.rs::try_write_streaming_config_i64_aura1_body_from_streams`
+- expected speedup: 15-25 ms on no-Huffman by avoiding generic per-row source
+  dispatch and source vector setup.
+- patch summary: added a conservative materialized-stream writer using
+  `StreamingAura1Config`; it fetches stream slices once, walks partition/event
+  runs directly, and falls back for unsupported footer plans.
+- commands run:
+  - `cargo check`
+  - `cargo build --release --bin aura-bench`
+  - `target/release/aura-bench --operation aura0-to-aura1-bytes ... --decode-path materialized`
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/nohuff_materialized_streaming_fastwriter_repeat.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/huff_materialized_streaming_fastwriter_repeat.json`
+- result: no-Huffman improved from 110.089 ms to 80.625 ms in the best repeat;
+  writer stage dropped from 72.452 ms to 49.425 ms. Huff did not use this
+  path and remained in the same range.
+- keep/reject decision: keep as a compact semantic optimization.
+- next implication: output zero-fill remains visible inside writer timing.
+
+## Compact Experiment C5: Exact-slot writer specialization
+
+- hypothesis: specializing the C4 writer to the exact 8-slot grimoire layout
+  would beat the generic `StreamingAura1Config` slot loops.
+- prior-art basis: fixed-width replay benefits from hardcoded row-store recipes
+  once schema compatibility is proven.
+- file/function targeted:
+  - `src/generic_planner.rs::try_write_exact_streaming_partitioned_sparse_i64_aura1_body_from_streams`
+- expected speedup: 3-8 ms writer-stage reduction.
+- patch summary: temporarily added an exact-slot writer for group slots 0-2,
+  partition slot 3, segmented slot 4, sparse slots 5-6, and presence-value
+  slot 7.
+- commands run:
+  - `cargo check`
+  - `cargo test --test writer_reader_api aura0_to_aura1_default_fast_path_matches_column_fallback -- --nocapture`
+  - `cargo build --release --bin aura-bench`
+  - huff/no-Huffman production benchmarks below.
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/nohuff_materialized_exactslot_writer.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/huff_materialized_exactslot_writer.json`
+- result: no-Huffman exact-slot writer was 88.831 ms, slower than the C4
+  repeat at 80.625 ms, with no meaningful writer-stage improvement.
+- keep/reject decision: rejected and removed.
+- next implication: C4 dispatch was not the remaining hard floor.
+
+## Compact Experiment C6: Raw append without zero-fill
+
+- hypothesis: the fixed-row writers spend about 20 ms zero-filling 36.4 MB of
+  Aura1 body bytes before overwriting every byte.
+- prior-art basis: fixed-width decoders should write each output byte once in
+  production mode; verification scans must be explicit, not hidden in the
+  allocation path.
+- file/function targeted:
+  - `src/generic_planner.rs::try_write_partitioned_sparse_i64_aura1_body_inner`
+  - `src/generic_planner.rs::try_write_streaming_config_i64_aura1_body_from_streams`
+  - `src/generic_planner.rs::write_partitioned_sparse_aura1_row_ptr`
+- expected speedup: remove most of the 20-21 ms allocation/zero-fill stage.
+- patch summary: for no-guard production writes, reserve the body capacity,
+  write fixed rows through raw pointers while `Vec::len` is unchanged, and
+  call `set_len` only after the body validates. Guarded modes keep the safe
+  resized buffer path.
+- commands run:
+  - `cargo check`
+  - `cargo test --test writer_reader_api aura0_to_aura1_default_fast_path_matches_column_fallback -- --nocapture`
+  - `cargo test --test writer_reader_api aura0_to_aura1_fused_output_guard_matches_full_scan -- --nocapture`
+  - `cargo build --release --bin aura-bench`
+  - huff/no-Huffman production benchmarks below.
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/huff_materialized_nozerofill_rawappend.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/nohuff_materialized_nozerofill_rawappend.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/final_huff_compact_optimized_verify.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/final_nohuff_compact_optimized_verify.json`
+- result: allocation timing dropped to 0.000 ms. Best huff optimized sample was
+  75.251 ms vs 81.811 ms baseline; best no-Huffman optimized sample was
+  79.386 ms vs 110.089 ms baseline. Verify-mode output bytes were equal with
+  hashes `12194870092346231300` and `10372430540135078667`.
+- keep/reject decision: keep for no-guard compact production writes.
+- next implication: remaining time is semantic stream decode plus row
+  reconstruction/writes, not hidden output zero-fill.
+
+## Compact Experiment C7: Remove per-row offset/slice construction
+
+- hypothesis: after C6, no-guard row writes still paid checked offset and slice
+  construction before using the raw pointer writer.
+- prior-art basis: fixed-row output range can be validated once per block.
+- file/function targeted:
+  - `src/generic_planner.rs::try_write_partitioned_sparse_i64_aura1_body_inner`
+  - `src/generic_planner.rs::try_write_streaming_config_i64_aura1_body_from_streams`
+- expected speedup: 1-3 ms writer-stage reduction.
+- patch summary: temporarily moved no-guard pointer writes ahead of safe slice
+  construction.
+- commands run:
+  - `cargo check`
+  - `cargo build --release --bin aura-bench`
+  - huff/no-Huffman production benchmarks below.
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/huff_materialized_rawappend_nooffset.json`
+  - `/tmp/aura-benchmarks/compact-semantic-20260623T044831Z/nohuff_materialized_rawappend_nooffset.json`
+- result: huff slowed to 76.000 ms from C6's 75.251 ms; no-Huffman slowed to
+  82.814 ms from C6's 79.386 ms.
+- keep/reject decision: rejected and reverted.
+- next implication: the remaining writer cost is actual row reconstruction and
+  byte stores, not offset arithmetic.
 
 ## Experiment 1: Fair Benchmark Truth Validation
 
@@ -334,3 +563,223 @@ Each experiment must record:
   separate from strict verification.
 - next implication: final status should be `PASSED_WITH_HYBRID_PROFILE`, with
   `fast` as byte-lane-only and `compact` as smallest archival profile.
+
+## Compact Deep Experiment C8: Zstd opponent warm30 truth table
+
+- hypothesis: The compact target must be compared against fresh zstd L3
+  warm30 results with the same memory sink and no production verification.
+- prior-art basis: zstd emits already-formed bytes and avoids semantic field
+  reconstruction; benchmark noise must not decide the target.
+- file/function targeted:
+  - `src/bin/aura_bench.rs` fair zstd operations.
+- expected speedup: none; establishes opponent.
+- patch summary: no code patch.
+- commands run:
+  - `target/release/aura-bench --operation zstd-aura1-to-aura1-bytes ... --zstd-level 1`
+  - `target/release/aura-bench --operation zstd-aura1-to-aura1-bytes ... --zstd-level 3`
+  - `target/release/aura-bench --operation zstd-aura1-to-aura1-bytes ... --zstd-level 9`
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/final_huff_zstd_l1_warm30.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/final2_huff_zstd_l3_warm30.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/final_huff_zstd_l9_warm30.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/final_nohuff_zstd_l1_warm30.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/final2_nohuff_zstd_l3_warm30.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/final_nohuff_zstd_l9_warm30.json`
+- result: zstd L3 target was 62.988 ms huff and 62.366 ms nohuff. Zstd L9
+  was faster and smaller than L3 on both fixtures.
+- keep/reject decision: keep as opponent evidence.
+- next implication: compact Aura0 must beat roughly 63 ms on both datasets to
+  pass the stated L3 target.
+
+## Compact Deep Experiment C9: Prechecked fixed-row stores
+
+- hypothesis: fixed-row stores spend avoidable time narrowing i64 values inside
+  every row write.
+- prior-art basis: DBN-style fixed-width replay should validate transforms once
+  near the source and write stable field widths directly.
+- file/function targeted:
+  - `src/generic_planner.rs::write_partitioned_sparse_aura1_row_ptr`
+  - `src/generic_planner.rs::try_write_partitioned_sparse_i64_aura1_body_inner`
+- expected speedup: 2-5 ms writer-stage reduction.
+- patch summary: added `write_partitioned_sparse_aura1_row_ptr_prechecked`
+  and preconverted `i32`/`i8` row values before the raw pointer store in the
+  fixed Aura1 layout path.
+- commands run:
+  - `cargo build --release --bin aura-bench`
+  - huff/nohuff compact production benchmarks below.
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/huff_prechecked_row_store.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/nohuff_prechecked_row_store.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/huff_prechecked_row_store_repeat.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/nohuff_prechecked_row_store_repeat.json`
+- result: huff improved to 62.560-63.611 ms in repeat samples; nohuff improved
+  to 80.024-81.100 ms but still lost to zstd.
+- keep/reject decision: keep.
+- next implication: row store conversions were avoidable but not the full gap.
+
+## Compact Deep Experiment C10: Dense partition base map
+
+- hypothesis: per-run partition base lookup should be dense table lookup, not
+  binary search or linear lookup, because the fixed Aura1 partition field is i8.
+- prior-art basis: footer/plan decode should turn stream IDs and small-domain
+  keys into direct lookup tables before hot loops.
+- file/function targeted:
+  - `src/generic_planner.rs::try_write_partitioned_sparse_i64_aura1_body_inner`
+  - `src/generic_planner.rs::try_write_streaming_config_i64_aura1_body_from_streams`
+- expected speedup: 1-3 ms on huff and reduce no-Huffman writer overhead.
+- patch summary: added dense `[Option<i64>; 256]` partition base tables for
+  i8 partition-key paths while preserving fallback linear lookup for generic
+  non-i8 shapes.
+- commands run:
+  - `cargo build --release --bin aura-bench`
+  - huff/nohuff compact production benchmarks below.
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/huff_dense_base_map.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/nohuff_dense_base_map.json`
+- result: huff sample improved to 60.857 ms and nohuff to 76.116 ms, but later
+  warm30 showed the stable kept path still loses to zstd L3.
+- keep/reject decision: keep dense map where type-compatible.
+- next implication: single-run pass is not enough; warm30 must decide.
+
+## Compact Deep Experiment C11: Cursor-direct recheck
+
+- hypothesis: after writer improvements, cursor-direct might become viable by
+  removing full stream vector materialization.
+- prior-art basis: direct cursor-to-row execution should avoid full-file
+  stream `Vec<i64>` materialization.
+- file/function targeted:
+  - existing `--decode-path cursor` route in `src/records.rs` and
+    `src/generic_planner.rs`.
+- expected speedup: remove materialized stream vectors.
+- patch summary: no new patch; rebenchmarked existing cursor path.
+- commands run:
+  - `target/release/aura-bench --operation aura0-to-aura1-bytes ... --decode-path cursor`
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/huff_cursor_dense_base.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/nohuff_cursor_dense_base.json`
+- result: huff cursor was 122.180 ms and nohuff cursor was 104.923 ms despite
+  `direct_cursor_stream_count=12` and zero materialized streams.
+- keep/reject decision: reject as default; keep behind flag for experiments.
+- next implication: eliminating materialization in the current cursor executor
+  is not enough because cursor row execution is slower.
+
+## Compact Deep Experiment C12: Pointer-advance row loop
+
+- hypothesis: advancing a row pointer linearly avoids repeated
+  `row * ROW_WIDTH` address calculations.
+- prior-art basis: fixed-width scans commonly advance pointers rather than
+  recomputing offsets.
+- file/function targeted:
+  - `src/generic_planner.rs` no-guard fixed row loops.
+- expected speedup: 0.5-2 ms.
+- patch summary: temporary pointer-advance row loop.
+- commands run:
+  - `cargo build --release --bin aura-bench`
+  - huff/nohuff compact production benchmarks below.
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/huff_pointer_advance.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/nohuff_pointer_advance.json`
+- result: huff slowed to 68.154 ms and nohuff slowed to 87.763 ms.
+- keep/reject decision: reverted.
+- next implication: the compiler already handles the indexed pointer pattern
+  well enough; this is not the bottleneck.
+
+## Compact Deep Experiment C13: Exact no-Huffman streaming writer
+
+- hypothesis: no-Huffman loses because the materialized streaming writer still
+  executes generic slot loops despite the fixture's fixed 8-field layout.
+- prior-art basis: generated writer recipes should execute direct field writes
+  when schema, slots, and guard mode match.
+- file/function targeted:
+  - `src/generic_planner.rs::try_write_streaming_config_i64_aura1_body_from_streams`
+- expected speedup: close most of no-Huffman's writer gap.
+- patch summary: added an exact no-guard/no-Huffman branch for group slots
+  0-2, partition slot 3, segmented slot 4, sparse slots 5-6, and presence
+  value slot 7.
+- commands run:
+  - `cargo build --release --bin aura-bench`
+  - huff/nohuff compact production benchmarks below.
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/huff_exact_streaming_branch.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/nohuff_exact_streaming_branch.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/huff_exact_nohuff_gate.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/nohuff_exact_nohuff_gate.json`
+- result: ungated exact branch hurt huff but helped nohuff. Gating it to
+  non-Huffman plans produced a 65.830 ms nohuff sample.
+- keep/reject decision: keep only behind the no-Huffman/shape guard.
+- next implication: specialized row recipes help, but not enough for a stable
+  target pass.
+
+## Compact Deep Experiment C14: Delta accumulator codec rewrite
+
+- hypothesis: `values.last()` inside delta decode loops is extra work that can
+  be replaced by a local accumulator.
+- prior-art basis: integer decode loops should keep prefix-sum state in a
+  scalar register.
+- file/function targeted:
+  - `src/body.rs` previous-delta and previous-varint decode loops.
+- expected speedup: reduce decode stage by 1-3 ms.
+- patch summary: temporary accumulator rewrite.
+- commands run:
+  - `cargo build --release --bin aura-bench`
+  - huff/nohuff compact production benchmarks below.
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/final_huff_delta_accumulator_warm30.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/final_nohuff_delta_accumulator_warm30.json`
+- result: huff was 65.551 ms and nohuff 66.129 ms, with p95 regression versus
+  the best kept candidate.
+- keep/reject decision: reverted.
+- next implication: scalar codec micro-edits do not overcome stream-to-row
+  reconstruction costs.
+
+## Compact Deep Experiment C15: Sparse prevalidation
+
+- hypothesis: prevalidating presence masks allows unchecked sparse stream reads
+  inside the row loop.
+- prior-art basis: one block-level validation can replace repeated bounds
+  checks when stream cardinalities are known.
+- file/function targeted:
+  - `src/generic_planner.rs` no-Huffman exact writer branch.
+- expected speedup: reduce sparse branch/index overhead.
+- patch summary: temporary mask pre-scan and unchecked sparse indexing.
+- commands run:
+  - `cargo build --release --bin aura-bench`
+  - huff/nohuff compact production benchmarks below.
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/final_huff_sparse_prevalidated_warm30.json`
+  - `/tmp/aura-benchmarks/compact-research-20260623T193509Z/final_nohuff_sparse_prevalidated_warm30.json`
+- result: huff slowed to 67.576 ms and nohuff slowed to 69.963 ms.
+- keep/reject decision: reverted.
+- next implication: extra validation passes are not acceptable in production
+  timing unless they also eliminate more row work.
+
+## Compact Deep Experiment C16: Final kept compact warm30 verification
+
+- hypothesis: the kept compact-only optimizations improve the path but still
+  need a warm30 fair comparison against zstd L3.
+- prior-art basis: no speed claim is valid without before/after benchmark
+  numbers and p95.
+- file/function targeted:
+  - `src/generic_planner.rs` fixed-row compact writer.
+- expected speedup: retain huff/nohuff improvements without p95 instability.
+- patch summary: kept prechecked fixed row stores, dense partition-base maps,
+  and the gated no-Huffman exact writer; reverted pointer advance, delta
+  accumulator, and sparse prevalidation.
+- commands run:
+  - `target/release/aura-bench --operation aura0-to-aura1-bytes ...`
+  - `target/release/aura-bench --operation aura0-to-aura1-bytes-verify ...`
+  - `target/release/aura-bench --operation zstd-aura1-to-aura1-bytes ... --zstd-level 3`
+- benchmark JSON paths:
+  - `/tmp/aura-benchmarks/compact-research-final-ba3cc23/huff_compact_warm30.json`
+  - `/tmp/aura-benchmarks/compact-research-final-ba3cc23/nohuff_compact_warm30.json`
+  - `/tmp/aura-benchmarks/compact-research-final-ba3cc23/huff_compact_verify.json`
+  - `/tmp/aura-benchmarks/compact-research-final-ba3cc23/nohuff_compact_verify.json`
+  - `/tmp/aura-benchmarks/compact-research-final-ba3cc23/huff_zstd_l3_warm30.json`
+  - `/tmp/aura-benchmarks/compact-research-final-ba3cc23/nohuff_zstd_l3_warm30.json`
+- result: post-commit compact huff 64.569 ms vs zstd L3 62.425 ms; compact
+  nohuff 69.679 ms vs zstd L3 63.164 ms. Verify outputs matched Aura1
+  references.
+- keep/reject decision: keep the compact code improvements, but mark the speed
+  target failed for the current compact layout.
+- next implication: a compact v2 semantic stream layout is required for another
+  serious attempt; byte lanes are not a valid answer for this compact sprint.
