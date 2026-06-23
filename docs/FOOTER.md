@@ -45,3 +45,26 @@ bytes and identifies the conversion metadata used for a benchmark run.
 Invalid magic, unsupported version, invalid field counts, invalid field indexes,
 wide i64-incompatible schema fields, and header/schema disagreement reject before
 hot-loop decoding.
+
+## Missing Metadata For The Zstd-Speed Byte Target
+
+The current compiled footer describes semantic decode/reconstruct programs. It
+does not contain an Aura1 byte lane: compressed Aura1-compatible body slices
+with per-block offsets and validation metadata. That is why current Aura0 byte
+expansion must decode streams and rebuild rows, while `.aura1.zst` can inflate
+already-formed Aura1 bytes.
+
+A future byte-lane footer extension would need at least:
+
+```text
+byte-lane codec and level
+row range per compressed block
+uncompressed Aura1 offset and length
+compressed body offset and length
+per-block checksum or output-byte guard
+optional codec dictionary id
+compatibility flag: acceleration cache vs authoritative payload
+```
+
+Until those fields exist and are tested, AURA0 should not claim zstd-beating
+decode-to-Aura1 byte speed for the fair product target.

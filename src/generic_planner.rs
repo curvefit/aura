@@ -1627,6 +1627,31 @@ pub(crate) fn try_write_generic_i64_aura1_body_guarded(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_write_generic_i64_aura1_body_from_streams_profiled(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+    output_guard: Option<&mut ByteGuard>,
+    timings: &mut DirectAura1WriterTimings,
+    stats: &mut DirectAura1WriterStats,
+) -> Result<bool> {
+    try_write_generic_i64_aura1_body_from_streams_inner(
+        plan,
+        stream_values,
+        record_count,
+        field_count,
+        aura1_plan,
+        out,
+        output_guard,
+        Some(timings),
+        Some(stats),
+    )
+}
+
 fn try_write_generic_i64_aura1_body_inner(
     plan: GenericInstructionPlan,
     bytes: &[u8],
@@ -1682,42 +1707,101 @@ fn try_write_generic_i64_aura1_body_inner(
         return Ok(true);
     }
 
-    let stage_start = profile.then(Instant::now);
+    try_write_generic_i64_aura1_body_from_streams_inner(
+        &plan,
+        &stream_values,
+        record_count,
+        field_count,
+        aura1_plan,
+        out,
+        output_guard.as_deref_mut(),
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_write_generic_i64_aura1_body_from_streams_inner(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+    mut output_guard: Option<&mut ByteGuard>,
+    mut timings: Option<&mut DirectAura1WriterTimings>,
+    mut stats: Option<&mut DirectAura1WriterStats>,
+) -> Result<bool> {
+    let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
+    let total_start = Instant::now();
+    let measure_stages = profile || timings.is_some();
+
+    let stage_start = measure_stages.then(Instant::now);
     let partition_runs =
-        partition_run_lengths_from_streams(&plan, &stream_values, record_count, field_count)?;
-    if let Some(stage_start) = stage_start {
+        partition_run_lengths_from_streams(plan, stream_values, record_count, field_count)?;
+    let partition_runs_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or_else(|| total_start.elapsed().as_nanos());
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.sparse_partition_traversal_ns = timings
+            .sparse_partition_traversal_ns
+            .saturating_add(partition_runs_ns);
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 partition_runs_us={}",
             stage_start.elapsed().as_micros()
         );
     }
 
-    let stage_start = profile.then(Instant::now);
-    let presence_maps = presence_maps_by_group(&plan, &stream_values, record_count)?;
-    if let Some(stage_start) = stage_start {
+    let stage_start = measure_stages.then(Instant::now);
+    let presence_maps = presence_maps_by_group(plan, stream_values, record_count)?;
+    let presence_maps_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.branch_record_type_handling_ns = timings
+            .branch_record_type_handling_ns
+            .saturating_add(presence_maps_ns);
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 presence_maps_us={}",
             stage_start.elapsed().as_micros()
         );
     }
 
-    let stage_start = profile.then(Instant::now);
+    let stage_start = measure_stages.then(Instant::now);
     let mut sources = direct_aura1_slot_sources(
-        &plan,
-        &stream_values,
+        plan,
+        stream_values,
         &partition_runs,
         &presence_maps,
         record_count,
         field_count,
     )?;
-    if let Some(stage_start) = stage_start {
+    let sources_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.buffer_slicing_view_creation_ns = timings
+            .buffer_slicing_view_creation_ns
+            .saturating_add(sources_ns);
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 sources_us={}",
             stage_start.elapsed().as_micros()
         );
     }
 
-    let stage_start = profile.then(Instant::now);
+    let stage_start = measure_stages.then(Instant::now);
     let mut field_specs = Vec::with_capacity(aura1_plan.fields.len());
     let mut row_width = 0usize;
     for field_plan in &aura1_plan.fields {
@@ -1733,7 +1817,17 @@ fn try_write_generic_i64_aura1_body_inner(
             .ok_or(AuraError::InvalidValue("body length"))?;
         field_specs.push((slot, field_plan.width));
     }
-    if let Some(stage_start) = stage_start {
+    let field_specs_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.field_reconstruction_packing_ns = timings
+            .field_reconstruction_packing_ns
+            .saturating_add(field_specs_ns);
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 field_specs_us={} row_width={} fields={}",
             stage_start.elapsed().as_micros(),
@@ -1742,13 +1836,35 @@ fn try_write_generic_i64_aura1_body_inner(
         );
     }
 
-    let stage_start = profile.then(Instant::now);
-    out.reserve(
-        record_count
-            .checked_mul(row_width)
-            .ok_or(AuraError::InvalidValue("body length"))?,
-    );
-    if let Some(stage_start) = stage_start {
+    let stage_start = measure_stages.then(Instant::now);
+    let body_len = record_count
+        .checked_mul(row_width)
+        .ok_or(AuraError::InvalidValue("body length"))?;
+    let body_start = out.len();
+    if is_partitioned_sparse_aura1_plan(aura1_plan) && field_count == 8 {
+        for source in sources.iter().take(8) {
+            if !source.is_supported() {
+                return Ok(false);
+            }
+        }
+        out.resize(
+            body_start
+                .checked_add(body_len)
+                .ok_or(AuraError::InvalidValue("body length"))?,
+            0,
+        );
+    } else {
+        out.reserve(body_len);
+    }
+    let allocation_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.allocation_reuse_ns = timings.allocation_reuse_ns.saturating_add(allocation_ns);
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 reserve_us={} reserved_body_bytes={}",
             stage_start.elapsed().as_micros(),
@@ -1756,18 +1872,54 @@ fn try_write_generic_i64_aura1_body_inner(
         );
     }
 
-    let stage_start = profile.then(Instant::now);
-    for row_index in 0..record_count {
-        for (slot, width) in &field_specs {
-            let value = sources[*slot].value_at(row_index)?;
+    let stage_start = measure_stages.then(Instant::now);
+    let fixed_row_writer = is_partitioned_sparse_aura1_plan(aura1_plan) && field_count == 8;
+    if fixed_row_writer {
+        const ROW_WIDTH: usize = 46;
+        for row_index in 0..record_count {
+            let offset = body_start + row_index * ROW_WIDTH;
+            let row_end = offset + ROW_WIDTH;
+            let values = [
+                sources[0].value_at(row_index)?,
+                sources[1].value_at(row_index)?,
+                sources[2].value_at(row_index)?,
+                sources[3].value_at(row_index)?,
+                sources[4].value_at(row_index)?,
+                sources[5].value_at(row_index)?,
+                sources[6].value_at(row_index)?,
+                sources[7].value_at(row_index)?,
+            ];
             if let Some(output_guard) = output_guard.as_deref_mut() {
-                write_direct_i64_width_guarded(out, value, *width, output_guard)?;
+                write_partitioned_sparse_aura1_row_guarded(
+                    &mut out[offset..row_end],
+                    values,
+                    output_guard,
+                )?;
             } else {
-                write_direct_i64_width(out, value, *width)?;
+                write_partitioned_sparse_aura1_row(&mut out[offset..row_end], values)?;
+            }
+        }
+    } else {
+        for row_index in 0..record_count {
+            for (slot, width) in &field_specs {
+                let value = sources[*slot].value_at(row_index)?;
+                if let Some(output_guard) = output_guard.as_deref_mut() {
+                    write_direct_i64_width_guarded(out, value, *width, output_guard)?;
+                } else {
+                    write_direct_i64_width(out, value, *width)?;
+                }
             }
         }
     }
-    if let Some(stage_start) = stage_start {
+    let output_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.output_byte_stores_ns = timings.output_byte_stores_ns.saturating_add(output_ns);
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 emit_rows_us={} rows={}",
             stage_start.elapsed().as_micros(),
@@ -1775,17 +1927,64 @@ fn try_write_generic_i64_aura1_body_inner(
         );
     }
 
-    let stage_start = profile.then(Instant::now);
+    let stage_start = measure_stages.then(Instant::now);
     for source in &mut sources {
         source.finish()?;
     }
-    if let Some(stage_start) = stage_start {
+    let finish_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.partition_finalization_ns =
+            timings.partition_finalization_ns.saturating_add(finish_ns);
+        timings.total_ns = total_start.elapsed().as_nanos();
+        timings.close_sum();
+    }
+    if let Some(stats) = stats.as_deref_mut() {
+        let mut run_lengths = partition_runs
+            .values()
+            .flat_map(|runs| runs.iter().map(|run| run.end.saturating_sub(run.start)));
+        let first_run_len = run_lengths.next();
+        stats.partition_count = partition_runs.values().map(Vec::len).max().unwrap_or(1);
+        stats.records_per_partition_min = first_run_len
+            .into_iter()
+            .chain(run_lengths)
+            .min()
+            .unwrap_or(record_count);
+        stats.records_per_partition_max = partition_runs
+            .values()
+            .flat_map(|runs| runs.iter().map(|run| run.end.saturating_sub(run.start)))
+            .max()
+            .unwrap_or(record_count);
+        stats.output_slices = if fixed_row_writer {
+            record_count
+        } else {
+            field_specs.len() * record_count
+        };
+        stats.non_contiguous_writes = stats.output_slices;
+        stats.output_offset_calculations = if fixed_row_writer { record_count } else { 0 };
+        stats.bounds_checks = if fixed_row_writer {
+            record_count
+        } else {
+            field_specs.len() * record_count
+        };
+        stats.temporary_buffer_bytes = 0;
+        stats.copied_bytes = body_len;
+        stats.allocation_count = stats.allocation_count.saturating_add(1);
+        if output_guard.is_some() {
+            stats.guard_update_calls = stats
+                .guard_update_calls
+                .saturating_add(field_specs.len().saturating_mul(record_count));
+            stats.guard_update_bytes = stats.guard_update_bytes.saturating_add(body_len);
+        }
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 finish_us={} total_us={}",
             stage_start.elapsed().as_micros(),
-            total_start
-                .map(|start| start.elapsed().as_micros())
-                .unwrap_or(0)
+            total_start.elapsed().as_micros()
         );
     }
     Ok(true)

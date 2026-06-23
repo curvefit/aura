@@ -1882,8 +1882,14 @@ fn fair_aura1_bytes_operation(
     };
 
     black_box(&output);
-    let output_bytes_equal = verify.then_some(output == context.aura1_bytes);
-    let output_byte_hash = verify.then_some(bytes_guard(&output));
+    let (output_bytes_equal, output_byte_hash) = if verify {
+        (
+            Some(output == context.aura1_bytes),
+            Some(bytes_guard(&output)),
+        )
+    } else {
+        (None, None)
+    };
     let compressed_input_bytes = if is_zstd {
         context.aura1_zst_bytes.len()
     } else {

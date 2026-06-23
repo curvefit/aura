@@ -348,6 +348,35 @@ fn aura0_to_aura1_cursor_decode_path_declines_unsupported_fixture() {
 }
 
 #[test]
+fn aura0_to_aura1_profiled_generic_writer_matches_reference_rows() {
+    let (aura0, aura1) = fixture_profiles();
+    let profiled = records::try_compile_i64_file_profiled(
+        &aura0,
+        Profile::Aura1,
+        records::OutputGuardMode::OldPostOutputGuard,
+        records::TranscodePath::Auto,
+        records::Aura0EncoderPath::Materialized,
+        records::Aura0DecodePath::Materialized,
+    )
+    .unwrap()
+    .expect("generic profiled aura0 to aura1 path");
+
+    assert!(profiled.conversion_plan_hash.is_some());
+    let timings = profiled
+        .timings
+        .aura0_to_aura1
+        .expect("aura0 to aura1 timings");
+    assert!(timings.total_ns > 0);
+    assert!(timings.decode_input_streams.total_ns > 0);
+    assert!(timings.partitioned_sparse_writer.total_ns > 0);
+    assert!(timings.partitioned_sparse_writer.output_byte_stores_ns > 0);
+    assert_eq!(
+        records::decode_i64_file(&aura1).unwrap().rows,
+        records::decode_i64_file(&profiled.bytes).unwrap().rows
+    );
+}
+
+#[test]
 fn aura_bench_reports_decode_path_field() {
     let Some(bin) = option_env!("CARGO_BIN_EXE_aura-bench") else {
         panic!("missing aura-bench binary");

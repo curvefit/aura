@@ -13,6 +13,7 @@ use crate::generic_planner::{
     encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan, plan_generic_i64_rows,
     try_decode_generic_i64_columns_body, try_encode_generic_i64_aura1_body,
     try_encode_generic_i64_aura1_body_streaming, try_write_generic_i64_aura1_body,
+    try_write_generic_i64_aura1_body_from_streams_profiled,
     try_write_generic_i64_aura1_body_guarded, try_write_partitioned_sparse_i64_aura1_body_profiled,
     DirectAura1DecodeStats, DirectAura1DecodeTimings, DirectAura1WriterStats,
     DirectAura1WriterTimings, GenericColumnEncodeStats,
@@ -939,7 +940,7 @@ fn try_compile_aura0_to_aura1_fast_profiled(
         stats.decode.materialized_stream_count = stats.decode.stream_count;
         stats.decode.materialized_value_count = stats.decode.stream_value_count;
 
-        match guard_mode {
+        let writer_supported = match guard_mode {
             OutputGuardMode::FusedOutputGuard => {
                 try_write_partitioned_sparse_i64_aura1_body_profiled(
                     &plan,
@@ -967,6 +968,40 @@ fn try_compile_aura0_to_aura1_fast_profiled(
                     &mut timings.partitioned_sparse_writer,
                     &mut stats.writer,
                 )?
+            }
+        };
+        if writer_supported {
+            true
+        } else {
+            match guard_mode {
+                OutputGuardMode::FusedOutputGuard => {
+                    try_write_generic_i64_aura1_body_from_streams_profiled(
+                        &plan,
+                        &stream_values,
+                        record_count,
+                        field_count,
+                        &aura1_plan,
+                        &mut out,
+                        Some(&mut guard),
+                        &mut timings.partitioned_sparse_writer,
+                        &mut stats.writer,
+                    )?
+                }
+                OutputGuardMode::NoGuard
+                | OutputGuardMode::OldPostOutputGuard
+                | OutputGuardMode::BlockBatchedOutputGuard => {
+                    try_write_generic_i64_aura1_body_from_streams_profiled(
+                        &plan,
+                        &stream_values,
+                        record_count,
+                        field_count,
+                        &aura1_plan,
+                        &mut out,
+                        None,
+                        &mut timings.partitioned_sparse_writer,
+                        &mut stats.writer,
+                    )?
+                }
             }
         }
     };

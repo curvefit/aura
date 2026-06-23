@@ -129,6 +129,10 @@ not a claim that the format has reached its final speed limit.
 
 - `.aura0 -> .aura1`: use the compiled/profiled materialized decode path
   (`--transcode-path auto --decode-path materialized`) for production bytes.
+  The profiled path now uses the shared compiled plan for the specialized
+  partitioned-sparse writer and for the generic direct writer fallback. The
+  fallback covers current no-Huffman/`PartitionRuns` artifacts instead of
+  falling back to the unprofiled helper.
   The cursor decode path removes stream-vector materialization on supported
   plans, but fresh grimoire huff/nohuff runs were slower, so it remains
   experimental.
@@ -146,6 +150,20 @@ not a claim that the format has reached its final speed limit.
   `verify` only for correctness checks.
 
 The fair product benchmark currently shows `.aura0 -> .aura1` bytes losing to
-`.aura1.zst -> .aura1` bytes on the grimoire huff/nohuff artifacts. Until that
-is reversed, AURA0 should not be documented as faster than zstd for the cold
-decode-to-Aura1 product path.
+`.aura1.zst -> .aura1` bytes on the grimoire huff/nohuff artifacts:
+
+```text
+grimoire-50mb-huff:   Aura0 81.971 ms, zstd L3 62.132 ms
+grimoire-50mb-nohuff: Aura0 107.088 ms, zstd L3 61.590 ms
+```
+
+The current Aura0 stream layout is compact but requires stream decode, semantic
+field reconstruction, partition/presence handling, and fixed-row Aura1 writes.
+Whole-file zstd inflates already-formed Aura1 bytes. Until the product
+benchmark is reversed, AURA0 should be documented as a compact cold format, not
+as faster than zstd for the cold decode-to-Aura1 byte path.
+
+The next format candidate for this product target is an optional Aura1 byte
+lane in Aura0: per-block Aura1-compatible byte slices compressed with zstd or
+lz4, described in the compiled footer and used for byte-output expansion while
+the existing semantic streams remain available for canonical decode.

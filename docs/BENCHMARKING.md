@@ -82,6 +82,11 @@ variants compare output bytes against `--reference-aura1` and emit
 `dataset_sha256_aura1_zst`, compressed sizes, uncompressed Aura1 size,
 `output_bytes_equal`, and `output_byte_hash`.
 
+The fair benchmark previously overstated production time because `Option::then_some`
+eagerly evaluated output equality/hash work even when verification was disabled.
+The production path now skips equality/hash work unless a `*-verify` operation
+is selected.
+
 Materialized paths are retained as reference/correctness fallbacks. Final
 candidate path decisions should use direct/profiled paths that emit
 `compiled_plan_used=true` and a non-null `conversion_plan_hash`.
@@ -115,9 +120,22 @@ target/release/aura-bench --operation transcode-aura1-to-aura0 --transcode-path 
 Fresh resolution artifacts used for the default decision:
 
 ```text
+/tmp/aura-benchmarks/zstd-resolution-lane-5/*.json
+/tmp/aura-benchmarks/zstd-resolution-pre-fallback/*.json
 /tmp/aura-benchmarks/final-resolution-lane-a/*.json
 /tmp/aura-benchmarks/final-resolution-lane-b/*.json
 /tmp/aura-benchmarks/final-resolution-lane-c/*.json
 /tmp/aura-benchmarks/final-resolution-lane-d/*.json
 /tmp/aura-benchmarks/final-resolution-fixtures/fixtures.json
 ```
+
+Current fair Aura0-vs-zstd product scoreboard:
+
+| Dataset | Aura0 bytes | Aura1.zst L3 bytes | Aura1 bytes | Aura0 -> Aura1 ms | zstd -> Aura1 ms | Winner |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| grimoire-50mb-huff | 1,879,040 | 5,542,945 | 36,410,980 | 81.971 | 62.132 | zstd |
+| grimoire-50mb-nohuff | 2,246,910 | 5,538,275 | 36,403,133 | 107.088 | 61.590 | zstd |
+
+Use verify-mode JSON from `/tmp/aura-benchmarks/zstd-resolution-lane-4/*verify.json`
+for output equality evidence. Both Aura0 and zstd verify runs reported
+`output_bytes_equal=true` and matching output byte hashes for huff and nohuff.
