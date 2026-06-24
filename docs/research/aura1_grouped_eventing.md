@@ -18,6 +18,10 @@ with `AuraReader::open_path`/`open_file`. File-backed grouped replay uses the
 same fixed-width range-read path as `replay_i64`; it does not copy the whole
 Aura1 file into memory before detecting groups.
 
+The current Aura1 implementation compares the selected fixed-width key bytes
+directly in the hot loop. It does not allocate a typed key vector per row.
+Typed `AuraValue` keys are materialized only when a group is emitted.
+
 ## Semantics
 
 - Grouping preserves physical row order.
@@ -67,16 +71,17 @@ The benchmark JSON reports:
 
 Fresh targeted matrix:
 
-`/tmp/aura-benchmarks/aura1-parse-20260623T235910Z/targeted-results/sdk_full_matrix_summary.json`
+`/tmp/aura-benchmarks/aura1-parse-speed-final-4bada14/sdk_full_matrix_summary.json`
 
 Selected rows:
 
 | Dataset | Operation | Median ms | P95 ms | Groups | Callback Reduction | P95 Rows/Group |
 |---|---|---:|---:|---:|---:|---:|
-| `repeated-timestamp` | grouped primary | 4.916 | 5.125 | 3,125 | 32.00x | 32 |
-| `repeated-timestamp-symbol` | grouped pair | 5.207 | 5.296 | 2,084 | 47.98x | 48 |
-| `mixed-burst` | grouped primary | 7.206 | 7.761 | 28,247 | 3.54x | 16 |
-| `high-cardinality` | grouped primary | 12.253 | 12.759 | 100,000 | 1.00x | 1 |
+| `repeated-timestamp` | grouped primary file-range | 1.506 | 1.608 | 3,125 | 32.00x | 32 |
+| `repeated-symbol` | grouped symbol file-range | 1.499 | 1.703 | 3,125 | 32.00x | 32 |
+| `repeated-timestamp-symbol` | grouped pair file-range | 1.826 | 1.987 | 2,084 | 47.98x | 48 |
+| `mixed-burst` | grouped primary file-range | 3.864 | 4.616 | 28,247 | 3.54x | 16 |
+| `high-cardinality` | grouped primary file-range | 8.850 | 9.460 | 100,000 | 1.00x | 1 |
 
 Decision: keep grouped replay as an opt-in API. It helps repeated-run datasets
 and degrades predictably on high-cardinality data.

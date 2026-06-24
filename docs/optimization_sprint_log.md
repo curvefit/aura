@@ -946,3 +946,108 @@ Each experiment must record:
   replay mode.
 - next implication: no footer group index is needed for v1. Revisit a footer or
   sidecar run index only if on-the-fly group detection becomes the bottleneck.
+
+## Aura1 Parse Replay Experiment R0: Research and preflight
+
+- experiment ID: R0
+- hypothesis: replay is slower than raw scan because of row decode, callback,
+  and materialization shape, not because Aura1 lacks fixed-width metadata.
+- prior-art basis: DBN-style fixed-width replay, file-backed range reads, and
+  Arrow-style run/grouped views.
+- target file/function:
+  - `docs/research/aura1_parse_replay_research.md`
+- expected speedup: none directly; this ranks the implementation experiments.
+- patch summary: documented metadata usage, file-range vs mmap, grouped replay
+  semantics, hot-loop costs, and ranked experiments.
+- command:
+  - `git status --short`
+  - `git rev-parse HEAD`
+  - `git log --oneline -15`
+  - `git diff --stat`
+  - `git diff --check`
+  - `cargo check`
+  - `cargo check --examples`
+  - `cargo test`
+  - `cargo build --release --bin aura-bench`
+  - `cargo build --release --bin aura_sdk_bench`
+- benchmark JSON path: none for research-only setup.
+- result: preflight passed from clean `a83b607`; memo created before production
+  code changes.
+- kept/rejected: kept.
+- implication: implement byte-key grouped replay and batch callback replay next;
+  reject mmap for this sprint unless file-range evidence shows source I/O is
+  the bottleneck.
+
+## Aura1 Parse Replay Experiment R1: Byte-key grouped replay
+
+- experiment ID: R1
+- hypothesis: grouped replay is spending avoidable work allocating a typed
+  `Vec<i64>` key per row; comparing fixed-width key bytes should improve
+  repeated-run grouping and reduce key decode work to group boundaries.
+- target file/function:
+  - `src/reader.rs` `AuraReader::grouped_replay`
+  - `src/bin/aura_sdk_bench.rs` grouped replay JSON counters
+- expected speedup: 2x or better on repeated timestamp/symbol group fixtures.
+- patch summary: Aura1 grouped replay now builds plan-derived key byte recipes,
+  compares raw row key bytes in the hot loop, and materializes `AuraValue` keys
+  only when a group is emitted.
+- command:
+  - `cargo test --test sdk_api -- --nocapture`
+  - `cargo test --test aura_bench_cli -- --nocapture`
+  - `cargo build --release --bin aura_sdk_bench`
+  - `target/release/aura_sdk_bench --fixture-dir /tmp/aura-benchmarks/aura1-file-backed-fixtures-20260624T173521Z --output-dir /tmp/aura-benchmarks/aura1-parse-speed-20260624T183000Z --iterations 10 --warmups 2 --batch-size 8192 --datasets sdk-dense,sdk-sparse,sdk-larger,repeated-timestamp,repeated-symbol,repeated-timestamp-symbol,high-cardinality,mixed-burst,nohuff --operations aura1-scan-raw,aura1-scan-raw-file-range,aura1-replay-i64,aura1-replay-file-range,aura1-replay-batch-callback,aura1-replay-batch-callback-file-range,aura1-read-batches-row,aura1-read-batches-row-file-range,aura1-read-batches-columnar,aura1-read-batches-columnar-file-range,aura1-grouped-replay-primary,aura1-grouped-replay-primary-file-range,aura1-grouped-replay-symbol,aura1-grouped-replay-symbol-file-range,aura1-grouped-replay-pair,aura1-grouped-replay-pair-file-range`
+- benchmark JSON path:
+  - `/tmp/aura-benchmarks/aura1-parse-speed-20260624T183000Z/sdk_full_matrix_summary.json`
+- result: repeated timestamp primary grouping measured 1.614 ms with 32x
+  callback reduction; repeated symbol grouping measured 1.522 ms with 32x
+  callback reduction; timestamp+symbol pair grouping measured 2.012 ms with
+  47.98x reduction.
+- kept/rejected: kept.
+- next implication: no footer group index for v1; high-cardinality still
+  correctly reports 1.00x callback reduction.
+
+## Aura1 Parse Replay Experiment R2: Fixed batch callback replay
+
+- experiment ID: R2
+- hypothesis: callers that can process row ranges should avoid one callback per
+  row and avoid decoding all fields eagerly.
+- target file/function:
+  - `src/reader.rs` `AuraReader::replay_fixed_batches`
+  - `src/bin/aura_sdk_bench.rs` `aura1-replay-batch-callback*`
+- expected speedup: approach raw scan speed for callbacks that only need batch
+  metadata or selected fields.
+- patch summary: added `Aura1FixedBatchView` and `replay_fixed_batches`, then
+  benchmarked memory and file-range batch callbacks separately from per-row
+  replay.
+- command:
+  - same targeted matrix as R1.
+- benchmark JSON path:
+  - `/tmp/aura-benchmarks/aura1-parse-speed-20260624T183000Z/sdk-larger-aura1-replay-batch-callback-file-range.json`
+- result: `sdk-larger` batch-callback file-range replay measured 1.327 ms,
+  376.78M records/sec, 7.54 GB/s, and 62 visitor calls. This is not equivalent
+  to per-row replay; it is a separate lower-level API.
+- kept/rejected: kept as an opt-in API.
+- next implication: default per-row `replay_i64` remains the compatibility API;
+  batch callback should be recommended for low-latency scan/replay consumers.
+
+## Aura1 Parse Replay Experiment R3: Mmap backend decision
+
+- experiment ID: R3
+- hypothesis: mmap may not help until API/callback overhead is lower than
+  file-range copy overhead.
+- target file/function:
+  - `src/reader.rs` input backend
+- expected speedup: unknown; range-read raw scan already reaches about 7 GB/s.
+- patch summary: no mmap code added. Compared raw scan and batch-callback
+  file-range numbers to replay/materialization numbers.
+- command:
+  - targeted matrix from R1.
+- benchmark JSON path:
+  - `/tmp/aura-benchmarks/aura1-parse-speed-20260624T183000Z/sdk-larger-aura1-scan-raw-file-range.json`
+- result: file-range raw scan measured 1.414 ms for 10 MB, about 7.07 GB/s;
+  batch callback measured 1.327 ms. The bottleneck is not file-range source I/O
+  in this sprint.
+- kept/rejected: mmap rejected for this pass with evidence; keep as future
+  optional backend only after borrowed views need it.
+- next implication: optimize per-row decode/callback or expose borrowed views
+  before adding platform-specific mmap surface.

@@ -146,6 +146,21 @@ while let Some(batch) = reader.next_column_batch(8192)? {
 construction. Use row batches when callers need `AuraRecordBatch`; use column
 batches for scan/analytics-style access.
 
+For low-level fixed-width Aura1 replay, use batch callbacks:
+
+```rust
+let reader = aura_codec::AuraReader::open_path("ticks.aura1")?;
+reader.replay_fixed_batches(8192, |batch| {
+    println!("rows={} width={}", batch.row_count(), batch.record_width());
+    Ok(())
+})?;
+# Ok::<(), aura_codec::AuraError>(())
+```
+
+Batch callback replay is not the same work as `replay_i64`: it avoids a
+callback per row and lets callers pull selected fields from the fixed-width
+batch view.
+
 Aura1 grouped replay is available for consecutive runs:
 
 ```rust
@@ -161,7 +176,9 @@ let stats = reader.grouped_replay(
 
 Grouped replay is opt-in and does not change row semantics. It is most useful
 for repeated timestamp, symbol, or event-type bursts; high-cardinality data
-falls back to one callback per row.
+falls back to one callback per row. Aura1 grouped replay is implemented with
+fixed-width key-byte comparison and materializes group key values only at group
+boundaries.
 
 ## Conversion
 
@@ -210,6 +227,7 @@ One current format constraint remains: the legacy compact timestamp-role shortcu
 - Batch API: prefer `AuraColumnBatch` for larger writes; `AuraRecordBatch` remains available for simple examples
 - Reader mode: schema-first reader with batch iteration
 - File reader mode: use `open_path`/`open_file` for range-read Aura1 replay
+- Fast Aura1 replay mode: use `replay_fixed_batches` when batch callbacks fit
 - Conversion: explicit target format through `ConvertOptions`
 - Guard mode: off unless using lower-level strict verification tools
 - Canonical hash mode: off by default at the SDK facade

@@ -8,7 +8,7 @@ use crate::footer::AuraFooter;
 use crate::format::SEAL_MAGIC;
 use crate::header::AuraHeader;
 use crate::options::{AuraFormat, ReaderOptions};
-use crate::program::{CompiledAuraPlan, CompiledFooter};
+use crate::program::{CompiledAuraField, CompiledAuraPlan, CompiledFooter};
 use crate::records::{self, DecodedI64File, DecodedTypedFile};
 use crate::schema::{AuraSchema, SchemaDescriptor};
 use crate::{
@@ -155,6 +155,21 @@ impl FileBackedAuraInput {
     }
 }
 
+#[derive(Debug, Clone)]
+struct GroupKeyRecipe {
+    field_name: String,
+    aura_type: crate::AuraType,
+    offset: usize,
+    width: usize,
+}
+
+#[derive(Debug, Default)]
+struct RawGroupState {
+    key: Vec<u8>,
+    row_start: usize,
+    row_count: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuraReaderSourceKind {
     Memory,
@@ -205,9 +220,84 @@ pub struct AuraReaderStats {
     pub body_offset_from_header: usize,
     pub footer_offset_from_trailer: usize,
     pub record_count_from_footer: usize,
+    pub rows_scanned: usize,
+    pub temp_row_buffers_allocated: usize,
+    pub visitor_calls: usize,
+    pub field_decode_count: usize,
+    pub endian_load_count: usize,
+    pub compiled_plan_used: bool,
     pub source_bytes_read_at_open: usize,
     pub source_bytes_read_total: usize,
     pub streaming_reader_used: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Aura1FixedBatchView<'a> {
+    body: &'a [u8],
+    record_width: usize,
+    row_count: usize,
+    field_offsets: Vec<CompiledAuraField>,
+}
+
+impl<'a> Aura1FixedBatchView<'a> {
+    fn new(body: &'a [u8], plan: &CompiledAuraPlan, row_count: usize) -> Result<Self> {
+        let expected_len = row_count
+            .checked_mul(plan.aura1_record_width)
+            .ok_or(AuraError::InvalidValue("body length"))?;
+        if body.len() != expected_len {
+            return Err(AuraError::UnexpectedEof);
+        }
+        Ok(Self {
+            body,
+            record_width: plan.aura1_record_width,
+            row_count,
+            field_offsets: plan.aura1_field_offsets(),
+        })
+    }
+
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    pub const fn record_width(&self) -> usize {
+        self.record_width
+    }
+
+    pub fn field_count(&self) -> usize {
+        self.field_offsets.len()
+    }
+
+    pub fn value_i64(&self, row_index: usize, field_index: usize) -> Result<i64> {
+        if row_index >= self.row_count {
+            return Err(AuraError::InvalidValue("row index"));
+        }
+        let field = self
+            .field_offsets
+            .iter()
+            .find(|field| usize::from(field.field_index) == field_index)
+            .ok_or(AuraError::InvalidValue("field index"))?;
+        let row_offset = row_index
+            .checked_mul(self.record_width)
+            .ok_or(AuraError::InvalidValue("row index"))?;
+        let start = row_offset
+            .checked_add(field.offset)
+            .ok_or(AuraError::InvalidValue("field offset"))?;
+        let end = start
+            .checked_add(field.width)
+            .ok_or(AuraError::InvalidValue("field offset"))?;
+        let bytes = self.body.get(start..end).ok_or(AuraError::UnexpectedEof)?;
+        read_i64_fixed_width(bytes)
+    }
+
+    pub fn row_i64_values(&self, row_index: usize, out: &mut Vec<i64>) -> Result<()> {
+        out.clear();
+        out.resize(self.field_offsets.len(), 0);
+        for field in &self.field_offsets {
+            out[usize::from(field.field_index)] =
+                self.value_i64(row_index, usize::from(field.field_index))?;
+        }
+        Ok(())
+    }
 }
 
 /// Public SDK reader for Aura files with dynamic schemas.
@@ -306,6 +396,12 @@ impl AuraReader {
                 body_offset_from_header: parsed.header_len,
                 footer_offset_from_trailer: parsed.footer_offset,
                 record_count_from_footer: record_count,
+                rows_scanned: 0,
+                temp_row_buffers_allocated: 0,
+                visitor_calls: 0,
+                field_decode_count: 0,
+                endian_load_count: 0,
+                compiled_plan_used: true,
                 source_bytes_read_at_open: parsed.bytes_read_at_open,
                 source_bytes_read_total: parsed.bytes_read_at_open,
                 streaming_reader_used: true,
@@ -377,6 +473,12 @@ impl AuraReader {
                 body_offset_from_header: metadata.header_len,
                 footer_offset_from_trailer: metadata.footer_start,
                 record_count_from_footer: metadata.record_count,
+                rows_scanned: 0,
+                temp_row_buffers_allocated: 0,
+                visitor_calls: 0,
+                field_decode_count: 0,
+                endian_load_count: 0,
+                compiled_plan_used: compiled_plan.is_some(),
                 source_bytes_read_at_open: bytes.len(),
                 source_bytes_read_total: bytes.len(),
                 streaming_reader_used: true,
@@ -525,11 +627,95 @@ impl AuraReader {
         }
     }
 
-    pub fn grouped_replay<F>(&self, group_by: &GroupBy, mut visitor: F) -> Result<AuraGroupStats>
+    pub fn replay_fixed_batches<F>(&self, batch_size: usize, mut visitor: F) -> Result<usize>
+    where
+        F: FnMut(Aura1FixedBatchView<'_>) -> Result<()>,
+    {
+        if batch_size == 0 {
+            return Err(AuraError::InvalidValue("batch size"));
+        }
+        if self.profile != Profile::Aura1 {
+            return Err(AuraError::InvalidValue("aura1 replay profile"));
+        }
+        let plan = self
+            .compiled_plan
+            .as_ref()
+            .ok_or(AuraError::InvalidValue("compiled plan"))?;
+        let mut rows_seen = 0usize;
+        match &self.source {
+            AuraReaderSource::Memory(bytes) => {
+                let stats = self.stats.get();
+                let body = bytes
+                    .get(stats.body_offset_from_header..stats.footer_offset_from_trailer)
+                    .ok_or(AuraError::UnexpectedEof)?;
+                while rows_seen < plan.record_count {
+                    let rows_to_visit = batch_size.min(plan.record_count - rows_seen);
+                    let byte_start = rows_seen
+                        .checked_mul(plan.aura1_record_width)
+                        .ok_or(AuraError::InvalidValue("row range"))?;
+                    let byte_len = rows_to_visit
+                        .checked_mul(plan.aura1_record_width)
+                        .ok_or(AuraError::InvalidValue("row range"))?;
+                    let byte_end = byte_start
+                        .checked_add(byte_len)
+                        .ok_or(AuraError::InvalidValue("row range"))?;
+                    let range = body
+                        .get(byte_start..byte_end)
+                        .ok_or(AuraError::UnexpectedEof)?;
+                    visitor(Aura1FixedBatchView::new(range, plan, rows_to_visit)?)?;
+                    rows_seen = rows_seen.saturating_add(rows_to_visit);
+                }
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(rows_seen);
+                    stats.visitor_calls = stats
+                        .visitor_calls
+                        .saturating_add(rows_seen.div_ceil(batch_size));
+                    stats.bytes_read_during_replay = stats
+                        .bytes_read_during_replay
+                        .saturating_add(plan.aura1_body_size);
+                    stats.compiled_plan_used = true;
+                });
+                Ok(rows_seen)
+            }
+            AuraReaderSource::FileRange(_) => {
+                while rows_seen < plan.record_count {
+                    let rows_to_read = batch_size.min(plan.record_count - rows_seen);
+                    let (body, rows_to_visit) =
+                        self.read_aura1_body_range(rows_seen, rows_to_read)?;
+                    visitor(Aura1FixedBatchView::new(&body, plan, rows_to_visit)?)?;
+                    rows_seen = rows_seen.saturating_add(rows_to_visit);
+                }
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(rows_seen);
+                    stats.visitor_calls = stats
+                        .visitor_calls
+                        .saturating_add(rows_seen.div_ceil(batch_size));
+                    stats.compiled_plan_used = true;
+                });
+                Ok(rows_seen)
+            }
+        }
+    }
+
+    pub fn grouped_replay<F>(&self, group_by: &GroupBy, visitor: F) -> Result<AuraGroupStats>
     where
         F: FnMut(&AuraEventGroup) -> Result<()>,
     {
         let group_indexes = self.group_indexes(group_by)?;
+        if self.profile == Profile::Aura1 {
+            return self.grouped_replay_aura1_raw(&group_indexes, visitor);
+        }
+        self.grouped_replay_i64(&group_indexes, visitor)
+    }
+
+    fn grouped_replay_i64<F>(
+        &self,
+        group_indexes: &[usize],
+        mut visitor: F,
+    ) -> Result<AuraGroupStats>
+    where
+        F: FnMut(&AuraEventGroup) -> Result<()>,
+    {
         let mut current_key = Vec::<i64>::new();
         let mut current_start = 0usize;
         let mut current_len = 0usize;
@@ -583,6 +769,221 @@ impl AuraReader {
             rows_per_group_avg,
             rows_per_group_p95: percentile_usize(&group_sizes, 0.95),
         })
+    }
+
+    fn grouped_replay_aura1_raw<F>(
+        &self,
+        group_indexes: &[usize],
+        mut visitor: F,
+    ) -> Result<AuraGroupStats>
+    where
+        F: FnMut(&AuraEventGroup) -> Result<()>,
+    {
+        let plan = self
+            .compiled_plan
+            .as_ref()
+            .ok_or(AuraError::InvalidValue("compiled plan"))?;
+        let recipes = self.group_key_recipes(group_indexes, plan)?;
+        let key_width = recipes.iter().try_fold(0usize, |acc, recipe| {
+            acc.checked_add(recipe.width)
+                .ok_or(AuraError::InvalidValue("group key"))
+        })?;
+        let mut state = RawGroupState {
+            key: Vec::with_capacity(key_width),
+            row_start: 0,
+            row_count: 0,
+        };
+        let mut group_sizes = Vec::<usize>::new();
+        let mut rows_seen = 0usize;
+        match &self.source {
+            AuraReaderSource::Memory(bytes) => {
+                let stats = self.stats.get();
+                let body = bytes
+                    .get(stats.body_offset_from_header..stats.footer_offset_from_trailer)
+                    .ok_or(AuraError::UnexpectedEof)?;
+                self.process_group_body(
+                    body,
+                    0,
+                    plan.record_count,
+                    &recipes,
+                    &mut state,
+                    &mut group_sizes,
+                    &mut visitor,
+                )?;
+                rows_seen = plan.record_count;
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(rows_seen);
+                    stats.bytes_read_during_replay = stats
+                        .bytes_read_during_replay
+                        .saturating_add(plan.aura1_body_size);
+                    stats.compiled_plan_used = true;
+                });
+            }
+            AuraReaderSource::FileRange(_) => {
+                let rows_per_chunk = rows_per_file_chunk(plan.aura1_record_width);
+                while rows_seen < plan.record_count {
+                    let rows_to_read = rows_per_chunk.min(plan.record_count - rows_seen);
+                    let (body, rows_to_visit) =
+                        self.read_aura1_body_range(rows_seen, rows_to_read)?;
+                    self.process_group_body(
+                        &body,
+                        rows_seen,
+                        rows_to_visit,
+                        &recipes,
+                        &mut state,
+                        &mut group_sizes,
+                        &mut visitor,
+                    )?;
+                    rows_seen = rows_seen.saturating_add(rows_to_visit);
+                }
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(rows_seen);
+                    stats.compiled_plan_used = true;
+                });
+            }
+        }
+        if state.row_count > 0 {
+            self.emit_raw_group(&recipes, &state, &mut visitor)?;
+            group_sizes.push(state.row_count);
+        }
+        let group_count = group_sizes.len();
+        self.update_stats(|stats| {
+            stats.visitor_calls = stats.visitor_calls.saturating_add(group_count);
+            stats.field_decode_count = stats
+                .field_decode_count
+                .saturating_add(group_count.saturating_mul(recipes.len()));
+            stats.endian_load_count = stats
+                .endian_load_count
+                .saturating_add(group_count.saturating_mul(recipes.len()));
+            stats.compiled_plan_used = true;
+        });
+        let rows_per_group_avg = if group_count == 0 {
+            0.0
+        } else {
+            rows_seen as f64 / group_count as f64
+        };
+        Ok(AuraGroupStats {
+            row_count: rows_seen,
+            group_count,
+            callback_count: group_count,
+            rows_per_group_avg,
+            rows_per_group_p95: percentile_usize(&group_sizes, 0.95),
+        })
+    }
+
+    fn group_key_recipes(
+        &self,
+        group_indexes: &[usize],
+        plan: &CompiledAuraPlan,
+    ) -> Result<Vec<GroupKeyRecipe>> {
+        let offsets = plan.aura1_field_offsets();
+        group_indexes
+            .iter()
+            .map(|index| {
+                let field = self
+                    .schema
+                    .fields()
+                    .get(*index)
+                    .ok_or(AuraError::InvalidValue("group field"))?;
+                let field_index =
+                    u16::try_from(*index).map_err(|_| AuraError::InvalidValue("field index"))?;
+                let offset = offsets
+                    .iter()
+                    .find(|offset| offset.field_index == field_index)
+                    .ok_or(AuraError::InvalidValue("field offset"))?;
+                Ok(GroupKeyRecipe {
+                    field_name: field.name.clone(),
+                    aura_type: field.aura_type,
+                    offset: offset.offset,
+                    width: offset.width,
+                })
+            })
+            .collect()
+    }
+
+    fn process_group_body<F>(
+        &self,
+        body: &[u8],
+        row_start: usize,
+        row_count: usize,
+        recipes: &[GroupKeyRecipe],
+        state: &mut RawGroupState,
+        group_sizes: &mut Vec<usize>,
+        visitor: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&AuraEventGroup) -> Result<()>,
+    {
+        let record_width = self
+            .compiled_plan
+            .as_ref()
+            .ok_or(AuraError::InvalidValue("compiled plan"))?
+            .aura1_record_width;
+        let expected_len = row_count
+            .checked_mul(record_width)
+            .ok_or(AuraError::InvalidValue("body length"))?;
+        if body.len() != expected_len {
+            return Err(AuraError::UnexpectedEof);
+        }
+        for local_row in 0..row_count {
+            let absolute_row = row_start.saturating_add(local_row);
+            let row_offset = local_row
+                .checked_mul(record_width)
+                .ok_or(AuraError::InvalidValue("row range"))?;
+            let row = body
+                .get(row_offset..row_offset + record_width)
+                .ok_or(AuraError::UnexpectedEof)?;
+            if state.row_count == 0 {
+                copy_group_key(row, recipes, &mut state.key)?;
+                state.row_start = absolute_row;
+                state.row_count = 1;
+            } else if row_key_matches(row, recipes, &state.key)? {
+                state.row_count = state.row_count.saturating_add(1);
+            } else {
+                self.emit_raw_group(recipes, state, visitor)?;
+                group_sizes.push(state.row_count);
+                copy_group_key(row, recipes, &mut state.key)?;
+                state.row_start = absolute_row;
+                state.row_count = 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_raw_group<F>(
+        &self,
+        recipes: &[GroupKeyRecipe],
+        state: &RawGroupState,
+        visitor: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&AuraEventGroup) -> Result<()>,
+    {
+        let mut key_offset = 0usize;
+        let mut field_names = Vec::with_capacity(recipes.len());
+        let mut values = Vec::with_capacity(recipes.len());
+        for recipe in recipes {
+            let end = key_offset
+                .checked_add(recipe.width)
+                .ok_or(AuraError::InvalidValue("group key"))?;
+            let bytes = state
+                .key
+                .get(key_offset..end)
+                .ok_or(AuraError::UnexpectedEof)?;
+            let value = read_i64_fixed_width(bytes)?;
+            field_names.push(recipe.field_name.clone());
+            values.push(AuraValue::from_i64_for_type(value, recipe.aura_type));
+            key_offset = end;
+        }
+        let group = AuraEventGroup {
+            row_start: state.row_start,
+            row_count: state.row_count,
+            key: AuraGroupKey {
+                field_names,
+                values,
+            },
+        };
+        visitor(&group)
     }
 
     pub fn stats(&self) -> AuraReaderStats {
@@ -661,7 +1062,28 @@ impl AuraReader {
         F: FnMut(&[i64]) -> Result<()>,
     {
         match &self.source {
-            AuraReaderSource::Memory(bytes) => records::visit_i64_rows_file(bytes, visitor),
+            AuraReaderSource::Memory(bytes) => {
+                let rows = records::visit_i64_rows_file(bytes, visitor)?;
+                let plan = self
+                    .compiled_plan
+                    .as_ref()
+                    .ok_or(AuraError::InvalidValue("compiled plan"))?;
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(rows);
+                    stats.visitor_calls = stats.visitor_calls.saturating_add(rows);
+                    stats.field_decode_count = stats
+                        .field_decode_count
+                        .saturating_add(rows.saturating_mul(plan.field_count));
+                    stats.endian_load_count = stats
+                        .endian_load_count
+                        .saturating_add(rows.saturating_mul(plan.field_count));
+                    stats.bytes_read_during_replay = stats
+                        .bytes_read_during_replay
+                        .saturating_add(plan.aura1_body_size);
+                    stats.compiled_plan_used = true;
+                });
+                Ok(rows)
+            }
             AuraReaderSource::FileRange(_) => {
                 let plan = self
                     .compiled_plan
@@ -682,6 +1104,17 @@ impl AuraReader {
                     )?;
                     rows_seen = rows_seen.saturating_add(rows_to_visit);
                 }
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(rows_seen);
+                    stats.visitor_calls = stats.visitor_calls.saturating_add(rows_seen);
+                    stats.field_decode_count = stats
+                        .field_decode_count
+                        .saturating_add(rows_seen.saturating_mul(plan.field_count));
+                    stats.endian_load_count = stats
+                        .endian_load_count
+                        .saturating_add(rows_seen.saturating_mul(plan.field_count));
+                    stats.compiled_plan_used = true;
+                });
                 Ok(rows_seen)
             }
         }
@@ -978,6 +1411,73 @@ fn read_aura1_column_batch_from_body(
         },
     )?;
     AuraColumnBatch::from_i64_columns(schema, columns)
+}
+
+fn read_i64_fixed_width(bytes: &[u8]) -> Result<i64> {
+    match bytes.len() {
+        0 => Ok(0),
+        1 => Ok(bytes[0] as i8 as i64),
+        2 => Ok(i16::from_le_bytes([bytes[0], bytes[1]]) as i64),
+        4 => Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64),
+        8 => Ok(i64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])),
+        16 => {
+            let value = i128::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
+            ]);
+            i64::try_from(value).map_err(|_| AuraError::InvalidValue("i128 value"))
+        }
+        _ => Err(AuraError::InvalidValue("field width")),
+    }
+}
+
+fn copy_group_key(row: &[u8], recipes: &[GroupKeyRecipe], out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
+    let key_width = recipes.iter().try_fold(0usize, |acc, recipe| {
+        acc.checked_add(recipe.width)
+            .ok_or(AuraError::InvalidValue("group key"))
+    })?;
+    if out.capacity() < key_width {
+        out.reserve(key_width);
+    }
+    for recipe in recipes {
+        let end = recipe
+            .offset
+            .checked_add(recipe.width)
+            .ok_or(AuraError::InvalidValue("group key"))?;
+        let bytes = row
+            .get(recipe.offset..end)
+            .ok_or(AuraError::UnexpectedEof)?;
+        out.extend_from_slice(bytes);
+    }
+    Ok(())
+}
+
+fn row_key_matches(row: &[u8], recipes: &[GroupKeyRecipe], key: &[u8]) -> Result<bool> {
+    let mut key_offset = 0usize;
+    for recipe in recipes {
+        let row_end = recipe
+            .offset
+            .checked_add(recipe.width)
+            .ok_or(AuraError::InvalidValue("group key"))?;
+        let key_end = key_offset
+            .checked_add(recipe.width)
+            .ok_or(AuraError::InvalidValue("group key"))?;
+        let row_bytes = row
+            .get(recipe.offset..row_end)
+            .ok_or(AuraError::UnexpectedEof)?;
+        let key_bytes = key
+            .get(key_offset..key_end)
+            .ok_or(AuraError::UnexpectedEof)?;
+        if row_bytes != key_bytes {
+            return Ok(false);
+        }
+        key_offset = key_end;
+    }
+    Ok(true)
 }
 
 fn rows_per_file_chunk(record_width: usize) -> usize {

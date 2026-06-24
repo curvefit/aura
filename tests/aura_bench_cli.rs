@@ -1252,6 +1252,9 @@ fn aura_bench_runs_sdk_generic_fixture_smoke_matrix() {
     let Some(fixture_bin) = option_env!("CARGO_BIN_EXE_aura-fixture-gen") else {
         panic!("missing aura-fixture-gen binary");
     };
+    let Some(sdk_bench_bin) = option_env!("CARGO_BIN_EXE_aura_sdk_bench") else {
+        panic!("missing aura_sdk_bench binary");
+    };
     let dir = std::env::temp_dir().join(format!(
         "aura-sdk-generic-bench-smoke-{}",
         std::process::id()
@@ -1323,6 +1326,51 @@ fn aura_bench_runs_sdk_generic_fixture_smoke_matrix() {
         serde_json::from_slice(&fs::read(dir.join("sdk_bench_smoke.json")).unwrap()).unwrap();
     assert_eq!("sdk-generic-smoke", smoke["matrix_kind"]);
     assert!(smoke["entries"].as_array().unwrap().len() >= 21);
+
+    let sdk_output_dir = dir.join("sdk-bench");
+    let sdk_output = Command::new(sdk_bench_bin)
+        .arg("--fixture-dir")
+        .arg(&dir)
+        .arg("--output-dir")
+        .arg(&sdk_output_dir)
+        .arg("--iterations")
+        .arg("1")
+        .arg("--warmups")
+        .arg("0")
+        .arg("--batch-size")
+        .arg("4")
+        .arg("--datasets")
+        .arg("sdk-tiny")
+        .arg("--operations")
+        .arg("aura1-replay-batch-callback-file-range,aura1-grouped-replay-primary-file-range")
+        .output()
+        .unwrap();
+    assert!(
+        sdk_output.status.success(),
+        "sdk bench stdout:\n{}\nsdk bench stderr:\n{}",
+        String::from_utf8_lossy(&sdk_output.stdout),
+        String::from_utf8_lossy(&sdk_output.stderr)
+    );
+    let sdk_summary: serde_json::Value = serde_json::from_slice(
+        &fs::read(sdk_output_dir.join("sdk_full_matrix_summary.json")).unwrap(),
+    )
+    .unwrap();
+    let entries = sdk_summary.as_array().unwrap();
+    let batch_entry = entries
+        .iter()
+        .find(|entry| entry["operation"] == "aura1-replay-batch-callback-file-range")
+        .expect("batch callback entry");
+    assert_eq!("file_range", batch_entry["source_kind"]);
+    assert_eq!(0, batch_entry["body_bytes_read_at_open"]);
+    assert_eq!(0, batch_entry["full_file_bytes_copied"]);
+    assert!(batch_entry["visitor_calls"].as_u64().unwrap() > 0);
+    let grouped_entry = entries
+        .iter()
+        .find(|entry| entry["operation"] == "aura1-grouped-replay-primary-file-range")
+        .expect("grouped entry");
+    assert_eq!("file_range", grouped_entry["source_kind"]);
+    assert!(grouped_entry["callback_count"].as_u64().unwrap() > 0);
+    assert!(grouped_entry["field_decode_count"].as_u64().unwrap() > 0);
 
     fs::remove_dir_all(&dir).unwrap();
 }

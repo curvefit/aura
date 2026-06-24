@@ -415,7 +415,7 @@ fn reader_streaming_batches_match_read_batches_and_replay() {
         .unwrap();
     assert_eq!(rows.len(), count);
     assert_eq!(
-        AuraRecordBatch::new(schema, rows)
+        AuraRecordBatch::new(schema, rows.clone())
             .unwrap()
             .to_i64_rows()
             .unwrap(),
@@ -518,7 +518,7 @@ fn aura1_file_backed_replay_reads_header_footer_at_open() {
         .unwrap();
     assert_eq!(rows.len(), count);
     assert_eq!(
-        AuraRecordBatch::new(schema, rows)
+        AuraRecordBatch::new(schema, rows.clone())
             .unwrap()
             .to_i64_rows()
             .unwrap(),
@@ -530,6 +530,28 @@ fn aura1_file_backed_replay_reads_header_footer_at_open() {
         replay_stats.bytes_read_during_replay
     );
     assert_eq!(0, replay_stats.full_file_bytes_copied);
+
+    let batch_reader = AuraReader::open_path(&path).unwrap();
+    let mut batch_rows = 0usize;
+    let mut first_values = Vec::new();
+    let batch_count = batch_reader
+        .replay_fixed_batches(2, |batch| {
+            batch_rows = batch_rows.saturating_add(batch.row_count());
+            if batch.row_count() > 0 {
+                first_values.push(batch.value_i64(0, 0)?);
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(rows.len(), batch_count);
+    assert_eq!(rows.len(), batch_rows);
+    assert_eq!(
+        vec![1_700_000_000_000_000_000, 1_700_000_000_002_000_000],
+        first_values
+    );
+    let batch_stats = batch_reader.stats();
+    assert_eq!(2, batch_stats.visitor_calls);
+    assert_eq!(0, batch_stats.full_file_bytes_copied);
 }
 
 #[test]
@@ -619,6 +641,9 @@ fn grouped_replay_uses_generic_field_names_and_preserves_runs() {
     assert_eq!(AuraReaderSourceKind::FileRange, file_stats.source_kind);
     assert_eq!(0, file_stats.body_bytes_read_at_open);
     assert_eq!(0, file_stats.full_file_bytes_copied);
+    assert_eq!(file_pair_counts.len(), file_stats.visitor_calls);
+    assert_eq!(file_pair_counts.len() * 2, file_stats.field_decode_count);
+    assert_eq!(6, file_stats.rows_scanned);
 
     let mut id_counts = Vec::new();
     reader

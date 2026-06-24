@@ -50,8 +50,9 @@ pub use options::{AuraFormat, AuraProfile, ConvertOptions, ReaderOptions, Writer
 pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 pub use program::{CompiledAuraField, CompiledAuraPlan};
 pub use reader::{
-    AuraBatchIter, AuraEventGroup, AuraGroupKey, AuraGroupStats, AuraI64Reader, AuraReader,
-    AuraReaderSourceKind, AuraReaderStats, AuraReplayBackend, AuraTypedReader, GroupBy,
+    Aura1FixedBatchView, AuraBatchIter, AuraEventGroup, AuraGroupKey, AuraGroupStats,
+    AuraI64Reader, AuraReader, AuraReaderSourceKind, AuraReaderStats, AuraReplayBackend,
+    AuraTypedReader, GroupBy,
 };
 pub use records::{
     Aura0ByteLaneCodec, Aura0ByteLaneUse, DecodedI64ColumnsFile, DecodedI64File, DecodedTypedFile,

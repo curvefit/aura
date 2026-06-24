@@ -193,6 +193,9 @@ The runner writes one JSON result per dataset/operation and a `sdk_full_matrix_s
 - `aura1-replay-i64`: visitor replay over fixed-width rows.
 - `aura1-replay-file-range`: visitor replay using `AuraReader::open_path` and
   bounded file range reads.
+- `aura1-replay-batch-callback`: fixed-width batch callback replay from memory.
+- `aura1-replay-batch-callback-file-range`: fixed-width batch callback replay
+  from file-backed row ranges.
 - `aura1-read-batches-row`: row-oriented `AuraRecordBatch` materialization.
 - `aura1-read-batches-row-file-range`: row batches from file-backed Aura1 row
   ranges.
@@ -222,9 +225,15 @@ File-backed Aura1 rows also report `source_kind`, `replay_backend`,
 `bytes_read_at_open`, `body_bytes_read_at_open`, `footer_bytes_read_at_open`,
 `bytes_read_during_replay`, `bytes_read_total`, `full_file_bytes_copied`,
 `row_width_from_plan`, `body_offset_from_header`, and
-`footer_offset_from_trailer`. A DBN-like file-backed run should show
+`footer_offset_from_trailer`. Parse-speed rows also report `visitor_calls`,
+`callback_count`, `field_decode_count`, `endian_load_count`, and
+`temp_row_buffers_allocated`. A DBN-like file-backed run should show
 `source_kind=file_range`, `body_bytes_read_at_open=0`, and
 `full_file_bytes_copied=0`.
+
+Batch-callback replay is labeled separately because it is not equivalent to
+per-row replay. It invokes one callback per fixed-width batch and lets the
+callback pull selected field values from the batch view.
 
 Do not compare grouped replay directly to row replay unless the callback
 semantics are labeled: grouped replay invokes one callback per consecutive run,

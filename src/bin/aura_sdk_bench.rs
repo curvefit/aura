@@ -255,6 +255,8 @@ fn run_fixture_matrix(fixture: &Fixture, args: &Args) -> Result<Vec<Value>> {
         "aura1-scan-raw-file-range",
         "aura1-replay-i64",
         "aura1-replay-file-range",
+        "aura1-replay-batch-callback",
+        "aura1-replay-batch-callback-file-range",
         "aura1-read-batches-row",
         "aura1-read-batches-row-file-range",
         "aura1-read-batches-columnar",
@@ -409,8 +411,21 @@ fn bench_operation(
         "body_offset_from_header": reader_stats.body_offset_from_header,
         "footer_offset_from_trailer": reader_stats.footer_offset_from_trailer,
         "record_count_from_footer": reader_stats.record_count_from_footer,
+        "rows_scanned": reader_stats.rows_scanned,
+        "temp_row_buffers_allocated": reader_stats.temp_row_buffers_allocated,
+        "visitor_calls": if group_stats.is_some() {
+            group_stats.map(|stats| stats.callback_count).unwrap_or(0)
+        } else {
+            reader_stats.visitor_calls
+        },
+        "field_decode_count": reader_stats.field_decode_count,
+        "endian_load_count": reader_stats.endian_load_count,
         "group_by_fields": last_output.group_by_fields,
         "group_count": group_stats.map(|stats| stats.group_count).unwrap_or(0),
+        "callback_count": group_stats
+            .map(|stats| stats.callback_count)
+            .unwrap_or(reader_stats.visitor_calls),
+        "group_row_count": group_stats.map(|stats| stats.row_count).unwrap_or(0),
         "groups_per_sec": groups_per_sec,
         "rows_per_group_avg": group_stats.map(|stats| stats.rows_per_group_avg).unwrap_or(0.0),
         "rows_per_group_p95": group_stats.map(|stats| stats.rows_per_group_p95).unwrap_or(0),
@@ -492,6 +507,10 @@ fn run_operation(
         "aura1-scan-raw" => scan_raw_aura1(aura1),
         "aura1-replay-i64" => replay_aura1(aura1),
         "aura1-replay-file-range" => replay_aura1_path(aura1_path),
+        "aura1-replay-batch-callback" => replay_aura1_batches(aura1, args.batch_size),
+        "aura1-replay-batch-callback-file-range" => {
+            replay_aura1_batches_path(aura1_path, args.batch_size)
+        }
         "aura1-read-batches-row" => read_batches(aura1, args.batch_size),
         "aura1-read-batches-row-file-range" => read_batches_path(aura1_path, args.batch_size),
         "aura1-read-batches-columnar" => read_column_batches(aura1, args.batch_size),
@@ -603,6 +622,39 @@ fn replay_aura1_path(path: &Path) -> Result<BenchOutput> {
     let mut output = BenchOutput::new(stats.file_len, record_count).with_reader_stats(stats);
     let scanned = stats.bytes_read_during_replay;
     output.bytes_scanned = scanned;
+    Ok(output)
+}
+
+fn replay_aura1_batches(bytes: &[u8], batch_size: usize) -> Result<BenchOutput> {
+    let reader = AuraReader::open(Cursor::new(bytes))?;
+    let mut record_count = 0usize;
+    reader.replay_fixed_batches(batch_size, |batch| {
+        record_count = record_count.saturating_add(batch.row_count());
+        if batch.row_count() > 0 && batch.field_count() > 0 {
+            black_box(batch.value_i64(0, 0)?);
+        }
+        Ok(())
+    })?;
+    let mut output = BenchOutput::new(bytes.len(), record_count).with_reader_stats(reader.stats());
+    if let Ok(info) = records::aura1_fixed_layout_info(bytes) {
+        output.bytes_scanned = info.body_bytes;
+    }
+    Ok(output)
+}
+
+fn replay_aura1_batches_path(path: &Path, batch_size: usize) -> Result<BenchOutput> {
+    let reader = AuraReader::open_path(path)?;
+    let mut record_count = 0usize;
+    reader.replay_fixed_batches(batch_size, |batch| {
+        record_count = record_count.saturating_add(batch.row_count());
+        if batch.row_count() > 0 && batch.field_count() > 0 {
+            black_box(batch.value_i64(0, 0)?);
+        }
+        Ok(())
+    })?;
+    let stats = reader.stats();
+    let mut output = BenchOutput::new(stats.file_len, record_count).with_reader_stats(stats);
+    output.bytes_scanned = stats.bytes_read_during_replay;
     Ok(output)
 }
 

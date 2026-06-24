@@ -23,6 +23,7 @@ Available reader methods:
 - `next_column_batch(batch_size)`
 - `batches(batch_size)`
 - `replay_i64(visitor)`
+- `replay_fixed_batches(batch_size, visitor)`
 - `grouped_replay(group_by, visitor)`
 
 Aura1 reads stream fixed-width rows directly from the Aura1 body. Aura0 compact opens by parsing metadata only, then lazily builds bounded row batches from compact stream columns. `read_batches()` is a convenience collector over `next_batch`.
@@ -47,6 +48,23 @@ The file-backed backend is range-read based. Mmap is intentionally not part of
 the v1 SDK backend; it can be added later behind an explicit source mode if a
 benchmark shows it beats bounded range reads on target platforms.
 
+For the fastest fixed-width Aura1 scan shape, use batch-callback replay:
+
+```rust
+reader.replay_fixed_batches(8192, |batch| {
+    for row in 0..batch.row_count() {
+        let ts = batch.value_i64(row, 0)?;
+        let _ = ts;
+    }
+    Ok(())
+})?;
+# Ok::<(), aura_codec::AuraError>(())
+```
+
+This API invokes one callback per fixed-width batch, not one callback per row.
+It is intentionally lower-level than `replay_i64` and is best for callers that
+can process row ranges or pull only selected fields.
+
 For Aura1 parse speed, prefer `next_column_batch` when callers want typed
 columns rather than row-oriented `AuraValue` batches. It builds
 `AuraColumnBatch` directly from fixed-width row scans and avoids the
@@ -68,7 +86,8 @@ let stats = reader.grouped_replay(
 
 Grouping is schema-driven. Field names or field IDs are resolved once before
 replay; row order is preserved; high-cardinality inputs degrade to one-row
-groups.
+groups. Aura1 grouping compares fixed-width key bytes in the hot loop and
+materializes typed group key values only when a group is emitted.
 
 `ReaderOptions::default()` uses byte-lane selection `Auto`. `Aura0ByteLaneUse::Always` rejects compact Aura0 files that do not contain a byte lane.
 
