@@ -54,6 +54,7 @@ pub use reader::{
     Aura1FieldI64Iter, Aura1FixedBatchView, Aura1RowView, Aura1SelectedRowView, AuraBatchIter,
     AuraEventGroup, AuraGroupKey, AuraGroupStats, AuraI64Reader, AuraReader,
     AuraReaderSourceKind, AuraReaderStats, AuraReplayBackend, AuraTypedReader, GroupBy,
+    OrderBookDeltaBatch, OrderBookDeltaSpec, OrderBookDeltaSpecBuilder,
 };
 pub use records::{
     Aura0ByteLaneCodec, Aura0ByteLaneUse, DecodedI64ColumnsFile, DecodedI64File, DecodedTypedFile,

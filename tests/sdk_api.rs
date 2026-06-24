@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aura_codec::{
     convert_aura, Aura0ByteLaneCodec, Aura0ByteLaneUse, AuraColumnBatch, AuraFormat, AuraProfile,
     AuraReader, AuraReaderSourceKind, AuraRecordBatch, AuraReplayBackend, AuraSchema, AuraType,
-    AuraValue, AuraWriter, CompiledAuraPlan, ConvertOptions, GroupBy, ReaderOptions, WriterOptions,
+    AuraValue, AuraWriter, CompiledAuraPlan, ConvertOptions, GroupBy, OrderBookDeltaSpec,
+    ReaderOptions, WriterOptions,
 };
 
 fn market_schema() -> AuraSchema {
@@ -689,6 +690,159 @@ fn aura1_all_field_parse_kernels_match_reordered_mixed_width_schema() {
     assert_ne!(0, selected_subset_field_major);
     assert_eq!(selected_subset_field_major, selected_subset_type_kernel);
     assert_eq!(selected_subset_field_major, selected_subset_default);
+}
+
+#[test]
+fn orderbook_delta_batch_replay_extracts_payload_without_rows() {
+    let schema = market_schema();
+    let rows = market_rows();
+    let expected = AuraRecordBatch::new(schema.clone(), rows.clone())
+        .unwrap()
+        .to_i64_rows()
+        .unwrap();
+    let aura1 = write_with_options(schema.clone(), rows, WriterOptions::aura1());
+    let path = write_temp_file("orderbook_delta_replay", &aura1);
+    let reader = AuraReader::open_path(&path).unwrap();
+    let spec = OrderBookDeltaSpec::builder()
+        .timestamp("ts_event")
+        .instrument("symbol_id")
+        .side("side")
+        .price("price")
+        .size("size")
+        .flags_optional("flags")
+        .build(reader.schema())
+        .unwrap();
+
+    let mut replayed = Vec::new();
+    let mut checksum = 0u64;
+    reader
+        .replay_orderbook_deltas(2, &spec, |batch| {
+            checksum = checksum.wrapping_add(batch.checksum_payload()?);
+            assert_eq!(6, batch.field_count());
+            for row in 0..batch.row_count() {
+                replayed.push(vec![
+                    batch.timestamp(row)?,
+                    batch.instrument(row)?,
+                    batch.price(row)?,
+                    batch.size(row)?,
+                    batch.side(row)?,
+                    batch.flags(row)?.unwrap(),
+                ]);
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    assert_ne!(0, checksum);
+    assert_eq!(expected, replayed);
+    let stats = reader.stats();
+    assert_eq!(0, stats.full_file_bytes_copied);
+    assert_eq!(0, stats.max_rows_materialized_at_once);
+    assert_eq!(2, stats.visitor_calls);
+    assert_eq!(expected.len().saturating_mul(spec.field_count()), stats.field_decode_count);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn orderbook_delta_batch_replay_supports_reordered_non_grimoire_schema() {
+    let schema = AuraSchema::builder()
+        .field("venue_flags", AuraType::FlagsU32)
+        .field("px_value", AuraType::PriceI64Scaled { scale: 4 })
+        .field("event_side", AuraType::EnumU8)
+        .field("event_time", AuraType::TimestampNanos)
+        .field("qty_lots", AuraType::U64)
+        .field("venue_id", AuraType::U32)
+        .build()
+        .unwrap();
+    let rows = vec![
+        vec![
+            1_u64.into(),
+            100_0100_i64.into(),
+            1_u64.into(),
+            1_700_000_000_000_000_000_i64.into(),
+            10_u64.into(),
+            42_u64.into(),
+        ],
+        vec![
+            3_u64.into(),
+            100_0200_i64.into(),
+            2_u64.into(),
+            1_700_000_000_000_000_100_i64.into(),
+            11_u64.into(),
+            42_u64.into(),
+        ],
+    ];
+    let aura1 = write_with_options(schema.clone(), rows, WriterOptions::aura1());
+    let reader = AuraReader::open(Cursor::new(&aura1)).unwrap();
+    let spec = OrderBookDeltaSpec::builder()
+        .timestamp("event_time")
+        .instrument("venue_id")
+        .side("event_side")
+        .price("px_value")
+        .size("qty_lots")
+        .flags_optional("venue_flags")
+        .build(reader.schema())
+        .unwrap();
+
+    let mut seen = Vec::new();
+    reader
+        .replay_orderbook_deltas(8, &spec, |batch| {
+            for row in 0..batch.row_count() {
+                seen.push((
+                    batch.timestamp(row)?,
+                    batch.instrument(row)?,
+                    batch.side(row)?,
+                    batch.price(row)?,
+                    batch.size(row)?,
+                    batch.flags(row)?.unwrap(),
+                ));
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        vec![
+            (1_700_000_000_000_000_000, 42, 1, 100_0100, 10, 1),
+            (1_700_000_000_000_000_100, 42, 2, 100_0200, 11, 3),
+        ],
+        seen
+    );
+}
+
+#[test]
+fn orderbook_delta_spec_rejects_missing_or_unsupported_required_fields() {
+    let schema = market_schema();
+    assert!(OrderBookDeltaSpec::builder()
+        .timestamp("ts_event")
+        .instrument("symbol_id")
+        .side("side")
+        .price("price")
+        .size("missing_size")
+        .build(&schema)
+        .is_err());
+
+    let bad_schema = AuraSchema::builder()
+        .field("ts", AuraType::TimestampNanos)
+        .field("symbol", AuraType::Utf8)
+        .field("side", AuraType::EnumU8)
+        .field("price", AuraType::PriceI64Scaled { scale: 9 })
+        .field("size", AuraType::U64)
+        .build();
+    assert!(bad_schema.is_err());
+}
+
+#[test]
+fn orderbook_delta_replay_rejects_truncated_aura1_body() {
+    let schema = market_schema();
+    let rows = market_rows();
+    let mut aura1 = write_with_options(schema, rows, WriterOptions::aura1());
+    aura_codec::records::aura1_fixed_layout_info(&aura1).unwrap();
+    let remove_at = aura1.len() - (4 + b"sealed:)".len()) - 1;
+    aura1.remove(remove_at);
+    let path = write_temp_file("orderbook_truncated", &aura1);
+    assert!(AuraReader::open_path(&path).is_err());
+    fs::remove_file(path).unwrap();
 }
 
 #[test]

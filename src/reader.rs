@@ -14,7 +14,7 @@ use crate::header::AuraHeader;
 use crate::options::{AuraFormat, ReaderOptions};
 use crate::program::{CompiledAuraField, CompiledAuraPlan, CompiledFooter};
 use crate::records::{self, DecodedI64File, DecodedTypedFile};
-use crate::schema::{AuraSchema, SchemaDescriptor};
+use crate::schema::{AuraSchema, AuraType, SchemaDescriptor};
 use crate::{
     AuraColumnBatch, AuraError, AuraRecordBatch, AuraTypedValue, AuraValue, Profile, Result,
 };
@@ -255,6 +255,363 @@ pub struct Aura1RowView<'a> {
 pub struct Aura1SelectedRowView<'a> {
     row_bytes: &'a [u8],
     selected_loads: &'a [FixedFieldLoad],
+}
+
+/// Schema-driven field mapping for fast order-book delta replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderBookDeltaSpec {
+    timestamp: usize,
+    instrument: usize,
+    side: usize,
+    price: usize,
+    size: usize,
+    action: Option<usize>,
+    sequence: Option<usize>,
+    order_id: Option<usize>,
+    flags: Option<usize>,
+}
+
+/// Builder for [`OrderBookDeltaSpec`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrderBookDeltaSpecBuilder {
+    timestamp: Option<String>,
+    instrument: Option<String>,
+    side: Option<String>,
+    price: Option<String>,
+    size: Option<String>,
+    action: Option<String>,
+    sequence: Option<String>,
+    order_id: Option<String>,
+    flags: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OrderBookDeltaLoads {
+    timestamp: FixedFieldLoad,
+    instrument: FixedFieldLoad,
+    side: FixedFieldLoad,
+    price: FixedFieldLoad,
+    size: FixedFieldLoad,
+    action: Option<FixedFieldLoad>,
+    sequence: Option<FixedFieldLoad>,
+    order_id: Option<FixedFieldLoad>,
+    flags: Option<FixedFieldLoad>,
+    payload_fields: Vec<CompiledAuraField>,
+    payload_loads: Vec<FixedFieldLoad>,
+    payload_byte_width: usize,
+}
+
+/// Borrowed batch of fixed-width order-book delta records.
+#[derive(Debug, Clone)]
+pub struct OrderBookDeltaBatch<'a> {
+    body: &'a [u8],
+    record_width: usize,
+    row_count: usize,
+    loads: OrderBookDeltaLoads,
+}
+
+impl OrderBookDeltaSpec {
+    pub fn builder() -> OrderBookDeltaSpecBuilder {
+        OrderBookDeltaSpecBuilder::default()
+    }
+
+    pub const fn timestamp_index(&self) -> usize {
+        self.timestamp
+    }
+
+    pub const fn instrument_index(&self) -> usize {
+        self.instrument
+    }
+
+    pub const fn side_index(&self) -> usize {
+        self.side
+    }
+
+    pub const fn price_index(&self) -> usize {
+        self.price
+    }
+
+    pub const fn size_index(&self) -> usize {
+        self.size
+    }
+
+    pub fn field_indices(&self) -> Vec<usize> {
+        let mut fields = vec![
+            self.timestamp,
+            self.instrument,
+            self.side,
+            self.price,
+            self.size,
+        ];
+        fields.extend(self.action);
+        fields.extend(self.sequence);
+        fields.extend(self.order_id);
+        fields.extend(self.flags);
+        fields
+    }
+
+    pub fn field_count(&self) -> usize {
+        self.field_indices().len()
+    }
+
+    fn compile_loads(&self, plan: &CompiledAuraPlan) -> Result<OrderBookDeltaLoads> {
+        let slots = aura1_field_slots(plan)?;
+        let load_at = |index: usize| -> Result<(CompiledAuraField, FixedFieldLoad)> {
+            let field = *slots
+                .get(index)
+                .ok_or(AuraError::InvalidValue("order book delta field"))?;
+            Ok((field, FixedFieldLoad::from_field(field)?))
+        };
+        let (timestamp_field, timestamp) = load_at(self.timestamp)?;
+        let (instrument_field, instrument) = load_at(self.instrument)?;
+        let (side_field, side) = load_at(self.side)?;
+        let (price_field, price) = load_at(self.price)?;
+        let (size_field, size) = load_at(self.size)?;
+        let action = self
+            .action
+            .map(|index| load_at(index).map(|(_, load)| load))
+            .transpose()?;
+        let sequence = self
+            .sequence
+            .map(|index| load_at(index).map(|(_, load)| load))
+            .transpose()?;
+        let order_id = self
+            .order_id
+            .map(|index| load_at(index).map(|(_, load)| load))
+            .transpose()?;
+        let flags = self
+            .flags
+            .map(|index| load_at(index).map(|(_, load)| load))
+            .transpose()?;
+        let mut payload_fields = vec![
+            timestamp_field,
+            instrument_field,
+            side_field,
+            price_field,
+            size_field,
+        ];
+        for index in [self.action, self.sequence, self.order_id, self.flags]
+            .into_iter()
+            .flatten()
+        {
+            payload_fields.push(load_at(index)?.0);
+        }
+        let payload_loads = fixed_field_loads(&payload_fields)?;
+        let payload_byte_width = payload_fields.iter().map(|field| field.width).sum();
+        Ok(OrderBookDeltaLoads {
+            timestamp,
+            instrument,
+            side,
+            price,
+            size,
+            action,
+            sequence,
+            order_id,
+            flags,
+            payload_fields,
+            payload_loads,
+            payload_byte_width,
+        })
+    }
+}
+
+impl OrderBookDeltaSpecBuilder {
+    pub fn timestamp(mut self, name: impl Into<String>) -> Self {
+        self.timestamp = Some(name.into());
+        self
+    }
+
+    pub fn instrument(mut self, name: impl Into<String>) -> Self {
+        self.instrument = Some(name.into());
+        self
+    }
+
+    pub fn side(mut self, name: impl Into<String>) -> Self {
+        self.side = Some(name.into());
+        self
+    }
+
+    pub fn price(mut self, name: impl Into<String>) -> Self {
+        self.price = Some(name.into());
+        self
+    }
+
+    pub fn size(mut self, name: impl Into<String>) -> Self {
+        self.size = Some(name.into());
+        self
+    }
+
+    pub fn action_optional(mut self, name: impl Into<String>) -> Self {
+        self.action = Some(name.into());
+        self
+    }
+
+    pub fn sequence_optional(mut self, name: impl Into<String>) -> Self {
+        self.sequence = Some(name.into());
+        self
+    }
+
+    pub fn order_id_optional(mut self, name: impl Into<String>) -> Self {
+        self.order_id = Some(name.into());
+        self
+    }
+
+    pub fn flags_optional(mut self, name: impl Into<String>) -> Self {
+        self.flags = Some(name.into());
+        self
+    }
+
+    pub fn build(self, schema: &AuraSchema) -> Result<OrderBookDeltaSpec> {
+        let timestamp =
+            required_delta_field(schema, self.timestamp.as_deref(), "timestamp", is_timestamp_type)?;
+        let instrument = required_delta_field(
+            schema,
+            self.instrument.as_deref(),
+            "instrument",
+            is_integer_type,
+        )?;
+        let side = required_delta_field(schema, self.side.as_deref(), "side", is_integer_type)?;
+        let price = required_delta_field(schema, self.price.as_deref(), "price", is_price_type)?;
+        let size = required_delta_field(schema, self.size.as_deref(), "size", is_integer_type)?;
+        let action =
+            optional_delta_field(schema, self.action.as_deref(), "action", is_integer_type)?;
+        let sequence =
+            optional_delta_field(schema, self.sequence.as_deref(), "sequence", is_integer_type)?;
+        let order_id =
+            optional_delta_field(schema, self.order_id.as_deref(), "order_id", is_integer_type)?;
+        let flags = optional_delta_field(schema, self.flags.as_deref(), "flags", is_integer_type)?;
+        let spec = OrderBookDeltaSpec {
+            timestamp,
+            instrument,
+            side,
+            price,
+            size,
+            action,
+            sequence,
+            order_id,
+            flags,
+        };
+        reject_duplicate_delta_fields(&spec)?;
+        Ok(spec)
+    }
+}
+
+impl<'a> OrderBookDeltaBatch<'a> {
+    fn new(
+        body: &'a [u8],
+        record_width: usize,
+        row_count: usize,
+        loads: OrderBookDeltaLoads,
+    ) -> Result<Self> {
+        validate_fixed_body(body, record_width, row_count, &loads.payload_fields)?;
+        Ok(Self {
+            body,
+            record_width,
+            row_count,
+            loads,
+        })
+    }
+
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    pub const fn record_width(&self) -> usize {
+        self.record_width
+    }
+
+    pub fn field_count(&self) -> usize {
+        self.loads.payload_loads.len()
+    }
+
+    pub fn payload_byte_width(&self) -> usize {
+        self.loads.payload_byte_width
+    }
+
+    pub fn timestamp(&self, row_index: usize) -> Result<i64> {
+        self.read(row_index, self.loads.timestamp)
+    }
+
+    pub fn instrument(&self, row_index: usize) -> Result<i64> {
+        self.read(row_index, self.loads.instrument)
+    }
+
+    pub fn side(&self, row_index: usize) -> Result<i64> {
+        self.read(row_index, self.loads.side)
+    }
+
+    pub fn price(&self, row_index: usize) -> Result<i64> {
+        self.read(row_index, self.loads.price)
+    }
+
+    pub fn size(&self, row_index: usize) -> Result<i64> {
+        self.read(row_index, self.loads.size)
+    }
+
+    pub fn action(&self, row_index: usize) -> Result<Option<i64>> {
+        self.read_optional(row_index, self.loads.action)
+    }
+
+    pub fn sequence(&self, row_index: usize) -> Result<Option<i64>> {
+        self.read_optional(row_index, self.loads.sequence)
+    }
+
+    pub fn order_id(&self, row_index: usize) -> Result<Option<i64>> {
+        self.read_optional(row_index, self.loads.order_id)
+    }
+
+    pub fn flags(&self, row_index: usize) -> Result<Option<i64>> {
+        self.read_optional(row_index, self.loads.flags)
+    }
+
+    pub fn checksum_payload(&self) -> Result<u64> {
+        let mut checksum = 0u64;
+        checksum = checksum_load_kind_group(
+            checksum,
+            self.body,
+            self.record_width,
+            self.row_count,
+            &self.loads.payload_loads,
+            FixedLoadKind::I64,
+        );
+        checksum = checksum_load_kind_group(
+            checksum,
+            self.body,
+            self.record_width,
+            self.row_count,
+            &self.loads.payload_loads,
+            FixedLoadKind::I32,
+        );
+        checksum = checksum_load_kind_group(
+            checksum,
+            self.body,
+            self.record_width,
+            self.row_count,
+            &self.loads.payload_loads,
+            FixedLoadKind::I16,
+        );
+        checksum = checksum_load_kind_group(
+            checksum,
+            self.body,
+            self.record_width,
+            self.row_count,
+            &self.loads.payload_loads,
+            FixedLoadKind::I8,
+        );
+        Ok(checksum)
+    }
+
+    fn read(&self, row_index: usize, load: FixedFieldLoad) -> Result<i64> {
+        if row_index >= self.row_count {
+            return Err(AuraError::InvalidValue("row index"));
+        }
+        let row_ptr = unsafe { self.body.as_ptr().add(row_index * self.record_width) };
+        Ok(unsafe { read_i64_unchecked(row_ptr, load) })
+    }
+
+    fn read_optional(&self, row_index: usize, load: Option<FixedFieldLoad>) -> Result<Option<i64>> {
+        load.map(|load| self.read(row_index, load)).transpose()
+    }
 }
 
 impl<'a> Aura1FixedBatchView<'a> {
@@ -750,6 +1107,94 @@ fn aura1_field_slots(plan: &CompiledAuraPlan) -> Result<Vec<CompiledAuraField>> 
     Ok(slots)
 }
 
+fn required_delta_field(
+    schema: &AuraSchema,
+    field_name: Option<&str>,
+    role: &'static str,
+    predicate: fn(AuraType) -> bool,
+) -> Result<usize> {
+    let name = field_name.ok_or(AuraError::InvalidValue(role))?;
+    let index = schema
+        .fields()
+        .iter()
+        .position(|field| field.name == name)
+        .ok_or(AuraError::InvalidValue(role))?;
+    let field = &schema.fields()[index];
+    if field.nullable {
+        return Err(AuraError::InvalidValue(role));
+    }
+    if !predicate(field.aura_type) {
+        return Err(AuraError::InvalidValue(role));
+    }
+    Ok(index)
+}
+
+fn optional_delta_field(
+    schema: &AuraSchema,
+    field_name: Option<&str>,
+    role: &'static str,
+    predicate: fn(AuraType) -> bool,
+) -> Result<Option<usize>> {
+    let Some(name) = field_name else {
+        return Ok(None);
+    };
+    let Some(index) = schema.fields().iter().position(|field| field.name == name) else {
+        return Ok(None);
+    };
+    let field = &schema.fields()[index];
+    if field.nullable {
+        return Err(AuraError::InvalidValue(role));
+    }
+    if !predicate(field.aura_type) {
+        return Err(AuraError::InvalidValue(role));
+    }
+    Ok(Some(index))
+}
+
+fn reject_duplicate_delta_fields(spec: &OrderBookDeltaSpec) -> Result<()> {
+    let mut fields = spec.field_indices();
+    fields.sort_unstable();
+    fields.dedup();
+    if fields.len() != spec.field_count() {
+        return Err(AuraError::InvalidValue("order book delta field"));
+    }
+    Ok(())
+}
+
+fn is_timestamp_type(aura_type: AuraType) -> bool {
+    matches!(
+        aura_type,
+        AuraType::TimestampNanos | AuraType::TimestampMicros | AuraType::I64
+    )
+}
+
+fn is_price_type(aura_type: AuraType) -> bool {
+    matches!(
+        aura_type,
+        AuraType::PriceI64Scaled { .. }
+            | AuraType::I64Scaled { .. }
+            | AuraType::I64
+            | AuraType::I32
+    )
+}
+
+fn is_integer_type(aura_type: AuraType) -> bool {
+    matches!(
+        aura_type,
+        AuraType::Bool
+            | AuraType::U8
+            | AuraType::U16
+            | AuraType::U32
+            | AuraType::U64
+            | AuraType::I8
+            | AuraType::I16
+            | AuraType::I32
+            | AuraType::I64
+            | AuraType::EnumU8
+            | AuraType::FlagsU32
+    )
+}
+
 /// Public SDK reader for Aura files with dynamic schemas.
 #[derive(Debug, Clone)]
 pub struct AuraReader {
@@ -1140,6 +1585,104 @@ impl AuraReader {
                     stats.visitor_calls = stats
                         .visitor_calls
                         .saturating_add(rows_seen.div_ceil(batch_size));
+                    stats.compiled_plan_used = true;
+                });
+                Ok(rows_seen)
+            }
+        }
+    }
+
+    pub fn replay_orderbook_deltas<F>(
+        &self,
+        batch_size: usize,
+        spec: &OrderBookDeltaSpec,
+        mut visitor: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(OrderBookDeltaBatch<'_>) -> Result<()>,
+    {
+        if batch_size == 0 {
+            return Err(AuraError::InvalidValue("batch size"));
+        }
+        if self.profile != Profile::Aura1 {
+            return Err(AuraError::InvalidValue("aura1 replay profile"));
+        }
+        let plan = self
+            .compiled_plan
+            .as_ref()
+            .ok_or(AuraError::InvalidValue("compiled plan"))?;
+        let loads = spec.compile_loads(plan)?;
+        let mut rows_seen = 0usize;
+        match &self.source {
+            AuraReaderSource::Memory(bytes) => {
+                let stats = self.stats.get();
+                let body = bytes
+                    .get(stats.body_offset_from_header..stats.footer_offset_from_trailer)
+                    .ok_or(AuraError::UnexpectedEof)?;
+                while rows_seen < plan.record_count {
+                    let rows_to_visit = batch_size.min(plan.record_count - rows_seen);
+                    let byte_start = rows_seen
+                        .checked_mul(plan.aura1_record_width)
+                        .ok_or(AuraError::InvalidValue("row range"))?;
+                    let byte_len = rows_to_visit
+                        .checked_mul(plan.aura1_record_width)
+                        .ok_or(AuraError::InvalidValue("row range"))?;
+                    let byte_end = byte_start
+                        .checked_add(byte_len)
+                        .ok_or(AuraError::InvalidValue("row range"))?;
+                    let range = body
+                        .get(byte_start..byte_end)
+                        .ok_or(AuraError::UnexpectedEof)?;
+                    visitor(OrderBookDeltaBatch::new(
+                        range,
+                        plan.aura1_record_width,
+                        rows_to_visit,
+                        loads.clone(),
+                    )?)?;
+                    rows_seen = rows_seen.saturating_add(rows_to_visit);
+                }
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(rows_seen);
+                    stats.visitor_calls = stats
+                        .visitor_calls
+                        .saturating_add(rows_seen.div_ceil(batch_size));
+                    stats.bytes_read_during_replay = stats
+                        .bytes_read_during_replay
+                        .saturating_add(plan.aura1_body_size);
+                    stats.field_decode_count = stats
+                        .field_decode_count
+                        .saturating_add(rows_seen.saturating_mul(loads.payload_loads.len()));
+                    stats.endian_load_count = stats
+                        .endian_load_count
+                        .saturating_add(rows_seen.saturating_mul(loads.payload_loads.len()));
+                    stats.compiled_plan_used = true;
+                });
+                Ok(rows_seen)
+            }
+            AuraReaderSource::FileRange(_) => {
+                while rows_seen < plan.record_count {
+                    let rows_to_read = batch_size.min(plan.record_count - rows_seen);
+                    let (body, rows_to_visit) =
+                        self.read_aura1_body_range(rows_seen, rows_to_read)?;
+                    visitor(OrderBookDeltaBatch::new(
+                        &body,
+                        plan.aura1_record_width,
+                        rows_to_visit,
+                        loads.clone(),
+                    )?)?;
+                    rows_seen = rows_seen.saturating_add(rows_to_visit);
+                }
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(rows_seen);
+                    stats.visitor_calls = stats
+                        .visitor_calls
+                        .saturating_add(rows_seen.div_ceil(batch_size));
+                    stats.field_decode_count = stats
+                        .field_decode_count
+                        .saturating_add(rows_seen.saturating_mul(loads.payload_loads.len()));
+                    stats.endian_load_count = stats
+                        .endian_load_count
+                        .saturating_add(rows_seen.saturating_mul(loads.payload_loads.len()));
                     stats.compiled_plan_used = true;
                 });
                 Ok(rows_seen)

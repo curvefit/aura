@@ -1453,5 +1453,71 @@ fn aura_bench_runs_sdk_generic_fixture_smoke_matrix() {
         .unwrap()
         .contains_key("group_boundary_detection_ms"));
 
+    let orderbook_output_dir = dir.join("sdk-orderbook-bench");
+    let orderbook_output = Command::new(sdk_bench_bin)
+        .arg("--fixture-dir")
+        .arg(&dir)
+        .arg("--output-dir")
+        .arg(&orderbook_output_dir)
+        .arg("--iterations")
+        .arg("1")
+        .arg("--warmups")
+        .arg("0")
+        .arg("--batch-size")
+        .arg("8192")
+        .arg("--datasets")
+        .arg("sdk-dense")
+        .arg("--operations")
+        .arg("aura1-replay-orderbook-deltas-batch,aura1-replay-orderbook-deltas-apply-batch")
+        .output()
+        .unwrap();
+    assert!(
+        orderbook_output.status.success(),
+        "sdk orderbook stdout:\n{}\nsdk orderbook stderr:\n{}",
+        String::from_utf8_lossy(&orderbook_output.stdout),
+        String::from_utf8_lossy(&orderbook_output.stderr)
+    );
+    let orderbook_summary: serde_json::Value = serde_json::from_slice(
+        &fs::read(orderbook_output_dir.join("sdk_full_matrix_summary.json")).unwrap(),
+    )
+    .unwrap();
+    let orderbook_entry = orderbook_summary
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["operation"] == "aura1-replay-orderbook-deltas-batch")
+        .expect("orderbook replay entry");
+    assert_eq!("replay", orderbook_entry["benchmark_class"]);
+    assert_eq!("batch", orderbook_entry["replay_mode"]);
+    assert!(orderbook_entry["fields_accessed"].as_u64().unwrap() >= 5);
+    assert!(orderbook_entry["values_decoded"].as_u64().unwrap() > 0);
+    assert_ne!(0, orderbook_entry["checksum"].as_u64().unwrap());
+    assert_eq!(0, orderbook_entry["rows_materialized"].as_u64().unwrap());
+    assert_eq!(0, orderbook_entry["full_file_bytes_copied"].as_u64().unwrap());
+    assert!(orderbook_entry["stage_times_ms"]
+        .as_object()
+        .unwrap()
+        .contains_key("orderbook_delta_loop_ms"));
+    let orderbook_apply_entry = orderbook_summary
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["operation"] == "aura1-replay-orderbook-deltas-apply-batch")
+        .expect("orderbook apply replay entry");
+    assert_eq!("replay", orderbook_apply_entry["benchmark_class"]);
+    assert_eq!("batch", orderbook_apply_entry["replay_mode"]);
+    assert!(orderbook_apply_entry["fields_accessed"].as_u64().unwrap() >= 5);
+    assert!(orderbook_apply_entry["values_decoded"].as_u64().unwrap() > 0);
+    assert_ne!(0, orderbook_apply_entry["checksum"].as_u64().unwrap());
+    assert_eq!(0, orderbook_apply_entry["rows_materialized"].as_u64().unwrap());
+    assert!(orderbook_apply_entry["counters"]["book_update_count"]
+        .as_u64()
+        .unwrap()
+        > 0);
+    assert!(orderbook_apply_entry["stage_times_ms"]
+        .as_object()
+        .unwrap()
+        .contains_key("orderbook_decode_apply_loop_ms"));
+
     fs::remove_dir_all(&dir).unwrap();
 }

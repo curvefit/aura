@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use aura_codec::{
     convert_aura, records, Aura1RowView, AuraColumn, AuraError, AuraFormat, AuraGroupStats,
-    AuraProfile, AuraReader, AuraReaderStats, AuraRecordBatch, AuraSchema, AuraWriter,
-    CompiledAuraField, ConvertOptions, GroupBy, WriterOptions,
+    AuraProfile, AuraReader, AuraReaderStats, AuraRecordBatch, AuraSchema, AuraType, AuraWriter,
+    CompiledAuraField, ConvertOptions, GroupBy, OrderBookDeltaSpec, WriterOptions,
 };
 use serde_json::{json, Value};
 
@@ -381,6 +381,8 @@ fn run_fixture_matrix(fixture: &Fixture, args: &Args) -> Result<Vec<Value>> {
         "aura1-replay-batch-noop",
         "aura1-replay-batch-touch-selected",
         "aura1-replay-batch-touch-all",
+        "aura1-replay-orderbook-deltas-batch",
+        "aura1-replay-orderbook-deltas-apply-batch",
         "aura1-replay-grouped-touch-selected",
         "aura1-replay-grouped-touch-all",
         "aura1-scan-raw",
@@ -439,6 +441,10 @@ fn run_fixture_matrix(fixture: &Fixture, args: &Args) -> Result<Vec<Value>> {
             if !selected.iter().any(|candidate| candidate == operation) {
                 continue;
             }
+        } else if operation == "aura1-replay-orderbook-deltas-batch"
+            || operation == "aura1-replay-orderbook-deltas-apply-batch"
+        {
+            continue;
         }
         let result_path = args
             .output_dir
@@ -776,6 +782,12 @@ fn run_operation(
             AllFieldMode::TypeKernel,
         )
         .map(|output| output.with_replay_mode("batch")),
+        "aura1-replay-orderbook-deltas-batch" => {
+            replay_orderbook_deltas_batch_path(aura1_path, args.batch_size)
+        }
+        "aura1-replay-orderbook-deltas-apply-batch" => {
+            replay_orderbook_deltas_apply_batch_path(aura1_path, args.batch_size)
+        }
         "aura1-replay-grouped-touch-selected" => grouped_replay_selected(aura1, schema),
         "aura1-replay-grouped-touch-all" => grouped_replay_truth(
             aura1,
@@ -1589,6 +1601,301 @@ fn replay_aura1_batch_default_selected_path(path: &Path, batch_size: usize) -> R
         .with_stages(stages))
 }
 
+fn replay_orderbook_deltas_batch_path(path: &Path, batch_size: usize) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
+    let reader = AuraReader::open_path(path)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
+    let recipe_start = Instant::now();
+    let spec = default_orderbook_delta_spec(reader.schema())?;
+    let payload_fields = spec.field_indices();
+    let bytes_per_row = selected_bytes_per_row(&reader, &payload_fields)?;
+    stages.add_duration("selected_field_recipe_lookup_ms", recipe_start.elapsed());
+    let mut record_count = 0usize;
+    let mut checksum = 0u64;
+    let replay_start = Instant::now();
+    reader.replay_orderbook_deltas(batch_size, &spec, |batch| {
+        let callback_start = Instant::now();
+        record_count = record_count.saturating_add(batch.row_count());
+        let field_loop_start = Instant::now();
+        checksum = checksum.wrapping_add(batch.checksum_payload()?);
+        let field_loop_elapsed = field_loop_start.elapsed();
+        stages.add_duration("orderbook_delta_loop_ms", field_loop_elapsed);
+        let callback_residual =
+            duration_ms(callback_start.elapsed()) - duration_ms(field_loop_elapsed);
+        stages.add_ms("batch_callback_ms", callback_residual.max(0.0));
+        Ok(())
+    })?;
+    let replay_total = replay_start.elapsed();
+    black_box(checksum);
+    let stats = reader.stats();
+    add_residual_ms(
+        &mut stages,
+        "batch_range_validation_ms",
+        replay_total,
+        &["orderbook_delta_loop_ms", "batch_callback_ms"],
+    );
+    stages.add_ms("batch_view_construction_ms", 0.0);
+    stages.add_ms("field_load_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
+    let mut output = BenchOutput::new(stats.file_len, record_count).with_reader_stats(stats);
+    output.bytes_scanned = output
+        .reader_stats
+        .map(|stats| stats.bytes_read_during_replay)
+        .unwrap_or_default();
+    Ok(output
+        .with_access(
+            payload_fields.len(),
+            record_count.saturating_mul(payload_fields.len()),
+            record_count.saturating_mul(bytes_per_row),
+            checksum,
+        )
+        .with_parse_counters(
+            selected_kernel_group_count(payload_fields.len()),
+            payload_fields.len(),
+            selected_kernel_group_count(payload_fields.len()),
+            true,
+        )
+        .with_replay_mode("batch")
+        .with_stages(stages))
+}
+
+fn replay_orderbook_deltas_apply_batch_path(path: &Path, batch_size: usize) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
+    let reader = AuraReader::open_path(path)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
+    let recipe_start = Instant::now();
+    let spec = default_orderbook_delta_spec(reader.schema())?;
+    let payload_fields = spec.field_indices();
+    let bytes_per_row = selected_bytes_per_row(&reader, &payload_fields)?;
+    stages.add_duration("selected_field_recipe_lookup_ms", recipe_start.elapsed());
+    let mut record_count = 0usize;
+    let record_capacity = reader
+        .compiled_plan()
+        .map(|plan| plan.record_count)
+        .unwrap_or(0);
+    let mut book = BenchOrderBook::with_capacity(record_capacity.saturating_mul(2));
+    let replay_start = Instant::now();
+    reader.replay_orderbook_deltas(batch_size, &spec, |batch| {
+        let callback_start = Instant::now();
+        record_count = record_count.saturating_add(batch.row_count());
+        let decode_start = Instant::now();
+        for row in 0..batch.row_count() {
+            let timestamp = batch.timestamp(row)?;
+            let instrument = batch.instrument(row)?;
+            let side = batch.side(row)?;
+            let price = batch.price(row)?;
+            let size = batch.size(row)?;
+            let flags = batch.flags(row)?.unwrap_or(0);
+            let action = batch.action(row)?.unwrap_or(0);
+            let sequence = batch.sequence(row)?.unwrap_or(0);
+            let order_id = batch.order_id(row)?.unwrap_or(0);
+            book.apply(BenchBookDelta {
+                timestamp,
+                instrument,
+                side,
+                price,
+                size,
+                flags,
+                action,
+                sequence,
+                order_id,
+            });
+        }
+        let decode_elapsed = decode_start.elapsed();
+        stages.add_duration("orderbook_decode_apply_loop_ms", decode_elapsed);
+        let callback_residual = duration_ms(callback_start.elapsed()) - duration_ms(decode_elapsed);
+        stages.add_ms("batch_callback_ms", callback_residual.max(0.0));
+        Ok(())
+    })?;
+    let replay_total = replay_start.elapsed();
+    let checksum = book.checksum;
+    black_box(checksum);
+    black_box(book.level_count);
+    let stats = reader.stats();
+    add_residual_ms(
+        &mut stages,
+        "batch_range_validation_ms",
+        replay_total,
+        &["orderbook_decode_apply_loop_ms", "batch_callback_ms"],
+    );
+    stages.add_ms("batch_view_construction_ms", 0.0);
+    stages.add_ms("field_load_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
+    stages.add_counter("book_update_count", book.updates);
+    stages.add_counter("book_delete_count", book.deletes);
+    stages.add_counter("book_level_count", book.level_count);
+    let mut output = BenchOutput::new(stats.file_len, record_count).with_reader_stats(stats);
+    output.bytes_scanned = output
+        .reader_stats
+        .map(|stats| stats.bytes_read_during_replay)
+        .unwrap_or_default();
+    Ok(output
+        .with_access(
+            payload_fields.len(),
+            record_count.saturating_mul(payload_fields.len()),
+            record_count.saturating_mul(bytes_per_row),
+            checksum,
+        )
+        .with_parse_counters(
+            selected_kernel_group_count(payload_fields.len()),
+            payload_fields.len(),
+            selected_kernel_group_count(payload_fields.len()),
+            true,
+        )
+        .with_replay_mode("batch")
+        .with_stages(stages))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BenchBookKey {
+    instrument: i64,
+    side: i64,
+    price: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BenchBookDelta {
+    timestamp: i64,
+    instrument: i64,
+    side: i64,
+    price: i64,
+    size: i64,
+    flags: i64,
+    action: i64,
+    sequence: i64,
+    order_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BenchBookSlot {
+    key: BenchBookKey,
+    size: i64,
+    state: u8,
+}
+
+#[derive(Debug)]
+struct BenchOrderBook {
+    slots: Vec<BenchBookSlot>,
+    mask: usize,
+    level_count: usize,
+    updates: usize,
+    deletes: usize,
+    checksum: u64,
+}
+
+impl BenchOrderBook {
+    fn with_capacity(capacity: usize) -> Self {
+        let table_len = capacity.min(16 * 1024).next_power_of_two().max(1024);
+        Self {
+            slots: vec![BenchBookSlot::default(); table_len],
+            mask: table_len - 1,
+            level_count: 0,
+            updates: 0,
+            deletes: 0,
+            checksum: 0,
+        }
+    }
+
+    fn apply(&mut self, delta: BenchBookDelta) {
+        let key = BenchBookKey {
+            instrument: delta.instrument,
+            side: delta.side,
+            price: delta.price,
+        };
+        let previous = if delta.size <= 0 || delta.action == 2 {
+            self.deletes = self.deletes.saturating_add(1);
+            self.delete(key)
+        } else {
+            self.updates = self.updates.saturating_add(1);
+            self.upsert(key, delta.size)
+        };
+        self.checksum = mix_checksum(self.checksum, delta.timestamp);
+        self.checksum = mix_checksum(self.checksum, delta.instrument);
+        self.checksum = mix_checksum(self.checksum, delta.side);
+        self.checksum = mix_checksum(self.checksum, delta.price);
+        self.checksum = mix_checksum(self.checksum, delta.size);
+        self.checksum = mix_checksum(self.checksum, delta.flags);
+        self.checksum = mix_checksum(self.checksum, delta.sequence);
+        self.checksum = mix_checksum(self.checksum, delta.order_id);
+        self.checksum = mix_checksum(self.checksum, previous);
+        self.checksum = self.checksum.wrapping_add(self.level_count as u64);
+    }
+
+    fn upsert(&mut self, key: BenchBookKey, size: i64) -> i64 {
+        if self.level_count.saturating_mul(10) >= self.slots.len().saturating_mul(7) {
+            self.grow();
+        }
+        let (index, found) = self.find_slot(key);
+        let slot = &mut self.slots[index];
+        if found {
+            let previous = slot.size;
+            slot.size = size;
+            previous
+        } else {
+            slot.key = key;
+            slot.size = size;
+            slot.state = 1;
+            self.level_count = self.level_count.saturating_add(1);
+            0
+        }
+    }
+
+    fn grow(&mut self) {
+        let old_slots = std::mem::take(&mut self.slots);
+        let table_len = (old_slots.len().saturating_mul(2)).max(1024);
+        self.slots = vec![BenchBookSlot::default(); table_len];
+        self.mask = table_len - 1;
+        self.level_count = 0;
+        for slot in old_slots {
+            if slot.state == 1 {
+                self.upsert(slot.key, slot.size);
+            }
+        }
+    }
+
+    fn delete(&mut self, key: BenchBookKey) -> i64 {
+        let (index, found) = self.find_slot(key);
+        if found {
+            let slot = &mut self.slots[index];
+            let previous = slot.size;
+            slot.size = 0;
+            slot.state = 2;
+            self.level_count = self.level_count.saturating_sub(1);
+            previous
+        } else {
+            0
+        }
+    }
+
+    fn find_slot(&self, key: BenchBookKey) -> (usize, bool) {
+        let mut index = hash_book_key(key) as usize & self.mask;
+        let mut first_tombstone = None;
+        loop {
+            let slot = self.slots[index];
+            match slot.state {
+                0 => return (first_tombstone.unwrap_or(index), false),
+                1 if slot.key == key => return (index, true),
+                2 if first_tombstone.is_none() => first_tombstone = Some(index),
+                _ => {}
+            }
+            index = (index + 1) & self.mask;
+        }
+    }
+}
+
+fn hash_book_key(key: BenchBookKey) -> u64 {
+    let mut hash = (key.instrument as u64).wrapping_mul(0x9E37_79B1_85EB_CA87);
+    hash ^= (key.side as u64).rotate_left(17).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    hash ^= (key.price as u64).rotate_left(31).wrapping_mul(0x1656_67B1_9E37_79F9);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    hash ^ (hash >> 29)
+}
+
 fn replay_aura1_row_view_only(bytes: &[u8]) -> Result<BenchOutput> {
     let reader = AuraReader::open(Cursor::new(bytes))?;
     let mut record_count = 0usize;
@@ -2089,6 +2396,144 @@ fn default_selected_field_indices(reader: &AuraReader) -> Result<Vec<usize>> {
         selected.push(usize::from(slots[0].field_index));
     }
     Ok(selected)
+}
+
+fn default_orderbook_delta_spec(schema: &AuraSchema) -> Result<OrderBookDeltaSpec> {
+    let mut used = Vec::new();
+    let timestamp = find_delta_field(schema, &used, is_timestamp_type, &["ts", "time", "event"])?;
+    used.push(timestamp);
+    let price = find_delta_field(schema, &used, is_price_type, &["price", "px", "open"])?;
+    used.push(price);
+    let size = find_delta_field(
+        schema,
+        &used,
+        is_integer_type,
+        &["size", "qty", "quantity", "volume"],
+    )?;
+    used.push(size);
+    let side = find_delta_field(
+        schema,
+        &used,
+        is_integer_type,
+        &["side", "event_type", "condition", "type"],
+    )?;
+    used.push(side);
+    let instrument = find_delta_field(
+        schema,
+        &used,
+        is_integer_type,
+        &["symbol", "instrument", "book", "venue", "id"],
+    )?;
+    used.push(instrument);
+    let flags = find_optional_delta_field(schema, &used, is_integer_type, &["flags"]);
+
+    let field_name = |index: usize| -> Result<String> {
+        schema
+            .fields()
+            .get(index)
+            .map(|field| field.name.clone())
+            .ok_or_else(|| anyhow::anyhow!("orderbook delta field index out of bounds"))
+    };
+
+    let mut builder = OrderBookDeltaSpec::builder()
+        .timestamp(field_name(timestamp)?)
+        .instrument(field_name(instrument)?)
+        .side(field_name(side)?)
+        .price(field_name(price)?)
+        .size(field_name(size)?);
+    if let Some(flags) = flags {
+        builder = builder.flags_optional(field_name(flags)?);
+    }
+    builder
+        .build(schema)
+        .map_err(|error| anyhow::anyhow!("orderbook delta spec: {error}"))
+}
+
+fn find_delta_field(
+    schema: &AuraSchema,
+    used: &[usize],
+    predicate: fn(AuraType) -> bool,
+    name_hints: &[&str],
+) -> Result<usize> {
+    find_named_delta_field(schema, used, predicate, name_hints)
+        .or_else(|| find_typed_delta_field(schema, used, predicate))
+        .ok_or_else(|| anyhow::anyhow!("orderbook delta schema needs more fixed-width fields"))
+}
+
+fn find_optional_delta_field(
+    schema: &AuraSchema,
+    used: &[usize],
+    predicate: fn(AuraType) -> bool,
+    name_hints: &[&str],
+) -> Option<usize> {
+    find_named_delta_field(schema, used, predicate, name_hints)
+}
+
+fn find_named_delta_field(
+    schema: &AuraSchema,
+    used: &[usize],
+    predicate: fn(AuraType) -> bool,
+    name_hints: &[&str],
+) -> Option<usize> {
+    schema.fields().iter().enumerate().find_map(|(index, field)| {
+        let lower = field.name.to_ascii_lowercase();
+        if !used.contains(&index)
+            && predicate(field.aura_type)
+            && name_hints.iter().any(|hint| lower.contains(hint))
+        {
+            Some(index)
+        } else {
+            None
+        }
+    })
+}
+
+fn find_typed_delta_field(
+    schema: &AuraSchema,
+    used: &[usize],
+    predicate: fn(AuraType) -> bool,
+) -> Option<usize> {
+    schema.fields().iter().enumerate().find_map(|(index, field)| {
+        if !used.contains(&index) && predicate(field.aura_type) {
+            Some(index)
+        } else {
+            None
+        }
+    })
+}
+
+fn is_timestamp_type(aura_type: AuraType) -> bool {
+    matches!(
+        aura_type,
+        AuraType::TimestampNanos | AuraType::TimestampMicros | AuraType::I64
+    )
+}
+
+fn is_price_type(aura_type: AuraType) -> bool {
+    matches!(
+        aura_type,
+        AuraType::PriceI64Scaled { .. }
+            | AuraType::I64Scaled { .. }
+            | AuraType::I64
+            | AuraType::I32
+    )
+}
+
+fn is_integer_type(aura_type: AuraType) -> bool {
+    matches!(
+        aura_type,
+        AuraType::Bool
+            | AuraType::U8
+            | AuraType::U16
+            | AuraType::U32
+            | AuraType::U64
+            | AuraType::I8
+            | AuraType::I16
+            | AuraType::I32
+            | AuraType::I64
+            | AuraType::EnumU8
+            | AuraType::FlagsU32
+    )
 }
 
 fn push_first_matching_field(
