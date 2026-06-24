@@ -1051,3 +1051,73 @@ Each experiment must record:
   optional backend only after borrowed views need it.
 - next implication: optimize per-row decode/callback or expose borrowed views
   before adding platform-specific mmap surface.
+
+## Aura1 True Parse Experiment T1: Field-access benchmarks and row views
+
+- experiment ID: T1
+- hypothesis: the previous batch-callback replay number was mostly view
+  construction and callback overhead, not field parse throughput. True parse
+  benchmarks must checksum accessed values.
+- target file/function:
+  - `src/reader.rs` `Aura1FixedBatchView`
+  - `src/reader.rs` `AuraReader::replay_row_views`
+  - `src/bin/aura_sdk_bench.rs` Aura1 parse operations
+- expected speedup: selected-field and batch all-field parse should beat the
+  current all-field `replay_i64` path when equivalent field access is measured.
+- patch summary: added plan-indexed field slots, `Aura1RowView`, row-view
+  replay, batch field iterators/checksums, true parse benchmark operations, and
+  JSON fields for `fields_accessed`, `values_decoded`, `bytes_touched`, and
+  `checksum`.
+- command:
+  - `cargo test --test sdk_api -- --nocapture`
+  - `cargo test --test aura_bench_cli -- --nocapture`
+  - `cargo build --release --bin aura_sdk_bench`
+  - `target/release/aura_sdk_bench --fixture-dir /tmp/aura-benchmarks/aura1-file-backed-fixtures-20260624T173521Z --output-dir /tmp/aura-benchmarks/aura1-true-parse-probe-2 --iterations 10 --warmups 2 --batch-size 8192 --datasets sdk-larger --operations aura1-scan-raw-file-range,aura1-batch-view-only-file-range,aura1-batch-touch-one-field-file-range,aura1-batch-touch-all-fields-file-range,aura1-row-view-only-file-range,aura1-row-view-one-field-file-range,aura1-row-view-all-fields-file-range,aura1-replay-i64-current-file-range,aura1-read-batches-columnar-file-range,aura1-read-batches-row-file-range`
+- benchmark JSON path:
+  - `/tmp/aura-benchmarks/aura1-true-parse-probe-2/sdk_full_matrix_summary.json`
+- result: on `sdk-larger`, view-only batch callback reported zero decoded
+  values and 1.215 ms; batch all-field parse decoded 3,000,000 values in
+  11.983 ms; current all-field `replay_i64` decoded the same values in
+  16.921 ms; row-view one-field parse decoded 500,000 selected values in
+  5.472 ms.
+- kept/rejected: keep batch field checksum/iterator path and row-view selected
+  field API. Reject row-view all-fields as the fastest all-field path because
+  it measured slower than current `replay_i64`.
+- next implication: final recommendation should separate no-parse view APIs,
+  selected-field APIs, all-field true parse APIs, and materializing batch APIs.
+
+## Aura1 All-Field Parse Experiment T2: Checked-once type kernels
+
+- experiment ID: T2
+- hypothesis: all-field parse is slow because each value pays row/field slice
+  validation and width dispatch. A checked-once fixed-width kernel should keep
+  the dynamic schema plan but move validation and width dispatch out of the cell
+  loop.
+- target file/function:
+  - `src/fixed_width.rs` checked-once load helpers
+  - `src/reader.rs` `Aura1FixedBatchView` checksum methods
+  - `src/bin/aura_sdk_bench.rs` all-field parse operations
+- expected speedup: reach at least 2 GB/s for true all-field parse on
+  `sdk-larger`.
+- patch summary: added safe field-major parse, checked-once unchecked loads,
+  width/type-kernel grouping, parse-program execution, selected-field batch
+  checksums, and JSON counters for dynamic dispatch, bounds checks, kernel
+  groups, and unsafe-load usage.
+- command:
+  - `cargo test --test sdk_api -- --nocapture`
+  - `cargo test --test aura_bench_cli -- --nocapture`
+  - `cargo build --release --bin aura_sdk_bench`
+  - `target/release/aura_sdk_bench --fixture-dir /tmp/aura-benchmarks/aura1-file-backed-fixtures-20260624T173521Z --output-dir /tmp/aura-benchmarks/aura1-all-field-probe --iterations 10 --warmups 2 --batch-size 8192 --datasets sdk-larger --operations aura1-scan-raw-file-range,aura1-batch-view-only-file-range,aura1-batch-touch-all-fields-file-range,aura1-batch-touch-all-fields-field-major-file-range,aura1-batch-touch-all-fields-unchecked-file-range,aura1-batch-touch-all-fields-type-kernel-file-range,aura1-batch-touch-all-fields-instruction-tape-file-range,aura1-batch-selected-one-field-file-range,aura1-batch-selected-two-fields-file-range,aura1-batch-selected-all-fields-file-range,aura1-read-batches-columnar-file-range,aura1-replay-i64-current-file-range`
+- benchmark JSON path:
+  - `/tmp/aura-benchmarks/aura1-all-field-probe/sdk_full_matrix_summary.json`
+- result: on `sdk-larger`, original all-field parse decoded 3,000,000 values
+  at 795 MB/s; safe field-major measured 832 MB/s; checked-once unchecked loads
+  measured 1343 MB/s; parse-program measured 1445 MB/s; width/type-kernel
+  measured 2384 MB/s and passed the 2 GB/s target. Selected one-field measured
+  3194 MB/s and selected two-field measured 2010 MB/s.
+- kept/rejected: keep checked-once, type-kernel, parse-program, and
+  selected-field APIs. Reject safe field-major and selected-all-fields as final
+  all-field winners because they remain below 2 GB/s.
+- next implication: recommend type-kernel all-field parse for max true-parse
+  throughput; keep `replay_i64` as ergonomic per-row replay and column/row
+  batches as materializing APIs.

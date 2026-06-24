@@ -4,6 +4,10 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::fixed_width::{
+    fixed_field_loads, parse_checksum_value, read_i64_checked, read_i64_unchecked,
+    validate_fixed_body, FixedFieldLoad, FixedLoadKind,
+};
 use crate::footer::AuraFooter;
 use crate::format::SEAL_MAGIC;
 use crate::header::AuraHeader;
@@ -239,6 +243,12 @@ pub struct Aura1FixedBatchView<'a> {
     field_offsets: Vec<CompiledAuraField>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Aura1RowView<'a> {
+    row_bytes: &'a [u8],
+    field_offsets: &'a [CompiledAuraField],
+}
+
 impl<'a> Aura1FixedBatchView<'a> {
     fn new(body: &'a [u8], plan: &CompiledAuraPlan, row_count: usize) -> Result<Self> {
         let expected_len = row_count
@@ -251,7 +261,7 @@ impl<'a> Aura1FixedBatchView<'a> {
             body,
             record_width: plan.aura1_record_width,
             row_count,
-            field_offsets: plan.aura1_field_offsets(),
+            field_offsets: aura1_field_slots(plan)?,
         })
     }
 
@@ -273,8 +283,7 @@ impl<'a> Aura1FixedBatchView<'a> {
         }
         let field = self
             .field_offsets
-            .iter()
-            .find(|field| usize::from(field.field_index) == field_index)
+            .get(field_index)
             .ok_or(AuraError::InvalidValue("field index"))?;
         let row_offset = row_index
             .checked_mul(self.record_width)
@@ -289,15 +298,412 @@ impl<'a> Aura1FixedBatchView<'a> {
         read_i64_fixed_width(bytes)
     }
 
+    pub fn row_view(&self, row_index: usize) -> Result<Aura1RowView<'_>> {
+        if row_index >= self.row_count {
+            return Err(AuraError::InvalidValue("row index"));
+        }
+        let start = row_index
+            .checked_mul(self.record_width)
+            .ok_or(AuraError::InvalidValue("row index"))?;
+        let end = start
+            .checked_add(self.record_width)
+            .ok_or(AuraError::InvalidValue("row index"))?;
+        let row_bytes = self.body.get(start..end).ok_or(AuraError::UnexpectedEof)?;
+        Ok(Aura1RowView {
+            row_bytes,
+            field_offsets: &self.field_offsets,
+        })
+    }
+
     pub fn row_i64_values(&self, row_index: usize, out: &mut Vec<i64>) -> Result<()> {
         out.clear();
         out.resize(self.field_offsets.len(), 0);
-        for field in &self.field_offsets {
-            out[usize::from(field.field_index)] =
-                self.value_i64(row_index, usize::from(field.field_index))?;
+        let row = self.row_view(row_index)?;
+        for index in 0..self.field_offsets.len() {
+            out[index] = row.get_i64(index)?;
         }
         Ok(())
     }
+
+    pub fn checksum_field(&self, field_index: usize) -> Result<u64> {
+        let mut checksum = 0u64;
+        for row_index in 0..self.row_count {
+            checksum = mix_checksum(checksum, self.value_i64(row_index, field_index)?);
+        }
+        Ok(checksum)
+    }
+
+    pub fn checksum_all_fields(&self) -> Result<u64> {
+        let mut checksum = 0u64;
+        for row_index in 0..self.row_count {
+            let row = self.row_view(row_index)?;
+            for field_index in 0..self.field_offsets.len() {
+                checksum = mix_checksum(checksum, row.get_i64(field_index)?);
+            }
+        }
+        Ok(checksum)
+    }
+
+    pub fn checksum_selected_fields(&self, field_indices: &[usize]) -> Result<u64> {
+        let fields = select_field_slots(&self.field_offsets, field_indices)?;
+        checksum_field_major_checked(self.body, self.record_width, self.row_count, &fields)
+    }
+
+    pub fn checksum_all_fields_field_major(&self) -> Result<u64> {
+        checksum_field_major_checked(
+            self.body,
+            self.record_width,
+            self.row_count,
+            &self.field_offsets,
+        )
+    }
+
+    pub fn checksum_all_fields_checked_once(&self) -> Result<u64> {
+        checksum_row_major_unchecked(
+            self.body,
+            self.record_width,
+            self.row_count,
+            &self.field_offsets,
+        )
+    }
+
+    pub fn checksum_all_fields_type_kernel(&self) -> Result<u64> {
+        checksum_type_kernel(
+            self.body,
+            self.record_width,
+            self.row_count,
+            &self.field_offsets,
+        )
+    }
+
+    pub fn checksum_all_fields_parse_program(&self) -> Result<u64> {
+        let ops = fixed_field_loads(&self.field_offsets)?;
+        checksum_parse_program(self.body, self.record_width, self.row_count, &ops)
+    }
+}
+
+impl<'a> Aura1RowView<'a> {
+    pub fn field_count(&self) -> usize {
+        self.field_offsets.len()
+    }
+
+    pub fn get_i64(&self, field_index: usize) -> Result<i64> {
+        let field = self
+            .field_offsets
+            .get(field_index)
+            .ok_or(AuraError::InvalidValue("field index"))?;
+        let end = field
+            .offset
+            .checked_add(field.width)
+            .ok_or(AuraError::InvalidValue("field offset"))?;
+        let bytes = self
+            .row_bytes
+            .get(field.offset..end)
+            .ok_or(AuraError::UnexpectedEof)?;
+        read_i64_fixed_width(bytes)
+    }
+
+    pub fn get_u64(&self, field_index: usize) -> Result<u64> {
+        Ok(self.get_i64(field_index)? as u64)
+    }
+
+    pub fn get_i32(&self, field_index: usize) -> Result<i32> {
+        i32::try_from(self.get_i64(field_index)?).map_err(|_| AuraError::InvalidValue("i32 value"))
+    }
+
+    pub fn get_u32(&self, field_index: usize) -> Result<u32> {
+        u32::try_from(self.get_i64(field_index)?).map_err(|_| AuraError::InvalidValue("u32 value"))
+    }
+
+    pub fn get_u8(&self, field_index: usize) -> Result<u8> {
+        u8::try_from(self.get_i64(field_index)?).map_err(|_| AuraError::InvalidValue("u8 value"))
+    }
+
+    pub fn get_timestamp_nanos(&self, field_index: usize) -> Result<i64> {
+        self.get_i64(field_index)
+    }
+
+    pub fn get_price_scaled(&self, field_index: usize) -> Result<i64> {
+        self.get_i64(field_index)
+    }
+
+    pub fn checksum_all_fields(&self) -> Result<u64> {
+        let mut checksum = 0u64;
+        for field_index in 0..self.field_offsets.len() {
+            checksum = mix_checksum(checksum, self.get_i64(field_index)?);
+        }
+        Ok(checksum)
+    }
+}
+
+pub struct Aura1FieldI64Iter<'a> {
+    body: &'a [u8],
+    record_width: usize,
+    field: CompiledAuraField,
+    row_count: usize,
+    row_index: usize,
+}
+
+impl<'a> Iterator for Aura1FieldI64Iter<'a> {
+    type Item = Result<i64>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.row_index >= self.row_count {
+            return None;
+        }
+        let start = match self
+            .row_index
+            .checked_mul(self.record_width)
+            .and_then(|row| row.checked_add(self.field.offset))
+        {
+            Some(start) => start,
+            None => return Some(Err(AuraError::InvalidValue("field offset"))),
+        };
+        let end = match start.checked_add(self.field.width) {
+            Some(end) => end,
+            None => return Some(Err(AuraError::InvalidValue("field offset"))),
+        };
+        self.row_index = self.row_index.saturating_add(1);
+        Some(
+            self.body
+                .get(start..end)
+                .ok_or(AuraError::UnexpectedEof)
+                .and_then(read_i64_fixed_width),
+        )
+    }
+}
+
+fn select_field_slots(
+    fields: &[CompiledAuraField],
+    field_indices: &[usize],
+) -> Result<Vec<CompiledAuraField>> {
+    field_indices
+        .iter()
+        .map(|index| {
+            fields
+                .get(*index)
+                .copied()
+                .ok_or(AuraError::InvalidValue("field index"))
+        })
+        .collect()
+}
+
+fn checksum_field_major_checked(
+    body: &[u8],
+    record_width: usize,
+    row_count: usize,
+    fields: &[CompiledAuraField],
+) -> Result<u64> {
+    validate_fixed_body(body, record_width, row_count, fields)?;
+    let mut checksum = 0u64;
+    for field in fields {
+        for row_index in 0..row_count {
+            let row_start = row_index
+                .checked_mul(record_width)
+                .ok_or(AuraError::InvalidValue("row offset"))?;
+            let row = body
+                .get(row_start..row_start + record_width)
+                .ok_or(AuraError::UnexpectedEof)?;
+            checksum = parse_checksum_value(
+                checksum,
+                row_index,
+                field.field_index,
+                read_i64_checked(row, *field)?,
+            );
+        }
+    }
+    Ok(checksum)
+}
+
+fn checksum_row_major_unchecked(
+    body: &[u8],
+    record_width: usize,
+    row_count: usize,
+    fields: &[CompiledAuraField],
+) -> Result<u64> {
+    validate_fixed_body(body, record_width, row_count, fields)?;
+    let loads = fixed_field_loads(fields)?;
+    let mut checksum = 0u64;
+    let base = body.as_ptr();
+    for row_index in 0..row_count {
+        let row_offset = row_index
+            .checked_mul(record_width)
+            .ok_or(AuraError::InvalidValue("row offset"))?;
+        let row_ptr = unsafe { base.add(row_offset) };
+        for load in &loads {
+            let value = unsafe { read_i64_unchecked(row_ptr, *load) };
+            checksum = parse_checksum_value(checksum, row_index, load.field_index, value);
+        }
+    }
+    Ok(checksum)
+}
+
+fn checksum_type_kernel(
+    body: &[u8],
+    record_width: usize,
+    row_count: usize,
+    fields: &[CompiledAuraField],
+) -> Result<u64> {
+    validate_fixed_body(body, record_width, row_count, fields)?;
+    let loads = fixed_field_loads(fields)?;
+    let mut checksum = 0u64;
+    checksum = checksum_load_kind_group(
+        checksum,
+        body,
+        record_width,
+        row_count,
+        &loads,
+        FixedLoadKind::I64,
+    );
+    checksum = checksum_load_kind_group(
+        checksum,
+        body,
+        record_width,
+        row_count,
+        &loads,
+        FixedLoadKind::I32,
+    );
+    checksum = checksum_load_kind_group(
+        checksum,
+        body,
+        record_width,
+        row_count,
+        &loads,
+        FixedLoadKind::I16,
+    );
+    checksum = checksum_load_kind_group(
+        checksum,
+        body,
+        record_width,
+        row_count,
+        &loads,
+        FixedLoadKind::I8,
+    );
+    Ok(checksum)
+}
+
+fn checksum_load_kind_group(
+    mut checksum: u64,
+    body: &[u8],
+    record_width: usize,
+    row_count: usize,
+    loads: &[FixedFieldLoad],
+    kind: FixedLoadKind,
+) -> u64 {
+    let base = body.as_ptr();
+    for load in loads.iter().copied().filter(|load| load.kind == kind) {
+        for row_index in 0..row_count {
+            let row_ptr = unsafe { base.add(row_index * record_width) };
+            let value = unsafe { read_i64_unchecked(row_ptr, load) };
+            checksum = parse_checksum_value(checksum, row_index, load.field_index, value);
+        }
+    }
+    checksum
+}
+
+fn checksum_parse_program(
+    body: &[u8],
+    record_width: usize,
+    row_count: usize,
+    ops: &[FixedFieldLoad],
+) -> Result<u64> {
+    let fields = ops
+        .iter()
+        .map(|op| CompiledAuraField {
+            field_index: op.field_index,
+            offset: op.offset,
+            width: match op.kind {
+                FixedLoadKind::I8 => 1,
+                FixedLoadKind::I16 => 2,
+                FixedLoadKind::I32 => 4,
+                FixedLoadKind::I64 => 8,
+            },
+        })
+        .collect::<Vec<_>>();
+    validate_fixed_body(body, record_width, row_count, &fields)?;
+    let mut checksum = 0u64;
+    let base = body.as_ptr();
+    for row_index in 0..row_count {
+        let row_ptr = unsafe { base.add(row_index * record_width) };
+        for op in ops {
+            let value = unsafe { read_i64_unchecked(row_ptr, *op) };
+            checksum = parse_checksum_value(checksum, row_index, op.field_index, value);
+        }
+    }
+    Ok(checksum)
+}
+
+impl<'a> Aura1FixedBatchView<'a> {
+    pub fn field_i64(&'a self, field_index: usize) -> Result<Aura1FieldI64Iter<'a>> {
+        let field = *self
+            .field_offsets
+            .get(field_index)
+            .ok_or(AuraError::InvalidValue("field index"))?;
+        Ok(Aura1FieldI64Iter {
+            body: self.body,
+            record_width: self.record_width,
+            field,
+            row_count: self.row_count,
+            row_index: 0,
+        })
+    }
+
+    pub fn field_u64(
+        &'a self,
+        field_index: usize,
+    ) -> Result<impl Iterator<Item = Result<u64>> + 'a> {
+        Ok(self
+            .field_i64(field_index)?
+            .map(|value| value.map(|value| value as u64)))
+    }
+
+    pub fn field_u32(
+        &'a self,
+        field_index: usize,
+    ) -> Result<impl Iterator<Item = Result<u32>> + 'a> {
+        Ok(self.field_i64(field_index)?.map(|value| {
+            value.and_then(|value| {
+                u32::try_from(value).map_err(|_| AuraError::InvalidValue("u32 value"))
+            })
+        }))
+    }
+
+    pub fn field_u8(&'a self, field_index: usize) -> Result<impl Iterator<Item = Result<u8>> + 'a> {
+        Ok(self.field_i64(field_index)?.map(|value| {
+            value.and_then(|value| {
+                u8::try_from(value).map_err(|_| AuraError::InvalidValue("u8 value"))
+            })
+        }))
+    }
+}
+
+fn mix_checksum(checksum: u64, value: i64) -> u64 {
+    checksum.wrapping_mul(0x9E37_79B1_85EB_CA87).rotate_left(7)
+        ^ (value as u64).wrapping_add(0xC2B2_AE3D_27D4_EB4F)
+}
+
+fn aura1_field_slots(plan: &CompiledAuraPlan) -> Result<Vec<CompiledAuraField>> {
+    let mut slots = vec![
+        CompiledAuraField {
+            field_index: 0,
+            offset: 0,
+            width: 0,
+        };
+        plan.field_count
+    ];
+    for field in plan.aura1_field_offsets() {
+        let index = usize::from(field.field_index);
+        let slot = slots
+            .get_mut(index)
+            .ok_or(AuraError::InvalidValue("field index"))?;
+        *slot = field;
+    }
+    for (index, field) in slots.iter().enumerate() {
+        if usize::from(field.field_index) != index {
+            return Err(AuraError::InvalidValue("field index"));
+        }
+    }
+    Ok(slots)
 }
 
 /// Public SDK reader for Aura files with dynamic schemas.
@@ -697,6 +1103,87 @@ impl AuraReader {
         }
     }
 
+    pub fn replay_row_views<F>(&self, mut visitor: F) -> Result<usize>
+    where
+        F: FnMut(Aura1RowView<'_>) -> Result<()>,
+    {
+        if self.profile != Profile::Aura1 {
+            return Err(AuraError::InvalidValue("aura1 replay profile"));
+        }
+        let plan = self
+            .compiled_plan
+            .as_ref()
+            .ok_or(AuraError::InvalidValue("compiled plan"))?;
+        let field_offsets = aura1_field_slots(plan)?;
+        let mut rows_seen = 0usize;
+        match &self.source {
+            AuraReaderSource::Memory(bytes) => {
+                let stats = self.stats.get();
+                let body = bytes
+                    .get(stats.body_offset_from_header..stats.footer_offset_from_trailer)
+                    .ok_or(AuraError::UnexpectedEof)?;
+                if body.len() != plan.aura1_body_size {
+                    return Err(AuraError::UnexpectedEof);
+                }
+                while rows_seen < plan.record_count {
+                    let row_start = rows_seen
+                        .checked_mul(plan.aura1_record_width)
+                        .ok_or(AuraError::InvalidValue("row range"))?;
+                    let row_end = row_start
+                        .checked_add(plan.aura1_record_width)
+                        .ok_or(AuraError::InvalidValue("row range"))?;
+                    let row_bytes = body
+                        .get(row_start..row_end)
+                        .ok_or(AuraError::UnexpectedEof)?;
+                    visitor(Aura1RowView {
+                        row_bytes,
+                        field_offsets: &field_offsets,
+                    })?;
+                    rows_seen = rows_seen.saturating_add(1);
+                }
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(rows_seen);
+                    stats.visitor_calls = stats.visitor_calls.saturating_add(rows_seen);
+                    stats.bytes_read_during_replay = stats
+                        .bytes_read_during_replay
+                        .saturating_add(plan.aura1_body_size);
+                    stats.compiled_plan_used = true;
+                });
+                Ok(rows_seen)
+            }
+            AuraReaderSource::FileRange(_) => {
+                let rows_per_chunk = rows_per_file_chunk(plan.aura1_record_width);
+                while rows_seen < plan.record_count {
+                    let rows_to_read = rows_per_chunk.min(plan.record_count - rows_seen);
+                    let (body, rows_to_visit) =
+                        self.read_aura1_body_range(rows_seen, rows_to_read)?;
+                    for local_row in 0..rows_to_visit {
+                        let row_start = local_row
+                            .checked_mul(plan.aura1_record_width)
+                            .ok_or(AuraError::InvalidValue("row range"))?;
+                        let row_end = row_start
+                            .checked_add(plan.aura1_record_width)
+                            .ok_or(AuraError::InvalidValue("row range"))?;
+                        let row_bytes = body
+                            .get(row_start..row_end)
+                            .ok_or(AuraError::UnexpectedEof)?;
+                        visitor(Aura1RowView {
+                            row_bytes,
+                            field_offsets: &field_offsets,
+                        })?;
+                    }
+                    rows_seen = rows_seen.saturating_add(rows_to_visit);
+                }
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(rows_seen);
+                    stats.visitor_calls = stats.visitor_calls.saturating_add(rows_seen);
+                    stats.compiled_plan_used = true;
+                });
+                Ok(rows_seen)
+            }
+        }
+    }
+
     pub fn grouped_replay<F>(&self, group_by: &GroupBy, visitor: F) -> Result<AuraGroupStats>
     where
         F: FnMut(&AuraEventGroup) -> Result<()>,
@@ -1077,6 +1564,8 @@ impl AuraReader {
                     stats.endian_load_count = stats
                         .endian_load_count
                         .saturating_add(rows.saturating_mul(plan.field_count));
+                    stats.temp_row_buffers_allocated =
+                        stats.temp_row_buffers_allocated.saturating_add(1);
                     stats.bytes_read_during_replay = stats
                         .bytes_read_during_replay
                         .saturating_add(plan.aura1_body_size);
@@ -1091,10 +1580,12 @@ impl AuraReader {
                     .ok_or(AuraError::InvalidValue("compiled plan"))?;
                 let rows_per_chunk = rows_per_file_chunk(plan.aura1_record_width);
                 let mut rows_seen = 0usize;
+                let mut chunk_count = 0usize;
                 while rows_seen < plan.record_count {
                     let rows_to_read = rows_per_chunk.min(plan.record_count - rows_seen);
                     let (body, rows_to_visit) =
                         self.read_aura1_body_range(rows_seen, rows_to_read)?;
+                    chunk_count = chunk_count.saturating_add(1);
                     records::visit_aura1_body(
                         &body,
                         &plan.aura1_plan,
@@ -1113,6 +1604,8 @@ impl AuraReader {
                     stats.endian_load_count = stats
                         .endian_load_count
                         .saturating_add(rows_seen.saturating_mul(plan.field_count));
+                    stats.temp_row_buffers_allocated =
+                        stats.temp_row_buffers_allocated.saturating_add(chunk_count);
                     stats.compiled_plan_used = true;
                 });
                 Ok(rows_seen)

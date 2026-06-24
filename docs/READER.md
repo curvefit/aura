@@ -24,6 +24,7 @@ Available reader methods:
 - `batches(batch_size)`
 - `replay_i64(visitor)`
 - `replay_fixed_batches(batch_size, visitor)`
+- `replay_row_views(visitor)`
 - `grouped_replay(group_by, visitor)`
 
 Aura1 reads stream fixed-width rows directly from the Aura1 body. Aura0 compact opens by parsing metadata only, then lazily builds bounded row batches from compact stream columns. `read_batches()` is a convenience collector over `next_batch`.
@@ -48,7 +49,8 @@ The file-backed backend is range-read based. Mmap is intentionally not part of
 the v1 SDK backend; it can be added later behind an explicit source mode if a
 benchmark shows it beats bounded range reads on target platforms.
 
-For the fastest fixed-width Aura1 scan shape, use batch-callback replay:
+For the fastest fixed-width Aura1 scan shape, use batch-callback replay and
+access only the fields needed by the caller:
 
 ```rust
 reader.replay_fixed_batches(8192, |batch| {
@@ -64,6 +66,27 @@ reader.replay_fixed_batches(8192, |batch| {
 This API invokes one callback per fixed-width batch, not one callback per row.
 It is intentionally lower-level than `replay_i64` and is best for callers that
 can process row ranges or pull only selected fields.
+
+Do not treat a view-only batch callback as parse throughput. The true parse
+benchmark is the path that calls `value_i64`, `field_i64`, `checksum_field`, or
+`checksum_all_fields` for the selected fields. View construction is measured
+separately in `aura_sdk_bench`.
+
+For ergonomic per-row borrowed access without the temporary full-row i64
+buffer used by `replay_i64`, use row views:
+
+```rust
+reader.replay_row_views(|row| {
+    let ts = row.get_i64(0)?;
+    let _ = ts;
+    Ok(())
+})?;
+# Ok::<(), aura_codec::AuraError>(())
+```
+
+`replay_row_views` still invokes one callback per row. It is useful for
+selected-field per-row access; `replay_fixed_batches` is the faster API when
+callers can process a batch at a time.
 
 For Aura1 parse speed, prefer `next_column_batch` when callers want typed
 columns rather than row-oriented `AuraValue` batches. It builds

@@ -459,6 +459,121 @@ fn reader_next_column_batch_matches_row_batches() {
 }
 
 #[test]
+fn aura1_row_view_and_batch_field_iterators_match_rows() {
+    let schema = market_schema();
+    let rows = market_rows();
+    let expected = AuraRecordBatch::new(schema.clone(), rows.clone())
+        .unwrap()
+        .to_i64_rows()
+        .unwrap();
+    let aura1 = write_with_options(schema, rows, WriterOptions::aura1());
+
+    let reader = AuraReader::open(Cursor::new(&aura1)).unwrap();
+    let mut replayed = Vec::new();
+    let mut checksums = Vec::new();
+    let count = reader
+        .replay_row_views(|row| {
+            let mut values = Vec::with_capacity(row.field_count());
+            for field_index in 0..row.field_count() {
+                values.push(row.get_i64(field_index)?);
+            }
+            checksums.push(row.checksum_all_fields()?);
+            replayed.push(values);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(expected.len(), count);
+    assert_eq!(expected, replayed);
+    assert_eq!(expected.len(), checksums.len());
+    let stats = reader.stats();
+    assert_eq!(expected.len(), stats.visitor_calls);
+    assert_eq!(expected.len(), stats.rows_scanned);
+
+    let batch_reader = AuraReader::open(Cursor::new(&aura1)).unwrap();
+    let mut prices = Vec::new();
+    let mut batch_checksum = 0u64;
+    batch_reader
+        .replay_fixed_batches(2, |batch| {
+            for value in batch.field_i64(2)? {
+                prices.push(value?);
+            }
+            batch_checksum ^= batch.checksum_all_fields()?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        expected.iter().map(|row| row[2]).collect::<Vec<_>>(),
+        prices
+    );
+    assert_ne!(0, batch_checksum);
+    assert_eq!(2, batch_reader.stats().visitor_calls);
+}
+
+#[test]
+fn aura1_all_field_parse_kernels_match_reordered_mixed_width_schema() {
+    let schema = AuraSchema::builder()
+        .field("venue_flags", AuraType::FlagsU32)
+        .field("px", AuraType::PriceI64Scaled { scale: 4 })
+        .field("side_code", AuraType::EnumU8)
+        .field("event_time", AuraType::TimestampNanos)
+        .field("qty", AuraType::U64)
+        .field("symbol_key", AuraType::U32)
+        .build()
+        .unwrap();
+    let rows = vec![
+        vec![
+            1_u64.into(),
+            100_0100_i64.into(),
+            1_u64.into(),
+            1_700_000_000_000_000_000_i64.into(),
+            10_u64.into(),
+            42_u64.into(),
+        ],
+        vec![
+            3_u64.into(),
+            100_0200_i64.into(),
+            2_u64.into(),
+            1_700_000_000_000_000_100_i64.into(),
+            11_u64.into(),
+            42_u64.into(),
+        ],
+        vec![
+            7_u64.into(),
+            99_9900_i64.into(),
+            1_u64.into(),
+            1_700_000_000_000_000_200_i64.into(),
+            12_u64.into(),
+            77_u64.into(),
+        ],
+    ];
+    let aura1 = write_with_options(schema, rows, WriterOptions::aura1());
+    let reader = AuraReader::open(Cursor::new(&aura1)).unwrap();
+
+    let mut field_major = 0u64;
+    let mut checked_once = 0u64;
+    let mut type_kernel = 0u64;
+    let mut parse_program = 0u64;
+    let mut selected_all = 0u64;
+    reader
+        .replay_fixed_batches(2, |batch| {
+            let all_fields = (0..batch.field_count()).collect::<Vec<_>>();
+            field_major = field_major.wrapping_add(batch.checksum_all_fields_field_major()?);
+            checked_once = checked_once.wrapping_add(batch.checksum_all_fields_checked_once()?);
+            type_kernel = type_kernel.wrapping_add(batch.checksum_all_fields_type_kernel()?);
+            parse_program = parse_program.wrapping_add(batch.checksum_all_fields_parse_program()?);
+            selected_all = selected_all.wrapping_add(batch.checksum_selected_fields(&all_fields)?);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_ne!(0, field_major);
+    assert_eq!(field_major, checked_once);
+    assert_eq!(field_major, type_kernel);
+    assert_eq!(field_major, parse_program);
+    assert_eq!(field_major, selected_all);
+}
+
+#[test]
 fn aura1_file_backed_replay_reads_header_footer_at_open() {
     let schema = market_schema();
     let rows = market_rows();

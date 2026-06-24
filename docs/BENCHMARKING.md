@@ -190,9 +190,37 @@ The runner writes one JSON result per dataset/operation and a `sdk_full_matrix_s
 - `aura1-scan-raw`: fixed body byte scan, no value decode.
 - `aura1-scan-raw-file-range`: fixed body byte scan from the file-backed
   body range after header/footer open.
+- `aura1-batch-view-only`: construct fixed-width batch views and call the
+  batch visitor without accessing fields. This is not a parse benchmark.
+- `aura1-batch-view-only-file-range`: same view-only work from file-backed row
+  ranges.
+- `aura1-batch-touch-one-field`: fixed-width batch callback that decodes one
+  field from every row and checksums it.
+- `aura1-batch-touch-one-field-file-range`: same selected-field parse from
+  file-backed row ranges.
+- `aura1-batch-touch-all-fields`: fixed-width batch callback that decodes every
+  field from every row and checksums all values.
+- `aura1-batch-touch-all-fields-file-range`: same all-field parse from
+  file-backed row ranges.
+- `aura1-row-view-only`: invoke one borrowed row-view callback per row without
+  accessing fields. This isolates per-row callback overhead.
+- `aura1-row-view-only-file-range`: same row-view callback test from
+  file-backed row ranges.
+- `aura1-row-view-one-field`: one borrowed row-view callback per row, decoding
+  one selected field from every row.
+- `aura1-row-view-one-field-file-range`: same selected-field row-view parse
+  from file-backed row ranges.
+- `aura1-row-view-all-fields`: one borrowed row-view callback per row, decoding
+  every field from every row.
+- `aura1-row-view-all-fields-file-range`: same all-field row-view parse from
+  file-backed row ranges.
 - `aura1-replay-i64`: visitor replay over fixed-width rows.
 - `aura1-replay-file-range`: visitor replay using `AuraReader::open_path` and
   bounded file range reads.
+- `aura1-replay-i64-current`: alias for the current full-row i64 replay path,
+  labeled explicitly for true-parse comparisons.
+- `aura1-replay-i64-current-file-range`: current full-row i64 replay from
+  file-backed row ranges.
 - `aura1-replay-batch-callback`: fixed-width batch callback replay from memory.
 - `aura1-replay-batch-callback-file-range`: fixed-width batch callback replay
   from file-backed row ranges.
@@ -214,12 +242,23 @@ The runner writes one JSON result per dataset/operation and a `sdk_full_matrix_s
   field when present.
 - `aura1-grouped-replay-pair-file-range`: same grouped replay using
   file-backed row access.
+- `aura1-grouped-view-only`: detect groups without accessing row fields.
+- `aura1-grouped-touch-key-only`: detect groups and checksum materialized group
+  keys only.
+- `aura1-grouped-touch-one-field`: detect groups and decode one field from
+  every row in every group.
+- `aura1-grouped-touch-all-fields`: detect groups and decode every field from
+  every row in every group.
+- `aura1-grouped-aggregate`: detect groups and compute a generic aggregate over
+  the first one or two fixed-width fields.
 
 The generated fixture matrix includes repeated timestamp, repeated symbol,
 timestamp+symbol, high-cardinality, and mixed-burst datasets. JSON rows report
 `rows_materialized`, `values_materialized`, `group_count`,
 `rows_per_group_avg`, `rows_per_group_p95`, and
-`callback_count_reduction`.
+`callback_count_reduction`. True parse rows additionally report
+`fields_accessed`, `values_decoded`, `bytes_touched`, and `checksum`; view-only
+rows should report zero accessed fields and zero decoded values.
 
 File-backed Aura1 rows also report `source_kind`, `replay_backend`,
 `bytes_read_at_open`, `body_bytes_read_at_open`, `footer_bytes_read_at_open`,

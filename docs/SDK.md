@@ -161,6 +161,14 @@ Batch callback replay is not the same work as `replay_i64`: it avoids a
 callback per row and lets callers pull selected fields from the fixed-width
 batch view.
 
+For true parse throughput, benchmark and use field-accessing batch operations,
+not view-only callbacks. `Aura1FixedBatchView::checksum_field`,
+`checksum_all_fields`, `value_i64`, and `field_i64` force real fixed-width
+field loads. `AuraReader::replay_row_views` provides an ergonomic borrowed
+per-row view for selected-field access, while `replay_i64` remains the
+compatibility API that decodes every field into an i64 slice before invoking a
+row callback.
+
 Aura1 grouped replay is available for consecutive runs:
 
 ```rust
