@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::fs;
 use std::hint::black_box;
 use std::io::Cursor;
@@ -6,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use aura_codec::{
-    convert_aura, records, AuraFormat, AuraGroupStats, AuraProfile, AuraReader, AuraRecordBatch,
-    AuraSchema, AuraWriter, ConvertOptions, GroupBy, WriterOptions,
+    convert_aura, records, AuraFormat, AuraGroupStats, AuraProfile, AuraReader, AuraReaderStats,
+    AuraRecordBatch, AuraSchema, AuraWriter, ConvertOptions, GroupBy, WriterOptions,
 };
 use serde_json::{json, Value};
 
@@ -19,6 +21,7 @@ struct Args {
     warmups: usize,
     batch_size: usize,
     datasets: Option<Vec<String>>,
+    operations: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +50,7 @@ struct BenchOutput {
     values_materialized: usize,
     group_by_fields: Vec<String>,
     group_stats: Option<AuraGroupStats>,
+    reader_stats: Option<AuraReaderStats>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +70,7 @@ impl BenchOutput {
             values_materialized: 0,
             group_by_fields: Vec::new(),
             group_stats: None,
+            reader_stats: None,
         }
     }
 
@@ -83,6 +88,11 @@ impl BenchOutput {
     fn with_group_stats(mut self, fields: Vec<String>, stats: AuraGroupStats) -> Self {
         self.group_by_fields = fields;
         self.group_stats = Some(stats);
+        self
+    }
+
+    fn with_reader_stats(mut self, stats: AuraReaderStats) -> Self {
+        self.reader_stats = Some(stats);
         self
     }
 }
@@ -110,6 +120,7 @@ fn parse_args() -> Result<Args> {
     let mut warmups = 2usize;
     let mut batch_size = 8192usize;
     let mut datasets = None;
+    let mut operations = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -121,6 +132,10 @@ fn parse_args() -> Result<Args> {
             "--datasets" => {
                 let raw: String = next_parse(&mut args, "--datasets")?;
                 datasets = Some(raw.split(',').map(str::to_owned).collect());
+            }
+            "--operations" => {
+                let raw: String = next_parse(&mut args, "--operations")?;
+                operations = Some(raw.split(',').map(str::to_owned).collect());
             }
             "--help" | "-h" => {
                 print_usage();
@@ -142,6 +157,7 @@ fn parse_args() -> Result<Args> {
         warmups,
         batch_size,
         datasets,
+        operations,
     })
 }
 
@@ -164,7 +180,7 @@ where
 
 fn print_usage() {
     eprintln!(
-        "usage: aura-sdk-bench --fixture-dir <dir> --output-dir <dir> [--iterations N] [--warmups N] [--batch-size N] [--datasets a,b]"
+        "usage: aura-sdk-bench --fixture-dir <dir> --output-dir <dir> [--iterations N] [--warmups N] [--batch-size N] [--datasets a,b] [--operations op1,op2]"
     );
 }
 
@@ -236,15 +252,27 @@ fn run_fixture_matrix(fixture: &Fixture, args: &Args) -> Result<Vec<Value>> {
         "sdk-zstd-aura1-to-aura1",
         "sdk-roundtrip-verify",
         "aura1-scan-raw",
+        "aura1-scan-raw-file-range",
         "aura1-replay-i64",
+        "aura1-replay-file-range",
         "aura1-read-batches-row",
+        "aura1-read-batches-row-file-range",
         "aura1-read-batches-columnar",
+        "aura1-read-batches-columnar-file-range",
         "aura1-grouped-replay-primary",
+        "aura1-grouped-replay-primary-file-range",
         "aura1-grouped-replay-symbol",
+        "aura1-grouped-replay-symbol-file-range",
         "aura1-grouped-replay-pair",
+        "aura1-grouped-replay-pair-file-range",
     ];
     let mut results = Vec::with_capacity(operations.len());
     for operation in operations {
+        if let Some(selected) = args.operations.as_deref() {
+            if !selected.iter().any(|candidate| candidate == operation) {
+                continue;
+            }
+        }
         let result_path = args
             .output_dir
             .join(format!("{}-{}.json", fixture.name, operation));
@@ -292,6 +320,7 @@ fn bench_operation(
         values_materialized: 0,
         group_by_fields: Vec::new(),
         group_stats: None,
+        reader_stats: None,
     };
     for _ in 0..args.warmups {
         last_output = run_operation(
@@ -300,6 +329,7 @@ fn bench_operation(
             source_batch,
             aura0,
             aura1,
+            &fixture.aura1_path,
             aura1_zst,
             args,
         )?;
@@ -313,6 +343,7 @@ fn bench_operation(
             source_batch,
             aura0,
             aura1,
+            &fixture.aura1_path,
             aura1_zst,
             args,
         )?;
@@ -328,7 +359,12 @@ fn bench_operation(
     let groups_per_sec = group_stats
         .map(|stats| stats.group_count as f64 / median.as_secs_f64())
         .unwrap_or(0.0);
-    let reader_stats = stats_for_operation(operation, aura0, aura1, args.batch_size)?;
+    let reader_stats = last_output.reader_stats.unwrap_or(stats_for_operation(
+        operation,
+        aura0,
+        aura1,
+        args.batch_size,
+    )?);
     let command = std::env::args().collect::<Vec<_>>().join(" ");
     Ok(json!({
         "operation": operation,
@@ -359,6 +395,20 @@ fn bench_operation(
         "streaming_reader_used": reader_stats.streaming_reader_used,
         "full_file_materialized": reader_stats.full_file_materialized,
         "max_rows_materialized_at_once": reader_stats.max_rows_materialized_at_once,
+        "source_kind": reader_stats.source_kind.as_str(),
+        "replay_backend": reader_stats.replay_backend.as_str(),
+        "file_len": reader_stats.file_len,
+        "bytes_read_at_open": reader_stats.bytes_read_at_open,
+        "body_bytes_read_at_open": reader_stats.body_bytes_read_at_open,
+        "footer_bytes_read_at_open": reader_stats.footer_bytes_read_at_open,
+        "bytes_read_during_replay": reader_stats.bytes_read_during_replay,
+        "bytes_read_total": reader_stats.source_bytes_read_total,
+        "bytes_read_in_last_batch": reader_stats.bytes_read_in_last_batch,
+        "full_file_bytes_copied": reader_stats.full_file_bytes_copied,
+        "row_width_from_plan": reader_stats.row_width_from_plan,
+        "body_offset_from_header": reader_stats.body_offset_from_header,
+        "footer_offset_from_trailer": reader_stats.footer_offset_from_trailer,
+        "record_count_from_footer": reader_stats.record_count_from_footer,
         "group_by_fields": last_output.group_by_fields,
         "group_count": group_stats.map(|stats| stats.group_count).unwrap_or(0),
         "groups_per_sec": groups_per_sec,
@@ -389,6 +439,7 @@ fn run_operation(
     source_batch: &AuraRecordBatch,
     aura0: &[u8],
     aura1: &[u8],
+    aura1_path: &Path,
     aura1_zst: &[u8],
     args: &Args,
 ) -> Result<BenchOutput> {
@@ -417,6 +468,7 @@ fn run_operation(
                 values_materialized: 0,
                 group_by_fields: Vec::new(),
                 group_stats: None,
+                reader_stats: None,
             })
         }
         "sdk-roundtrip-verify" => {
@@ -434,15 +486,31 @@ fn run_operation(
                 values_materialized: 0,
                 group_by_fields: Vec::new(),
                 group_stats: None,
+                reader_stats: None,
             })
         }
         "aura1-scan-raw" => scan_raw_aura1(aura1),
         "aura1-replay-i64" => replay_aura1(aura1),
+        "aura1-replay-file-range" => replay_aura1_path(aura1_path),
         "aura1-read-batches-row" => read_batches(aura1, args.batch_size),
+        "aura1-read-batches-row-file-range" => read_batches_path(aura1_path, args.batch_size),
         "aura1-read-batches-columnar" => read_column_batches(aura1, args.batch_size),
+        "aura1-read-batches-columnar-file-range" => {
+            read_column_batches_path(aura1_path, args.batch_size)
+        }
+        "aura1-scan-raw-file-range" => scan_raw_aura1_path(aura1_path),
         "aura1-grouped-replay-primary" => grouped_replay_aura1(aura1, schema, GroupMode::Primary),
         "aura1-grouped-replay-symbol" => grouped_replay_aura1(aura1, schema, GroupMode::Symbol),
         "aura1-grouped-replay-pair" => grouped_replay_aura1(aura1, schema, GroupMode::Pair),
+        "aura1-grouped-replay-primary-file-range" => {
+            grouped_replay_aura1_path(aura1_path, schema, GroupMode::Primary)
+        }
+        "aura1-grouped-replay-symbol-file-range" => {
+            grouped_replay_aura1_path(aura1_path, schema, GroupMode::Symbol)
+        }
+        "aura1-grouped-replay-pair-file-range" => {
+            grouped_replay_aura1_path(aura1_path, schema, GroupMode::Pair)
+        }
         _ => bail!("unknown operation {operation}"),
     }
 }
@@ -462,12 +530,27 @@ fn write_batch(
 
 fn read_batches(bytes: &[u8], batch_size: usize) -> Result<BenchOutput> {
     let mut reader = AuraReader::open(Cursor::new(bytes))?;
+    let field_count = reader.schema().field_count();
     let mut records = 0usize;
     while let Some(batch) = reader.next_batch(batch_size)? {
         records = records.saturating_add(batch.row_count());
     }
     Ok(BenchOutput::new(bytes.len(), records)
-        .with_row_materialization(AuraReader::open(Cursor::new(bytes))?.schema().field_count()))
+        .with_row_materialization(field_count)
+        .with_reader_stats(reader.stats()))
+}
+
+fn read_batches_path(path: &Path, batch_size: usize) -> Result<BenchOutput> {
+    let mut reader = AuraReader::open_path(path)?;
+    let field_count = reader.schema().field_count();
+    let mut records = 0usize;
+    while let Some(batch) = reader.next_batch(batch_size)? {
+        records = records.saturating_add(batch.row_count());
+    }
+    let stats = reader.stats();
+    Ok(BenchOutput::new(stats.file_len, records)
+        .with_row_materialization(field_count)
+        .with_reader_stats(stats))
 }
 
 fn read_column_batches(bytes: &[u8], batch_size: usize) -> Result<BenchOutput> {
@@ -477,7 +560,22 @@ fn read_column_batches(bytes: &[u8], batch_size: usize) -> Result<BenchOutput> {
     while let Some(batch) = reader.next_column_batch(batch_size)? {
         records = records.saturating_add(batch.row_count());
     }
-    Ok(BenchOutput::new(bytes.len(), records).with_column_materialization(field_count))
+    Ok(BenchOutput::new(bytes.len(), records)
+        .with_column_materialization(field_count)
+        .with_reader_stats(reader.stats()))
+}
+
+fn read_column_batches_path(path: &Path, batch_size: usize) -> Result<BenchOutput> {
+    let mut reader = AuraReader::open_path(path)?;
+    let field_count = reader.schema().field_count();
+    let mut records = 0usize;
+    while let Some(batch) = reader.next_column_batch(batch_size)? {
+        records = records.saturating_add(batch.row_count());
+    }
+    let stats = reader.stats();
+    Ok(BenchOutput::new(stats.file_len, records)
+        .with_column_materialization(field_count)
+        .with_reader_stats(stats))
 }
 
 fn replay_aura1(bytes: &[u8]) -> Result<BenchOutput> {
@@ -491,6 +589,20 @@ fn replay_aura1(bytes: &[u8]) -> Result<BenchOutput> {
     if let Ok(info) = records::aura1_fixed_layout_info(bytes) {
         output.bytes_scanned = info.body_bytes;
     }
+    Ok(output.with_reader_stats(reader.stats()))
+}
+
+fn replay_aura1_path(path: &Path) -> Result<BenchOutput> {
+    let reader = AuraReader::open_path(path)?;
+    let mut record_count = 0usize;
+    reader.replay_i64(|_| {
+        record_count = record_count.saturating_add(1);
+        Ok(())
+    })?;
+    let stats = reader.stats();
+    let mut output = BenchOutput::new(stats.file_len, record_count).with_reader_stats(stats);
+    let scanned = stats.bytes_read_during_replay;
+    output.bytes_scanned = scanned;
     Ok(output)
 }
 
@@ -510,6 +622,39 @@ fn scan_raw_aura1(bytes: &[u8]) -> Result<BenchOutput> {
     Ok(output)
 }
 
+fn scan_raw_aura1_path(path: &Path) -> Result<BenchOutput> {
+    let reader = AuraReader::open_path(path)?;
+    let stats_at_open = reader.stats();
+    let mut file = fs::File::open(path)?;
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(
+        stats_at_open.body_offset_from_header as u64,
+    ))?;
+    let mut remaining = stats_at_open
+        .footer_offset_from_trailer
+        .saturating_sub(stats_at_open.body_offset_from_header);
+    let mut buffer = vec![0u8; 256 * 1024];
+    let mut checksum = 0u8;
+    let mut bytes_read = 0usize;
+    while remaining > 0 {
+        let len = remaining.min(buffer.len());
+        file.read_exact(&mut buffer[..len])?;
+        for chunk in buffer[..len].chunks(stats_at_open.row_width_from_plan.max(1)) {
+            checksum ^= chunk.first().copied().unwrap_or(0);
+        }
+        remaining -= len;
+        bytes_read = bytes_read.saturating_add(len);
+    }
+    black_box(checksum);
+    let mut stats = stats_at_open;
+    stats.bytes_read_during_replay = bytes_read;
+    stats.source_bytes_read_total = stats.source_bytes_read_total.saturating_add(bytes_read);
+    let mut output =
+        BenchOutput::new(stats.file_len, stats.record_count_from_footer).with_reader_stats(stats);
+    output.bytes_scanned = bytes_read;
+    Ok(output)
+}
+
 fn grouped_replay_aura1(bytes: &[u8], schema: &AuraSchema, mode: GroupMode) -> Result<BenchOutput> {
     let fields = group_fields(schema, mode)?;
     let reader = AuraReader::open(Cursor::new(bytes))?;
@@ -523,7 +668,27 @@ fn grouped_replay_aura1(bytes: &[u8], schema: &AuraSchema, mode: GroupMode) -> R
     if let Ok(info) = records::aura1_fixed_layout_info(bytes) {
         output.bytes_scanned = info.body_bytes;
     }
-    Ok(output)
+    Ok(output.with_reader_stats(reader.stats()))
+}
+
+fn grouped_replay_aura1_path(
+    path: &Path,
+    schema: &AuraSchema,
+    mode: GroupMode,
+) -> Result<BenchOutput> {
+    let fields = group_fields(schema, mode)?;
+    let reader = AuraReader::open_path(path)?;
+    let mut callback_count = 0usize;
+    let stats = reader.grouped_replay(&GroupBy::fields(fields.iter().cloned()), |_| {
+        callback_count = callback_count.saturating_add(1);
+        Ok(())
+    })?;
+    black_box(callback_count);
+    let reader_stats = reader.stats();
+    let mut output =
+        BenchOutput::new(reader_stats.file_len, stats.row_count).with_group_stats(fields, stats);
+    output.bytes_scanned = reader_stats.bytes_read_during_replay;
+    Ok(output.with_reader_stats(reader_stats))
 }
 
 fn group_fields(schema: &AuraSchema, mode: GroupMode) -> Result<Vec<String>> {
@@ -579,6 +744,7 @@ fn convert_bytes(bytes: &[u8], target: AuraFormat) -> Result<BenchOutput> {
         values_materialized: 0,
         group_by_fields: Vec::new(),
         group_stats: None,
+        reader_stats: None,
     })
 }
 

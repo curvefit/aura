@@ -188,21 +188,43 @@ The runner writes one JSON result per dataset/operation and a `sdk_full_matrix_s
 `aura_sdk_bench` also emits Aura1 parse-speed rows:
 
 - `aura1-scan-raw`: fixed body byte scan, no value decode.
+- `aura1-scan-raw-file-range`: fixed body byte scan from the file-backed
+  body range after header/footer open.
 - `aura1-replay-i64`: visitor replay over fixed-width rows.
+- `aura1-replay-file-range`: visitor replay using `AuraReader::open_path` and
+  bounded file range reads.
 - `aura1-read-batches-row`: row-oriented `AuraRecordBatch` materialization.
+- `aura1-read-batches-row-file-range`: row batches from file-backed Aura1 row
+  ranges.
 - `aura1-read-batches-columnar`: direct `AuraColumnBatch` materialization.
+- `aura1-read-batches-columnar-file-range`: column batches from file-backed
+  Aura1 row ranges.
 - `aura1-grouped-replay-primary`: consecutive-run grouped replay by the first
   timestamp field, or the first field if no timestamp exists.
+- `aura1-grouped-replay-primary-file-range`: same grouped replay using
+  file-backed row access.
 - `aura1-grouped-replay-symbol`: consecutive-run grouped replay by the first
   symbol/id-like field when present.
+- `aura1-grouped-replay-symbol-file-range`: same grouped replay using
+  file-backed row access.
 - `aura1-grouped-replay-pair`: grouped replay by timestamp plus a symbol/id-like
   field when present.
+- `aura1-grouped-replay-pair-file-range`: same grouped replay using
+  file-backed row access.
 
 The generated fixture matrix includes repeated timestamp, repeated symbol,
 timestamp+symbol, high-cardinality, and mixed-burst datasets. JSON rows report
 `rows_materialized`, `values_materialized`, `group_count`,
 `rows_per_group_avg`, `rows_per_group_p95`, and
 `callback_count_reduction`.
+
+File-backed Aura1 rows also report `source_kind`, `replay_backend`,
+`bytes_read_at_open`, `body_bytes_read_at_open`, `footer_bytes_read_at_open`,
+`bytes_read_during_replay`, `bytes_read_total`, `full_file_bytes_copied`,
+`row_width_from_plan`, `body_offset_from_header`, and
+`footer_offset_from_trailer`. A DBN-like file-backed run should show
+`source_kind=file_range`, `body_bytes_read_at_open=0`, and
+`full_file_bytes_copied=0`.
 
 Do not compare grouped replay directly to row replay unless the callback
 semantics are labeled: grouped replay invokes one callback per consecutive run,

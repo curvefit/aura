@@ -2310,7 +2310,10 @@ fn read_trailer_footer_len(bytes: &[u8], offset: usize) -> Result<usize> {
     ]) as usize)
 }
 
-fn validate_header_schema_agreement(header: &AuraHeader, schema: &SchemaDescriptor) -> Result<()> {
+pub(crate) fn validate_header_schema_agreement(
+    header: &AuraHeader,
+    schema: &SchemaDescriptor,
+) -> Result<()> {
     let expected_mapping = schema_parent_mapping(schema)?;
     if header.schema_mapping != expected_mapping {
         return Err(AuraError::InvalidValue("header schema mapping"));
@@ -2319,6 +2322,17 @@ fn validate_header_schema_agreement(header: &AuraHeader, schema: &SchemaDescript
         return Err(AuraError::InvalidValue("header derived expressions"));
     }
     Ok(())
+}
+
+pub(crate) fn validate_compiled_i64_metadata(
+    header: &AuraHeader,
+    footer: &CompiledFooter,
+) -> Result<usize> {
+    validate_header_schema_agreement(header, &footer.schema)?;
+    if schema_has_wide_fields(&footer.schema) {
+        return Err(AuraError::InvalidValue("i64 schema"));
+    }
+    usize::try_from(footer.record_count).map_err(|_| AuraError::InvalidValue("record count"))
 }
 
 impl DecodedI64File {
@@ -3750,7 +3764,7 @@ fn decode_aura1_body(
     Ok(rows)
 }
 
-fn visit_aura1_body<F>(
+pub(crate) fn visit_aura1_body<F>(
     bytes: &[u8],
     plan: &Aura1Plan,
     record_count: usize,

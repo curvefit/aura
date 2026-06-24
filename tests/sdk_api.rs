@@ -1,9 +1,12 @@
+use std::fs::{self, File};
 use std::io::Cursor;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aura_codec::{
     convert_aura, Aura0ByteLaneCodec, Aura0ByteLaneUse, AuraColumnBatch, AuraFormat, AuraProfile,
-    AuraReader, AuraRecordBatch, AuraSchema, AuraType, AuraValue, AuraWriter, CompiledAuraPlan,
-    ConvertOptions, GroupBy, ReaderOptions, WriterOptions,
+    AuraReader, AuraReaderSourceKind, AuraRecordBatch, AuraReplayBackend, AuraSchema, AuraType,
+    AuraValue, AuraWriter, CompiledAuraPlan, ConvertOptions, GroupBy, ReaderOptions, WriterOptions,
 };
 
 fn market_schema() -> AuraSchema {
@@ -74,6 +77,20 @@ fn assert_roundtrip(bytes: &[u8], schema: &AuraSchema, rows: &[Vec<AuraValue>]) 
     let batches = reader.read_batches().unwrap();
     assert_eq!(1, batches.len());
     assert_eq!(rows, batches[0].rows());
+}
+
+fn write_temp_file(name: &str, bytes: &[u8]) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "aura_sdk_api_{name}_{}_{}.aura",
+        std::process::id(),
+        nanos
+    ));
+    fs::write(&path, bytes).unwrap();
+    path
 }
 
 fn column_market_batch(schema: AuraSchema) -> AuraColumnBatch {
@@ -442,6 +459,100 @@ fn reader_next_column_batch_matches_row_batches() {
 }
 
 #[test]
+fn aura1_file_backed_replay_reads_header_footer_at_open() {
+    let schema = market_schema();
+    let rows = market_rows();
+    let aura1 = write_with_options(schema.clone(), rows.clone(), WriterOptions::aura1());
+    let path = write_temp_file("file_backed_replay", &aura1);
+
+    let mut reader = AuraReader::open_path(&path).unwrap();
+    let layout = aura_codec::records::aura1_fixed_layout_info(&aura1).unwrap();
+    assert_eq!(schema.fields(), reader.schema().fields());
+    let open_stats = reader.stats();
+    assert_eq!(AuraReaderSourceKind::FileRange, open_stats.source_kind);
+    assert_eq!(AuraReplayBackend::FileRange, open_stats.replay_backend);
+    assert_eq!(aura1.len(), open_stats.file_len);
+    assert!(open_stats.bytes_read_at_open < aura1.len());
+    assert_eq!(0, open_stats.body_bytes_read_at_open);
+    assert_eq!(0, open_stats.full_file_bytes_copied);
+    assert_eq!(3, open_stats.record_count_from_footer);
+    assert_eq!(layout.record_width, open_stats.row_width_from_plan);
+    assert_eq!(layout.record_count, open_stats.record_count_from_footer);
+    assert!(open_stats.body_offset_from_header < open_stats.footer_offset_from_trailer);
+    assert_eq!(
+        open_stats.bytes_read_at_open,
+        open_stats.source_bytes_read_total
+    );
+
+    let first = reader.next_batch(2).unwrap().unwrap();
+    assert_eq!(&rows[..2], first.rows());
+    let first_stats = reader.stats();
+    assert_eq!(2, first_stats.rows_decoded_in_last_batch);
+    assert_eq!(2, first_stats.max_rows_materialized_at_once);
+    assert_eq!(
+        2 * first_stats.row_width_from_plan,
+        first_stats.bytes_read_in_last_batch
+    );
+    assert_eq!(
+        first_stats.bytes_read_at_open + first_stats.bytes_read_in_last_batch,
+        first_stats.source_bytes_read_total
+    );
+
+    let second = reader.next_column_batch(2).unwrap().unwrap();
+    assert_eq!(1, second.row_count());
+    assert_eq!(&rows[2..], second.into_record_batch().unwrap().rows());
+    let second_stats = reader.stats();
+    assert_eq!(
+        second_stats.row_width_from_plan,
+        second_stats.bytes_read_in_last_batch
+    );
+    assert!(!second_stats.full_file_materialized);
+
+    let replay_reader = AuraReader::open_file(File::open(&path).unwrap()).unwrap();
+    let mut replayed = Vec::new();
+    let count = replay_reader
+        .replay_i64(|row| {
+            replayed.push(row.to_vec());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(rows.len(), count);
+    assert_eq!(
+        AuraRecordBatch::new(schema, rows)
+            .unwrap()
+            .to_i64_rows()
+            .unwrap(),
+        replayed
+    );
+    let replay_stats = replay_reader.stats();
+    assert_eq!(
+        replay_stats.record_count_from_footer * replay_stats.row_width_from_plan,
+        replay_stats.bytes_read_during_replay
+    );
+    assert_eq!(0, replay_stats.full_file_bytes_copied);
+}
+
+#[test]
+fn aura1_file_backed_open_rejects_bad_seal_and_truncated_body() {
+    let schema = market_schema();
+    let rows = market_rows();
+    let aura1 = write_with_options(schema, rows, WriterOptions::aura1());
+
+    let mut bad_seal = aura1.clone();
+    let last = bad_seal.last_mut().unwrap();
+    *last ^= 0x01;
+    let bad_seal_path = write_temp_file("bad_seal", &bad_seal);
+    assert!(AuraReader::open_path(&bad_seal_path).is_err());
+
+    let info = aura_codec::records::aura1_fixed_layout_info(&aura1).unwrap();
+    let mut truncated_body = Vec::new();
+    truncated_body.extend_from_slice(&aura1[..info.footer_offset - 1]);
+    truncated_body.extend_from_slice(&aura1[info.footer_offset..]);
+    let truncated_path = write_temp_file("truncated_body", &truncated_body);
+    assert!(AuraReader::open_path(&truncated_path).is_err());
+}
+
+#[test]
 fn grouped_replay_uses_generic_field_names_and_preserves_runs() {
     let schema = AuraSchema::named("grouped_non_grimoire")
         .field("venue", AuraType::U16)
@@ -493,6 +604,21 @@ fn grouped_replay_uses_generic_field_names_and_preserves_runs() {
         })
         .unwrap();
     assert_eq!(vec![2, 1, 2, 1], pair_counts);
+
+    let path = write_temp_file("grouped_file_backed", &aura1);
+    let file_reader = AuraReader::open_path(&path).unwrap();
+    let mut file_pair_counts = Vec::new();
+    file_reader
+        .grouped_replay(&GroupBy::fields(["event_time", "symbol_code"]), |group| {
+            file_pair_counts.push(group.row_count());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(pair_counts, file_pair_counts);
+    let file_stats = file_reader.stats();
+    assert_eq!(AuraReaderSourceKind::FileRange, file_stats.source_kind);
+    assert_eq!(0, file_stats.body_bytes_read_at_open);
+    assert_eq!(0, file_stats.full_file_bytes_copied);
 
     let mut id_counts = Vec::new();
     reader

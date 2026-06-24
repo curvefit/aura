@@ -104,6 +104,22 @@ let batches = reader.read_batches()?;
 # Ok::<(), aura_codec::AuraError>(())
 ```
 
+For Aura1 files on disk, prefer the file-backed APIs:
+
+```rust
+let mut reader = aura_codec::AuraReader::open_path("ticks.aura1")?;
+while let Some(batch) = reader.next_batch(8192)? {
+    println!("rows={}", batch.row_count());
+}
+assert_eq!("file_range", reader.stats().source_kind.as_str());
+# Ok::<(), aura_codec::AuraError>(())
+```
+
+`open_path` and `open_file` read only the Aura1 header/trailer/footer at open,
+compile the `CompiledAuraPlan`, and range-read Aura1 body rows as replay or
+batches request them. The generic `open(Read)` API remains memory-backed
+because a plain `Read` source cannot seek to the footer without buffering.
+
 `AuraReader` supports whole-file batches and true batch iteration:
 
 ```rust
@@ -193,6 +209,7 @@ One current format constraint remains: the legacy compact timestamp-role shortcu
 - Aura1 writer behavior: fixed-width compiled profile
 - Batch API: prefer `AuraColumnBatch` for larger writes; `AuraRecordBatch` remains available for simple examples
 - Reader mode: schema-first reader with batch iteration
+- File reader mode: use `open_path`/`open_file` for range-read Aura1 replay
 - Conversion: explicit target format through `ConvertOptions`
 - Guard mode: off unless using lower-level strict verification tools
 - Canonical hash mode: off by default at the SDK facade

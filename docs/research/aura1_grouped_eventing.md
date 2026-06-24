@@ -13,6 +13,11 @@ reader.grouped_replay(&GroupBy::fields(["ts_event", "symbol_id"]), |group| {
 })?;
 ```
 
+It works with both memory-backed readers and file-backed Aura1 readers opened
+with `AuraReader::open_path`/`open_file`. File-backed grouped replay uses the
+same fixed-width range-read path as `replay_i64`; it does not copy the whole
+Aura1 file into memory before detecting groups.
+
 ## Semantics
 
 - Grouping preserves physical row order.
@@ -52,6 +57,11 @@ The benchmark JSON reports:
 - `rows_per_group_avg`
 - `rows_per_group_p95`
 - `callback_count_reduction`
+- `source_kind`
+- `replay_backend`
+- `bytes_read_at_open`
+- `body_bytes_read_at_open`
+- `full_file_bytes_copied`
 
 ## Targeted Evidence
 
