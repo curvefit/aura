@@ -489,6 +489,31 @@ fn aura1_row_view_and_batch_field_iterators_match_rows() {
     assert_eq!(expected.len(), stats.visitor_calls);
     assert_eq!(expected.len(), stats.rows_scanned);
 
+    let selected_reader = AuraReader::open(Cursor::new(&aura1)).unwrap();
+    let selected_fields = vec![0, 2, 4];
+    let mut selected_replayed = Vec::new();
+    let selected_count = selected_reader
+        .replay_selected_row_views(&selected_fields, |row| {
+            let mut values = Vec::with_capacity(row.field_count());
+            for selected_index in 0..row.field_count() {
+                values.push(row.get_i64(selected_index)?);
+            }
+            selected_replayed.push(values);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(expected.len(), selected_count);
+    assert_eq!(
+        expected
+            .iter()
+            .map(|row| selected_fields
+                .iter()
+                .map(|index| row[*index])
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        selected_replayed
+    );
+
     let batch_reader = AuraReader::open(Cursor::new(&aura1)).unwrap();
     let mut prices = Vec::new();
     let mut batch_checksum = 0u64;
@@ -507,6 +532,86 @@ fn aura1_row_view_and_batch_field_iterators_match_rows() {
     );
     assert_ne!(0, batch_checksum);
     assert_eq!(2, batch_reader.stats().visitor_calls);
+}
+
+#[test]
+fn aura1_fast_row_replay_matches_reordered_wide_non_grimoire_schema() {
+    let schema = AuraSchema::builder()
+        .field("venue_code", AuraType::U16)
+        .field("event_kind", AuraType::EnumU8)
+        .field("notional_px", AuraType::PriceI64Scaled { scale: 4 })
+        .field("capture_time", AuraType::TimestampNanos)
+        .field("lot_size", AuraType::U64)
+        .field("route_flags", AuraType::FlagsU32)
+        .field("sequence", AuraType::I32)
+        .field("desk_id", AuraType::U32)
+        .build()
+        .unwrap();
+    let rows = vec![
+        vec![
+            7_u64.into(),
+            1_u64.into(),
+            100_0100_i64.into(),
+            1_700_000_000_000_000_000_i64.into(),
+            10_u64.into(),
+            3_u64.into(),
+            100_i64.into(),
+            42_u64.into(),
+        ],
+        vec![
+            8_u64.into(),
+            2_u64.into(),
+            100_0200_i64.into(),
+            1_700_000_000_000_000_010_i64.into(),
+            20_u64.into(),
+            4_u64.into(),
+            AuraValue::from(-7_i64),
+            43_u64.into(),
+        ],
+    ];
+    let expected = AuraRecordBatch::new(schema.clone(), rows.clone())
+        .unwrap()
+        .to_i64_rows()
+        .unwrap();
+    let aura1 = write_with_options(schema, rows, WriterOptions::aura1());
+
+    let reader = AuraReader::open(Cursor::new(&aura1)).unwrap();
+    let mut replayed = Vec::new();
+    reader
+        .replay_row_views(|row| {
+            let mut values = Vec::new();
+            for field_index in 0..row.field_count() {
+                values.push(row.get_i64(field_index)?);
+            }
+            replayed.push(values);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(expected, replayed);
+
+    let selected_reader = AuraReader::open(Cursor::new(&aura1)).unwrap();
+    let selected_fields = vec![0, 2, 5, 7];
+    let mut selected_replayed = Vec::new();
+    selected_reader
+        .replay_selected_row_views(&selected_fields, |row| {
+            let mut values = Vec::new();
+            for selected_index in 0..row.field_count() {
+                values.push(row.get_i64(selected_index)?);
+            }
+            selected_replayed.push(values);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        expected
+            .iter()
+            .map(|row| selected_fields
+                .iter()
+                .map(|index| row[*index])
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        selected_replayed
+    );
 }
 
 #[test]
@@ -554,14 +659,24 @@ fn aura1_all_field_parse_kernels_match_reordered_mixed_width_schema() {
     let mut type_kernel = 0u64;
     let mut parse_program = 0u64;
     let mut selected_all = 0u64;
+    let mut selected_subset_field_major = 0u64;
+    let mut selected_subset_type_kernel = 0u64;
+    let mut selected_subset_default = 0u64;
     reader
         .replay_fixed_batches(2, |batch| {
             let all_fields = (0..batch.field_count()).collect::<Vec<_>>();
+            let selected_subset = vec![0, 2, 4];
             field_major = field_major.wrapping_add(batch.checksum_all_fields_field_major()?);
             checked_once = checked_once.wrapping_add(batch.checksum_all_fields_checked_once()?);
             type_kernel = type_kernel.wrapping_add(batch.checksum_all_fields_type_kernel()?);
             parse_program = parse_program.wrapping_add(batch.checksum_all_fields_parse_program()?);
             selected_all = selected_all.wrapping_add(batch.checksum_selected_fields(&all_fields)?);
+            selected_subset_field_major = selected_subset_field_major
+                .wrapping_add(batch.checksum_selected_fields_field_major(&selected_subset)?);
+            selected_subset_type_kernel = selected_subset_type_kernel
+                .wrapping_add(batch.checksum_selected_fields_type_kernel(&selected_subset)?);
+            selected_subset_default = selected_subset_default
+                .wrapping_add(batch.checksum_selected_fields(&selected_subset)?);
             Ok(())
         })
         .unwrap();
@@ -571,6 +686,9 @@ fn aura1_all_field_parse_kernels_match_reordered_mixed_width_schema() {
     assert_eq!(field_major, type_kernel);
     assert_eq!(field_major, parse_program);
     assert_eq!(field_major, selected_all);
+    assert_ne!(0, selected_subset_field_major);
+    assert_eq!(selected_subset_field_major, selected_subset_type_kernel);
+    assert_eq!(selected_subset_field_major, selected_subset_default);
 }
 
 #[test]

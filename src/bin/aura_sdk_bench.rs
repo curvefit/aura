@@ -1195,10 +1195,10 @@ fn replay_aura1_per_row_selected_path(path: &Path) -> Result<BenchOutput> {
     let mut record_count = 0usize;
     let mut checksum = 0u64;
     let replay_start = Instant::now();
-    reader.replay_row_views(|row| {
+    reader.replay_selected_row_views(&selected, |row| {
         record_count = record_count.saturating_add(1);
-        for field_index in &selected {
-            checksum = mix_checksum(checksum, row.get_i64(*field_index)?);
+        for selected_index in 0..row.field_count() {
+            checksum = mix_checksum(checksum, row.get_i64(selected_index)?);
         }
         Ok(())
     })?;
@@ -1460,7 +1460,12 @@ fn replay_aura1_batch_selected(
             record_count.saturating_mul(bytes_per_row),
             checksum,
         )
-        .with_parse_counters(selected.len(), selected.len(), selected.len(), false))
+        .with_parse_counters(
+            selected_kernel_group_count(selected.len()),
+            selected.len(),
+            selected_kernel_group_count(selected.len()),
+            true,
+        ))
 }
 
 fn replay_aura1_batch_selected_path(
@@ -1516,7 +1521,12 @@ fn replay_aura1_batch_selected_path(
             record_count.saturating_mul(bytes_per_row),
             checksum,
         )
-        .with_parse_counters(selected.len(), selected.len(), selected.len(), false)
+        .with_parse_counters(
+            selected_kernel_group_count(selected.len()),
+            selected.len(),
+            selected_kernel_group_count(selected.len()),
+            true,
+        )
         .with_stages(stages))
 }
 
@@ -1568,6 +1578,12 @@ fn replay_aura1_batch_default_selected_path(path: &Path, batch_size: usize) -> R
             record_count.saturating_mul(selected.len()),
             record_count.saturating_mul(bytes_per_row),
             checksum,
+        )
+        .with_parse_counters(
+            selected_kernel_group_count(selected.len()),
+            selected.len(),
+            selected_kernel_group_count(selected.len()),
+            true,
         )
         .with_replay_mode("batch")
         .with_stages(stages))
@@ -2143,6 +2159,10 @@ fn kernel_group_count_for_all_field_mode(mode: AllFieldMode, field_count: usize)
         AllFieldMode::InstructionTape => field_count,
         _ => 0,
     }
+}
+
+fn selected_kernel_group_count(field_count: usize) -> usize {
+    field_count.min(4)
 }
 
 fn unsafe_loads_for_all_field_mode(mode: AllFieldMode) -> bool {

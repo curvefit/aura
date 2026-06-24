@@ -241,12 +241,20 @@ pub struct Aura1FixedBatchView<'a> {
     record_width: usize,
     row_count: usize,
     field_offsets: Vec<CompiledAuraField>,
+    field_loads: Option<Vec<FixedFieldLoad>>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Aura1RowView<'a> {
     row_bytes: &'a [u8],
     field_offsets: &'a [CompiledAuraField],
+    field_loads: Option<&'a [FixedFieldLoad]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Aura1SelectedRowView<'a> {
+    row_bytes: &'a [u8],
+    selected_loads: &'a [FixedFieldLoad],
 }
 
 impl<'a> Aura1FixedBatchView<'a> {
@@ -257,11 +265,17 @@ impl<'a> Aura1FixedBatchView<'a> {
         if body.len() != expected_len {
             return Err(AuraError::UnexpectedEof);
         }
+        let field_offsets = aura1_field_slots(plan)?;
+        let field_loads = fixed_field_loads(&field_offsets).ok();
+        if field_loads.is_some() {
+            validate_fixed_body(body, plan.aura1_record_width, row_count, &field_offsets)?;
+        }
         Ok(Self {
             body,
             record_width: plan.aura1_record_width,
             row_count,
-            field_offsets: aura1_field_slots(plan)?,
+            field_offsets,
+            field_loads,
         })
     }
 
@@ -312,6 +326,7 @@ impl<'a> Aura1FixedBatchView<'a> {
         Ok(Aura1RowView {
             row_bytes,
             field_offsets: &self.field_offsets,
+            field_loads: self.field_loads.as_deref(),
         })
     }
 
@@ -345,8 +360,17 @@ impl<'a> Aura1FixedBatchView<'a> {
     }
 
     pub fn checksum_selected_fields(&self, field_indices: &[usize]) -> Result<u64> {
+        self.checksum_selected_fields_type_kernel(field_indices)
+    }
+
+    pub fn checksum_selected_fields_field_major(&self, field_indices: &[usize]) -> Result<u64> {
         let fields = select_field_slots(&self.field_offsets, field_indices)?;
         checksum_field_major_checked(self.body, self.record_width, self.row_count, &fields)
+    }
+
+    pub fn checksum_selected_fields_type_kernel(&self, field_indices: &[usize]) -> Result<u64> {
+        let fields = select_field_slots(&self.field_offsets, field_indices)?;
+        checksum_type_kernel(self.body, self.record_width, self.row_count, &fields)
     }
 
     pub fn checksum_all_fields_field_major(&self) -> Result<u64> {
@@ -388,6 +412,12 @@ impl<'a> Aura1RowView<'a> {
     }
 
     pub fn get_i64(&self, field_index: usize) -> Result<i64> {
+        if let Some(loads) = self.field_loads {
+            let load = loads
+                .get(field_index)
+                .ok_or(AuraError::InvalidValue("field index"))?;
+            return Ok(unsafe { read_i64_unchecked(self.row_bytes.as_ptr(), *load) });
+        }
         let field = self
             .field_offsets
             .get(field_index)
@@ -433,6 +463,20 @@ impl<'a> Aura1RowView<'a> {
             checksum = mix_checksum(checksum, self.get_i64(field_index)?);
         }
         Ok(checksum)
+    }
+}
+
+impl<'a> Aura1SelectedRowView<'a> {
+    pub fn field_count(&self) -> usize {
+        self.selected_loads.len()
+    }
+
+    pub fn get_i64(&self, selected_index: usize) -> Result<i64> {
+        let load = self
+            .selected_loads
+            .get(selected_index)
+            .ok_or(AuraError::InvalidValue("field index"))?;
+        Ok(unsafe { read_i64_unchecked(self.row_bytes.as_ptr(), *load) })
     }
 }
 
@@ -1115,6 +1159,7 @@ impl AuraReader {
             .as_ref()
             .ok_or(AuraError::InvalidValue("compiled plan"))?;
         let field_offsets = aura1_field_slots(plan)?;
+        let field_loads = fixed_field_loads(&field_offsets).ok();
         let mut rows_seen = 0usize;
         match &self.source {
             AuraReaderSource::Memory(bytes) => {
@@ -1125,19 +1170,31 @@ impl AuraReader {
                 if body.len() != plan.aura1_body_size {
                     return Err(AuraError::UnexpectedEof);
                 }
+                if field_loads.is_some() {
+                    validate_fixed_body(
+                        body,
+                        plan.aura1_record_width,
+                        plan.record_count,
+                        &field_offsets,
+                    )?;
+                }
                 while rows_seen < plan.record_count {
-                    let row_start = rows_seen
-                        .checked_mul(plan.aura1_record_width)
-                        .ok_or(AuraError::InvalidValue("row range"))?;
-                    let row_end = row_start
-                        .checked_add(plan.aura1_record_width)
-                        .ok_or(AuraError::InvalidValue("row range"))?;
-                    let row_bytes = body
-                        .get(row_start..row_end)
-                        .ok_or(AuraError::UnexpectedEof)?;
+                    let row_bytes = if field_loads.is_some() {
+                        unsafe { prevalidated_row_bytes(body, rows_seen, plan.aura1_record_width) }
+                    } else {
+                        let row_start = rows_seen
+                            .checked_mul(plan.aura1_record_width)
+                            .ok_or(AuraError::InvalidValue("row range"))?;
+                        let row_end = row_start
+                            .checked_add(plan.aura1_record_width)
+                            .ok_or(AuraError::InvalidValue("row range"))?;
+                        body.get(row_start..row_end)
+                            .ok_or(AuraError::UnexpectedEof)?
+                    };
                     visitor(Aura1RowView {
                         row_bytes,
                         field_offsets: &field_offsets,
+                        field_loads: field_loads.as_deref(),
                     })?;
                     rows_seen = rows_seen.saturating_add(1);
                 }
@@ -1157,19 +1214,116 @@ impl AuraReader {
                     let rows_to_read = rows_per_chunk.min(plan.record_count - rows_seen);
                     let (body, rows_to_visit) =
                         self.read_aura1_body_range(rows_seen, rows_to_read)?;
+                    if field_loads.is_some() {
+                        validate_fixed_body(
+                            &body,
+                            plan.aura1_record_width,
+                            rows_to_visit,
+                            &field_offsets,
+                        )?;
+                    }
                     for local_row in 0..rows_to_visit {
-                        let row_start = local_row
-                            .checked_mul(plan.aura1_record_width)
-                            .ok_or(AuraError::InvalidValue("row range"))?;
-                        let row_end = row_start
-                            .checked_add(plan.aura1_record_width)
-                            .ok_or(AuraError::InvalidValue("row range"))?;
-                        let row_bytes = body
-                            .get(row_start..row_end)
-                            .ok_or(AuraError::UnexpectedEof)?;
+                        let row_bytes = if field_loads.is_some() {
+                            unsafe {
+                                prevalidated_row_bytes(&body, local_row, plan.aura1_record_width)
+                            }
+                        } else {
+                            let row_start = local_row
+                                .checked_mul(plan.aura1_record_width)
+                                .ok_or(AuraError::InvalidValue("row range"))?;
+                            let row_end = row_start
+                                .checked_add(plan.aura1_record_width)
+                                .ok_or(AuraError::InvalidValue("row range"))?;
+                            body.get(row_start..row_end)
+                                .ok_or(AuraError::UnexpectedEof)?
+                        };
                         visitor(Aura1RowView {
                             row_bytes,
                             field_offsets: &field_offsets,
+                            field_loads: field_loads.as_deref(),
+                        })?;
+                    }
+                    rows_seen = rows_seen.saturating_add(rows_to_visit);
+                }
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(rows_seen);
+                    stats.visitor_calls = stats.visitor_calls.saturating_add(rows_seen);
+                    stats.compiled_plan_used = true;
+                });
+                Ok(rows_seen)
+            }
+        }
+    }
+
+    pub fn replay_selected_row_views<F>(
+        &self,
+        field_indices: &[usize],
+        mut visitor: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(Aura1SelectedRowView<'_>) -> Result<()>,
+    {
+        if self.profile != Profile::Aura1 {
+            return Err(AuraError::InvalidValue("aura1 replay profile"));
+        }
+        let plan = self
+            .compiled_plan
+            .as_ref()
+            .ok_or(AuraError::InvalidValue("compiled plan"))?;
+        let field_offsets = aura1_field_slots(plan)?;
+        let selected_fields = select_field_slots(&field_offsets, field_indices)?;
+        let selected_loads = fixed_field_loads(&selected_fields)?;
+        let mut rows_seen = 0usize;
+        match &self.source {
+            AuraReaderSource::Memory(bytes) => {
+                let stats = self.stats.get();
+                let body = bytes
+                    .get(stats.body_offset_from_header..stats.footer_offset_from_trailer)
+                    .ok_or(AuraError::UnexpectedEof)?;
+                validate_fixed_body(
+                    body,
+                    plan.aura1_record_width,
+                    plan.record_count,
+                    &selected_fields,
+                )?;
+                while rows_seen < plan.record_count {
+                    let row_bytes =
+                        unsafe { prevalidated_row_bytes(body, rows_seen, plan.aura1_record_width) };
+                    visitor(Aura1SelectedRowView {
+                        row_bytes,
+                        selected_loads: &selected_loads,
+                    })?;
+                    rows_seen = rows_seen.saturating_add(1);
+                }
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(rows_seen);
+                    stats.visitor_calls = stats.visitor_calls.saturating_add(rows_seen);
+                    stats.bytes_read_during_replay = stats
+                        .bytes_read_during_replay
+                        .saturating_add(plan.aura1_body_size);
+                    stats.compiled_plan_used = true;
+                });
+                Ok(rows_seen)
+            }
+            AuraReaderSource::FileRange(_) => {
+                let rows_per_chunk = rows_per_file_chunk(plan.aura1_record_width);
+                while rows_seen < plan.record_count {
+                    let rows_to_read = rows_per_chunk.min(plan.record_count - rows_seen);
+                    let (body, rows_to_visit) =
+                        self.read_aura1_body_range(rows_seen, rows_to_read)?;
+                    validate_fixed_body(
+                        &body,
+                        plan.aura1_record_width,
+                        rows_to_visit,
+                        &selected_fields,
+                    )?;
+                    for local_row in 0..rows_to_visit {
+                        let row_bytes = unsafe {
+                            prevalidated_row_bytes(&body, local_row, plan.aura1_record_width)
+                        };
+                        visitor(Aura1SelectedRowView {
+                            row_bytes,
+                            selected_loads: &selected_loads,
                         })?;
                     }
                     rows_seen = rows_seen.saturating_add(rows_to_visit);
@@ -1925,6 +2079,19 @@ fn read_i64_fixed_width(bytes: &[u8]) -> Result<i64> {
         }
         _ => Err(AuraError::InvalidValue("field width")),
     }
+}
+
+/// Return one Aura1 row slice after `validate_fixed_body` has established that
+/// `body` contains `row_count * record_width` bytes.
+///
+/// # Safety
+///
+/// `row_index * record_width + record_width` must be within `body`. The replay
+/// callers satisfy this by validating the body once per memory/file-range chunk
+/// and iterating `row_index < row_count` for that validated chunk.
+unsafe fn prevalidated_row_bytes(body: &[u8], row_index: usize, record_width: usize) -> &[u8] {
+    let row_start = row_index * record_width;
+    unsafe { std::slice::from_raw_parts(body.as_ptr().add(row_start), record_width) }
 }
 
 fn copy_group_key(row: &[u8], recipes: &[GroupKeyRecipe], out: &mut Vec<u8>) -> Result<()> {
