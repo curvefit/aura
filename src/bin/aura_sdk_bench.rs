@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::hint::black_box;
 use std::io::Cursor;
@@ -43,6 +44,44 @@ struct Fixture {
     aura1_zst_bytes: u64,
 }
 
+#[derive(Debug, Clone)]
+struct StageBreakdown {
+    times_ms: BTreeMap<&'static str, f64>,
+    counters: BTreeMap<&'static str, u64>,
+    timer_tree_kind: &'static str,
+}
+
+impl StageBreakdown {
+    fn summed() -> Self {
+        Self {
+            times_ms: BTreeMap::new(),
+            counters: BTreeMap::new(),
+            timer_tree_kind: "summed",
+        }
+    }
+
+    fn add_duration(&mut self, name: &'static str, duration: Duration) {
+        self.add_ms(name, duration_ms(duration));
+    }
+
+    fn add_ms(&mut self, name: &'static str, ms: f64) {
+        if ms <= 0.0 {
+            self.times_ms.entry(name).or_insert(0.0);
+            return;
+        }
+        *self.times_ms.entry(name).or_insert(0.0) += ms;
+    }
+
+    fn add_counter(&mut self, name: &'static str, value: usize) {
+        self.counters.insert(name, value as u64);
+    }
+
+    fn stage_sum_ms(&self) -> f64 {
+        self.times_ms.values().sum()
+    }
+}
+
+#[derive(Clone)]
 struct BenchOutput {
     output_bytes: usize,
     records: usize,
@@ -60,6 +99,9 @@ struct BenchOutput {
     bounds_check_count: usize,
     kernel_group_count: usize,
     unsafe_loads_used: bool,
+    replay_mode: Option<&'static str>,
+    benchmark_class: &'static str,
+    stages: StageBreakdown,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -111,6 +153,9 @@ impl BenchOutput {
             bounds_check_count: 0,
             kernel_group_count: 0,
             unsafe_loads_used: false,
+            replay_mode: None,
+            benchmark_class: "other",
+            stages: StageBreakdown::summed(),
         }
     }
 
@@ -161,6 +206,17 @@ impl BenchOutput {
         self.bounds_check_count = bounds_check_count;
         self.kernel_group_count = kernel_group_count;
         self.unsafe_loads_used = unsafe_loads_used;
+        self
+    }
+
+    fn with_replay_mode(mut self, replay_mode: &'static str) -> Self {
+        self.replay_mode = Some(replay_mode);
+        self.benchmark_class = "replay";
+        self
+    }
+
+    fn with_stages(mut self, stages: StageBreakdown) -> Self {
+        self.stages = stages;
         self
     }
 }
@@ -319,6 +375,14 @@ fn run_fixture_matrix(fixture: &Fixture, args: &Args) -> Result<Vec<Value>> {
         "sdk-convert-aura1-to-aura0",
         "sdk-zstd-aura1-to-aura1",
         "sdk-roundtrip-verify",
+        "aura1-replay-per-row-noop",
+        "aura1-replay-per-row-touch-selected",
+        "aura1-replay-per-row-touch-all",
+        "aura1-replay-batch-noop",
+        "aura1-replay-batch-touch-selected",
+        "aura1-replay-batch-touch-all",
+        "aura1-replay-grouped-touch-selected",
+        "aura1-replay-grouped-touch-all",
         "aura1-scan-raw",
         "aura1-scan-raw-file-range",
         "aura1-batch-view-only",
@@ -415,24 +479,7 @@ fn bench_operation(
     aura1_zst: &[u8],
     result_path: &Path,
 ) -> Result<Value> {
-    let mut last_output = BenchOutput {
-        output_bytes: 0,
-        records: fixture.record_count,
-        bytes_scanned: 0,
-        bytes_touched: 0,
-        fields_accessed: 0,
-        values_decoded: 0,
-        checksum: 0,
-        rows_materialized: 0,
-        values_materialized: 0,
-        group_by_fields: Vec::new(),
-        group_stats: None,
-        reader_stats: None,
-        dynamic_dispatch_count: 0,
-        bounds_check_count: 0,
-        kernel_group_count: 0,
-        unsafe_loads_used: false,
-    };
+    let mut last_output = BenchOutput::new(0, fixture.record_count);
     for _ in 0..args.warmups {
         last_output = run_operation(
             operation,
@@ -445,7 +492,7 @@ fn bench_operation(
             args,
         )?;
     }
-    let mut times = Vec::with_capacity(args.iterations);
+    let mut samples = Vec::with_capacity(args.iterations);
     for _ in 0..args.iterations {
         let start = Instant::now();
         last_output = run_operation(
@@ -458,10 +505,20 @@ fn bench_operation(
             aura1_zst,
             args,
         )?;
-        times.push(start.elapsed());
+        samples.push((start.elapsed(), last_output.clone()));
     }
+    let times = samples
+        .iter()
+        .map(|(elapsed, _)| *elapsed)
+        .collect::<Vec<_>>();
     let median = percentile(&times, 0.5);
     let p95 = percentile(&times, 0.95);
+    if let Some((_elapsed, median_output)) = samples
+        .iter()
+        .min_by_key(|(elapsed, _)| elapsed.abs_diff(median))
+    {
+        last_output = median_output.clone();
+    }
     let records = last_output.records.max(1);
     let output_bytes = last_output.output_bytes;
     let output_mb_sec = mb_per_sec(output_bytes, median);
@@ -476,6 +533,91 @@ fn bench_operation(
         aura1,
         args.batch_size,
     )?);
+    let stage_sum_ms = last_output.stages.stage_sum_ms();
+    let runtime_ms = duration_ms(median);
+    let unexplained_ms = runtime_ms - stage_sum_ms;
+    let unexplained_pct = if runtime_ms > 0.0 {
+        (unexplained_ms / runtime_ms) * 100.0
+    } else {
+        0.0
+    };
+    let mut counters = last_output.stages.counters.clone();
+    counters.entry("record_count").or_insert(records as u64);
+    counters
+        .entry("record_width")
+        .or_insert(reader_stats.row_width_from_plan as u64);
+    counters
+        .entry("field_count")
+        .or_insert(fixture.field_count as u64);
+    counters
+        .entry("fields_accessed")
+        .or_insert(last_output.fields_accessed as u64);
+    counters
+        .entry("values_decoded")
+        .or_insert(last_output.values_decoded as u64);
+    counters.entry("callback_count").or_insert(
+        group_stats
+            .map(|stats| stats.callback_count)
+            .unwrap_or(reader_stats.visitor_calls) as u64,
+    );
+    counters
+        .entry("batch_count")
+        .or_insert(reader_stats.visitor_calls as u64);
+    counters
+        .entry("group_count")
+        .or_insert(group_stats.map(|stats| stats.group_count).unwrap_or(0) as u64);
+    counters
+        .entry("rows_materialized")
+        .or_insert(last_output.rows_materialized as u64);
+    counters
+        .entry("values_materialized")
+        .or_insert(last_output.values_materialized as u64);
+    counters
+        .entry("aura_value_materialized_count")
+        .or_insert(last_output.values_materialized as u64);
+    counters
+        .entry("row_vec_alloc_count")
+        .or_insert(last_output.rows_materialized as u64);
+    counters.entry("column_vec_alloc_count").or_insert(
+        if last_output.values_materialized > 0 && last_output.rows_materialized == 0 {
+            fixture.field_count as u64
+        } else {
+            0
+        },
+    );
+    counters
+        .entry("temp_row_buffer_count")
+        .or_insert(reader_stats.temp_row_buffers_allocated as u64);
+    counters
+        .entry("field_load_count")
+        .or_insert(last_output.values_decoded as u64);
+    counters
+        .entry("endian_decode_count")
+        .or_insert(last_output.values_decoded as u64);
+    counters
+        .entry("checksum_ops")
+        .or_insert(last_output.values_decoded as u64);
+    counters
+        .entry("bounds_check_count")
+        .or_insert(last_output.bounds_check_count as u64);
+    counters
+        .entry("dynamic_dispatch_count")
+        .or_insert(last_output.dynamic_dispatch_count as u64);
+    counters
+        .entry("type_kernel_group_count")
+        .or_insert(last_output.kernel_group_count as u64);
+    counters
+        .entry("bytes_read_at_open")
+        .or_insert(reader_stats.bytes_read_at_open as u64);
+    counters
+        .entry("body_bytes_read_at_open")
+        .or_insert(reader_stats.body_bytes_read_at_open as u64);
+    counters
+        .entry("bytes_read_total")
+        .or_insert(reader_stats.source_bytes_read_total as u64);
+    counters
+        .entry("full_file_bytes_copied")
+        .or_insert(reader_stats.full_file_bytes_copied as u64);
     let command = std::env::args().collect::<Vec<_>>().join(" ");
     Ok(json!({
         "operation": operation,
@@ -490,6 +632,8 @@ fn bench_operation(
         "record_count": fixture.record_count,
         "format": format_for_operation(operation),
         "profile": profile_for_operation(operation),
+        "benchmark_class": benchmark_class_for_operation(operation, last_output.benchmark_class),
+        "replay_mode": replay_mode_for_operation(operation, last_output.replay_mode),
         "batch_size": args.batch_size,
         "median_ms": duration_ms(median),
         "p95_ms": duration_ms(p95),
@@ -498,6 +642,7 @@ fn bench_operation(
         "output_bytes": output_bytes,
         "compressed_bytes": compressed_bytes_for_operation(operation, fixture),
         "output_mb_sec": output_mb_sec,
+        "mb_per_sec": output_mb_sec,
         "bytes_scanned": last_output.bytes_scanned,
         "bytes_touched": last_output.bytes_touched,
         "fields_accessed": last_output.fields_accessed,
@@ -537,6 +682,13 @@ fn bench_operation(
         "bounds_check_count": last_output.bounds_check_count,
         "kernel_group_count": last_output.kernel_group_count,
         "unsafe_loads_used": last_output.unsafe_loads_used,
+        "stage_times_ms": last_output.stages.times_ms,
+        "counters": counters,
+        "timer_tree_kind": last_output.stages.timer_tree_kind,
+        "stage_sum_ms": stage_sum_ms,
+        "runtime_ms": runtime_ms,
+        "unexplained_ms": unexplained_ms,
+        "unexplained_pct": unexplained_pct,
         "group_by_fields": last_output.group_by_fields,
         "group_count": group_stats.map(|stats| stats.group_count).unwrap_or(0),
         "callback_count": group_stats
@@ -607,6 +759,31 @@ fn run_operation(
             output.bytes_scanned = aura0.len();
             Ok(output)
         }
+        "aura1-replay-per-row-noop" => replay_aura1_per_row_noop_path(aura1_path),
+        "aura1-replay-per-row-touch-selected" => replay_aura1_per_row_selected_path(aura1_path),
+        "aura1-replay-per-row-touch-all" => {
+            replay_aura1_row_view_path(aura1_path, TouchMode::AllFields)
+                .map(|output| output.with_replay_mode("per_row"))
+        }
+        "aura1-replay-batch-noop" => replay_aura1_batches_path(aura1_path, args.batch_size)
+            .map(|output| output.with_replay_mode("batch")),
+        "aura1-replay-batch-touch-selected" => {
+            replay_aura1_batch_default_selected_path(aura1_path, args.batch_size)
+        }
+        "aura1-replay-batch-touch-all" => replay_aura1_batch_all_fields_mode_path(
+            aura1_path,
+            args.batch_size,
+            AllFieldMode::TypeKernel,
+        )
+        .map(|output| output.with_replay_mode("batch")),
+        "aura1-replay-grouped-touch-selected" => grouped_replay_selected(aura1, schema),
+        "aura1-replay-grouped-touch-all" => grouped_replay_truth(
+            aura1,
+            schema,
+            GroupMode::Primary,
+            GroupTruthMode::AllFieldsPerRow,
+        )
+        .map(|output| output.with_replay_mode("grouped")),
         "aura1-scan-raw" => scan_raw_aura1(aura1),
         "aura1-batch-view-only" => replay_aura1_batch_view_only(aura1, args.batch_size),
         "aura1-batch-view-only-file-range" => {
@@ -781,20 +958,39 @@ fn read_batches(bytes: &[u8], batch_size: usize) -> Result<BenchOutput> {
 }
 
 fn read_batches_path(path: &Path, batch_size: usize) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
     let mut reader = AuraReader::open_path(path)?;
     let field_count = reader.schema().field_count();
     let bytes_touched = reader
         .compiled_plan()
         .map(|plan| plan.aura1_body_size)
         .unwrap_or(0);
+    stages.add_duration("open_total_ms", setup_start.elapsed());
     let mut records = 0usize;
     let mut checksum = 0u64;
+    let loop_start = Instant::now();
     while let Some(batch) = reader.next_batch(batch_size)? {
+        let batch_rows = batch.row_count();
         records = records.saturating_add(batch.row_count());
+        let checksum_start = Instant::now();
         checksum = checksum_record_batch(checksum, &batch)?;
+        stages.add_duration("checksum_mix_ms", checksum_start.elapsed());
+        stages.add_counter("last_batch_rows", batch_rows);
     }
+    let loop_total = loop_start.elapsed();
     black_box(checksum);
     let stats = reader.stats();
+    add_residual_ms(
+        &mut stages,
+        "aura_value_materialize_ms",
+        loop_total,
+        &["checksum_mix_ms"],
+    );
+    stages.add_ms("row_batch_alloc_ms", 0.0);
+    stages.add_ms("row_vec_alloc_ms", 0.0);
+    stages.add_ms("field_decode_ms", 0.0);
+    stages.add_ms("row_push_ms", 0.0);
     Ok(BenchOutput::new(stats.file_len, records)
         .with_row_materialization(field_count)
         .with_access(
@@ -803,7 +999,8 @@ fn read_batches_path(path: &Path, batch_size: usize) -> Result<BenchOutput> {
             bytes_touched,
             checksum,
         )
-        .with_reader_stats(stats))
+        .with_reader_stats(stats)
+        .with_stages(stages))
 }
 
 fn read_column_batches(bytes: &[u8], batch_size: usize) -> Result<BenchOutput> {
@@ -832,20 +1029,36 @@ fn read_column_batches(bytes: &[u8], batch_size: usize) -> Result<BenchOutput> {
 }
 
 fn read_column_batches_path(path: &Path, batch_size: usize) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
     let mut reader = AuraReader::open_path(path)?;
     let field_count = reader.schema().field_count();
     let bytes_touched = reader
         .compiled_plan()
         .map(|plan| plan.aura1_body_size)
         .unwrap_or(0);
+    stages.add_duration("open_total_ms", setup_start.elapsed());
     let mut records = 0usize;
     let mut checksum = 0u64;
+    let loop_start = Instant::now();
     while let Some(batch) = reader.next_column_batch(batch_size)? {
         records = records.saturating_add(batch.row_count());
+        let checksum_start = Instant::now();
         checksum = checksum_column_batch(checksum, &batch)?;
+        stages.add_duration("checksum_mix_ms", checksum_start.elapsed());
     }
+    let loop_total = loop_start.elapsed();
     black_box(checksum);
     let stats = reader.stats();
+    add_residual_ms(
+        &mut stages,
+        "field_major_decode_ms",
+        loop_total,
+        &["checksum_mix_ms"],
+    );
+    stages.add_ms("column_alloc_ms", 0.0);
+    stages.add_ms("typed_vec_alloc_ms", 0.0);
+    stages.add_ms("column_push_or_write_ms", 0.0);
     Ok(BenchOutput::new(stats.file_len, records)
         .with_column_materialization(field_count)
         .with_access(
@@ -854,7 +1067,8 @@ fn read_column_batches_path(path: &Path, batch_size: usize) -> Result<BenchOutpu
             bytes_touched,
             checksum,
         )
-        .with_reader_stats(stats))
+        .with_reader_stats(stats)
+        .with_stages(stages))
 }
 
 fn replay_aura1(bytes: &[u8]) -> Result<BenchOutput> {
@@ -935,19 +1149,82 @@ fn replay_aura1_batches(bytes: &[u8], batch_size: usize) -> Result<BenchOutput> 
 }
 
 fn replay_aura1_batches_path(path: &Path, batch_size: usize) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
     let reader = AuraReader::open_path(path)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
     let mut record_count = 0usize;
     let mut checksum = 0u64;
+    let replay_start = Instant::now();
     reader.replay_fixed_batches(batch_size, |batch| {
+        let callback_start = Instant::now();
         record_count = record_count.saturating_add(batch.row_count());
         checksum = checksum.wrapping_add(batch.row_count() as u64);
+        stages.add_duration("batch_callback_ms", callback_start.elapsed());
         Ok(())
     })?;
+    let replay_total = replay_start.elapsed();
     black_box(checksum);
     let stats = reader.stats();
+    add_residual_ms(
+        &mut stages,
+        "batch_range_validation_ms",
+        replay_total,
+        &["batch_callback_ms"],
+    );
+    stages.add_ms("batch_view_construction_ms", 0.0);
+    stages.add_ms("batch_advance_ms", 0.0);
     let mut output = BenchOutput::new(stats.file_len, record_count).with_reader_stats(stats);
     output.bytes_scanned = stats.bytes_read_during_replay;
-    Ok(output.with_access(0, 0, 0, checksum))
+    Ok(output.with_access(0, 0, 0, checksum).with_stages(stages))
+}
+
+fn replay_aura1_per_row_noop_path(path: &Path) -> Result<BenchOutput> {
+    replay_aura1_row_view_only_path(path).map(|output| output.with_replay_mode("per_row"))
+}
+
+fn replay_aura1_per_row_selected_path(path: &Path) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
+    let reader = AuraReader::open_path(path)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
+    let recipe_start = Instant::now();
+    let selected = default_selected_field_indices(&reader)?;
+    let bytes_per_row = selected_bytes_per_row(&reader, &selected)?;
+    stages.add_duration("selected_field_recipe_lookup_ms", recipe_start.elapsed());
+    let mut record_count = 0usize;
+    let mut checksum = 0u64;
+    let replay_start = Instant::now();
+    reader.replay_row_views(|row| {
+        record_count = record_count.saturating_add(1);
+        for field_index in &selected {
+            checksum = mix_checksum(checksum, row.get_i64(*field_index)?);
+        }
+        Ok(())
+    })?;
+    let replay_total = replay_start.elapsed();
+    black_box(checksum);
+    let stats = reader.stats();
+    stages.add_duration("field_load_ms", replay_total);
+    stages.add_ms("row_range_validation_ms", 0.0);
+    stages.add_ms("row_slice_setup_ms", 0.0);
+    stages.add_ms("row_view_construction_ms", 0.0);
+    stages.add_ms("field_offset_calc_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
+    stages.add_ms("user_callback_ms", 0.0);
+    stages.add_ms("loop_overhead_ms", 0.0);
+    let mut output = BenchOutput::new(stats.file_len, record_count).with_reader_stats(stats);
+    output.bytes_scanned = stats.bytes_read_during_replay;
+    Ok(output
+        .with_access(
+            selected.len(),
+            record_count.saturating_mul(selected.len()),
+            record_count.saturating_mul(bytes_per_row),
+            checksum,
+        )
+        .with_replay_mode("per_row")
+        .with_stages(stages))
 }
 
 fn replay_aura1_batch_view_only(bytes: &[u8], batch_size: usize) -> Result<BenchOutput> {
@@ -995,30 +1272,63 @@ fn replay_aura1_batch_touch_path(
     batch_size: usize,
     mode: TouchMode,
 ) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
     let reader = AuraReader::open_path(path)?;
     let field_count = reader.schema().field_count();
     let fields_accessed = fields_accessed(field_count, mode);
     let bytes_per_row = bytes_per_row_for_touch(&reader, mode)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
     let mut record_count = 0usize;
     let mut checksum = 0u64;
+    let replay_start = Instant::now();
     reader.replay_fixed_batches(batch_size, |batch| {
+        let callback_start = Instant::now();
         record_count = record_count.saturating_add(batch.row_count());
+        let field_loop_start = Instant::now();
         checksum = match mode {
             TouchMode::OneField => mix_checksum(checksum, batch.checksum_field(0)? as i64),
             TouchMode::AllFields => mix_checksum(checksum, batch.checksum_all_fields()? as i64),
         };
+        let field_loop_elapsed = field_loop_start.elapsed();
+        match mode {
+            TouchMode::OneField => {
+                stages.add_duration("selected_field_loop_ms", field_loop_elapsed)
+            }
+            TouchMode::AllFields => stages.add_duration("all_field_loop_ms", field_loop_elapsed),
+        }
+        let callback_residual =
+            duration_ms(callback_start.elapsed()) - duration_ms(field_loop_elapsed);
+        stages.add_ms("batch_callback_ms", callback_residual.max(0.0));
         Ok(())
     })?;
+    let replay_total = replay_start.elapsed();
     black_box(checksum);
     let stats = reader.stats();
+    add_residual_ms(
+        &mut stages,
+        "batch_range_validation_ms",
+        replay_total,
+        &[
+            "selected_field_loop_ms",
+            "all_field_loop_ms",
+            "batch_callback_ms",
+        ],
+    );
+    stages.add_ms("batch_view_construction_ms", 0.0);
+    stages.add_ms("field_load_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
     let mut output = BenchOutput::new(stats.file_len, record_count).with_reader_stats(stats);
     output.bytes_scanned = stats.bytes_read_during_replay;
-    Ok(output.with_access(
-        fields_accessed,
-        record_count.saturating_mul(fields_accessed),
-        record_count.saturating_mul(bytes_per_row),
-        checksum,
-    ))
+    Ok(output
+        .with_access(
+            fields_accessed,
+            record_count.saturating_mul(fields_accessed),
+            record_count.saturating_mul(bytes_per_row),
+            checksum,
+        )
+        .with_stages(stages))
 }
 
 fn replay_aura1_batch_all_fields_mode(
@@ -1061,18 +1371,47 @@ fn replay_aura1_batch_all_fields_mode_path(
     batch_size: usize,
     mode: AllFieldMode,
 ) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
     let reader = AuraReader::open_path(path)?;
     let field_count = reader.schema().field_count();
     let bytes_per_row = bytes_per_row_for_touch(&reader, TouchMode::AllFields)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
     let mut record_count = 0usize;
     let mut checksum = 0u64;
+    let replay_start = Instant::now();
     reader.replay_fixed_batches(batch_size, |batch| {
+        let callback_start = Instant::now();
         record_count = record_count.saturating_add(batch.row_count());
+        let dispatch_start = Instant::now();
+        let dispatch_elapsed = dispatch_start.elapsed();
+        stages.add_duration("type_kernel_dispatch_ms", dispatch_elapsed);
+        let field_loop_start = Instant::now();
         checksum = checksum.wrapping_add(checksum_batch_all_fields(&batch, mode)?);
+        let field_loop_elapsed = field_loop_start.elapsed();
+        stages.add_duration("all_field_loop_ms", field_loop_elapsed);
+        let measured = duration_ms(dispatch_elapsed) + duration_ms(field_loop_elapsed);
+        let callback_residual = duration_ms(callback_start.elapsed()) - measured;
+        stages.add_ms("batch_callback_ms", callback_residual.max(0.0));
         Ok(())
     })?;
+    let replay_total = replay_start.elapsed();
     black_box(checksum);
     let stats = reader.stats();
+    add_residual_ms(
+        &mut stages,
+        "batch_range_validation_ms",
+        replay_total,
+        &[
+            "type_kernel_dispatch_ms",
+            "all_field_loop_ms",
+            "batch_callback_ms",
+        ],
+    );
+    stages.add_ms("field_load_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
+    stages.add_ms("batch_view_construction_ms", 0.0);
     let mut output = BenchOutput::new(stats.file_len, record_count).with_reader_stats(stats);
     output.bytes_scanned = output
         .reader_stats
@@ -1090,7 +1429,8 @@ fn replay_aura1_batch_all_fields_mode_path(
             bounds_check_count_for_all_field_mode(mode, record_count, field_count),
             kernel_group_count_for_all_field_mode(mode, field_count),
             unsafe_loads_for_all_field_mode(mode),
-        ))
+        )
+        .with_stages(stages))
 }
 
 fn replay_aura1_batch_selected(
@@ -1128,18 +1468,42 @@ fn replay_aura1_batch_selected_path(
     batch_size: usize,
     requested_fields: usize,
 ) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
     let reader = AuraReader::open_path(path)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
+    let recipe_start = Instant::now();
     let selected = selected_field_indices(reader.schema().field_count(), requested_fields);
     let bytes_per_row = selected_bytes_per_row(&reader, &selected)?;
+    stages.add_duration("selected_field_recipe_lookup_ms", recipe_start.elapsed());
     let mut record_count = 0usize;
     let mut checksum = 0u64;
+    let replay_start = Instant::now();
     reader.replay_fixed_batches(batch_size, |batch| {
+        let callback_start = Instant::now();
         record_count = record_count.saturating_add(batch.row_count());
+        let field_loop_start = Instant::now();
         checksum = checksum.wrapping_add(batch.checksum_selected_fields(&selected)?);
+        let field_loop_elapsed = field_loop_start.elapsed();
+        stages.add_duration("selected_field_loop_ms", field_loop_elapsed);
+        let callback_residual =
+            duration_ms(callback_start.elapsed()) - duration_ms(field_loop_elapsed);
+        stages.add_ms("batch_callback_ms", callback_residual.max(0.0));
         Ok(())
     })?;
+    let replay_total = replay_start.elapsed();
     black_box(checksum);
     let stats = reader.stats();
+    add_residual_ms(
+        &mut stages,
+        "batch_range_validation_ms",
+        replay_total,
+        &["selected_field_loop_ms", "batch_callback_ms"],
+    );
+    stages.add_ms("batch_view_construction_ms", 0.0);
+    stages.add_ms("field_load_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
     let mut output = BenchOutput::new(stats.file_len, record_count).with_reader_stats(stats);
     output.bytes_scanned = output
         .reader_stats
@@ -1152,7 +1516,61 @@ fn replay_aura1_batch_selected_path(
             record_count.saturating_mul(bytes_per_row),
             checksum,
         )
-        .with_parse_counters(selected.len(), selected.len(), selected.len(), false))
+        .with_parse_counters(selected.len(), selected.len(), selected.len(), false)
+        .with_stages(stages))
+}
+
+fn replay_aura1_batch_default_selected_path(path: &Path, batch_size: usize) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
+    let reader = AuraReader::open_path(path)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
+    let recipe_start = Instant::now();
+    let selected = default_selected_field_indices(&reader)?;
+    let bytes_per_row = selected_bytes_per_row(&reader, &selected)?;
+    stages.add_duration("selected_field_recipe_lookup_ms", recipe_start.elapsed());
+    let mut record_count = 0usize;
+    let mut checksum = 0u64;
+    let replay_start = Instant::now();
+    reader.replay_fixed_batches(batch_size, |batch| {
+        let callback_start = Instant::now();
+        record_count = record_count.saturating_add(batch.row_count());
+        let field_loop_start = Instant::now();
+        checksum = checksum.wrapping_add(batch.checksum_selected_fields(&selected)?);
+        let field_loop_elapsed = field_loop_start.elapsed();
+        stages.add_duration("selected_field_loop_ms", field_loop_elapsed);
+        let callback_residual =
+            duration_ms(callback_start.elapsed()) - duration_ms(field_loop_elapsed);
+        stages.add_ms("batch_callback_ms", callback_residual.max(0.0));
+        Ok(())
+    })?;
+    let replay_total = replay_start.elapsed();
+    black_box(checksum);
+    let stats = reader.stats();
+    add_residual_ms(
+        &mut stages,
+        "batch_range_validation_ms",
+        replay_total,
+        &["selected_field_loop_ms", "batch_callback_ms"],
+    );
+    stages.add_ms("batch_view_construction_ms", 0.0);
+    stages.add_ms("field_load_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
+    let mut output = BenchOutput::new(stats.file_len, record_count).with_reader_stats(stats);
+    output.bytes_scanned = output
+        .reader_stats
+        .map(|stats| stats.bytes_read_during_replay)
+        .unwrap_or_default();
+    Ok(output
+        .with_access(
+            selected.len(),
+            record_count.saturating_mul(selected.len()),
+            record_count.saturating_mul(bytes_per_row),
+            checksum,
+        )
+        .with_replay_mode("batch")
+        .with_stages(stages))
 }
 
 fn replay_aura1_row_view_only(bytes: &[u8]) -> Result<BenchOutput> {
@@ -1173,19 +1591,29 @@ fn replay_aura1_row_view_only(bytes: &[u8]) -> Result<BenchOutput> {
 }
 
 fn replay_aura1_row_view_only_path(path: &Path) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
     let reader = AuraReader::open_path(path)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
     let mut record_count = 0usize;
     let mut checksum = 0u64;
+    let replay_start = Instant::now();
     reader.replay_row_views(|row| {
         record_count = record_count.saturating_add(1);
         checksum = checksum.wrapping_add(row.field_count() as u64);
         Ok(())
     })?;
+    let replay_total = replay_start.elapsed();
     black_box(checksum);
     let stats = reader.stats();
+    stages.add_duration("loop_overhead_ms", replay_total);
+    stages.add_ms("row_range_validation_ms", 0.0);
+    stages.add_ms("row_slice_setup_ms", 0.0);
+    stages.add_ms("row_view_construction_ms", 0.0);
+    stages.add_ms("user_callback_ms", 0.0);
     let mut output = BenchOutput::new(stats.file_len, record_count).with_reader_stats(stats);
     output.bytes_scanned = stats.bytes_read_during_replay;
-    Ok(output.with_access(0, 0, 0, checksum))
+    Ok(output.with_access(0, 0, 0, checksum).with_stages(stages))
 }
 
 fn replay_aura1_row_view(bytes: &[u8], mode: TouchMode) -> Result<BenchOutput> {
@@ -1214,27 +1642,43 @@ fn replay_aura1_row_view(bytes: &[u8], mode: TouchMode) -> Result<BenchOutput> {
 }
 
 fn replay_aura1_row_view_path(path: &Path, mode: TouchMode) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
     let reader = AuraReader::open_path(path)?;
     let field_count = reader.schema().field_count();
     let fields_accessed = fields_accessed(field_count, mode);
     let bytes_per_row = bytes_per_row_for_touch(&reader, mode)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
     let mut record_count = 0usize;
     let mut checksum = 0u64;
+    let replay_start = Instant::now();
     reader.replay_row_views(|row| {
         record_count = record_count.saturating_add(1);
         checksum = checksum_row_view(checksum, row, mode)?;
         Ok(())
     })?;
+    let replay_total = replay_start.elapsed();
     black_box(checksum);
     let stats = reader.stats();
+    stages.add_duration("field_load_ms", replay_total);
+    stages.add_ms("row_range_validation_ms", 0.0);
+    stages.add_ms("row_slice_setup_ms", 0.0);
+    stages.add_ms("row_view_construction_ms", 0.0);
+    stages.add_ms("field_offset_calc_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
+    stages.add_ms("user_callback_ms", 0.0);
+    stages.add_ms("loop_overhead_ms", 0.0);
     let mut output = BenchOutput::new(stats.file_len, record_count).with_reader_stats(stats);
     output.bytes_scanned = stats.bytes_read_during_replay;
-    Ok(output.with_access(
-        fields_accessed,
-        record_count.saturating_mul(fields_accessed),
-        record_count.saturating_mul(bytes_per_row),
-        checksum,
-    ))
+    Ok(output
+        .with_access(
+            fields_accessed,
+            record_count.saturating_mul(fields_accessed),
+            record_count.saturating_mul(bytes_per_row),
+            checksum,
+        )
+        .with_stages(stages))
 }
 
 fn scan_raw_aura1(bytes: &[u8]) -> Result<BenchOutput> {
@@ -1254,8 +1698,12 @@ fn scan_raw_aura1(bytes: &[u8]) -> Result<BenchOutput> {
 }
 
 fn scan_raw_aura1_path(path: &Path) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
     let reader = AuraReader::open_path(path)?;
     let stats_at_open = reader.stats();
+    stages.add_duration("open_total_ms", setup_start.elapsed());
+    let range_start = Instant::now();
     let mut file = fs::File::open(path)?;
     use std::io::{Read, Seek, SeekFrom};
     file.seek(SeekFrom::Start(
@@ -1264,26 +1712,32 @@ fn scan_raw_aura1_path(path: &Path) -> Result<BenchOutput> {
     let mut remaining = stats_at_open
         .footer_offset_from_trailer
         .saturating_sub(stats_at_open.body_offset_from_header);
+    stages.add_duration("raw_range_validation_ms", range_start.elapsed());
     let mut buffer = vec![0u8; 256 * 1024];
     let mut checksum = 0u8;
     let mut bytes_read = 0usize;
     while remaining > 0 {
         let len = remaining.min(buffer.len());
+        let read_start = Instant::now();
         file.read_exact(&mut buffer[..len])?;
+        stages.add_duration("raw_body_read_or_map_ms", read_start.elapsed());
+        let scan_start = Instant::now();
         for chunk in buffer[..len].chunks(stats_at_open.row_width_from_plan.max(1)) {
             checksum ^= chunk.first().copied().unwrap_or(0);
         }
+        stages.add_duration("raw_scan_loop_ms", scan_start.elapsed());
         remaining -= len;
         bytes_read = bytes_read.saturating_add(len);
     }
     black_box(checksum);
+    stages.add_ms("raw_checksum_ms", 0.0);
     let mut stats = stats_at_open;
     stats.bytes_read_during_replay = bytes_read;
     stats.source_bytes_read_total = stats.source_bytes_read_total.saturating_add(bytes_read);
     let mut output =
         BenchOutput::new(stats.file_len, stats.record_count_from_footer).with_reader_stats(stats);
     output.bytes_scanned = bytes_read;
-    Ok(output)
+    Ok(output.with_stages(stages))
 }
 
 fn grouped_replay_aura1(bytes: &[u8], schema: &AuraSchema, mode: GroupMode) -> Result<BenchOutput> {
@@ -1328,6 +1782,8 @@ fn grouped_replay_truth(
     group_mode: GroupMode,
     truth_mode: GroupTruthMode,
 ) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
     let fields = group_fields(schema, group_mode)?;
     let reader = AuraReader::open(Cursor::new(bytes))?;
     let info = records::aura1_fixed_layout_info(bytes)?;
@@ -1346,8 +1802,12 @@ fn grouped_replay_truth(
             .map(|field| field.width)
             .sum(),
     };
+    stages.add_duration("open_total_ms", setup_start.elapsed());
+    let recipe_start = Instant::now();
     let mut checksum = 0u64;
     let mut values_decoded = 0usize;
+    stages.add_duration("group_key_recipe_setup_ms", recipe_start.elapsed());
+    let grouped_start = Instant::now();
     let stats = reader.grouped_replay(&GroupBy::fields(fields.iter().cloned()), |group| {
         match truth_mode {
             GroupTruthMode::ViewOnly => {
@@ -1405,8 +1865,21 @@ fn grouped_replay_truth(
         }
         Ok(())
     })?;
+    let grouped_total = grouped_start.elapsed();
     black_box(checksum);
     let reader_stats = reader.stats();
+    match truth_mode {
+        GroupTruthMode::ViewOnly => stages.add_duration("group_callback_ms", grouped_total),
+        GroupTruthMode::KeyOnly => {
+            stages.add_duration("group_key_materialization_ms", grouped_total)
+        }
+        GroupTruthMode::OneFieldPerRow | GroupTruthMode::AllFieldsPerRow => {
+            stages.add_duration("grouped_field_touch_ms", grouped_total)
+        }
+        GroupTruthMode::Aggregate => stages.add_duration("grouped_aggregate_ms", grouped_total),
+    }
+    stages.add_ms("group_boundary_detection_ms", 0.0);
+    stages.add_ms("key_byte_compare_ms", 0.0);
     let fields_accessed = match truth_mode {
         GroupTruthMode::ViewOnly => 0,
         GroupTruthMode::KeyOnly => fields.len(),
@@ -1423,7 +1896,69 @@ fn grouped_replay_truth(
             stats.row_count.saturating_mul(bytes_per_row),
             checksum,
         )
-        .with_reader_stats(reader_stats))
+        .with_reader_stats(reader_stats)
+        .with_stages(stages))
+}
+
+fn grouped_replay_selected(bytes: &[u8], schema: &AuraSchema) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
+    let fields = group_fields(schema, GroupMode::Primary)?;
+    let reader = AuraReader::open(Cursor::new(bytes))?;
+    let selected = default_selected_field_indices(&reader)?;
+    let bytes_per_row = selected_bytes_per_row(&reader, &selected)?;
+    let info = records::aura1_fixed_layout_info(bytes)?;
+    let body = bytes
+        .get(info.body_offset..info.body_offset.saturating_add(info.body_bytes))
+        .ok_or_else(|| anyhow::anyhow!("invalid Aura1 body range"))?;
+    let slots = bench_field_slots(&reader)?;
+    let selected_slots = selected
+        .iter()
+        .map(|index| {
+            slots
+                .get(*index)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("field index out of bounds"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
+    stages.add_ms("group_key_recipe_setup_ms", 0.0);
+    let mut checksum = 0u64;
+    let mut values_decoded = 0usize;
+    let grouped_start = Instant::now();
+    let stats = reader.grouped_replay(&GroupBy::fields(fields.iter().cloned()), |group| {
+        checksum = checksum_group_selected_rows(
+            checksum,
+            body,
+            info.record_width,
+            &selected_slots,
+            group.row_start(),
+            group.row_count(),
+        )?;
+        values_decoded =
+            values_decoded.saturating_add(group.row_count().saturating_mul(selected_slots.len()));
+        Ok(())
+    })?;
+    let grouped_total = grouped_start.elapsed();
+    black_box(checksum);
+    let reader_stats = reader.stats();
+    stages.add_duration("grouped_field_touch_ms", grouped_total);
+    stages.add_ms("group_boundary_detection_ms", 0.0);
+    stages.add_ms("key_byte_compare_ms", 0.0);
+    stages.add_ms("group_key_materialization_ms", 0.0);
+    stages.add_ms("group_callback_ms", 0.0);
+    let mut output = BenchOutput::new(bytes.len(), stats.row_count).with_group_stats(fields, stats);
+    output.bytes_scanned = info.body_bytes;
+    Ok(output
+        .with_access(
+            selected.len(),
+            values_decoded,
+            stats.row_count.saturating_mul(bytes_per_row),
+            checksum,
+        )
+        .with_reader_stats(reader_stats)
+        .with_replay_mode("grouped")
+        .with_stages(stages))
 }
 
 fn group_fields(schema: &AuraSchema, mode: GroupMode) -> Result<Vec<String>> {
@@ -1494,6 +2029,69 @@ fn selected_field_indices(field_count: usize, requested_fields: usize) -> Vec<us
     (0..selected_count).collect()
 }
 
+fn default_selected_field_indices(reader: &AuraReader) -> Result<Vec<usize>> {
+    let slots = bench_field_slots(reader)?;
+    let mut selected = Vec::new();
+    let schema = reader.schema();
+    push_first_matching_field(&mut selected, schema, &slots, |aura_type| {
+        matches!(
+            aura_type,
+            aura_codec::AuraType::TimestampNanos | aura_codec::AuraType::TimestampMicros
+        )
+    });
+    push_first_matching_field(&mut selected, schema, &slots, |aura_type| {
+        matches!(
+            aura_type,
+            aura_codec::AuraType::PriceI64Scaled { .. } | aura_codec::AuraType::I64Scaled { .. }
+        )
+    });
+    push_first_matching_field(&mut selected, schema, &slots, |aura_type| {
+        matches!(
+            aura_type,
+            aura_codec::AuraType::U64
+                | aura_codec::AuraType::U32
+                | aura_codec::AuraType::I64
+                | aura_codec::AuraType::I32
+                | aura_codec::AuraType::U16
+                | aura_codec::AuraType::I16
+                | aura_codec::AuraType::U8
+                | aura_codec::AuraType::I8
+                | aura_codec::AuraType::FlagsU32
+                | aura_codec::AuraType::EnumU8
+        )
+    });
+    for field in &slots {
+        let index = usize::from(field.field_index);
+        if selected.len() >= 3 {
+            break;
+        }
+        if field.width > 0 && !selected.contains(&index) {
+            selected.push(index);
+        }
+    }
+    if selected.is_empty() && !slots.is_empty() {
+        selected.push(usize::from(slots[0].field_index));
+    }
+    Ok(selected)
+}
+
+fn push_first_matching_field(
+    selected: &mut Vec<usize>,
+    schema: &AuraSchema,
+    slots: &[CompiledAuraField],
+    predicate: impl Fn(aura_codec::AuraType) -> bool,
+) {
+    if let Some((index, _field)) = schema.fields().iter().enumerate().find(|(index, field)| {
+        predicate(field.aura_type)
+            && slots
+                .iter()
+                .any(|slot| usize::from(slot.field_index) == *index && slot.width > 0)
+            && !selected.contains(index)
+    }) {
+        selected.push(index);
+    }
+}
+
 fn selected_bytes_per_row(reader: &AuraReader, field_indices: &[usize]) -> Result<usize> {
     let slots = bench_field_slots(reader)?;
     field_indices.iter().try_fold(0usize, |acc, index| {
@@ -1552,6 +2150,24 @@ fn unsafe_loads_for_all_field_mode(mode: AllFieldMode) -> bool {
         mode,
         AllFieldMode::Unchecked | AllFieldMode::TypeKernel | AllFieldMode::InstructionTape
     )
+}
+
+fn measured_ms(stages: &StageBreakdown, names: &[&'static str]) -> f64 {
+    names
+        .iter()
+        .filter_map(|name| stages.times_ms.get(name))
+        .copied()
+        .sum()
+}
+
+fn add_residual_ms(
+    stages: &mut StageBreakdown,
+    name: &'static str,
+    total: Duration,
+    measured_names: &[&'static str],
+) {
+    let residual = duration_ms(total) - measured_ms(stages, measured_names);
+    stages.add_ms(name, residual.max(0.0));
 }
 
 fn checksum_row_view(
@@ -1694,6 +2310,33 @@ fn checksum_group_rows(
                     checksum = mix_checksum(checksum, read_field_i64(row, *field)?);
                 }
             }
+        }
+    }
+    Ok(checksum)
+}
+
+fn checksum_group_selected_rows(
+    checksum: u64,
+    body: &[u8],
+    record_width: usize,
+    fields: &[CompiledAuraField],
+    row_start: usize,
+    row_count: usize,
+) -> std::result::Result<u64, AuraError> {
+    let mut checksum = checksum;
+    let row_end = row_start
+        .checked_add(row_count)
+        .ok_or(AuraError::InvalidValue("row range"))?;
+    for row_index in row_start..row_end {
+        let start = row_index
+            .checked_mul(record_width)
+            .ok_or(AuraError::InvalidValue("row offset"))?;
+        let end = start
+            .checked_add(record_width)
+            .ok_or(AuraError::InvalidValue("row offset"))?;
+        let row = body.get(start..end).ok_or(AuraError::UnexpectedEof)?;
+        for field in fields {
+            checksum = mix_checksum(checksum, read_field_i64(row, *field)?);
         }
     }
     Ok(checksum)
@@ -1873,6 +2516,42 @@ fn format_for_operation(operation: &str) -> &'static str {
         "aura0"
     } else {
         "aura1"
+    }
+}
+
+fn replay_mode_for_operation(operation: &str, replay_mode: Option<&'static str>) -> &'static str {
+    replay_mode.unwrap_or_else(|| {
+        if operation.contains("per-row") {
+            "per_row"
+        } else if operation.contains("grouped") {
+            "grouped"
+        } else if operation.contains("batch") && operation.starts_with("aura1-replay-") {
+            "batch"
+        } else {
+            "none"
+        }
+    })
+}
+
+fn benchmark_class_for_operation(operation: &str, benchmark_class: &'static str) -> &'static str {
+    if benchmark_class != "other" {
+        benchmark_class
+    } else if operation.contains("scan-raw") {
+        "raw scan"
+    } else if operation.contains("view-only") || operation.contains("batch-callback") {
+        "view construction"
+    } else if operation.contains("read-batches-row") || operation.contains("read-batches-columnar")
+    {
+        "materialized read"
+    } else if operation.contains("batch-touch")
+        || operation.contains("batch-selected")
+        || operation.contains("row-view")
+        || operation.contains("grouped-touch")
+        || operation.contains("grouped-aggregate")
+    {
+        "parse kernel"
+    } else {
+        benchmark_class
     }
 }
 

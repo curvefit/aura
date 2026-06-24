@@ -1107,14 +1107,14 @@ Each experiment must record:
   - `cargo test --test sdk_api -- --nocapture`
   - `cargo test --test aura_bench_cli -- --nocapture`
   - `cargo build --release --bin aura_sdk_bench`
-  - `target/release/aura_sdk_bench --fixture-dir /tmp/aura-benchmarks/aura1-file-backed-fixtures-20260624T173521Z --output-dir /tmp/aura-benchmarks/aura1-all-field-probe --iterations 10 --warmups 2 --batch-size 8192 --datasets sdk-larger --operations aura1-scan-raw-file-range,aura1-batch-view-only-file-range,aura1-batch-touch-all-fields-file-range,aura1-batch-touch-all-fields-field-major-file-range,aura1-batch-touch-all-fields-unchecked-file-range,aura1-batch-touch-all-fields-type-kernel-file-range,aura1-batch-touch-all-fields-instruction-tape-file-range,aura1-batch-selected-one-field-file-range,aura1-batch-selected-two-fields-file-range,aura1-batch-selected-all-fields-file-range,aura1-read-batches-columnar-file-range,aura1-replay-i64-current-file-range`
+  - `target/release/aura_sdk_bench --fixture-dir /tmp/aura-benchmarks/aura1-file-backed-fixtures-20260624T173521Z --output-dir /tmp/aura-benchmarks/aura1-all-field-parse-22c3c1a --iterations 10 --warmups 2 --batch-size 8192 --datasets sdk-larger,sdk-dense,sdk-sparse,sdk-wide,sdk-reordered,repeated-timestamp,repeated-timestamp-symbol,high-cardinality,nohuff --operations aura1-scan-raw-file-range,aura1-batch-view-only-file-range,aura1-batch-touch-all-fields-file-range,aura1-batch-touch-all-fields-field-major-file-range,aura1-batch-touch-all-fields-unchecked-file-range,aura1-batch-touch-all-fields-type-kernel-file-range,aura1-batch-touch-all-fields-instruction-tape-file-range,aura1-batch-selected-one-field-file-range,aura1-batch-selected-two-fields-file-range,aura1-batch-selected-all-fields-file-range,aura1-row-view-all-fields-file-range,aura1-replay-i64-current-file-range,aura1-read-batches-columnar-file-range,aura1-grouped-touch-all-fields,aura1-grouped-aggregate`
 - benchmark JSON path:
-  - `/tmp/aura-benchmarks/aura1-all-field-probe/sdk_full_matrix_summary.json`
+  - `/tmp/aura-benchmarks/aura1-all-field-parse-22c3c1a/sdk_full_matrix_summary.json`
 - result: on `sdk-larger`, original all-field parse decoded 3,000,000 values
-  at 795 MB/s; safe field-major measured 832 MB/s; checked-once unchecked loads
-  measured 1343 MB/s; parse-program measured 1445 MB/s; width/type-kernel
-  measured 2384 MB/s and passed the 2 GB/s target. Selected one-field measured
-  3194 MB/s and selected two-field measured 2010 MB/s.
+  at 801 MB/s; safe field-major measured 831 MB/s; checked-once unchecked loads
+  measured 1464 MB/s; parse-program measured 1537 MB/s; width/type-kernel
+  measured 2543 MB/s and passed the 2 GB/s target. Selected one-field measured
+  3150 MB/s and selected two-field measured 1939 MB/s.
 - kept/rejected: keep checked-once, type-kernel, parse-program, and
   selected-field APIs. Reject safe field-major and selected-all-fields as final
   all-field winners because they remain below 2 GB/s.

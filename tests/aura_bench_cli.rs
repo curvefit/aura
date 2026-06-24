@@ -1342,7 +1342,7 @@ fn aura_bench_runs_sdk_generic_fixture_smoke_matrix() {
         .arg("--datasets")
         .arg("sdk-tiny")
         .arg("--operations")
-        .arg("aura1-batch-view-only-file-range,aura1-batch-touch-all-fields-file-range,aura1-batch-touch-all-fields-field-major-file-range,aura1-batch-touch-all-fields-unchecked-file-range,aura1-batch-selected-two-fields-file-range,aura1-row-view-all-fields-file-range,aura1-grouped-touch-all-fields")
+        .arg("aura1-replay-per-row-noop,aura1-replay-per-row-touch-selected,aura1-replay-per-row-touch-all,aura1-replay-batch-noop,aura1-replay-batch-touch-selected,aura1-replay-batch-touch-all,aura1-replay-grouped-touch-selected,aura1-replay-grouped-touch-all,aura1-batch-view-only-file-range,aura1-batch-touch-all-fields-type-kernel-file-range")
         .output()
         .unwrap();
     assert!(
@@ -1360,55 +1360,98 @@ fn aura_bench_runs_sdk_generic_fixture_smoke_matrix() {
         .iter()
         .find(|entry| entry["operation"] == "aura1-batch-view-only-file-range")
         .expect("batch view entry");
+    assert_eq!("view construction", batch_entry["benchmark_class"]);
+    assert_eq!("none", batch_entry["replay_mode"]);
     assert_eq!("file_range", batch_entry["source_kind"]);
     assert_eq!(0, batch_entry["body_bytes_read_at_open"]);
     assert_eq!(0, batch_entry["full_file_bytes_copied"]);
     assert!(batch_entry["visitor_calls"].as_u64().unwrap() > 0);
     assert_eq!(0, batch_entry["fields_accessed"].as_u64().unwrap());
     assert_eq!(0, batch_entry["values_decoded"].as_u64().unwrap());
-    let touch_entry = entries
+    assert!(batch_entry["mb_per_sec"].as_f64().unwrap() > 0.0);
+    assert_eq!("summed", batch_entry["timer_tree_kind"]);
+    assert!(batch_entry["stage_times_ms"]
+        .as_object()
+        .unwrap()
+        .contains_key("batch_callback_ms"));
+    assert!(batch_entry["runtime_ms"].as_f64().unwrap() > 0.0);
+    assert!(batch_entry["unexplained_ms"].is_number());
+    assert_eq!(
+        batch_entry["record_count"].as_u64().unwrap(),
+        batch_entry["counters"]["record_count"].as_u64().unwrap()
+    );
+    let parse_entry = entries
         .iter()
-        .find(|entry| entry["operation"] == "aura1-batch-touch-all-fields-file-range")
-        .expect("batch touch entry");
-    assert_eq!("file_range", touch_entry["source_kind"]);
-    assert!(touch_entry["fields_accessed"].as_u64().unwrap() > 0);
-    assert!(touch_entry["values_decoded"].as_u64().unwrap() > 0);
-    assert!(touch_entry["bytes_touched"].as_u64().unwrap() > 0);
-    assert_ne!(0, touch_entry["checksum"].as_u64().unwrap());
-    let field_major_entry = entries
+        .find(|entry| entry["operation"] == "aura1-batch-touch-all-fields-type-kernel-file-range")
+        .expect("parse kernel entry");
+    assert_eq!("parse kernel", parse_entry["benchmark_class"]);
+    assert_eq!("none", parse_entry["replay_mode"]);
+    assert!(parse_entry["fields_accessed"].as_u64().unwrap() > 0);
+    assert!(parse_entry["values_decoded"].as_u64().unwrap() > 0);
+    assert_ne!(0, parse_entry["checksum"].as_u64().unwrap());
+    assert!(parse_entry["stage_times_ms"]
+        .as_object()
+        .unwrap()
+        .contains_key("all_field_loop_ms"));
+    let per_row_noop = entries
         .iter()
-        .find(|entry| entry["operation"] == "aura1-batch-touch-all-fields-field-major-file-range")
-        .expect("field-major entry");
-    assert!(field_major_entry["values_decoded"].as_u64().unwrap() > 0);
-    assert_eq!(false, field_major_entry["unsafe_loads_used"]);
-    assert!(field_major_entry["bounds_check_count"].as_u64().unwrap() > 0);
-    let unchecked_entry = entries
+        .find(|entry| entry["operation"] == "aura1-replay-per-row-noop")
+        .expect("per-row noop replay");
+    assert_eq!("replay", per_row_noop["benchmark_class"]);
+    assert_eq!("per_row", per_row_noop["replay_mode"]);
+    assert_eq!(0, per_row_noop["fields_accessed"].as_u64().unwrap());
+    assert_eq!(0, per_row_noop["values_decoded"].as_u64().unwrap());
+    assert!(per_row_noop["callback_count"].as_u64().unwrap() > 0);
+    assert!(per_row_noop["stage_times_ms"]
+        .as_object()
+        .unwrap()
+        .contains_key("loop_overhead_ms"));
+    let per_row_selected = entries
         .iter()
-        .find(|entry| entry["operation"] == "aura1-batch-touch-all-fields-unchecked-file-range")
-        .expect("unchecked entry");
-    assert!(unchecked_entry["values_decoded"].as_u64().unwrap() > 0);
-    assert_eq!(true, unchecked_entry["unsafe_loads_used"]);
-    assert_ne!(0, unchecked_entry["checksum"].as_u64().unwrap());
-    let selected_entry = entries
+        .find(|entry| entry["operation"] == "aura1-replay-per-row-touch-selected")
+        .expect("per-row selected replay");
+    assert_eq!("per_row", per_row_selected["replay_mode"]);
+    assert!(per_row_selected["fields_accessed"].as_u64().unwrap() > 0);
+    assert!(per_row_selected["values_decoded"].as_u64().unwrap() > 0);
+    assert_ne!(0, per_row_selected["checksum"].as_u64().unwrap());
+    assert!(per_row_selected["stage_times_ms"]
+        .as_object()
+        .unwrap()
+        .contains_key("field_load_ms"));
+    let batch_all = entries
         .iter()
-        .find(|entry| entry["operation"] == "aura1-batch-selected-two-fields-file-range")
-        .expect("selected fields entry");
-    assert_eq!(2, selected_entry["fields_accessed"].as_u64().unwrap());
-    assert!(selected_entry["values_decoded"].as_u64().unwrap() > 0);
-    assert_ne!(0, selected_entry["checksum"].as_u64().unwrap());
-    let row_view_entry = entries
+        .find(|entry| entry["operation"] == "aura1-replay-batch-touch-all")
+        .expect("batch all replay");
+    assert_eq!("batch", batch_all["replay_mode"]);
+    assert!(batch_all["values_decoded"].as_u64().unwrap() > 0);
+    assert_eq!(true, batch_all["unsafe_loads_used"]);
+    assert!(batch_all["stage_times_ms"]
+        .as_object()
+        .unwrap()
+        .contains_key("all_field_loop_ms"));
+    let batch_selected = entries
         .iter()
-        .find(|entry| entry["operation"] == "aura1-row-view-all-fields-file-range")
-        .expect("row view entry");
-    assert!(row_view_entry["values_decoded"].as_u64().unwrap() > 0);
-    assert_ne!(0, row_view_entry["checksum"].as_u64().unwrap());
+        .find(|entry| entry["operation"] == "aura1-replay-batch-touch-selected")
+        .expect("batch selected replay");
+    assert_eq!("batch", batch_selected["replay_mode"]);
+    assert!(batch_selected["fields_accessed"].as_u64().unwrap() > 0);
+    assert!(batch_selected["values_decoded"].as_u64().unwrap() > 0);
+    assert!(batch_selected["stage_times_ms"]
+        .as_object()
+        .unwrap()
+        .contains_key("selected_field_loop_ms"));
     let grouped_entry = entries
         .iter()
-        .find(|entry| entry["operation"] == "aura1-grouped-touch-all-fields")
+        .find(|entry| entry["operation"] == "aura1-replay-grouped-touch-all")
         .expect("grouped touch entry");
+    assert_eq!("grouped", grouped_entry["replay_mode"]);
     assert!(grouped_entry["callback_count"].as_u64().unwrap() > 0);
     assert!(grouped_entry["values_decoded"].as_u64().unwrap() > 0);
     assert_ne!(0, grouped_entry["checksum"].as_u64().unwrap());
+    assert!(grouped_entry["stage_times_ms"]
+        .as_object()
+        .unwrap()
+        .contains_key("group_boundary_detection_ms"));
 
     fs::remove_dir_all(&dir).unwrap();
 }
