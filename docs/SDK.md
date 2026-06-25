@@ -39,6 +39,8 @@ writer.finish()?;
 - `AuraSchema`, `AuraSchemaBuilder`, `AuraField`, `AuraType`
 - `AuraRecordBatch`, `AuraColumnBatch`, `AuraColumn`, `AuraValue`
 - `AuraWriter`, `AuraReader`
+- `AuraEventSource`, `AuraEventBatch`
+- `AuraMemorySource`, `AuraFileSource`, `AuraLiveSource`
 - `WriterOptions`, `ReaderOptions`, `ConvertOptions`
 - `AuraFormat`, `AuraProfile`
 - `CompiledAuraPlan`, `CompiledAuraField`
@@ -160,6 +162,37 @@ reader.replay_fixed_batches(8192, |batch| {
 Batch callback replay is not the same work as `replay_i64`: it avoids a
 callback per row and lets callers pull selected fields from the fixed-width
 batch view.
+
+For code that should run against historical files, historical in-memory bytes,
+and live fixed-record streams, use the event source API:
+
+```rust
+use aura_codec::{AuraEventBatch, AuraEventSource, AuraFileSource, Result};
+
+fn consume<S>(source: &mut S) -> Result<u64>
+where
+    S: AuraEventSource,
+    for<'a> S::Batch<'a>: AuraEventBatch,
+{
+    let mut checksum = 0u64;
+    while let Some(batch) = source.next_batch()? {
+        checksum = checksum.wrapping_add(batch.checksum_all_fields()?);
+    }
+    Ok(checksum)
+}
+
+let mut source = AuraFileSource::open_path("ticks.aura1", 8192)?;
+let checksum = consume(&mut source)?;
+let _ = checksum;
+# Ok::<(), aura_codec::AuraError>(())
+```
+
+`AuraMemorySource` and `AuraFileSource` open sealed `.aura1` files and expose
+borrowed fixed-width batches. `AuraLiveSource<R>` consumes a stream of Aura1
+body records with a caller-supplied schema or compiled plan. Use
+`AuraLiveSource::with_plan` when the stream contains bytes produced from an
+existing Aura1 footer plan, because optimized Aura1 records may be narrower than
+the schema's maximum physical widths.
 
 For true parse throughput, benchmark and use field-accessing batch operations,
 not view-only callbacks. `Aura1FixedBatchView::checksum_field`,

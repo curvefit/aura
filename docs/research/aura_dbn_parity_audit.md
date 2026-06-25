@@ -37,24 +37,30 @@ hot path:
 - The SDK benchmark includes both order-book delta extraction and
   extract+book-apply operations.
 
-The DBN-parity gaps are concentrated in two places:
+The DBN-parity gaps were concentrated in two places at audit time:
 
 1. Aura does not yet expose a common historical/live event-source trait.
 2. Aura metadata is schema/plan self-describing, but not market-data
    self-sufficient in the DBN sense: no dataset/source/venue fields, no
    symbol/instrument mapping table, and no time-aware symbology contract.
 
+Phase 3 implemented the first gap for the Aura1 hot path:
+`AuraEventSource`, `AuraEventBatch`, `AuraMemorySource`, `AuraFileSource`, and
+`AuraLiveSource<R>` now let one event loop consume historical memory bytes,
+historical files, and live fixed-record streams. The second gap remains explicit
+and intentionally unimplemented.
+
 ## Area Table
 
 | Area | Current Aura status | Evidence | Missing piece | Priority |
 |---|---|---|---|---|
-| A. End-to-end representation | Partial but coherent across tiers. `.aura` preserves ingest facts, `.aura0` stores compact/semantic cold data, `.aura1` stores fixed-width replay data. | `docs/FORMAT.md:7` defines `.aura`; `docs/FORMAT.md:9` defines `.aura0`; `docs/FORMAT.md:11` defines `.aura1`; `docs/FORMAT.md:14` documents common container shape. | The public API does not yet package `.aura1` disk/memory/live consumption behind one source interface. | High |
+| A. End-to-end representation | Partial but coherent across tiers. `.aura` preserves ingest facts, `.aura0` stores compact/semantic cold data, `.aura1` stores fixed-width replay data. Phase 3 packages `.aura1` disk/memory/live consumption behind one source interface. | `docs/FORMAT.md:7` defines `.aura`; `docs/FORMAT.md:9` defines `.aura0`; `docs/FORMAT.md:11` defines `.aura1`; `src/source.rs` defines `AuraEventSource`; `tests/event_source.rs` covers memory/file/live consumption. | Remaining gap is market-data metadata, not the event-source shape. | Medium |
 | A. Borrow/mmap Aura1 bytes | Borrowed memory-backed views exist; file-backed Aura1 avoids full-file copies but range-reads into bounded `Vec<u8>` chunks rather than mmap. | `src/reader.rs:1525` exposes `replay_fixed_batches`; `src/reader.rs:1541` borrows memory body slices; `src/reader.rs:1575` uses file-range chunks; `docs/READER.md:48` says mmap is intentionally absent in v1. | No mmap-backed API; file-backed batch views borrow chunk buffers, not the file mapping. | Medium |
-| A. Stable transport layout | Aura1 has stable fixed-width rows for current SDK types, but docs do not yet name Aura1 as a transport/event-source profile. | `docs/FORMAT.md:68` documents Aura1 fixed-width body; `src/program.rs:500` computes record width from the Aura1 plan. | Add a public event-source API that treats Aura1 fixed batches as the transport/live-compatible event unit. | High |
+| A. Stable transport layout | Aura1 has stable fixed-width rows for current SDK types, and Phase 3 names Aura1 fixed batches as the event-source unit. | `docs/FORMAT.md` documents the end-to-end source model; `src/source.rs` defines `AuraLiveSource<R>` over Aura1 body records; `src/program.rs:500` computes record width from the Aura1 plan. | Transport framing, metadata exchange, and symbology are still outside v1. | Medium |
 | A. Borrowed views exposed | Yes for Aura1 replay; not for generic `next_batch`. | `docs/SDK.md:149` documents low-level fixed replay; `docs/SDK.md:160` distinguishes batch callback replay from `replay_i64`; `src/reader.rs:1595` exposes `replay_orderbook_deltas`. | `next_batch` still returns materialized `AuraRecordBatch`; common source API should default to borrowed fixed batches where possible. | High |
-| B. Same code historical/live | Missing. Aura has file/memory readers and callbacks, but no `AuraEventSource`-style common source. | `rg AuraEventSource` found no source implementation; `src/reader.rs:1226` has file open, `src/reader.rs:1214` has generic read open, and `src/reader.rs:1525` has replay callbacks but no live source trait. | Add `AuraEventSource`, `AuraFileSource`, `AuraMemorySource`, and `AuraLiveSource<R>`. | High |
-| B. Same event type | Partial. Historical Aura1 replay can emit `Aura1FixedBatchView`; live has no equivalent. | `src/reader.rs:1527` callback receives `Aura1FixedBatchView`; `src/reader.rs:1602` callback receives `OrderBookDeltaBatch`. | Define the common batch type for sources as borrowed Aura1 fixed batches. | High |
-| C. Zero-copy | Partial. Memory-backed Aura1 fixed replay borrows body slices without per-record allocation. File-backed replay avoids whole-file copy but copies each requested range into a temporary buffer. Generic `next_batch` materializes values. | `src/reader.rs:1541` borrows memory slices; `src/reader.rs:1578` reads file ranges into `body`; `src/reader.rs:1428` materializes `AuraRecordBatch`; `src/reader.rs:1366` records memory open as full-file copied. | Make zero-copy/borrowed paths obvious in API names and docs; add source trait over borrowed fixed batches. | High |
+| B. Same code historical/live | Implemented for Aura1 fixed batches. One generic loop can consume memory, file, and live sources. | `src/source.rs` defines `AuraEventSource`; `tests/event_source.rs` uses one `consume_source<S>` for `AuraMemorySource`, `AuraFileSource`, and `AuraLiveSource<R>`. | `.aura`/`.aura0` do not directly implement the source trait; they must be converted/expanded to Aura1 first. | Low |
+| B. Same event type | Implemented for fixed-width batches through `AuraEventBatch`; historical and live sources both yield `Aura1FixedBatchView` semantics. | `src/source.rs` implements `AuraEventBatch` for `Aura1FixedBatchView`; `tests/event_source.rs` compares historical and live checksums. | Order-book-specific borrowed batches are not yet an event-source batch specialization. | Medium |
+| C. Zero-copy | Partial. Memory-backed Aura1 source borrows body slices without per-record allocation. File-backed source avoids whole-file copy but copies each requested range into a temporary buffer. Generic `next_batch` materializes values. | `src/reader.rs` exposes `next_fixed_batch`; `src/source.rs` uses it for memory/file sources; `src/reader.rs:1428` materializes `AuraRecordBatch`; `src/reader.rs:1366` records memory open as full-file copied. | Mmap-backed file batches and non-Aura1 zero-copy sources remain unimplemented. | Medium |
 | C. `AuraValue` materialization | Present in row batches; avoidable with column batches and fixed views. | `src/reader.rs:1450` constructs `AuraRecordBatch::from_i64_decoded`; `docs/READER.md:91` says `next_column_batch` avoids intermediate row/value materialization. | Source API should not force `AuraValue`; retain materialized APIs as compatibility. | High |
 | D. Metadata/schema | Strong for schema/plan replay; weak for market-data self-sufficiency. | `src/header.rs:141` stores profile, stream/dictionary IDs, base time, schema map, derived expressions, comment; `src/footer.rs:56` stores schema, stats, compression, plans, chunks; `src/program.rs:471` stores record width/body size/field order/hash in `CompiledAuraPlan`. | Add or explicitly defer dataset/source/venue metadata and symbology mapping tables. | Medium |
 | D. Symbology | Missing as a first-class feature. `stream_id` and `dictionary_id` exist, but there is no instrument mapping table or time-aware symbol mapping. | `src/header.rs:143` and `src/options.rs:62` expose stream/dictionary IDs only; no symbology types or mapping structs are exported in `src/lib.rs`. | Document as explicit gap; do not fake DBN-style symbology until Aura has real dataset semantics. | Medium |
@@ -94,10 +100,11 @@ Yes: `Aura1FixedBatchView`, `Aura1RowView`, `Aura1SelectedRowView`, and
 
 ### B. Same code historical/live
 
-Aura does not yet have a common source trait for historical and live sources.
-Historical file/memory code can replay callbacks, but live consumers cannot
-implement the same interface today. This is the highest-priority implementation
-gap.
+Aura now has a common source trait for the Aura1 hot path. Historical
+file/memory sources and live fixed-record streams implement `AuraEventSource`,
+and tests prove the same generic event loop can consume all three. This does
+not make `.aura` or `.aura0` live sources; they remain ingest/cold formats that
+must be converted or expanded to Aura1 for shared replay.
 
 ### C. Zero-copy
 
@@ -136,9 +143,10 @@ difference from DBN.
 ### F. CPU/cache
 
 Aura1 is sequential and predictable. `CompiledAuraPlan` exposes record width,
-body size, field count, and field offsets. The remaining missing piece is API
-ergonomics: source consumers should be able to inspect the plan without
-downcasting through `AuraReader`.
+body size, field count, and field offsets. Source consumers can now inspect the
+plan through `AuraEventSource::compiled_plan`. The remaining ergonomic gap is
+higher-level domain batches: order-book-specific batches are still reached
+through reader replay APIs rather than the source trait.
 
 ### G. Full order-book replay
 

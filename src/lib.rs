@@ -25,6 +25,7 @@ pub mod reader;
 pub mod records;
 pub mod schema;
 pub mod scoped;
+pub mod source;
 pub mod stats;
 pub mod types;
 pub mod varint;
@@ -52,9 +53,9 @@ pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 pub use program::{CompiledAuraField, CompiledAuraPlan};
 pub use reader::{
     Aura1FieldI64Iter, Aura1FixedBatchView, Aura1RowView, Aura1SelectedRowView, AuraBatchIter,
-    AuraEventGroup, AuraGroupKey, AuraGroupStats, AuraI64Reader, AuraReader,
-    AuraReaderSourceKind, AuraReaderStats, AuraReplayBackend, AuraTypedReader, GroupBy,
-    OrderBookDeltaBatch, OrderBookDeltaSpec, OrderBookDeltaSpecBuilder,
+    AuraEventGroup, AuraGroupKey, AuraGroupStats, AuraI64Reader, AuraReader, AuraReaderSourceKind,
+    AuraReaderStats, AuraReplayBackend, AuraTypedReader, GroupBy, OrderBookDeltaBatch,
+    OrderBookDeltaSpec, OrderBookDeltaSpecBuilder,
 };
 pub use records::{
     Aura0ByteLaneCodec, Aura0ByteLaneUse, DecodedI64ColumnsFile, DecodedI64File, DecodedTypedFile,
@@ -65,6 +66,9 @@ pub use schema::{
     AuraSchemaBuilder, AuraType, FieldDescriptor, FieldRelation, FieldRole, FieldScope,
     FieldTransform, FieldType, I64SchemaDefinition, RelatedFieldMapping, SchemaBuilder,
     SchemaDescriptor, SchemaMapEntry, SchemaMapHint, TransformCandidates,
+};
+pub use source::{
+    AuraEventBatch, AuraEventSource, AuraFileSource, AuraLiveSource, AuraMemorySource,
 };
 pub use stats::{FieldStats, IngestStats, PhysicalWidth, RunHistogramEntry, ShapeStats};
 pub use types::{

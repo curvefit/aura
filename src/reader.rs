@@ -462,8 +462,12 @@ impl OrderBookDeltaSpecBuilder {
     }
 
     pub fn build(self, schema: &AuraSchema) -> Result<OrderBookDeltaSpec> {
-        let timestamp =
-            required_delta_field(schema, self.timestamp.as_deref(), "timestamp", is_timestamp_type)?;
+        let timestamp = required_delta_field(
+            schema,
+            self.timestamp.as_deref(),
+            "timestamp",
+            is_timestamp_type,
+        )?;
         let instrument = required_delta_field(
             schema,
             self.instrument.as_deref(),
@@ -475,10 +479,18 @@ impl OrderBookDeltaSpecBuilder {
         let size = required_delta_field(schema, self.size.as_deref(), "size", is_integer_type)?;
         let action =
             optional_delta_field(schema, self.action.as_deref(), "action", is_integer_type)?;
-        let sequence =
-            optional_delta_field(schema, self.sequence.as_deref(), "sequence", is_integer_type)?;
-        let order_id =
-            optional_delta_field(schema, self.order_id.as_deref(), "order_id", is_integer_type)?;
+        let sequence = optional_delta_field(
+            schema,
+            self.sequence.as_deref(),
+            "sequence",
+            is_integer_type,
+        )?;
+        let order_id = optional_delta_field(
+            schema,
+            self.order_id.as_deref(),
+            "order_id",
+            is_integer_type,
+        )?;
         let flags = optional_delta_field(schema, self.flags.as_deref(), "flags", is_integer_type)?;
         let spec = OrderBookDeltaSpec {
             timestamp,
@@ -615,7 +627,7 @@ impl<'a> OrderBookDeltaBatch<'a> {
 }
 
 impl<'a> Aura1FixedBatchView<'a> {
-    fn new(body: &'a [u8], plan: &CompiledAuraPlan, row_count: usize) -> Result<Self> {
+    pub(crate) fn new(body: &'a [u8], plan: &CompiledAuraPlan, row_count: usize) -> Result<Self> {
         let expected_len = row_count
             .checked_mul(plan.aura1_record_width)
             .ok_or(AuraError::InvalidValue("body length"))?;
@@ -1206,6 +1218,7 @@ pub struct AuraReader {
     cursor: usize,
     record_count: usize,
     state: AuraReaderState,
+    fixed_batch_buffer: Vec<u8>,
     stats: Cell<AuraReaderStats>,
     use_byte_lane: crate::Aura0ByteLaneUse,
 }
@@ -1220,6 +1233,14 @@ impl AuraReader {
         input
             .read_to_end(&mut bytes)
             .map_err(|_| crate::AuraError::InvalidValue("reader input"))?;
+        Self::open_memory(bytes, options)
+    }
+
+    pub fn open_bytes(bytes: Vec<u8>) -> Result<Self> {
+        Self::open_bytes_with_options(bytes, ReaderOptions::default())
+    }
+
+    pub fn open_bytes_with_options(bytes: Vec<u8>, options: ReaderOptions) -> Result<Self> {
         Self::open_memory(bytes, options)
     }
 
@@ -1309,6 +1330,7 @@ impl AuraReader {
             cursor: 0,
             record_count,
             state,
+            fixed_batch_buffer: Vec::new(),
             use_byte_lane: options.use_byte_lane,
         })
     }
@@ -1386,6 +1408,7 @@ impl AuraReader {
             cursor: 0,
             record_count: metadata.record_count,
             state,
+            fixed_batch_buffer: Vec::new(),
             use_byte_lane: options.use_byte_lane,
         })
     }
@@ -1589,6 +1612,77 @@ impl AuraReader {
                 });
                 Ok(rows_seen)
             }
+        }
+    }
+
+    pub fn next_fixed_batch(
+        &mut self,
+        batch_size: usize,
+    ) -> Result<Option<Aura1FixedBatchView<'_>>> {
+        if batch_size == 0 {
+            return Err(AuraError::InvalidValue("batch size"));
+        }
+        if self.profile != Profile::Aura1 {
+            return Err(AuraError::InvalidValue("aura1 replay profile"));
+        }
+        if self.cursor >= self.record_count {
+            return Ok(None);
+        }
+
+        let plan = self
+            .compiled_plan
+            .clone()
+            .ok_or(AuraError::InvalidValue("compiled plan"))?;
+        let rows_to_read = batch_size.min(self.record_count - self.cursor);
+        let start_row = self.cursor;
+        let end_row = self.cursor.saturating_add(rows_to_read);
+        self.update_stats(|stats| stats.bytes_read_in_last_batch = 0);
+
+        if matches!(&self.source, AuraReaderSource::Memory(_)) {
+            let stats = self.stats.get();
+            let byte_start = start_row
+                .checked_mul(plan.aura1_record_width)
+                .ok_or(AuraError::InvalidValue("row range"))?;
+            let byte_len = rows_to_read
+                .checked_mul(plan.aura1_record_width)
+                .ok_or(AuraError::InvalidValue("row range"))?;
+            let byte_end = byte_start
+                .checked_add(byte_len)
+                .ok_or(AuraError::InvalidValue("row range"))?;
+            self.cursor = end_row;
+            self.update_stats(|stats| {
+                stats.batches_read = stats.batches_read.saturating_add(1);
+                stats.rows_decoded_in_last_batch = rows_to_read;
+                stats.bytes_read_in_last_batch = byte_len;
+                stats.bytes_read_during_replay =
+                    stats.bytes_read_during_replay.saturating_add(byte_len);
+                stats.rows_scanned = stats.rows_scanned.saturating_add(rows_to_read);
+                stats.visitor_calls = stats.visitor_calls.saturating_add(1);
+                stats.compiled_plan_used = true;
+            });
+            let bytes = match &self.source {
+                AuraReaderSource::Memory(bytes) => bytes,
+                AuraReaderSource::FileRange(_) => unreachable!("source checked above"),
+            };
+            let body = bytes
+                .get(stats.body_offset_from_header..stats.footer_offset_from_trailer)
+                .ok_or(AuraError::UnexpectedEof)?;
+            let range = body
+                .get(byte_start..byte_end)
+                .ok_or(AuraError::UnexpectedEof)?;
+            Aura1FixedBatchView::new(range, &plan, rows_to_read).map(Some)
+        } else {
+            let (body, rows_to_visit) = self.read_aura1_body_range(start_row, rows_to_read)?;
+            self.fixed_batch_buffer = body;
+            self.cursor = end_row;
+            self.update_stats(|stats| {
+                stats.batches_read = stats.batches_read.saturating_add(1);
+                stats.rows_decoded_in_last_batch = rows_to_visit;
+                stats.rows_scanned = stats.rows_scanned.saturating_add(rows_to_visit);
+                stats.visitor_calls = stats.visitor_calls.saturating_add(1);
+                stats.compiled_plan_used = true;
+            });
+            Aura1FixedBatchView::new(&self.fixed_batch_buffer, &plan, rows_to_visit).map(Some)
         }
     }
 

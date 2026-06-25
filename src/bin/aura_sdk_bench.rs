@@ -9,9 +9,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use aura_codec::{
-    convert_aura, records, Aura1RowView, AuraColumn, AuraError, AuraFormat, AuraGroupStats,
-    AuraProfile, AuraReader, AuraReaderStats, AuraRecordBatch, AuraSchema, AuraType, AuraWriter,
-    CompiledAuraField, ConvertOptions, GroupBy, OrderBookDeltaSpec, WriterOptions,
+    convert_aura, records, Aura1RowView, AuraColumn, AuraError, AuraEventBatch, AuraEventSource,
+    AuraFileSource, AuraFormat, AuraGroupStats, AuraLiveSource, AuraMemorySource, AuraProfile,
+    AuraReader, AuraReaderSourceKind, AuraReaderStats, AuraRecordBatch, AuraReplayBackend,
+    AuraSchema, AuraType, AuraWriter, CompiledAuraField, CompiledAuraPlan, ConvertOptions, GroupBy,
+    OrderBookDeltaSpec, WriterOptions,
 };
 use serde_json::{json, Value};
 
@@ -100,6 +102,7 @@ struct BenchOutput {
     kernel_group_count: usize,
     unsafe_loads_used: bool,
     replay_mode: Option<&'static str>,
+    source_kind_override: Option<&'static str>,
     benchmark_class: &'static str,
     stages: StageBreakdown,
 }
@@ -154,6 +157,7 @@ impl BenchOutput {
             kernel_group_count: 0,
             unsafe_loads_used: false,
             replay_mode: None,
+            source_kind_override: None,
             benchmark_class: "other",
             stages: StageBreakdown::summed(),
         }
@@ -212,6 +216,11 @@ impl BenchOutput {
     fn with_replay_mode(mut self, replay_mode: &'static str) -> Self {
         self.replay_mode = Some(replay_mode);
         self.benchmark_class = "replay";
+        self
+    }
+
+    fn with_source_kind(mut self, source_kind: &'static str) -> Self {
+        self.source_kind_override = Some(source_kind);
         self
     }
 
@@ -383,6 +392,9 @@ fn run_fixture_matrix(fixture: &Fixture, args: &Args) -> Result<Vec<Value>> {
         "aura1-replay-batch-touch-all",
         "aura1-replay-orderbook-deltas-batch",
         "aura1-replay-orderbook-deltas-apply-batch",
+        "aura1-event-source-file-orderbook-apply",
+        "aura1-event-source-memory-orderbook-apply",
+        "aura1-event-source-live-orderbook-apply",
         "aura1-replay-grouped-touch-selected",
         "aura1-replay-grouped-touch-all",
         "aura1-scan-raw",
@@ -661,7 +673,9 @@ fn bench_operation(
         "streaming_reader_used": reader_stats.streaming_reader_used,
         "full_file_materialized": reader_stats.full_file_materialized,
         "max_rows_materialized_at_once": reader_stats.max_rows_materialized_at_once,
-        "source_kind": reader_stats.source_kind.as_str(),
+        "source_kind": last_output
+            .source_kind_override
+            .unwrap_or_else(|| reader_stats.source_kind.as_str()),
         "replay_backend": reader_stats.replay_backend.as_str(),
         "file_len": reader_stats.file_len,
         "bytes_read_at_open": reader_stats.bytes_read_at_open,
@@ -787,6 +801,15 @@ fn run_operation(
         }
         "aura1-replay-orderbook-deltas-apply-batch" => {
             replay_orderbook_deltas_apply_batch_path(aura1_path, args.batch_size)
+        }
+        "aura1-event-source-file-orderbook-apply" => {
+            replay_event_source_file_orderbook_apply(aura1_path, args.batch_size)
+        }
+        "aura1-event-source-memory-orderbook-apply" => {
+            replay_event_source_memory_orderbook_apply(aura1, args.batch_size)
+        }
+        "aura1-event-source-live-orderbook-apply" => {
+            replay_event_source_live_orderbook_apply(aura1, args.batch_size)
         }
         "aura1-replay-grouped-touch-selected" => grouped_replay_selected(aura1, schema),
         "aura1-replay-grouped-touch-all" => grouped_replay_truth(
@@ -1750,6 +1773,281 @@ fn replay_orderbook_deltas_apply_batch_path(path: &Path, batch_size: usize) -> R
         .with_stages(stages))
 }
 
+#[derive(Debug)]
+struct EventSourceOrderBookStats {
+    record_count: usize,
+    batch_count: usize,
+    last_batch_rows: usize,
+    checksum: u64,
+}
+
+fn replay_event_source_file_orderbook_apply(path: &Path, batch_size: usize) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
+    let mut source = AuraFileSource::open_path(path, batch_size)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
+    let recipe_start = Instant::now();
+    let spec = default_orderbook_delta_spec(source.schema())?;
+    let payload_fields = spec.field_indices();
+    let bytes_per_row = selected_bytes_per_row_from_plan(source.compiled_plan(), &payload_fields)?;
+    stages.add_duration("selected_field_recipe_lookup_ms", recipe_start.elapsed());
+    let replay = replay_event_source_orderbook_apply(&mut source, &spec, &mut stages)?;
+    let reader = source.into_reader();
+    let stats = reader.stats();
+    event_source_orderbook_output(
+        stats,
+        replay,
+        payload_fields.len(),
+        bytes_per_row,
+        None,
+        stages,
+    )
+}
+
+fn replay_event_source_memory_orderbook_apply(
+    aura1: &[u8],
+    batch_size: usize,
+) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
+    let mut source = AuraMemorySource::try_new(aura1.to_vec(), batch_size)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
+    let recipe_start = Instant::now();
+    let spec = default_orderbook_delta_spec(source.schema())?;
+    let payload_fields = spec.field_indices();
+    let bytes_per_row = selected_bytes_per_row_from_plan(source.compiled_plan(), &payload_fields)?;
+    stages.add_duration("selected_field_recipe_lookup_ms", recipe_start.elapsed());
+    let replay = replay_event_source_orderbook_apply(&mut source, &spec, &mut stages)?;
+    let reader = source.into_reader();
+    let stats = reader.stats();
+    event_source_orderbook_output(
+        stats,
+        replay,
+        payload_fields.len(),
+        bytes_per_row,
+        None,
+        stages,
+    )
+}
+
+fn replay_event_source_live_orderbook_apply(
+    aura1: &[u8],
+    batch_size: usize,
+) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
+    let reader = AuraReader::open(Cursor::new(aura1))?;
+    let schema = reader.schema().clone();
+    let plan = reader
+        .compiled_plan()
+        .ok_or_else(|| anyhow::anyhow!("compiled plan"))?
+        .clone();
+    let body = aura1_body_slice(aura1)?;
+    let body_len = body.len();
+    let mut source =
+        AuraLiveSource::with_plan(Cursor::new(body.to_vec()), schema, plan.clone(), batch_size)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
+    let recipe_start = Instant::now();
+    let spec = default_orderbook_delta_spec(source.schema())?;
+    let payload_fields = spec.field_indices();
+    let bytes_per_row = selected_bytes_per_row_from_plan(source.compiled_plan(), &payload_fields)?;
+    stages.add_duration("selected_field_recipe_lookup_ms", recipe_start.elapsed());
+    let replay = replay_event_source_orderbook_apply(&mut source, &spec, &mut stages)?;
+    let stats = live_event_source_stats(
+        reader.stats(),
+        &plan,
+        body_len,
+        replay.batch_count,
+        replay.last_batch_rows,
+        replay.record_count.saturating_mul(payload_fields.len()),
+    );
+    event_source_orderbook_output(
+        stats,
+        replay,
+        payload_fields.len(),
+        bytes_per_row,
+        Some("live_stream"),
+        stages,
+    )
+}
+
+fn replay_event_source_orderbook_apply<S>(
+    source: &mut S,
+    spec: &OrderBookDeltaSpec,
+    stages: &mut StageBreakdown,
+) -> Result<EventSourceOrderBookStats>
+where
+    S: AuraEventSource,
+    for<'a> S::Batch<'a>: AuraEventBatch,
+{
+    let payload_fields = spec.field_indices();
+    let flags_index = payload_fields.get(5).copied();
+    let record_capacity = source.compiled_plan().record_count;
+    let mut book = BenchOrderBook::with_capacity(record_capacity.saturating_mul(2));
+    let mut record_count = 0usize;
+    let mut batch_count = 0usize;
+    let mut last_batch_rows = 0usize;
+    let replay_start = Instant::now();
+    loop {
+        let next_start = Instant::now();
+        let Some(batch) = source.next_batch()? else {
+            stages.add_duration("event_source_next_batch_ms", next_start.elapsed());
+            break;
+        };
+        stages.add_duration("event_source_next_batch_ms", next_start.elapsed());
+        batch_count = batch_count.saturating_add(1);
+        last_batch_rows = batch.row_count();
+        record_count = record_count.saturating_add(batch.row_count());
+        let apply_start = Instant::now();
+        for row in 0..batch.row_count() {
+            let timestamp = batch.value_i64(row, spec.timestamp_index())?;
+            let instrument = batch.value_i64(row, spec.instrument_index())?;
+            let side = batch.value_i64(row, spec.side_index())?;
+            let price = batch.value_i64(row, spec.price_index())?;
+            let size = batch.value_i64(row, spec.size_index())?;
+            let flags = flags_index
+                .map(|index| batch.value_i64(row, index))
+                .transpose()?
+                .unwrap_or(0);
+            book.apply(BenchBookDelta {
+                timestamp,
+                instrument,
+                side,
+                price,
+                size,
+                flags,
+                action: 0,
+                sequence: 0,
+                order_id: 0,
+            });
+        }
+        stages.add_duration(
+            "event_source_orderbook_apply_loop_ms",
+            apply_start.elapsed(),
+        );
+    }
+    let replay_elapsed = replay_start.elapsed();
+    add_residual_ms(
+        stages,
+        "event_source_batch_overhead_ms",
+        replay_elapsed,
+        &[
+            "event_source_next_batch_ms",
+            "event_source_orderbook_apply_loop_ms",
+        ],
+    );
+    stages.add_ms("field_load_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
+    stages.add_counter("book_update_count", book.updates);
+    stages.add_counter("book_delete_count", book.deletes);
+    stages.add_counter("book_level_count", book.level_count);
+    let checksum = book.checksum;
+    black_box(checksum);
+    black_box(book.level_count);
+    Ok(EventSourceOrderBookStats {
+        record_count,
+        batch_count,
+        last_batch_rows,
+        checksum,
+    })
+}
+
+fn event_source_orderbook_output(
+    stats: AuraReaderStats,
+    replay: EventSourceOrderBookStats,
+    payload_field_count: usize,
+    bytes_per_row: usize,
+    source_kind_override: Option<&'static str>,
+    stages: StageBreakdown,
+) -> Result<BenchOutput> {
+    let mut output = BenchOutput::new(stats.file_len, replay.record_count).with_reader_stats(stats);
+    output.bytes_scanned = stats.bytes_read_during_replay;
+    let output = output
+        .with_access(
+            payload_field_count,
+            replay.record_count.saturating_mul(payload_field_count),
+            replay.record_count.saturating_mul(bytes_per_row),
+            replay.checksum,
+        )
+        .with_parse_counters(
+            selected_kernel_group_count(payload_field_count),
+            payload_field_count,
+            selected_kernel_group_count(payload_field_count),
+            true,
+        )
+        .with_replay_mode("event_source")
+        .with_stages(stages);
+    let output = if let Some(source_kind) = source_kind_override {
+        output.with_source_kind(source_kind)
+    } else {
+        output
+    };
+    Ok(output)
+}
+
+fn live_event_source_stats(
+    mut stats: AuraReaderStats,
+    plan: &CompiledAuraPlan,
+    body_len: usize,
+    batch_count: usize,
+    last_batch_rows: usize,
+    values_decoded: usize,
+) -> AuraReaderStats {
+    stats.source_kind = AuraReaderSourceKind::Memory;
+    stats.replay_backend = AuraReplayBackend::Memory;
+    stats.file_len = body_len;
+    stats.open_decoded_row_count = 0;
+    stats.full_file_materialized = false;
+    stats.batches_read = batch_count;
+    stats.rows_decoded_in_last_batch = last_batch_rows;
+    stats.max_rows_materialized_at_once = 0;
+    stats.bytes_read_at_open = 0;
+    stats.body_bytes_read_at_open = 0;
+    stats.footer_bytes_read_at_open = 0;
+    stats.bytes_read_during_replay = body_len;
+    stats.bytes_read_in_last_batch = last_batch_rows.saturating_mul(plan.aura1_record_width);
+    stats.full_file_bytes_copied = 0;
+    stats.row_width_from_plan = plan.aura1_record_width;
+    stats.body_offset_from_header = 0;
+    stats.footer_offset_from_trailer = body_len;
+    stats.record_count_from_footer = plan.record_count;
+    stats.rows_scanned = plan.record_count;
+    stats.temp_row_buffers_allocated = 0;
+    stats.visitor_calls = batch_count;
+    stats.field_decode_count = values_decoded;
+    stats.endian_load_count = values_decoded;
+    stats.compiled_plan_used = true;
+    stats.source_bytes_read_at_open = 0;
+    stats.source_bytes_read_total = body_len;
+    stats.streaming_reader_used = true;
+    stats
+}
+
+fn selected_bytes_per_row_from_plan(
+    plan: &CompiledAuraPlan,
+    field_indices: &[usize],
+) -> Result<usize> {
+    let slots = plan.aura1_field_offsets();
+    field_indices.iter().try_fold(0usize, |acc, index| {
+        let field_index =
+            u16::try_from(*index).map_err(|_| anyhow::anyhow!("field index out of bounds"))?;
+        let field = slots
+            .iter()
+            .find(|field| field.field_index == field_index)
+            .ok_or_else(|| anyhow::anyhow!("field index out of bounds"))?;
+        acc.checked_add(field.width)
+            .ok_or_else(|| anyhow::anyhow!("field width overflow"))
+    })
+}
+
+fn aura1_body_slice(aura1: &[u8]) -> Result<&[u8]> {
+    let info = records::aura1_fixed_layout_info(aura1)?;
+    aura1
+        .get(info.body_offset..info.body_offset.saturating_add(info.body_bytes))
+        .ok_or_else(|| anyhow::anyhow!("invalid Aura1 body range"))
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct BenchBookKey {
     instrument: i64,
@@ -1889,8 +2187,12 @@ impl BenchOrderBook {
 
 fn hash_book_key(key: BenchBookKey) -> u64 {
     let mut hash = (key.instrument as u64).wrapping_mul(0x9E37_79B1_85EB_CA87);
-    hash ^= (key.side as u64).rotate_left(17).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-    hash ^= (key.price as u64).rotate_left(31).wrapping_mul(0x1656_67B1_9E37_79F9);
+    hash ^= (key.side as u64)
+        .rotate_left(17)
+        .wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    hash ^= (key.price as u64)
+        .rotate_left(31)
+        .wrapping_mul(0x1656_67B1_9E37_79F9);
     hash ^= hash >> 33;
     hash = hash.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     hash ^ (hash >> 29)
@@ -2475,17 +2777,21 @@ fn find_named_delta_field(
     predicate: fn(AuraType) -> bool,
     name_hints: &[&str],
 ) -> Option<usize> {
-    schema.fields().iter().enumerate().find_map(|(index, field)| {
-        let lower = field.name.to_ascii_lowercase();
-        if !used.contains(&index)
-            && predicate(field.aura_type)
-            && name_hints.iter().any(|hint| lower.contains(hint))
-        {
-            Some(index)
-        } else {
-            None
-        }
-    })
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .find_map(|(index, field)| {
+            let lower = field.name.to_ascii_lowercase();
+            if !used.contains(&index)
+                && predicate(field.aura_type)
+                && name_hints.iter().any(|hint| lower.contains(hint))
+            {
+                Some(index)
+            } else {
+                None
+            }
+        })
 }
 
 fn find_typed_delta_field(
@@ -2493,13 +2799,17 @@ fn find_typed_delta_field(
     used: &[usize],
     predicate: fn(AuraType) -> bool,
 ) -> Option<usize> {
-    schema.fields().iter().enumerate().find_map(|(index, field)| {
-        if !used.contains(&index) && predicate(field.aura_type) {
-            Some(index)
-        } else {
-            None
-        }
-    })
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .find_map(|(index, field)| {
+            if !used.contains(&index) && predicate(field.aura_type) {
+                Some(index)
+            } else {
+                None
+            }
+        })
 }
 
 fn is_timestamp_type(aura_type: AuraType) -> bool {

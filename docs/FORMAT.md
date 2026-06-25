@@ -71,6 +71,28 @@ Aura1 rows are fixed-width i64 records. Field order is schema/index order.
 Each field uses the width stamped by the Aura1 decode program. Values are
 little-endian. There is no per-record allocation in the Aura1 visitor path.
 
+## End-to-End Source Model
+
+Aura's DBN-like hot path is the Aura1 body plus its schema-derived
+`CompiledAuraPlan`, not DBN records or DBN metadata. On disk, the Aura1 body is
+wrapped by the common Aura header/footer container. In memory, the SDK can
+borrow fixed-width Aura1 body ranges as `Aura1FixedBatchView`. For transport or
+live use, `AuraLiveSource<R>` consumes the same aligned Aura1 body records when
+the caller supplies the schema/compiled plan out of band.
+
+`AuraEventSource` is the common event-loop interface for this model:
+
+- `AuraMemorySource` replays sealed Aura1 bytes from memory.
+- `AuraFileSource` replays sealed Aura1 files with bounded range reads.
+- `AuraLiveSource<R>` replays an incoming stream of fixed-width Aura1 body
+  records.
+
+This intentionally differs from DBN's single binary format. Aura keeps `.aura`
+as dumb ingest/preservation, `.aura0` as compact semantic cold storage, and
+`.aura1` as the fixed-width replay/transport candidate. Aura also does not yet
+define DBN-style dataset metadata or time-aware symbology mappings in the file
+format.
+
 ## Aura0 Body
 
 Aura0 uses the generic instruction plan when present. The body contains stream

@@ -251,6 +251,13 @@ The runner writes one JSON result per dataset/operation and a `sdk_full_matrix_s
   every row in every group.
 - `aura1-grouped-aggregate`: detect groups and compute a generic aggregate over
   the first one or two fixed-width fields.
+- `aura1-event-source-file-orderbook-apply`: run one generic
+  `AuraEventSource` order-book apply loop over a sealed Aura1 file source.
+- `aura1-event-source-memory-orderbook-apply`: run the same generic
+  `AuraEventSource` order-book apply loop over sealed Aura1 bytes in memory.
+- `aura1-event-source-live-orderbook-apply`: run the same generic
+  `AuraEventSource` order-book apply loop over an Aura1 body stream with the
+  schema/compiled plan supplied out of band.
 
 The generated fixture matrix includes repeated timestamp, repeated symbol,
 timestamp+symbol, high-cardinality, and mixed-burst datasets. JSON rows report

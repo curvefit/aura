@@ -1493,7 +1493,10 @@ fn aura_bench_runs_sdk_generic_fixture_smoke_matrix() {
     assert!(orderbook_entry["values_decoded"].as_u64().unwrap() > 0);
     assert_ne!(0, orderbook_entry["checksum"].as_u64().unwrap());
     assert_eq!(0, orderbook_entry["rows_materialized"].as_u64().unwrap());
-    assert_eq!(0, orderbook_entry["full_file_bytes_copied"].as_u64().unwrap());
+    assert_eq!(
+        0,
+        orderbook_entry["full_file_bytes_copied"].as_u64().unwrap()
+    );
     assert!(orderbook_entry["stage_times_ms"]
         .as_object()
         .unwrap()
@@ -1509,15 +1512,72 @@ fn aura_bench_runs_sdk_generic_fixture_smoke_matrix() {
     assert!(orderbook_apply_entry["fields_accessed"].as_u64().unwrap() >= 5);
     assert!(orderbook_apply_entry["values_decoded"].as_u64().unwrap() > 0);
     assert_ne!(0, orderbook_apply_entry["checksum"].as_u64().unwrap());
-    assert_eq!(0, orderbook_apply_entry["rows_materialized"].as_u64().unwrap());
-    assert!(orderbook_apply_entry["counters"]["book_update_count"]
-        .as_u64()
-        .unwrap()
-        > 0);
+    assert_eq!(
+        0,
+        orderbook_apply_entry["rows_materialized"].as_u64().unwrap()
+    );
+    assert!(
+        orderbook_apply_entry["counters"]["book_update_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
     assert!(orderbook_apply_entry["stage_times_ms"]
         .as_object()
         .unwrap()
         .contains_key("orderbook_decode_apply_loop_ms"));
+
+    let event_source_output_dir = dir.join("sdk-event-source-bench");
+    let event_source_output = Command::new(sdk_bench_bin)
+        .arg("--fixture-dir")
+        .arg(&dir)
+        .arg("--output-dir")
+        .arg(&event_source_output_dir)
+        .arg("--iterations")
+        .arg("1")
+        .arg("--warmups")
+        .arg("0")
+        .arg("--batch-size")
+        .arg("8192")
+        .arg("--datasets")
+        .arg("sdk-dense")
+        .arg("--operations")
+        .arg("aura1-event-source-file-orderbook-apply,aura1-event-source-memory-orderbook-apply,aura1-event-source-live-orderbook-apply")
+        .output()
+        .unwrap();
+    assert!(
+        event_source_output.status.success(),
+        "sdk event source stdout:\n{}\nsdk event source stderr:\n{}",
+        String::from_utf8_lossy(&event_source_output.stdout),
+        String::from_utf8_lossy(&event_source_output.stderr)
+    );
+    let event_source_summary: serde_json::Value = serde_json::from_slice(
+        &fs::read(event_source_output_dir.join("sdk_full_matrix_summary.json")).unwrap(),
+    )
+    .unwrap();
+    let event_source_entries = event_source_summary.as_array().unwrap();
+    for (operation, expected_source_kind) in [
+        ("aura1-event-source-file-orderbook-apply", "file_range"),
+        ("aura1-event-source-memory-orderbook-apply", "memory"),
+        ("aura1-event-source-live-orderbook-apply", "live_stream"),
+    ] {
+        let entry = event_source_entries
+            .iter()
+            .find(|entry| entry["operation"] == operation)
+            .unwrap_or_else(|| panic!("missing {operation}"));
+        assert_eq!("replay", entry["benchmark_class"]);
+        assert_eq!("event_source", entry["replay_mode"]);
+        assert_eq!(expected_source_kind, entry["source_kind"]);
+        assert!(entry["fields_accessed"].as_u64().unwrap() >= 5);
+        assert!(entry["values_decoded"].as_u64().unwrap() > 0);
+        assert_ne!(0, entry["checksum"].as_u64().unwrap());
+        assert_eq!(0, entry["rows_materialized"].as_u64().unwrap());
+        assert!(entry["counters"]["book_update_count"].as_u64().unwrap() > 0);
+        assert!(entry["stage_times_ms"]
+            .as_object()
+            .unwrap()
+            .contains_key("event_source_orderbook_apply_loop_ms"));
+    }
 
     fs::remove_dir_all(&dir).unwrap();
 }

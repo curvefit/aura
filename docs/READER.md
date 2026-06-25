@@ -20,6 +20,7 @@ Available reader methods:
 - `compiled_plan()`
 - `read_batches()`
 - `next_batch(batch_size)`
+- `next_fixed_batch(batch_size)`
 - `next_column_batch(batch_size)`
 - `batches(batch_size)`
 - `replay_i64(visitor)`
@@ -93,6 +94,31 @@ columns rather than row-oriented `AuraValue` batches. It builds
 `AuraColumnBatch` directly from fixed-width row scans and avoids the
 intermediate `Vec<Vec<i64>>` plus per-cell `AuraValue` path used by
 `next_batch`.
+
+For generic event-driven code, use `AuraEventSource` instead of choosing a
+reader backend directly. `AuraMemorySource` and `AuraFileSource` wrap sealed
+Aura1 bytes/files; `AuraLiveSource<R>` wraps a live stream of Aura1 body
+records. All three expose the same schema, compiled plan, and borrowed
+`AuraEventBatch` batches:
+
+```rust
+fn consume<S>(source: &mut S) -> aura_codec::Result<usize>
+where
+    S: aura_codec::AuraEventSource,
+    for<'a> S::Batch<'a>: aura_codec::AuraEventBatch,
+{
+    let mut rows = 0usize;
+    while let Some(batch) = source.next_batch()? {
+        rows += batch.row_count();
+    }
+    Ok(rows)
+}
+# Ok::<(), aura_codec::AuraError>(())
+```
+
+The event source API is Aura1-only in this version. `.aura` and `.aura0`
+sources must be converted or expanded to Aura1 before they can participate in
+the shared historical/live event loop.
 
 Grouped replay is an opt-in consecutive-run API:
 
