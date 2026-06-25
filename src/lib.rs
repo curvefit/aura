@@ -17,6 +17,7 @@ pub mod generic_planner;
 pub mod header;
 pub mod instructions;
 pub mod legacy;
+pub mod metadata;
 pub mod ohlcv;
 pub mod options;
 pub mod plan;
@@ -48,6 +49,7 @@ pub use instructions::{
     DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
     GenericStreamOp,
 };
+pub use metadata::{AuraMetadata, SymbolMap};
 pub use options::{AuraFormat, AuraProfile, ConvertOptions, ReaderOptions, WriterOptions};
 pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 pub use program::{CompiledAuraField, CompiledAuraPlan};
@@ -68,7 +70,8 @@ pub use schema::{
     SchemaDescriptor, SchemaMapEntry, SchemaMapHint, TransformCandidates,
 };
 pub use source::{
-    AuraEventBatch, AuraEventSource, AuraFileSource, AuraLiveSource, AuraMemorySource,
+    AuraEventBatch, AuraEventSource, AuraEventSourceStats, AuraFileSource, AuraLiveFrameSource,
+    AuraLiveSource, AuraMemorySource,
 };
 pub use stats::{FieldStats, IngestStats, PhysicalWidth, RunHistogramEntry, ShapeStats};
 pub use types::{

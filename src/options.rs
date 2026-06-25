@@ -1,5 +1,5 @@
 use crate::records::{Aura0ByteLaneCodec, Aura0ByteLaneUse, Aura0FileProfile};
-use crate::Profile;
+use crate::{AuraMetadata, Profile};
 
 /// Public Aura file role for SDK writers, readers, and converters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -54,13 +54,14 @@ impl AuraProfile {
 }
 
 /// Writer options for the public SDK writer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriterOptions {
     pub format: AuraFormat,
     pub aura0_profile: AuraProfile,
     pub byte_lane_codec: Aura0ByteLaneCodec,
     pub stream_id: u16,
     pub dictionary_id: u16,
+    pub metadata: Option<AuraMetadata>,
 }
 
 impl WriterOptions {
@@ -71,6 +72,7 @@ impl WriterOptions {
             byte_lane_codec: Aura0ByteLaneCodec::Lz4,
             stream_id: 0,
             dictionary_id: 0,
+            metadata: None,
         }
     }
 
@@ -95,6 +97,11 @@ impl WriterOptions {
     pub const fn stream(mut self, stream_id: u16, dictionary_id: u16) -> Self {
         self.stream_id = stream_id;
         self.dictionary_id = dictionary_id;
+        self
+    }
+
+    pub fn metadata(mut self, metadata: AuraMetadata) -> Self {
+        self.metadata = Some(metadata);
         self
     }
 }

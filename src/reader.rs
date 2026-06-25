@@ -11,6 +11,7 @@ use crate::fixed_width::{
 use crate::footer::AuraFooter;
 use crate::format::SEAL_MAGIC;
 use crate::header::AuraHeader;
+use crate::metadata::AuraMetadata;
 use crate::options::{AuraFormat, ReaderOptions};
 use crate::program::{CompiledAuraField, CompiledAuraPlan, CompiledFooter};
 use crate::records::{self, DecodedI64File, DecodedTypedFile};
@@ -233,6 +234,7 @@ pub struct AuraReaderStats {
     pub source_bytes_read_at_open: usize,
     pub source_bytes_read_total: usize,
     pub streaming_reader_used: bool,
+    pub symbol_string_lookup_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1212,6 +1214,8 @@ fn is_integer_type(aura_type: AuraType) -> bool {
 pub struct AuraReader {
     source: AuraReaderSource,
     schema: AuraSchema,
+    metadata: AuraMetadata,
+    header_comment: String,
     profile: Profile,
     compiled_footer: Option<CompiledFooter>,
     compiled_plan: Option<CompiledAuraPlan>,
@@ -1285,6 +1289,8 @@ impl AuraReader {
             return Err(AuraError::InvalidValue("aura1 body length"));
         }
         let state = AuraReaderState::Aura1Fixed;
+        let header_comment = parsed.header.comment.clone();
+        let metadata = AuraMetadata::decode_header_comment(&header_comment);
         let source = AuraReaderSource::FileRange(FileBackedAuraInput {
             file: Arc::new(Mutex::new(file)),
             file_len: parsed.file_len,
@@ -1321,9 +1327,12 @@ impl AuraReader {
                 source_bytes_read_at_open: parsed.bytes_read_at_open,
                 source_bytes_read_total: parsed.bytes_read_at_open,
                 streaming_reader_used: true,
+                symbol_string_lookup_count: 0,
             }),
             source,
             schema: AuraSchema::from(footer.schema.clone()),
+            metadata,
+            header_comment,
             profile: parsed.header.profile,
             compiled_footer: Some(footer),
             compiled_plan: Some(compiled_plan),
@@ -1370,6 +1379,8 @@ impl AuraReader {
             .as_ref()
             .map(|plan| plan.aura1_record_width)
             .unwrap_or(0);
+        let header_comment = metadata.header.comment.clone();
+        let metadata_block = AuraMetadata::decode_header_comment(&header_comment);
         Ok(Self {
             stats: Cell::new(AuraReaderStats {
                 source_kind: AuraReaderSourceKind::Memory,
@@ -1399,9 +1410,12 @@ impl AuraReader {
                 source_bytes_read_at_open: bytes.len(),
                 source_bytes_read_total: bytes.len(),
                 streaming_reader_used: true,
+                symbol_string_lookup_count: 0,
             }),
             source: AuraReaderSource::Memory(bytes),
             schema: AuraSchema::from(metadata.schema.clone()),
+            metadata: metadata_block,
+            header_comment,
             profile: metadata.header.profile,
             compiled_footer: metadata.compiled_footer,
             compiled_plan,
@@ -1415,6 +1429,14 @@ impl AuraReader {
 
     pub fn schema(&self) -> &AuraSchema {
         &self.schema
+    }
+
+    pub fn metadata(&self) -> &AuraMetadata {
+        &self.metadata
+    }
+
+    pub fn header_comment(&self) -> &str {
+        &self.header_comment
     }
 
     pub const fn profile(&self) -> Profile {

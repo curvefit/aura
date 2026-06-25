@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aura_codec::{
-    AuraEventBatch, AuraEventSource, AuraFileSource, AuraFormat, AuraLiveSource, AuraMemorySource,
-    AuraRecordBatch, AuraSchema, AuraType, AuraValue, AuraWriter, Result, WriterOptions,
+    AuraEventBatch, AuraEventSource, AuraFileSource, AuraFormat, AuraLiveFrameSource,
+    AuraLiveSource, AuraMemorySource, AuraRecordBatch, AuraSchema, AuraType, AuraValue, AuraWriter,
+    OrderBookDeltaSpec, Result, WriterOptions,
 };
 
 fn market_schema() -> AuraSchema {
@@ -157,4 +158,116 @@ fn event_sources_reject_invalid_profiles_and_batch_sizes() {
 
     assert!(AuraMemorySource::try_new(ingest, 2).is_err());
     assert!(AuraLiveSource::try_new(Cursor::new(Vec::<u8>::new()), schema, 0).is_err());
+}
+
+#[test]
+fn event_source_file_zero_copy_stats() {
+    let schema = market_schema();
+    let aura1 = write_aura1(schema, market_rows());
+    let path = write_temp_file("file_zero_copy", &aura1);
+
+    let mut source = AuraFileSource::open_path(&path, 2).unwrap();
+    let result = consume_source(&mut source).unwrap();
+    let stats = source.source_stats();
+
+    assert_eq!(3, result.0);
+    assert_eq!("file_range", stats.source_kind);
+    assert_eq!(0, stats.rows_materialized);
+    assert!(!stats.full_file_materialized);
+    assert_eq!(0, stats.full_file_bytes_copied);
+    assert_eq!(0, stats.bytes_copied);
+    assert!(stats.bytes_borrowed_or_ranged > 0);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn event_source_memory_zero_copy_stats() {
+    let schema = market_schema();
+    let aura1 = write_aura1(schema, market_rows());
+    let aura1_len = aura1.len();
+
+    let mut source = AuraMemorySource::try_new(aura1, 2).unwrap();
+    let result = consume_source(&mut source).unwrap();
+    let stats = source.source_stats();
+
+    assert_eq!(3, result.0);
+    assert_eq!("memory", stats.source_kind);
+    assert_eq!(0, stats.rows_materialized);
+    assert!(!stats.full_file_materialized);
+    assert_eq!(aura1_len, stats.full_file_bytes_copied);
+    assert_eq!(aura1_len, stats.bytes_copied);
+    assert!(stats.bytes_borrowed_or_ranged > 0);
+}
+
+#[test]
+fn event_source_live_bounded_buffer_stats() {
+    let schema = market_schema();
+    let aura1 = write_aura1(schema.clone(), market_rows());
+    let body = aura1_body(&aura1);
+    let historical = AuraMemorySource::try_new(aura1, 2).unwrap();
+
+    let mut source =
+        AuraLiveFrameSource::from_body_chunks(body, schema, historical.compiled_plan().clone(), 2)
+            .unwrap();
+    let result = consume_source(&mut source).unwrap();
+    let stats = source.source_stats();
+
+    assert_eq!(3, result.0);
+    assert_eq!("live_frame", stats.source_kind);
+    assert!(stats.buffer_reuse_enabled);
+    assert_eq!(0, stats.rows_materialized);
+    assert!(!stats.full_file_materialized);
+    assert_eq!(0, stats.full_file_bytes_copied);
+    assert_eq!(0, stats.bytes_copied);
+    assert!(stats.bytes_borrowed_or_ranged > 0);
+    assert_eq!(0, stats.allocations_proxy);
+}
+
+#[test]
+fn orderbook_delta_batch_no_row_materialization() {
+    let schema = market_schema();
+    let aura1 = write_aura1(schema.clone(), market_rows());
+    let reader = aura_codec::AuraReader::open(Cursor::new(aura1)).unwrap();
+    let spec = OrderBookDeltaSpec::builder()
+        .timestamp("ts_event")
+        .instrument("symbol_id")
+        .side("side")
+        .price("price")
+        .size("size")
+        .flags_optional("flags")
+        .build(&schema)
+        .unwrap();
+    let mut rows = 0usize;
+    let mut checksum = 0u64;
+    reader
+        .replay_orderbook_deltas(2, &spec, |batch| {
+            rows = rows.saturating_add(batch.row_count());
+            checksum = checksum.wrapping_add(batch.checksum_payload()?);
+            Ok(())
+        })
+        .unwrap();
+    let stats = reader.stats();
+
+    assert_eq!(3, rows);
+    assert_ne!(0, checksum);
+    assert_eq!(0, stats.max_rows_materialized_at_once);
+    assert_eq!(0, stats.open_decoded_row_count);
+    assert_eq!(0, stats.full_file_materialized as usize);
+}
+
+#[test]
+fn borrowed_batch_rejects_truncated_body() {
+    let schema = market_schema();
+    let aura1 = write_aura1(schema.clone(), market_rows());
+    let mut body = aura1_body(&aura1);
+    body.pop();
+    let historical = AuraMemorySource::try_new(aura1, 2).unwrap();
+
+    assert!(AuraLiveFrameSource::from_body_chunks(
+        body,
+        schema,
+        historical.compiled_plan().clone(),
+        2
+    )
+    .is_err());
 }

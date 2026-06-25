@@ -2,8 +2,20 @@ use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::path::Path;
 
-use crate::reader::{Aura1FixedBatchView, AuraReader};
+use crate::reader::{Aura1FixedBatchView, AuraReader, AuraReaderStats};
 use crate::{AuraError, AuraFormat, AuraSchema, CompiledAuraPlan, ReaderOptions, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuraEventSourceStats {
+    pub source_kind: &'static str,
+    pub buffer_reuse_enabled: bool,
+    pub bytes_copied: usize,
+    pub bytes_borrowed_or_ranged: usize,
+    pub allocations_proxy: usize,
+    pub rows_materialized: usize,
+    pub full_file_materialized: bool,
+    pub full_file_bytes_copied: usize,
+}
 
 /// Common borrowed fixed-width batch surface for Aura event sources.
 pub trait AuraEventBatch {
@@ -70,6 +82,27 @@ pub struct AuraLiveSource<R> {
     batch_size: usize,
     batch_bytes: Vec<u8>,
     finished: bool,
+    bytes_copied: usize,
+    batch_count: usize,
+}
+
+#[derive(Debug, Clone)]
+enum AuraLiveFrameStorage {
+    Owned(Vec<Vec<u8>>),
+    OwnedBody(Vec<u8>),
+}
+
+/// Live Aura1 source backed by already-framed fixed-width message chunks.
+#[derive(Debug, Clone)]
+pub struct AuraLiveFrameSource {
+    storage: AuraLiveFrameStorage,
+    frame_index: usize,
+    cursor: usize,
+    frame_bytes: usize,
+    schema: AuraSchema,
+    compiled_plan: CompiledAuraPlan,
+    bytes_borrowed: usize,
+    allocations_proxy: usize,
 }
 
 impl AuraMemorySource {
@@ -89,6 +122,10 @@ impl AuraMemorySource {
 
     pub fn into_reader(self) -> AuraReader {
         self.reader
+    }
+
+    pub fn source_stats(&self) -> AuraEventSourceStats {
+        source_stats_from_reader(self.reader.stats(), "memory", true)
     }
 }
 
@@ -144,6 +181,10 @@ impl AuraFileSource {
     pub fn into_reader(self) -> AuraReader {
         self.reader
     }
+
+    pub fn source_stats(&self) -> AuraEventSourceStats {
+        source_stats_from_reader(self.reader.stats(), "file_range", false)
+    }
 }
 
 impl AuraEventSource for AuraFileSource {
@@ -190,11 +231,26 @@ impl<R: Read> AuraLiveSource<R> {
             batch_size,
             batch_bytes: Vec::new(),
             finished: false,
+            bytes_copied: 0,
+            batch_count: 0,
         })
     }
 
     pub fn into_inner(self) -> R {
         self.input
+    }
+
+    pub fn source_stats(&self) -> AuraEventSourceStats {
+        AuraEventSourceStats {
+            source_kind: "live_read",
+            buffer_reuse_enabled: true,
+            bytes_copied: self.bytes_copied,
+            bytes_borrowed_or_ranged: self.bytes_copied,
+            allocations_proxy: usize::from(self.batch_bytes.capacity() > 0),
+            rows_materialized: 0,
+            full_file_materialized: false,
+            full_file_bytes_copied: 0,
+        }
     }
 }
 
@@ -234,6 +290,7 @@ impl<R: Read> AuraEventSource for AuraLiveSource<R> {
                 }
                 Ok(read) => {
                     self.batch_bytes.truncate(start + read);
+                    self.bytes_copied = self.bytes_copied.saturating_add(read);
                     if self.batch_bytes.len() >= record_width
                         && self.batch_bytes.len() % record_width == 0
                     {
@@ -258,11 +315,142 @@ impl<R: Read> AuraEventSource for AuraLiveSource<R> {
             return Err(AuraError::UnexpectedEof);
         }
         let row_count = self.batch_bytes.len() / record_width;
+        self.batch_count = self.batch_count.saturating_add(1);
         Ok(Some(Aura1FixedBatchView::new(
             &self.batch_bytes,
             &self.compiled_plan,
             row_count,
         )?))
+    }
+}
+
+impl AuraLiveFrameSource {
+    pub fn try_new(frames: Vec<Vec<u8>>, schema: AuraSchema) -> Result<Self> {
+        let compiled_plan = CompiledAuraPlan::from_schema(&schema)?;
+        Self::with_plan(frames, schema, compiled_plan)
+    }
+
+    pub fn with_plan(
+        frames: Vec<Vec<u8>>,
+        schema: AuraSchema,
+        compiled_plan: CompiledAuraPlan,
+    ) -> Result<Self> {
+        if schema.hash() != compiled_plan.schema_hash {
+            return Err(AuraError::InvalidValue("live frame source schema"));
+        }
+        if compiled_plan.aura1_record_width == 0 {
+            return Err(AuraError::InvalidValue("live frame record width"));
+        }
+        for frame in &frames {
+            if frame.is_empty() || frame.len() % compiled_plan.aura1_record_width != 0 {
+                return Err(AuraError::UnexpectedEof);
+            }
+        }
+        let allocations_proxy = frames.len();
+        Ok(Self {
+            storage: AuraLiveFrameStorage::Owned(frames),
+            frame_index: 0,
+            cursor: 0,
+            frame_bytes: 0,
+            schema,
+            compiled_plan,
+            bytes_borrowed: 0,
+            allocations_proxy,
+        })
+    }
+
+    pub fn from_body_chunks(
+        body: Vec<u8>,
+        schema: AuraSchema,
+        compiled_plan: CompiledAuraPlan,
+        batch_size: usize,
+    ) -> Result<Self> {
+        validate_batch_size(batch_size)?;
+        if schema.hash() != compiled_plan.schema_hash {
+            return Err(AuraError::InvalidValue("live frame source schema"));
+        }
+        let record_width = compiled_plan.aura1_record_width;
+        if record_width == 0 {
+            return Err(AuraError::InvalidValue("live frame record width"));
+        }
+        if body.is_empty() || body.len() % record_width != 0 {
+            return Err(AuraError::UnexpectedEof);
+        }
+        let frame_bytes = batch_size
+            .checked_mul(record_width)
+            .ok_or(AuraError::InvalidValue("batch size"))?;
+        Ok(Self {
+            storage: AuraLiveFrameStorage::OwnedBody(body),
+            frame_index: 0,
+            cursor: 0,
+            frame_bytes,
+            schema,
+            compiled_plan,
+            bytes_borrowed: 0,
+            allocations_proxy: 0,
+        })
+    }
+
+    pub fn source_stats(&self) -> AuraEventSourceStats {
+        AuraEventSourceStats {
+            source_kind: "live_frame",
+            buffer_reuse_enabled: true,
+            bytes_copied: 0,
+            bytes_borrowed_or_ranged: self.bytes_borrowed,
+            allocations_proxy: self.allocations_proxy,
+            rows_materialized: 0,
+            full_file_materialized: false,
+            full_file_bytes_copied: 0,
+        }
+    }
+}
+
+impl AuraEventSource for AuraLiveFrameSource {
+    type Batch<'a>
+        = Aura1FixedBatchView<'a>
+    where
+        Self: 'a;
+
+    fn schema(&self) -> &AuraSchema {
+        &self.schema
+    }
+
+    fn compiled_plan(&self) -> &CompiledAuraPlan {
+        &self.compiled_plan
+    }
+
+    fn next_batch(&mut self) -> Result<Option<Self::Batch<'_>>> {
+        let record_width = self.compiled_plan.aura1_record_width;
+        let frame = match &self.storage {
+            AuraLiveFrameStorage::Owned(frames) => {
+                if self.frame_index >= frames.len() {
+                    return Ok(None);
+                }
+                let index = self.frame_index;
+                self.frame_index = self.frame_index.saturating_add(1);
+                frames[index].as_slice()
+            }
+            AuraLiveFrameStorage::OwnedBody(body) => {
+                if self.cursor >= body.len() {
+                    return Ok(None);
+                }
+                let remaining = body.len() - self.cursor;
+                let frame_len = self.frame_bytes.min(remaining);
+                if frame_len == 0 || frame_len % record_width != 0 {
+                    return Err(AuraError::UnexpectedEof);
+                }
+                let start = self.cursor;
+                let end = start + frame_len;
+                self.cursor = end;
+                &body[start..end]
+            }
+        };
+        if frame.is_empty() || frame.len() % record_width != 0 {
+            return Err(AuraError::UnexpectedEof);
+        }
+        let row_count = frame.len() / record_width;
+        self.bytes_borrowed = self.bytes_borrowed.saturating_add(frame.len());
+        Aura1FixedBatchView::new(frame, &self.compiled_plan, row_count).map(Some)
     }
 }
 
@@ -281,4 +469,21 @@ fn validate_aura1_reader(reader: &AuraReader) -> Result<()> {
         .compiled_plan()
         .ok_or(AuraError::InvalidValue("compiled plan"))?;
     Ok(())
+}
+
+fn source_stats_from_reader(
+    stats: AuraReaderStats,
+    source_kind: &'static str,
+    buffer_reuse_enabled: bool,
+) -> AuraEventSourceStats {
+    AuraEventSourceStats {
+        source_kind,
+        buffer_reuse_enabled,
+        bytes_copied: stats.full_file_bytes_copied,
+        bytes_borrowed_or_ranged: stats.bytes_read_during_replay,
+        allocations_proxy: stats.temp_row_buffers_allocated,
+        rows_materialized: stats.max_rows_materialized_at_once,
+        full_file_materialized: stats.full_file_materialized,
+        full_file_bytes_copied: stats.full_file_bytes_copied,
+    }
 }

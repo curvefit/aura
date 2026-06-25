@@ -81,19 +81,24 @@ impl<W: Write> AuraWriter<W> {
             return Err(AuraError::InvalidValue("writer finished"));
         }
         let row_count = self.rows.len();
-        let ingest = records::encode_ingest_i64_file(I64FileInput {
-            schema: self.schema.clone().into_descriptor(),
-            rows: self.rows,
-            stream_id: self.options.stream_id,
-            dictionary_id: self.options.dictionary_id,
-            header_comment: Some(
+        let header_comment = if let Some(metadata) = &self.options.metadata {
+            Some(metadata.encode_header_comment()?)
+        } else {
+            Some(
                 self.schema
                     .fields()
                     .iter()
                     .map(|field| field.name.as_str())
                     .collect::<Vec<_>>()
                     .join(","),
-            ),
+            )
+        };
+        let ingest = records::encode_ingest_i64_file(I64FileInput {
+            schema: self.schema.clone().into_descriptor(),
+            rows: self.rows,
+            stream_id: self.options.stream_id,
+            dictionary_id: self.options.dictionary_id,
+            header_comment,
         })?;
         let bytes = match self.options.format {
             AuraFormat::Aura => ingest,
