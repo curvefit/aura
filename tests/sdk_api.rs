@@ -739,7 +739,10 @@ fn orderbook_delta_batch_replay_extracts_payload_without_rows() {
     assert_eq!(0, stats.full_file_bytes_copied);
     assert_eq!(0, stats.max_rows_materialized_at_once);
     assert_eq!(2, stats.visitor_calls);
-    assert_eq!(expected.len().saturating_mul(spec.field_count()), stats.field_decode_count);
+    assert_eq!(
+        expected.len().saturating_mul(spec.field_count()),
+        stats.field_decode_count
+    );
     fs::remove_file(path).unwrap();
 }
 

@@ -40,7 +40,9 @@ writer.finish()?;
 - `AuraRecordBatch`, `AuraColumnBatch`, `AuraColumn`, `AuraValue`
 - `AuraWriter`, `AuraReader`
 - `AuraEventSource`, `AuraEventBatch`
-- `AuraMemorySource`, `AuraFileSource`, `AuraLiveSource`
+- `AuraMemorySource`, `AuraFileSource`, `AuraLiveSource`, `AuraLiveFrameSource`
+- `AuraEventSourceStats`
+- `AuraMetadata`, `SymbolMap`
 - `WriterOptions`, `ReaderOptions`, `ConvertOptions`
 - `AuraFormat`, `AuraProfile`
 - `CompiledAuraPlan`, `CompiledAuraField`
@@ -79,6 +81,25 @@ Supported output formats:
 - `WriterOptions::aura1()` for fixed-width `.aura1`
 
 Aura0 fast and hybrid profiles are available through `WriterOptions::profile`, but compact remains the default SDK Aura0 writer profile.
+
+Static dataset metadata can be attached at write time:
+
+```rust
+let metadata = aura_codec::AuraMetadata::new()
+    .with_dataset("example-market")
+    .with_source("unit-test")
+    .with_venue("XNAS")
+    .with_writer_version(env!("CARGO_PKG_VERSION"))
+    .with_symbol_map(aura_codec::SymbolMap::new().insert(10, "AAPL"));
+
+let options = WriterOptions::aura1().metadata(metadata);
+# let _ = options;
+```
+
+Metadata v1 is intentionally small: optional dataset/source/venue strings,
+writer version, a static numeric symbol map, and custom key/value strings. Hot
+replay APIs use numeric IDs; resolving symbol strings is an out-of-band
+post-processing step.
 
 `write_batch` accepts both row batches and column batches:
 
@@ -192,7 +213,23 @@ borrowed fixed-width batches. `AuraLiveSource<R>` consumes a stream of Aura1
 body records with a caller-supplied schema or compiled plan. Use
 `AuraLiveSource::with_plan` when the stream contains bytes produced from an
 existing Aura1 footer plan, because optimized Aura1 records may be narrower than
-the schema's maximum physical widths.
+the schema's maximum physical widths. `AuraLiveFrameSource` consumes already
+bounded fixed-width chunks or a contiguous Aura1 body buffer and returns the
+same borrowed batch view without constructing row vectors.
+
+Each source exposes `source_stats()` for zero-copy accounting. The file source
+reports ranged bytes and no full-file copy; the memory source reports sealed
+byte ownership; live sources report bounded buffer or frame ownership behavior.
+
+Reader metadata is available before replay:
+
+```rust
+let reader = aura_codec::AuraReader::open(std::io::Cursor::new(bytes))?;
+if let Some(dataset) = reader.metadata().dataset() {
+    println!("dataset={dataset}");
+}
+# Ok::<(), aura_codec::AuraError>(())
+```
 
 For true parse throughput, benchmark and use field-accessing batch operations,
 not view-only callbacks. `Aura1FixedBatchView::checksum_field`,

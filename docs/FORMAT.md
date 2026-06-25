@@ -31,6 +31,20 @@ schema parent mapping, derived expression table, and optional comment. The
 compiled profiles preserve the schema mapping and derived expression table from
 the logical schema.
 
+## Metadata
+
+SDK writers can store an `AuraMetadata` v1 block in the header comment using
+the `AURAMETA1|` tag. This block can carry optional dataset/source/venue
+strings, writer version, a static numeric `SymbolMap`, and safe custom
+key/value pairs. Readers expose it through `AuraReader::metadata()` before
+replay starts.
+
+The v1 metadata contract is intentionally static. Aura order-book replay uses
+numeric symbol or instrument IDs in the hot loop and does not resolve symbol
+strings while replaying. Time-ranged symbology, corporate-action-aware symbol
+history, and dataset registry semantics remain out of scope for this metadata
+block.
+
 ## Footers
 
 `.aura` uses the ingest footer magic `AURF`. The current order is:
@@ -89,9 +103,9 @@ the caller supplies the schema/compiled plan out of band.
 
 This intentionally differs from DBN's single binary format. Aura keeps `.aura`
 as dumb ingest/preservation, `.aura0` as compact semantic cold storage, and
-`.aura1` as the fixed-width replay/transport candidate. Aura also does not yet
-define DBN-style dataset metadata or time-aware symbology mappings in the file
-format.
+`.aura1` as the fixed-width replay/transport candidate. Aura defines only
+static metadata/symbology in v1; time-aware DBN-style symbology mappings remain
+a future format extension.
 
 ## Aura0 Body
 

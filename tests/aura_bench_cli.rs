@@ -1542,7 +1542,7 @@ fn aura_bench_runs_sdk_generic_fixture_smoke_matrix() {
         .arg("--datasets")
         .arg("sdk-dense")
         .arg("--operations")
-        .arg("aura1-event-source-file-orderbook-apply,aura1-event-source-memory-orderbook-apply,aura1-event-source-live-orderbook-apply")
+        .arg("aura1-event-source-file-orderbook-apply,aura1-event-source-memory-orderbook-apply,aura1-event-source-live-orderbook-apply,aura1-event-source-live-frame-orderbook-apply")
         .output()
         .unwrap();
     assert!(
@@ -1559,7 +1559,11 @@ fn aura_bench_runs_sdk_generic_fixture_smoke_matrix() {
     for (operation, expected_source_kind) in [
         ("aura1-event-source-file-orderbook-apply", "file_range"),
         ("aura1-event-source-memory-orderbook-apply", "memory"),
-        ("aura1-event-source-live-orderbook-apply", "live_stream"),
+        ("aura1-event-source-live-orderbook-apply", "live_read"),
+        (
+            "aura1-event-source-live-frame-orderbook-apply",
+            "live_frame",
+        ),
     ] {
         let entry = event_source_entries
             .iter()
@@ -1572,11 +1576,72 @@ fn aura_bench_runs_sdk_generic_fixture_smoke_matrix() {
         assert!(entry["values_decoded"].as_u64().unwrap() > 0);
         assert_ne!(0, entry["checksum"].as_u64().unwrap());
         assert_eq!(0, entry["rows_materialized"].as_u64().unwrap());
+        assert!(entry["extract_ms"].as_f64().unwrap() > 0.0);
+        assert!(entry["apply_ms"].as_f64().unwrap() > 0.0);
+        assert!(entry["total_ms"].as_f64().unwrap() > 0.0);
+        assert!(entry["records_per_sec"].as_f64().unwrap() > 0.0);
+        assert!(entry["bytes_copied"].as_u64().is_some());
+        assert!(entry["allocations_proxy"].as_u64().is_some());
+        assert!(entry["buffer_reuse_enabled"].as_bool().is_some());
         assert!(entry["counters"]["book_update_count"].as_u64().unwrap() > 0);
         assert!(entry["stage_times_ms"]
             .as_object()
             .unwrap()
             .contains_key("event_source_orderbook_apply_loop_ms"));
+    }
+
+    let book_variant_output_dir = dir.join("sdk-book-variant-bench");
+    let book_variant_output = Command::new(sdk_bench_bin)
+        .arg("--fixture-dir")
+        .arg(&dir)
+        .arg("--output-dir")
+        .arg(&book_variant_output_dir)
+        .arg("--iterations")
+        .arg("1")
+        .arg("--warmups")
+        .arg("0")
+        .arg("--batch-size")
+        .arg("8192")
+        .arg("--datasets")
+        .arg("sdk-dense")
+        .arg("--operations")
+        .arg("aura1-book-apply-current,aura1-book-apply-packed-key,aura1-book-apply-per-instrument,aura1-book-apply-side-split,aura1-book-apply-dense-ladder,aura1-book-apply-btree")
+        .output()
+        .unwrap();
+    assert!(
+        book_variant_output.status.success(),
+        "sdk book variant stdout:\n{}\nsdk book variant stderr:\n{}",
+        String::from_utf8_lossy(&book_variant_output.stdout),
+        String::from_utf8_lossy(&book_variant_output.stderr)
+    );
+    let book_variant_summary: serde_json::Value = serde_json::from_slice(
+        &fs::read(book_variant_output_dir.join("sdk_full_matrix_summary.json")).unwrap(),
+    )
+    .unwrap();
+    let book_variant_entries = book_variant_summary.as_array().unwrap();
+    for operation in [
+        "aura1-book-apply-current",
+        "aura1-book-apply-packed-key",
+        "aura1-book-apply-per-instrument",
+        "aura1-book-apply-side-split",
+        "aura1-book-apply-dense-ladder",
+        "aura1-book-apply-btree",
+    ] {
+        let entry = book_variant_entries
+            .iter()
+            .find(|entry| entry["operation"] == operation)
+            .unwrap_or_else(|| panic!("missing {operation}"));
+        assert_eq!("orderbook apply", entry["benchmark_class"]);
+        assert!(entry["book_levels"].as_u64().unwrap() > 0);
+        assert!(entry["instruments"].as_u64().unwrap() > 0);
+        assert!(entry["price_levels"].as_u64().unwrap() > 0);
+        assert!(entry["extract_ms"].as_f64().unwrap() > 0.0);
+        assert!(entry["apply_ms"].as_f64().unwrap() > 0.0);
+        assert!(entry["total_ms"].as_f64().unwrap() > 0.0);
+        assert!(entry["records_per_sec"].as_f64().unwrap() > 0.0);
+        assert_ne!(0, entry["state_hash"].as_u64().unwrap());
+        assert_eq!(0, entry["rows_materialized"].as_u64().unwrap());
+        assert!(entry["allocations_proxy"].as_u64().is_some());
     }
 
     fs::remove_dir_all(&dir).unwrap();

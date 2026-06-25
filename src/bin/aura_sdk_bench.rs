@@ -1,6 +1,6 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hint::black_box;
 use std::io::Cursor;
@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use aura_codec::{
     convert_aura, records, Aura1RowView, AuraColumn, AuraError, AuraEventBatch, AuraEventSource,
-    AuraFileSource, AuraFormat, AuraGroupStats, AuraLiveSource, AuraMemorySource, AuraProfile,
-    AuraReader, AuraReaderSourceKind, AuraReaderStats, AuraRecordBatch, AuraReplayBackend,
-    AuraSchema, AuraType, AuraWriter, CompiledAuraField, CompiledAuraPlan, ConvertOptions, GroupBy,
-    OrderBookDeltaSpec, WriterOptions,
+    AuraEventSourceStats, AuraFileSource, AuraFormat, AuraGroupStats, AuraLiveFrameSource,
+    AuraLiveSource, AuraMemorySource, AuraProfile, AuraReader, AuraReaderSourceKind,
+    AuraReaderStats, AuraRecordBatch, AuraReplayBackend, AuraSchema, AuraType, AuraWriter,
+    CompiledAuraField, CompiledAuraPlan, ConvertOptions, GroupBy, OrderBookDeltaSpec,
+    WriterOptions,
 };
 use serde_json::{json, Value};
 
@@ -103,6 +104,15 @@ struct BenchOutput {
     unsafe_loads_used: bool,
     replay_mode: Option<&'static str>,
     source_kind_override: Option<&'static str>,
+    source_stats: Option<AuraEventSourceStats>,
+    allocations_proxy_override: Option<usize>,
+    book_levels: usize,
+    instrument_count: usize,
+    price_level_count: usize,
+    book_adds: usize,
+    book_modifies: usize,
+    book_deletes: usize,
+    state_hash: u64,
     benchmark_class: &'static str,
     stages: StageBreakdown,
 }
@@ -158,6 +168,15 @@ impl BenchOutput {
             unsafe_loads_used: false,
             replay_mode: None,
             source_kind_override: None,
+            source_stats: None,
+            allocations_proxy_override: None,
+            book_levels: 0,
+            instrument_count: 0,
+            price_level_count: 0,
+            book_adds: 0,
+            book_modifies: 0,
+            book_deletes: 0,
+            state_hash: 0,
             benchmark_class: "other",
             stages: StageBreakdown::summed(),
         }
@@ -221,6 +240,24 @@ impl BenchOutput {
 
     fn with_source_kind(mut self, source_kind: &'static str) -> Self {
         self.source_kind_override = Some(source_kind);
+        self
+    }
+
+    fn with_source_stats(mut self, source_stats: AuraEventSourceStats) -> Self {
+        self.source_stats = Some(source_stats);
+        self
+    }
+
+    fn with_book_metrics(mut self, metrics: BookApplyMetrics) -> Self {
+        self.book_levels = metrics.book_levels;
+        self.instrument_count = metrics.instruments;
+        self.price_level_count = metrics.price_levels;
+        self.book_adds = metrics.adds;
+        self.book_modifies = metrics.modifies;
+        self.book_deletes = metrics.deletes;
+        self.state_hash = metrics.state_hash;
+        self.allocations_proxy_override = Some(metrics.allocations_proxy);
+        self.benchmark_class = "orderbook apply";
         self
     }
 
@@ -395,6 +432,13 @@ fn run_fixture_matrix(fixture: &Fixture, args: &Args) -> Result<Vec<Value>> {
         "aura1-event-source-file-orderbook-apply",
         "aura1-event-source-memory-orderbook-apply",
         "aura1-event-source-live-orderbook-apply",
+        "aura1-event-source-live-frame-orderbook-apply",
+        "aura1-book-apply-current",
+        "aura1-book-apply-packed-key",
+        "aura1-book-apply-per-instrument",
+        "aura1-book-apply-side-split",
+        "aura1-book-apply-dense-ladder",
+        "aura1-book-apply-btree",
         "aura1-replay-grouped-touch-selected",
         "aura1-replay-grouped-touch-all",
         "aura1-scan-raw",
@@ -551,8 +595,37 @@ fn bench_operation(
         aura1,
         args.batch_size,
     )?);
+    let source_stats = last_output.source_stats.unwrap_or(AuraEventSourceStats {
+        source_kind: last_output
+            .source_kind_override
+            .unwrap_or_else(|| reader_stats.source_kind.as_str()),
+        buffer_reuse_enabled: false,
+        bytes_copied: reader_stats.full_file_bytes_copied,
+        bytes_borrowed_or_ranged: reader_stats.bytes_read_during_replay,
+        allocations_proxy: reader_stats.temp_row_buffers_allocated,
+        rows_materialized: reader_stats.max_rows_materialized_at_once,
+        full_file_materialized: reader_stats.full_file_materialized,
+        full_file_bytes_copied: reader_stats.full_file_bytes_copied,
+    });
     let stage_sum_ms = last_output.stages.stage_sum_ms();
     let runtime_ms = duration_ms(median);
+    let extract_ms = measured_ms(
+        &last_output.stages,
+        &[
+            "event_source_extract_ms",
+            "orderbook_extract_ms",
+            "orderbook_delta_loop_ms",
+        ],
+    );
+    let apply_ms = measured_ms(
+        &last_output.stages,
+        &[
+            "event_source_apply_ms",
+            "event_source_orderbook_apply_loop_ms",
+            "orderbook_apply_ms",
+            "orderbook_decode_apply_loop_ms",
+        ],
+    );
     let unexplained_ms = runtime_ms - stage_sum_ms;
     let unexplained_pct = if runtime_ms > 0.0 {
         (unexplained_ms / runtime_ms) * 100.0
@@ -636,6 +709,15 @@ fn bench_operation(
     counters
         .entry("full_file_bytes_copied")
         .or_insert(reader_stats.full_file_bytes_copied as u64);
+    let allocations_proxy = last_output
+        .allocations_proxy_override
+        .unwrap_or(source_stats.allocations_proxy);
+    counters
+        .entry("bytes_copied")
+        .or_insert(source_stats.bytes_copied as u64);
+    counters
+        .entry("allocations_proxy")
+        .or_insert(allocations_proxy as u64);
     let command = std::env::args().collect::<Vec<_>>().join(" ");
     Ok(json!({
         "operation": operation,
@@ -673,9 +755,18 @@ fn bench_operation(
         "streaming_reader_used": reader_stats.streaming_reader_used,
         "full_file_materialized": reader_stats.full_file_materialized,
         "max_rows_materialized_at_once": reader_stats.max_rows_materialized_at_once,
-        "source_kind": last_output
-            .source_kind_override
-            .unwrap_or_else(|| reader_stats.source_kind.as_str()),
+        "source_kind": source_stats.source_kind,
+        "buffer_reuse_enabled": source_stats.buffer_reuse_enabled,
+        "bytes_copied": source_stats.bytes_copied,
+        "bytes_borrowed_or_ranged": source_stats.bytes_borrowed_or_ranged,
+        "allocations_proxy": allocations_proxy,
+        "book_levels": last_output.book_levels,
+        "instruments": last_output.instrument_count,
+        "price_levels": last_output.price_level_count,
+        "adds": last_output.book_adds,
+        "modifies": last_output.book_modifies,
+        "deletes": last_output.book_deletes,
+        "state_hash": last_output.state_hash,
         "replay_backend": reader_stats.replay_backend.as_str(),
         "file_len": reader_stats.file_len,
         "bytes_read_at_open": reader_stats.bytes_read_at_open,
@@ -703,6 +794,9 @@ fn bench_operation(
         "kernel_group_count": last_output.kernel_group_count,
         "unsafe_loads_used": last_output.unsafe_loads_used,
         "stage_times_ms": last_output.stages.times_ms,
+        "extract_ms": extract_ms,
+        "apply_ms": apply_ms,
+        "total_ms": runtime_ms,
         "counters": counters,
         "timer_tree_kind": last_output.stages.timer_tree_kind,
         "stage_sum_ms": stage_sum_ms,
@@ -811,6 +905,39 @@ fn run_operation(
         "aura1-event-source-live-orderbook-apply" => {
             replay_event_source_live_orderbook_apply(aura1, args.batch_size)
         }
+        "aura1-event-source-live-frame-orderbook-apply" => {
+            replay_event_source_live_frame_orderbook_apply(aura1, args.batch_size)
+        }
+        "aura1-book-apply-current" => replay_orderbook_apply_variant_path(
+            aura1_path,
+            args.batch_size,
+            BookApplyVariant::Current,
+        ),
+        "aura1-book-apply-packed-key" => replay_orderbook_apply_variant_path(
+            aura1_path,
+            args.batch_size,
+            BookApplyVariant::PackedKey,
+        ),
+        "aura1-book-apply-per-instrument" => replay_orderbook_apply_variant_path(
+            aura1_path,
+            args.batch_size,
+            BookApplyVariant::PerInstrument,
+        ),
+        "aura1-book-apply-side-split" => replay_orderbook_apply_variant_path(
+            aura1_path,
+            args.batch_size,
+            BookApplyVariant::SideSplit,
+        ),
+        "aura1-book-apply-dense-ladder" => replay_orderbook_apply_variant_path(
+            aura1_path,
+            args.batch_size,
+            BookApplyVariant::DenseLadder,
+        ),
+        "aura1-book-apply-btree" => replay_orderbook_apply_variant_path(
+            aura1_path,
+            args.batch_size,
+            BookApplyVariant::BTree,
+        ),
         "aura1-replay-grouped-touch-selected" => grouped_replay_selected(aura1, schema),
         "aura1-replay-grouped-touch-all" => grouped_replay_truth(
             aura1,
@@ -1773,6 +1900,501 @@ fn replay_orderbook_deltas_apply_batch_path(path: &Path, batch_size: usize) -> R
         .with_stages(stages))
 }
 
+#[derive(Debug, Clone, Copy)]
+enum BookApplyVariant {
+    Current,
+    PackedKey,
+    PerInstrument,
+    SideSplit,
+    DenseLadder,
+    BTree,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BookApplyMetrics {
+    book_levels: usize,
+    instruments: usize,
+    price_levels: usize,
+    adds: usize,
+    modifies: usize,
+    deletes: usize,
+    state_hash: u64,
+    allocations_proxy: usize,
+}
+
+#[derive(Debug, Default)]
+struct BookApplyCounts {
+    instruments: HashSet<i64>,
+    prices: HashSet<i64>,
+    adds: usize,
+    modifies: usize,
+    deletes: usize,
+}
+
+impl BookApplyCounts {
+    fn observe(&mut self, delta: BenchBookDelta) {
+        self.instruments.insert(delta.instrument);
+        self.prices.insert(delta.price);
+    }
+
+    fn add(&mut self) {
+        self.adds = self.adds.saturating_add(1);
+    }
+
+    fn modify(&mut self) {
+        self.modifies = self.modifies.saturating_add(1);
+    }
+
+    fn delete(&mut self) {
+        self.deletes = self.deletes.saturating_add(1);
+    }
+
+    fn finish(
+        self,
+        book_levels: usize,
+        state_hash: u64,
+        allocations_proxy: usize,
+    ) -> BookApplyMetrics {
+        BookApplyMetrics {
+            book_levels,
+            instruments: self.instruments.len(),
+            price_levels: self.prices.len(),
+            adds: self.adds,
+            modifies: self.modifies,
+            deletes: self.deletes,
+            state_hash,
+            allocations_proxy,
+        }
+    }
+}
+
+fn replay_orderbook_apply_variant_path(
+    path: &Path,
+    batch_size: usize,
+    variant: BookApplyVariant,
+) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
+    let reader = AuraReader::open_path(path)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
+    let recipe_start = Instant::now();
+    let spec = default_orderbook_delta_spec(reader.schema())?;
+    let payload_fields = spec.field_indices();
+    let bytes_per_row = selected_bytes_per_row(&reader, &payload_fields)?;
+    let record_capacity = reader
+        .compiled_plan()
+        .map(|plan| plan.record_count)
+        .unwrap_or(0);
+    stages.add_duration("selected_field_recipe_lookup_ms", recipe_start.elapsed());
+
+    let mut deltas = Vec::with_capacity(record_capacity);
+    let extract_start = Instant::now();
+    reader.replay_orderbook_deltas(batch_size, &spec, |batch| {
+        for row in 0..batch.row_count() {
+            deltas.push(BenchBookDelta {
+                timestamp: batch.timestamp(row)?,
+                instrument: batch.instrument(row)?,
+                side: batch.side(row)?,
+                price: batch.price(row)?,
+                size: batch.size(row)?,
+                flags: batch.flags(row)?.unwrap_or(0),
+                action: batch.action(row)?.unwrap_or(0),
+                sequence: batch.sequence(row)?.unwrap_or(0),
+                order_id: batch.order_id(row)?.unwrap_or(0),
+            });
+        }
+        Ok(())
+    })?;
+    stages.add_duration("orderbook_extract_ms", extract_start.elapsed());
+
+    let apply_start = Instant::now();
+    let metrics = apply_book_variant(&deltas, variant)?;
+    stages.add_duration("orderbook_apply_ms", apply_start.elapsed());
+    stages.add_ms("field_load_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
+    stages.add_counter(
+        "book_update_count",
+        metrics.adds.saturating_add(metrics.modifies),
+    );
+    stages.add_counter("book_add_count", metrics.adds);
+    stages.add_counter("book_modify_count", metrics.modifies);
+    stages.add_counter("book_delete_count", metrics.deletes);
+    stages.add_counter("book_level_count", metrics.book_levels);
+    stages.add_counter("instrument_count", metrics.instruments);
+    stages.add_counter("price_level_count", metrics.price_levels);
+    black_box(metrics.state_hash);
+
+    let stats = reader.stats();
+    let mut output = BenchOutput::new(stats.file_len, deltas.len()).with_reader_stats(stats);
+    output.bytes_scanned = output
+        .reader_stats
+        .map(|stats| stats.bytes_read_during_replay)
+        .unwrap_or_default();
+    Ok(output
+        .with_access(
+            payload_fields.len(),
+            deltas.len().saturating_mul(payload_fields.len()),
+            deltas.len().saturating_mul(bytes_per_row),
+            metrics.state_hash,
+        )
+        .with_parse_counters(
+            selected_kernel_group_count(payload_fields.len()),
+            payload_fields.len(),
+            selected_kernel_group_count(payload_fields.len()),
+            true,
+        )
+        .with_book_metrics(metrics)
+        .with_stages(stages))
+}
+
+fn apply_book_variant(
+    deltas: &[BenchBookDelta],
+    variant: BookApplyVariant,
+) -> Result<BookApplyMetrics> {
+    match variant {
+        BookApplyVariant::Current => Ok(apply_current_book(deltas)),
+        BookApplyVariant::PackedKey => apply_packed_key_book(deltas),
+        BookApplyVariant::PerInstrument => Ok(apply_per_instrument_book(deltas)),
+        BookApplyVariant::SideSplit => Ok(apply_side_split_book(deltas)),
+        BookApplyVariant::DenseLadder => Ok(apply_dense_ladder_book(deltas)),
+        BookApplyVariant::BTree => Ok(apply_btree_book(deltas)),
+    }
+}
+
+fn apply_current_book(deltas: &[BenchBookDelta]) -> BookApplyMetrics {
+    let mut book = BenchOrderBook::with_capacity(deltas.len().saturating_mul(2));
+    let mut counts = BookApplyCounts::default();
+    for &delta in deltas {
+        counts.observe(delta);
+        book.apply(delta);
+    }
+    counts.adds = book.adds;
+    counts.modifies = book.modifies;
+    counts.deletes = book.deletes;
+    let state_hash = hash_book_entries(book.active_entries());
+    counts.finish(book.level_count, state_hash, book.slots.len())
+}
+
+fn apply_packed_key_book(deltas: &[BenchBookDelta]) -> Result<BookApplyMetrics> {
+    let mut levels: HashMap<u128, i64> = HashMap::with_capacity(deltas.len().saturating_mul(2));
+    let mut counts = BookApplyCounts::default();
+    for &delta in deltas {
+        counts.observe(delta);
+        let key = BenchBookKey {
+            instrument: delta.instrument,
+            side: delta.side,
+            price: delta.price,
+        };
+        let packed = pack_book_key(key)?;
+        if is_delete_delta(delta) {
+            counts.delete();
+            levels.remove(&packed);
+        } else if let std::collections::hash_map::Entry::Occupied(mut entry) = levels.entry(packed)
+        {
+            counts.modify();
+            entry.insert(delta.size);
+        } else {
+            counts.add();
+            levels.insert(packed, delta.size);
+        }
+    }
+    let entries = levels
+        .iter()
+        .map(|(packed, size)| unpack_book_key(*packed).map(|key| (key, *size)))
+        .collect::<Result<Vec<_>>>()?;
+    let state_hash = hash_book_entries(entries);
+    Ok(counts.finish(levels.len(), state_hash, levels.capacity()))
+}
+
+fn apply_per_instrument_book(deltas: &[BenchBookDelta]) -> BookApplyMetrics {
+    let mut levels: HashMap<i64, HashMap<(i64, i64), i64>> =
+        HashMap::with_capacity(deltas.len().min(1024));
+    let mut counts = BookApplyCounts::default();
+    for &delta in deltas {
+        counts.observe(delta);
+        let side_price = (delta.side, delta.price);
+        if is_delete_delta(delta) {
+            counts.delete();
+            if let Some(book) = levels.get_mut(&delta.instrument) {
+                book.remove(&side_price);
+            }
+        } else {
+            let book = levels.entry(delta.instrument).or_default();
+            if let std::collections::hash_map::Entry::Occupied(mut entry) = book.entry(side_price) {
+                counts.modify();
+                entry.insert(delta.size);
+            } else {
+                counts.add();
+                book.insert(side_price, delta.size);
+            }
+        }
+    }
+    let entries = levels
+        .iter()
+        .flat_map(|(instrument, book)| {
+            book.iter().map(move |((side, price), size)| {
+                (
+                    BenchBookKey {
+                        instrument: *instrument,
+                        side: *side,
+                        price: *price,
+                    },
+                    *size,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let book_levels = entries.len();
+    let allocations_proxy = levels
+        .values()
+        .map(HashMap::capacity)
+        .sum::<usize>()
+        .saturating_add(levels.capacity());
+    counts.finish(book_levels, hash_book_entries(entries), allocations_proxy)
+}
+
+fn apply_side_split_book(deltas: &[BenchBookDelta]) -> BookApplyMetrics {
+    let mut levels: HashMap<(i64, i64), HashMap<i64, i64>> =
+        HashMap::with_capacity(deltas.len().min(2048));
+    let mut counts = BookApplyCounts::default();
+    for &delta in deltas {
+        counts.observe(delta);
+        let book_key = (delta.instrument, delta.side);
+        if is_delete_delta(delta) {
+            counts.delete();
+            if let Some(book) = levels.get_mut(&book_key) {
+                book.remove(&delta.price);
+            }
+        } else {
+            let book = levels.entry(book_key).or_default();
+            if let std::collections::hash_map::Entry::Occupied(mut entry) = book.entry(delta.price)
+            {
+                counts.modify();
+                entry.insert(delta.size);
+            } else {
+                counts.add();
+                book.insert(delta.price, delta.size);
+            }
+        }
+    }
+    let entries = levels
+        .iter()
+        .flat_map(|((instrument, side), book)| {
+            book.iter().map(move |(price, size)| {
+                (
+                    BenchBookKey {
+                        instrument: *instrument,
+                        side: *side,
+                        price: *price,
+                    },
+                    *size,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let book_levels = entries.len();
+    let allocations_proxy = levels
+        .values()
+        .map(HashMap::capacity)
+        .sum::<usize>()
+        .saturating_add(levels.capacity());
+    counts.finish(book_levels, hash_book_entries(entries), allocations_proxy)
+}
+
+#[derive(Debug)]
+struct DenseBookLadder {
+    min_price: i64,
+    levels: Vec<i64>,
+    active: usize,
+}
+
+fn apply_dense_ladder_book(deltas: &[BenchBookDelta]) -> BookApplyMetrics {
+    let ranges = dense_ladder_ranges(deltas);
+    let total_slots = ranges.values().fold(0usize, |acc, (min_price, max_price)| {
+        let width = max_price
+            .checked_sub(*min_price)
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(usize::MAX);
+        acc.saturating_add(width)
+    });
+    let max_slots = deltas.len().saturating_mul(64).max(1_000_000);
+    if total_slots > max_slots {
+        return apply_packed_key_book(deltas).unwrap_or_else(|_| apply_per_instrument_book(deltas));
+    }
+
+    let mut ladders = ranges
+        .into_iter()
+        .map(|(key, (min_price, max_price))| {
+            let width = usize::try_from(max_price - min_price + 1).unwrap_or(0);
+            (
+                key,
+                DenseBookLadder {
+                    min_price,
+                    levels: vec![0; width],
+                    active: 0,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut counts = BookApplyCounts::default();
+    for &delta in deltas {
+        counts.observe(delta);
+        let key = (delta.instrument, delta.side);
+        if is_delete_delta(delta) {
+            counts.delete();
+            if let Some(ladder) = ladders.get_mut(&key) {
+                if let Some(slot) = dense_ladder_slot_mut(ladder, delta.price) {
+                    if *slot != 0 {
+                        *slot = 0;
+                        ladder.active = ladder.active.saturating_sub(1);
+                    }
+                }
+            }
+        } else if let Some(ladder) = ladders.get_mut(&key) {
+            let mut inserted = false;
+            let mut modified = false;
+            if let Some(slot) = dense_ladder_slot_mut(ladder, delta.price) {
+                inserted = *slot == 0;
+                modified = !inserted;
+                *slot = delta.size;
+            }
+            if inserted {
+                counts.add();
+                ladder.active = ladder.active.saturating_add(1);
+            } else if modified {
+                counts.modify();
+            }
+        }
+    }
+    let entries = ladders
+        .iter()
+        .flat_map(|((instrument, side), ladder)| {
+            ladder
+                .levels
+                .iter()
+                .enumerate()
+                .filter(|(_, size)| **size != 0)
+                .map(move |(offset, size)| {
+                    (
+                        BenchBookKey {
+                            instrument: *instrument,
+                            side: *side,
+                            price: ladder.min_price + offset as i64,
+                        },
+                        *size,
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    let book_levels = entries.len();
+    counts.finish(book_levels, hash_book_entries(entries), total_slots)
+}
+
+fn dense_ladder_ranges(deltas: &[BenchBookDelta]) -> HashMap<(i64, i64), (i64, i64)> {
+    let mut ranges = HashMap::new();
+    for delta in deltas
+        .iter()
+        .copied()
+        .filter(|delta| !is_delete_delta(*delta))
+    {
+        ranges
+            .entry((delta.instrument, delta.side))
+            .and_modify(|range: &mut (i64, i64)| {
+                range.0 = range.0.min(delta.price);
+                range.1 = range.1.max(delta.price);
+            })
+            .or_insert((delta.price, delta.price));
+    }
+    ranges
+}
+
+fn dense_ladder_slot_mut(ladder: &mut DenseBookLadder, price: i64) -> Option<&mut i64> {
+    let offset = price.checked_sub(ladder.min_price)?;
+    ladder.levels.get_mut(usize::try_from(offset).ok()?)
+}
+
+fn apply_btree_book(deltas: &[BenchBookDelta]) -> BookApplyMetrics {
+    let mut levels: BTreeMap<BenchBookKey, i64> = BTreeMap::new();
+    let mut counts = BookApplyCounts::default();
+    for &delta in deltas {
+        counts.observe(delta);
+        let key = BenchBookKey {
+            instrument: delta.instrument,
+            side: delta.side,
+            price: delta.price,
+        };
+        if is_delete_delta(delta) {
+            counts.delete();
+            levels.remove(&key);
+        } else if let std::collections::btree_map::Entry::Occupied(mut entry) = levels.entry(key) {
+            counts.modify();
+            entry.insert(delta.size);
+        } else {
+            counts.add();
+            levels.insert(key, delta.size);
+        }
+    }
+    let entries = levels
+        .iter()
+        .map(|(key, size)| (*key, *size))
+        .collect::<Vec<_>>();
+    counts.finish(levels.len(), hash_book_entries(entries), levels.len())
+}
+
+fn is_delete_delta(delta: BenchBookDelta) -> bool {
+    delta.size <= 0 || delta.action == 2
+}
+
+fn pack_book_key(key: BenchBookKey) -> Result<u128> {
+    if !fits_signed_bits(key.instrument, 48) || !fits_signed_bits(key.side, 16) {
+        bail!("book key outside packed-key benchmark range");
+    }
+    let instrument = (i128::from(key.instrument) & ((1i128 << 48) - 1)) as u128;
+    let side = (i128::from(key.side) & ((1i128 << 16) - 1)) as u128;
+    let price = key.price as u64 as u128;
+    Ok((instrument << 80) | (side << 64) | price)
+}
+
+fn unpack_book_key(packed: u128) -> Result<BenchBookKey> {
+    let instrument = sign_extend_i64(packed >> 80, 48)?;
+    let side = sign_extend_i64((packed >> 64) & 0xffff, 16)?;
+    let price = packed as u64 as i64;
+    Ok(BenchBookKey {
+        instrument,
+        side,
+        price,
+    })
+}
+
+fn fits_signed_bits(value: i64, bits: u32) -> bool {
+    let min = -(1i128 << (bits - 1));
+    let max = (1i128 << (bits - 1)) - 1;
+    let value = i128::from(value);
+    value >= min && value <= max
+}
+
+fn sign_extend_i64(value: u128, bits: u32) -> Result<i64> {
+    let shift = 128 - bits;
+    let signed = ((value << shift) as i128) >> shift;
+    i64::try_from(signed).map_err(|_| anyhow::anyhow!("packed book key sign extension"))
+}
+
+fn hash_book_entries(entries: impl IntoIterator<Item = (BenchBookKey, i64)>) -> u64 {
+    let mut entries = entries.into_iter().collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(key, _)| *key);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for (key, size) in entries {
+        hash = mix_checksum(hash, key.instrument);
+        hash = mix_checksum(hash, key.side);
+        hash = mix_checksum(hash, key.price);
+        hash = mix_checksum(hash, size);
+    }
+    hash = hash.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    hash
+}
+
 #[derive(Debug)]
 struct EventSourceOrderBookStats {
     record_count: usize,
@@ -1792,6 +2414,7 @@ fn replay_event_source_file_orderbook_apply(path: &Path, batch_size: usize) -> R
     let bytes_per_row = selected_bytes_per_row_from_plan(source.compiled_plan(), &payload_fields)?;
     stages.add_duration("selected_field_recipe_lookup_ms", recipe_start.elapsed());
     let replay = replay_event_source_orderbook_apply(&mut source, &spec, &mut stages)?;
+    let source_stats = source.source_stats();
     let reader = source.into_reader();
     let stats = reader.stats();
     event_source_orderbook_output(
@@ -1800,6 +2423,7 @@ fn replay_event_source_file_orderbook_apply(path: &Path, batch_size: usize) -> R
         payload_fields.len(),
         bytes_per_row,
         None,
+        source_stats,
         stages,
     )
 }
@@ -1818,6 +2442,7 @@ fn replay_event_source_memory_orderbook_apply(
     let bytes_per_row = selected_bytes_per_row_from_plan(source.compiled_plan(), &payload_fields)?;
     stages.add_duration("selected_field_recipe_lookup_ms", recipe_start.elapsed());
     let replay = replay_event_source_orderbook_apply(&mut source, &spec, &mut stages)?;
+    let source_stats = source.source_stats();
     let reader = source.into_reader();
     let stats = reader.stats();
     event_source_orderbook_output(
@@ -1826,6 +2451,7 @@ fn replay_event_source_memory_orderbook_apply(
         payload_fields.len(),
         bytes_per_row,
         None,
+        source_stats,
         stages,
     )
 }
@@ -1853,6 +2479,7 @@ fn replay_event_source_live_orderbook_apply(
     let bytes_per_row = selected_bytes_per_row_from_plan(source.compiled_plan(), &payload_fields)?;
     stages.add_duration("selected_field_recipe_lookup_ms", recipe_start.elapsed());
     let replay = replay_event_source_orderbook_apply(&mut source, &spec, &mut stages)?;
+    let source_stats = source.source_stats();
     let stats = live_event_source_stats(
         reader.stats(),
         &plan,
@@ -1867,6 +2494,50 @@ fn replay_event_source_live_orderbook_apply(
         payload_fields.len(),
         bytes_per_row,
         Some("live_stream"),
+        source_stats,
+        stages,
+    )
+}
+
+fn replay_event_source_live_frame_orderbook_apply(
+    aura1: &[u8],
+    batch_size: usize,
+) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let setup_start = Instant::now();
+    let reader = AuraReader::open(Cursor::new(aura1))?;
+    let schema = reader.schema().clone();
+    let plan = reader
+        .compiled_plan()
+        .ok_or_else(|| anyhow::anyhow!("compiled plan"))?
+        .clone();
+    let body = aura1_body_slice(aura1)?;
+    let body_len = body.len();
+    let mut source =
+        AuraLiveFrameSource::from_body_chunks(body.to_vec(), schema, plan.clone(), batch_size)?;
+    stages.add_duration("open_total_ms", setup_start.elapsed());
+    let recipe_start = Instant::now();
+    let spec = default_orderbook_delta_spec(source.schema())?;
+    let payload_fields = spec.field_indices();
+    let bytes_per_row = selected_bytes_per_row_from_plan(source.compiled_plan(), &payload_fields)?;
+    stages.add_duration("selected_field_recipe_lookup_ms", recipe_start.elapsed());
+    let replay = replay_event_source_orderbook_apply(&mut source, &spec, &mut stages)?;
+    let source_stats = source.source_stats();
+    let stats = live_event_source_stats(
+        reader.stats(),
+        &plan,
+        body_len,
+        replay.batch_count,
+        replay.last_batch_rows,
+        replay.record_count.saturating_mul(payload_fields.len()),
+    );
+    event_source_orderbook_output(
+        stats,
+        replay,
+        payload_fields.len(),
+        bytes_per_row,
+        Some("live_frame"),
+        source_stats,
         stages,
     )
 }
@@ -1898,7 +2569,8 @@ where
         batch_count = batch_count.saturating_add(1);
         last_batch_rows = batch.row_count();
         record_count = record_count.saturating_add(batch.row_count());
-        let apply_start = Instant::now();
+        let extract_start = Instant::now();
+        let mut deltas = Vec::with_capacity(batch.row_count());
         for row in 0..batch.row_count() {
             let timestamp = batch.value_i64(row, spec.timestamp_index())?;
             let instrument = batch.value_i64(row, spec.instrument_index())?;
@@ -1909,7 +2581,7 @@ where
                 .map(|index| batch.value_i64(row, index))
                 .transpose()?
                 .unwrap_or(0);
-            book.apply(BenchBookDelta {
+            deltas.push(BenchBookDelta {
                 timestamp,
                 instrument,
                 side,
@@ -1921,10 +2593,14 @@ where
                 order_id: 0,
             });
         }
-        stages.add_duration(
-            "event_source_orderbook_apply_loop_ms",
-            apply_start.elapsed(),
-        );
+        stages.add_duration("event_source_extract_ms", extract_start.elapsed());
+        let apply_start = Instant::now();
+        for delta in deltas {
+            book.apply(delta);
+        }
+        let apply_elapsed = apply_start.elapsed();
+        stages.add_duration("event_source_apply_ms", apply_elapsed);
+        stages.add_duration("event_source_orderbook_apply_loop_ms", apply_elapsed);
     }
     let replay_elapsed = replay_start.elapsed();
     add_residual_ms(
@@ -1933,7 +2609,8 @@ where
         replay_elapsed,
         &[
             "event_source_next_batch_ms",
-            "event_source_orderbook_apply_loop_ms",
+            "event_source_extract_ms",
+            "event_source_apply_ms",
         ],
     );
     stages.add_ms("field_load_ms", 0.0);
@@ -1959,6 +2636,7 @@ fn event_source_orderbook_output(
     payload_field_count: usize,
     bytes_per_row: usize,
     source_kind_override: Option<&'static str>,
+    source_stats: AuraEventSourceStats,
     stages: StageBreakdown,
 ) -> Result<BenchOutput> {
     let mut output = BenchOutput::new(stats.file_len, replay.record_count).with_reader_stats(stats);
@@ -1977,6 +2655,7 @@ fn event_source_orderbook_output(
             true,
         )
         .with_replay_mode("event_source")
+        .with_source_stats(source_stats)
         .with_stages(stages);
     let output = if let Some(source_kind) = source_kind_override {
         output.with_source_kind(source_kind)
@@ -2048,7 +2727,7 @@ fn aura1_body_slice(aura1: &[u8]) -> Result<&[u8]> {
         .ok_or_else(|| anyhow::anyhow!("invalid Aura1 body range"))
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct BenchBookKey {
     instrument: i64,
     side: i64,
@@ -2081,6 +2760,8 @@ struct BenchOrderBook {
     mask: usize,
     level_count: usize,
     updates: usize,
+    adds: usize,
+    modifies: usize,
     deletes: usize,
     checksum: u64,
 }
@@ -2093,6 +2774,8 @@ impl BenchOrderBook {
             mask: table_len - 1,
             level_count: 0,
             updates: 0,
+            adds: 0,
+            modifies: 0,
             deletes: 0,
             checksum: 0,
         }
@@ -2109,7 +2792,13 @@ impl BenchOrderBook {
             self.delete(key)
         } else {
             self.updates = self.updates.saturating_add(1);
-            self.upsert(key, delta.size)
+            let (previous, inserted) = self.upsert_with_status(key, delta.size);
+            if inserted {
+                self.adds = self.adds.saturating_add(1);
+            } else {
+                self.modifies = self.modifies.saturating_add(1);
+            }
+            previous
         };
         self.checksum = mix_checksum(self.checksum, delta.timestamp);
         self.checksum = mix_checksum(self.checksum, delta.instrument);
@@ -2124,6 +2813,10 @@ impl BenchOrderBook {
     }
 
     fn upsert(&mut self, key: BenchBookKey, size: i64) -> i64 {
+        self.upsert_with_status(key, size).0
+    }
+
+    fn upsert_with_status(&mut self, key: BenchBookKey, size: i64) -> (i64, bool) {
         if self.level_count.saturating_mul(10) >= self.slots.len().saturating_mul(7) {
             self.grow();
         }
@@ -2132,13 +2825,13 @@ impl BenchOrderBook {
         if found {
             let previous = slot.size;
             slot.size = size;
-            previous
+            (previous, false)
         } else {
             slot.key = key;
             slot.size = size;
             slot.state = 1;
             self.level_count = self.level_count.saturating_add(1);
-            0
+            (0, true)
         }
     }
 
@@ -2182,6 +2875,14 @@ impl BenchOrderBook {
             }
             index = (index + 1) & self.mask;
         }
+    }
+
+    fn active_entries(&self) -> Vec<(BenchBookKey, i64)> {
+        self.slots
+            .iter()
+            .filter(|slot| slot.state == 1)
+            .map(|slot| (slot.key, slot.size))
+            .collect()
     }
 }
 
