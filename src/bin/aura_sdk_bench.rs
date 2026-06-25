@@ -13,8 +13,9 @@ use aura_codec::{
     AuraEventSourceStats, AuraFileSource, AuraFormat, AuraGroupStats, AuraLiveFrameSource,
     AuraLiveSource, AuraMemorySource, AuraProfile, AuraReader, AuraReaderSourceKind,
     AuraReaderStats, AuraRecordBatch, AuraReplayBackend, AuraSchema, AuraType, AuraWriter,
-    CompiledAuraField, CompiledAuraPlan, ConvertOptions, GroupBy, OrderBookDeltaSpec,
-    WriterOptions,
+    BookApplyBreakdown, BookApplyStats, CompiledAuraField, CompiledAuraPlan, ConvertOptions,
+    GroupBy, OrderBookApplyPlan, OrderBookDelta, OrderBookDeltaSpec, OrderBookEngine,
+    OrderBookEngineKind, WriterOptions,
 };
 use serde_json::{json, Value};
 
@@ -52,6 +53,15 @@ struct StageBreakdown {
     times_ms: BTreeMap<&'static str, f64>,
     counters: BTreeMap<&'static str, u64>,
     timer_tree_kind: &'static str,
+}
+
+#[derive(Clone)]
+struct ExtractedOrderBookDeltas {
+    deltas: Vec<OrderBookDelta>,
+    payload_field_count: usize,
+    bytes_per_row: usize,
+    bytes_scanned: usize,
+    reader_stats: AuraReaderStats,
 }
 
 impl StageBreakdown {
@@ -112,7 +122,13 @@ struct BenchOutput {
     book_adds: usize,
     book_modifies: usize,
     book_deletes: usize,
+    zero_size_removes: usize,
     state_hash: u64,
+    engine_kind: Option<&'static str>,
+    allocation_count_proxy: usize,
+    bytes_allocated_proxy: usize,
+    cache_shape: Option<&'static str>,
+    apply_breakdown: Option<BookApplyBreakdown>,
     benchmark_class: &'static str,
     stages: StageBreakdown,
 }
@@ -176,7 +192,13 @@ impl BenchOutput {
             book_adds: 0,
             book_modifies: 0,
             book_deletes: 0,
+            zero_size_removes: 0,
             state_hash: 0,
+            engine_kind: None,
+            allocation_count_proxy: 0,
+            bytes_allocated_proxy: 0,
+            cache_shape: None,
+            apply_breakdown: None,
             benchmark_class: "other",
             stages: StageBreakdown::summed(),
         }
@@ -257,6 +279,25 @@ impl BenchOutput {
         self.book_deletes = metrics.deletes;
         self.state_hash = metrics.state_hash;
         self.allocations_proxy_override = Some(metrics.allocations_proxy);
+        self.benchmark_class = "orderbook apply";
+        self
+    }
+
+    fn with_book_stats(mut self, stats: BookApplyStats) -> Self {
+        self.book_levels = stats.book_levels;
+        self.instrument_count = stats.instruments;
+        self.price_level_count = stats.price_levels;
+        self.book_adds = stats.adds;
+        self.book_modifies = stats.modifies;
+        self.book_deletes = stats.deletes;
+        self.zero_size_removes = stats.zero_size_removes;
+        self.state_hash = stats.state_hash.0;
+        self.engine_kind = Some(stats.engine_kind);
+        self.allocations_proxy_override = Some(stats.allocation_count_proxy);
+        self.allocation_count_proxy = stats.allocation_count_proxy;
+        self.bytes_allocated_proxy = stats.bytes_allocated_proxy;
+        self.cache_shape = Some(stats.cache_shape);
+        self.apply_breakdown = Some(stats.breakdown);
         self.benchmark_class = "orderbook apply";
         self
     }
@@ -439,6 +480,21 @@ fn run_fixture_matrix(fixture: &Fixture, args: &Args) -> Result<Vec<Value>> {
         "aura1-book-apply-side-split",
         "aura1-book-apply-dense-ladder",
         "aura1-book-apply-btree",
+        "orderbook-apply-only-current",
+        "orderbook-apply-only-dense-ladder",
+        "orderbook-apply-only-paged-ladder",
+        "orderbook-apply-only-packed-key",
+        "orderbook-apply-only-direct-index",
+        "orderbook-apply-only-run-locality",
+        "orderbook-apply-only-optimized",
+        "orderbook-apply-only-btree",
+        "aura1-orderbook-extract-only",
+        "aura1-orderbook-extract-plus-apply-current",
+        "aura1-orderbook-extract-plus-apply-dense-ladder",
+        "aura1-orderbook-extract-plus-apply-paged-ladder",
+        "aura1-orderbook-extract-plus-apply-direct-index",
+        "aura1-orderbook-extract-plus-apply-run-locality",
+        "aura1-orderbook-extract-plus-apply-optimized",
         "aura1-replay-grouped-touch-selected",
         "aura1-replay-grouped-touch-all",
         "aura1-scan-raw",
@@ -541,6 +597,14 @@ fn bench_operation(
     aura1_zst: &[u8],
     result_path: &Path,
 ) -> Result<Value> {
+    let preextracted_orderbook = if orderbook_apply_only_kind(operation).is_some() {
+        Some(extract_orderbook_deltas_for_engine(
+            &fixture.aura1_path,
+            args.batch_size,
+        )?)
+    } else {
+        None
+    };
     let mut last_output = BenchOutput::new(0, fixture.record_count);
     for _ in 0..args.warmups {
         last_output = run_operation(
@@ -552,6 +616,7 @@ fn bench_operation(
             &fixture.aura1_path,
             aura1_zst,
             args,
+            preextracted_orderbook.as_ref(),
         )?;
     }
     let mut samples = Vec::with_capacity(args.iterations);
@@ -566,6 +631,7 @@ fn bench_operation(
             &fixture.aura1_path,
             aura1_zst,
             args,
+            preextracted_orderbook.as_ref(),
         )?;
         samples.push((start.elapsed(), last_output.clone()));
     }
@@ -626,6 +692,11 @@ fn bench_operation(
             "orderbook_decode_apply_loop_ms",
         ],
     );
+    let apply_recs_per_sec = if apply_ms > 0.0 {
+        records as f64 / (apply_ms / 1000.0)
+    } else {
+        0.0
+    };
     let unexplained_ms = runtime_ms - stage_sum_ms;
     let unexplained_pct = if runtime_ms > 0.0 {
         (unexplained_ms / runtime_ms) * 100.0
@@ -718,9 +789,20 @@ fn bench_operation(
     counters
         .entry("allocations_proxy")
         .or_insert(allocations_proxy as u64);
+    counters
+        .entry("allocation_count_proxy")
+        .or_insert(last_output.allocation_count_proxy as u64);
+    counters
+        .entry("bytes_allocated_proxy")
+        .or_insert(last_output.bytes_allocated_proxy as u64);
+    counters
+        .entry("zero_size_removes")
+        .or_insert(last_output.zero_size_removes as u64);
     let command = std::env::args().collect::<Vec<_>>().join(" ");
+    let breakdown = last_output.apply_breakdown.unwrap_or_default();
     Ok(json!({
         "operation": operation,
+        "dataset": fixture.name,
         "dataset_kind": fixture.name,
         "schema_hash": fixture.schema_hash,
         "schema_name": fixture.schema_name,
@@ -730,6 +812,7 @@ fn bench_operation(
         "field_physical_types": fixture.field_physical_types,
         "record_width": fixture.record_width,
         "record_count": fixture.record_count,
+        "records": records,
         "format": format_for_operation(operation),
         "profile": profile_for_operation(operation),
         "benchmark_class": benchmark_class_for_operation(operation, last_output.benchmark_class),
@@ -738,6 +821,8 @@ fn bench_operation(
         "median_ms": duration_ms(median),
         "p95_ms": duration_ms(p95),
         "records_per_sec": records_per_sec,
+        "recs_per_sec": records_per_sec,
+        "apply_recs_per_sec": apply_recs_per_sec,
         "input_bytes": input_bytes_for_operation(operation, fixture),
         "output_bytes": output_bytes,
         "compressed_bytes": compressed_bytes_for_operation(operation, fixture),
@@ -766,7 +851,19 @@ fn bench_operation(
         "adds": last_output.book_adds,
         "modifies": last_output.book_modifies,
         "deletes": last_output.book_deletes,
+        "zero_size_removes": last_output.zero_size_removes,
         "state_hash": last_output.state_hash,
+        "engine_kind": last_output.engine_kind.unwrap_or("none"),
+        "allocation_count_proxy": last_output.allocation_count_proxy,
+        "bytes_allocated_proxy": last_output.bytes_allocated_proxy,
+        "cache_shape": last_output.cache_shape.unwrap_or("none"),
+        "instrument_lookup_ns": breakdown.instrument_lookup_ns,
+        "side_lookup_ns": breakdown.side_lookup_ns,
+        "price_lookup_ns": breakdown.price_lookup_ns,
+        "update_remove_ns": breakdown.update_remove_ns,
+        "allocation_ns": breakdown.allocation_ns,
+        "state_hash_ns": breakdown.state_hash_ns,
+        "loop_overhead_ns": breakdown.loop_overhead_ns,
         "replay_backend": reader_stats.replay_backend.as_str(),
         "file_len": reader_stats.file_len,
         "bytes_read_at_open": reader_stats.bytes_read_at_open,
@@ -840,6 +937,7 @@ fn run_operation(
     aura1_path: &Path,
     aura1_zst: &[u8],
     args: &Args,
+    preextracted_orderbook: Option<&ExtractedOrderBookDeltas>,
 ) -> Result<BenchOutput> {
     match operation {
         "sdk-write-aura1" => write_batch(schema, source_batch, WriterOptions::aura1()),
@@ -908,16 +1006,58 @@ fn run_operation(
         "aura1-event-source-live-frame-orderbook-apply" => {
             replay_event_source_live_frame_orderbook_apply(aura1, args.batch_size)
         }
-        "aura1-book-apply-current" => replay_orderbook_apply_variant_path(
+        "aura1-orderbook-extract-only" => {
+            replay_orderbook_extract_only_engine_path(aura1_path, args.batch_size)
+        }
+        "aura1-orderbook-extract-plus-apply-current" | "aura1-book-apply-current" => {
+            replay_orderbook_apply_engine_path(
+                aura1_path,
+                args.batch_size,
+                OrderBookEngineKind::Current,
+            )
+        }
+        "aura1-orderbook-extract-plus-apply-dense-ladder" | "aura1-book-apply-dense-ladder" => {
+            replay_orderbook_apply_engine_path(
+                aura1_path,
+                args.batch_size,
+                OrderBookEngineKind::DenseLadder,
+            )
+        }
+        "aura1-orderbook-extract-plus-apply-paged-ladder" => replay_orderbook_apply_engine_path(
             aura1_path,
             args.batch_size,
-            BookApplyVariant::Current,
+            OrderBookEngineKind::PagedLadder { page_size: 64 },
         ),
-        "aura1-book-apply-packed-key" => replay_orderbook_apply_variant_path(
+        "aura1-orderbook-extract-plus-apply-direct-index" => replay_orderbook_apply_engine_path(
             aura1_path,
             args.batch_size,
-            BookApplyVariant::PackedKey,
+            OrderBookEngineKind::DirectIndex,
         ),
+        "aura1-orderbook-extract-plus-apply-run-locality" => replay_orderbook_apply_engine_path(
+            aura1_path,
+            args.batch_size,
+            OrderBookEngineKind::RunLocality,
+        ),
+        "aura1-orderbook-extract-plus-apply-optimized" => replay_orderbook_apply_engine_path(
+            aura1_path,
+            args.batch_size,
+            OrderBookEngineKind::Optimized,
+        ),
+        "aura1-book-apply-packed-key" => replay_orderbook_apply_engine_path(
+            aura1_path,
+            args.batch_size,
+            OrderBookEngineKind::PackedKey,
+        ),
+        "aura1-book-apply-btree" => replay_orderbook_apply_engine_path(
+            aura1_path,
+            args.batch_size,
+            OrderBookEngineKind::BTreeMap,
+        ),
+        operation if orderbook_apply_only_kind(operation).is_some() => {
+            let extracted = preextracted_orderbook
+                .ok_or_else(|| anyhow::anyhow!("missing pre-extracted orderbook deltas"))?;
+            apply_orderbook_preextracted(extracted, orderbook_apply_only_kind(operation).unwrap())
+        }
         "aura1-book-apply-per-instrument" => replay_orderbook_apply_variant_path(
             aura1_path,
             args.batch_size,
@@ -927,16 +1067,6 @@ fn run_operation(
             aura1_path,
             args.batch_size,
             BookApplyVariant::SideSplit,
-        ),
-        "aura1-book-apply-dense-ladder" => replay_orderbook_apply_variant_path(
-            aura1_path,
-            args.batch_size,
-            BookApplyVariant::DenseLadder,
-        ),
-        "aura1-book-apply-btree" => replay_orderbook_apply_variant_path(
-            aura1_path,
-            args.batch_size,
-            BookApplyVariant::BTree,
         ),
         "aura1-replay-grouped-touch-selected" => grouped_replay_selected(aura1, schema),
         "aura1-replay-grouped-touch-all" => grouped_replay_truth(
@@ -1900,7 +2030,212 @@ fn replay_orderbook_deltas_apply_batch_path(path: &Path, batch_size: usize) -> R
         .with_stages(stages))
 }
 
+fn replay_orderbook_extract_only_engine_path(
+    path: &Path,
+    batch_size: usize,
+) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let extract_start = Instant::now();
+    let extracted = extract_orderbook_deltas_for_engine(path, batch_size)?;
+    stages.add_duration("orderbook_extract_ms", extract_start.elapsed());
+    stages.add_ms("field_load_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
+    let mut output = BenchOutput::new(extracted.reader_stats.file_len, extracted.deltas.len())
+        .with_reader_stats(extracted.reader_stats);
+    output.bytes_scanned = extracted.bytes_scanned;
+    Ok(output
+        .with_access(
+            extracted.payload_field_count,
+            extracted
+                .deltas
+                .len()
+                .saturating_mul(extracted.payload_field_count),
+            extracted
+                .deltas
+                .len()
+                .saturating_mul(extracted.bytes_per_row),
+            0,
+        )
+        .with_parse_counters(
+            selected_kernel_group_count(extracted.payload_field_count),
+            extracted.payload_field_count,
+            selected_kernel_group_count(extracted.payload_field_count),
+            true,
+        )
+        .with_replay_mode("batch")
+        .with_stages(stages))
+}
+
+fn replay_orderbook_apply_engine_path(
+    path: &Path,
+    batch_size: usize,
+    kind: OrderBookEngineKind,
+) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let extract_start = Instant::now();
+    let extracted = extract_orderbook_deltas_for_engine(path, batch_size)?;
+    stages.add_duration("orderbook_extract_ms", extract_start.elapsed());
+
+    let apply_start = Instant::now();
+    let stats = apply_orderbook_engine(&extracted.deltas, kind)?;
+    stages.add_duration("orderbook_apply_ms", apply_start.elapsed());
+    add_orderbook_stats_counters(&mut stages, &stats);
+    stages.add_ms("field_load_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
+
+    let mut output = BenchOutput::new(extracted.reader_stats.file_len, extracted.deltas.len())
+        .with_reader_stats(extracted.reader_stats);
+    output.bytes_scanned = extracted.bytes_scanned;
+    Ok(output
+        .with_access(
+            extracted.payload_field_count,
+            extracted
+                .deltas
+                .len()
+                .saturating_mul(extracted.payload_field_count),
+            extracted
+                .deltas
+                .len()
+                .saturating_mul(extracted.bytes_per_row),
+            stats.state_hash.0,
+        )
+        .with_parse_counters(
+            selected_kernel_group_count(extracted.payload_field_count),
+            extracted.payload_field_count,
+            selected_kernel_group_count(extracted.payload_field_count),
+            true,
+        )
+        .with_replay_mode("batch")
+        .with_book_stats(stats)
+        .with_stages(stages))
+}
+
+fn apply_orderbook_preextracted(
+    extracted: &ExtractedOrderBookDeltas,
+    kind: OrderBookEngineKind,
+) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    stages.add_ms("orderbook_extract_ms", 0.0);
+    let apply_start = Instant::now();
+    let stats = apply_orderbook_engine(&extracted.deltas, kind)?;
+    stages.add_duration("orderbook_apply_ms", apply_start.elapsed());
+    add_orderbook_stats_counters(&mut stages, &stats);
+    stages.add_ms("field_load_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
+
+    let mut output = BenchOutput::new(extracted.reader_stats.file_len, extracted.deltas.len())
+        .with_reader_stats(extracted.reader_stats);
+    output.bytes_scanned = 0;
+    Ok(output
+        .with_access(0, 0, 0, stats.state_hash.0)
+        .with_parse_counters(0, 0, 0, true)
+        .with_replay_mode("apply_only")
+        .with_book_stats(stats)
+        .with_stages(stages))
+}
+
+fn extract_orderbook_deltas_for_engine(
+    path: &Path,
+    batch_size: usize,
+) -> Result<ExtractedOrderBookDeltas> {
+    let reader = AuraReader::open_path(path)?;
+    let spec = default_orderbook_delta_spec(reader.schema())?;
+    let payload_fields = spec.field_indices();
+    let bytes_per_row = selected_bytes_per_row(&reader, &payload_fields)?;
+    let record_capacity = reader
+        .compiled_plan()
+        .map(|plan| plan.record_count)
+        .unwrap_or(0);
+    let mut deltas = Vec::with_capacity(record_capacity);
+    reader.replay_orderbook_deltas(batch_size, &spec, |batch| {
+        for row in 0..batch.row_count() {
+            deltas.push(OrderBookDelta::try_new(
+                batch.timestamp(row)?,
+                batch.instrument(row)?,
+                batch.side(row)?,
+                batch.price(row)?,
+                batch.size(row)?,
+                batch.flags(row)?.unwrap_or(0),
+                batch.action(row)?.unwrap_or(0),
+                batch.sequence(row)?.unwrap_or(0),
+                batch.order_id(row)?.unwrap_or(0),
+            )?);
+        }
+        Ok(())
+    })?;
+    let stats = reader.stats();
+    Ok(ExtractedOrderBookDeltas {
+        deltas,
+        payload_field_count: payload_fields.len(),
+        bytes_per_row,
+        bytes_scanned: stats.bytes_read_during_replay,
+        reader_stats: stats,
+    })
+}
+
+fn apply_orderbook_engine(
+    deltas: &[OrderBookDelta],
+    kind: OrderBookEngineKind,
+) -> Result<BookApplyStats> {
+    let setup_start = Instant::now();
+    let plan = OrderBookApplyPlan::compile(deltas, kind)?;
+    let mut engine = OrderBookEngine::with_plan(plan)?;
+    let allocation_ns = setup_start.elapsed().as_nanos();
+    let mut stats = engine.apply_all_profiled(deltas)?;
+    stats.breakdown.allocation_ns = allocation_ns;
+    Ok(stats)
+}
+
+fn add_orderbook_stats_counters(stages: &mut StageBreakdown, stats: &BookApplyStats) {
+    stages.add_counter(
+        "book_update_count",
+        stats.adds.saturating_add(stats.modifies),
+    );
+    stages.add_counter("book_add_count", stats.adds);
+    stages.add_counter("book_modify_count", stats.modifies);
+    stages.add_counter("book_delete_count", stats.deletes);
+    stages.add_counter("book_zero_size_remove_count", stats.zero_size_removes);
+    stages.add_counter("book_level_count", stats.book_levels);
+    stages.add_counter("instrument_count", stats.instruments);
+    stages.add_counter("price_level_count", stats.price_levels);
+    stages.add_counter("allocation_count_proxy", stats.allocation_count_proxy);
+    stages.add_counter("bytes_allocated_proxy", stats.bytes_allocated_proxy);
+    black_box(stats.state_hash.0);
+}
+
+fn orderbook_apply_only_kind(operation: &str) -> Option<OrderBookEngineKind> {
+    match operation {
+        "orderbook-apply-only-current" => Some(OrderBookEngineKind::Current),
+        "orderbook-apply-only-dense-ladder" => Some(OrderBookEngineKind::DenseLadder),
+        "orderbook-apply-only-paged-ladder" | "orderbook-apply-only-paged-ladder-64" => {
+            Some(OrderBookEngineKind::PagedLadder { page_size: 64 })
+        }
+        "orderbook-apply-only-paged-ladder-32" => {
+            Some(OrderBookEngineKind::PagedLadder { page_size: 32 })
+        }
+        "orderbook-apply-only-paged-ladder-128" => {
+            Some(OrderBookEngineKind::PagedLadder { page_size: 128 })
+        }
+        "orderbook-apply-only-paged-ladder-256" => {
+            Some(OrderBookEngineKind::PagedLadder { page_size: 256 })
+        }
+        "orderbook-apply-only-paged-ladder-512" => {
+            Some(OrderBookEngineKind::PagedLadder { page_size: 512 })
+        }
+        "orderbook-apply-only-packed-key" => Some(OrderBookEngineKind::PackedKey),
+        "orderbook-apply-only-direct-index" => Some(OrderBookEngineKind::DirectIndex),
+        "orderbook-apply-only-run-locality" => Some(OrderBookEngineKind::RunLocality),
+        "orderbook-apply-only-optimized" => Some(OrderBookEngineKind::Optimized),
+        "orderbook-apply-only-btree" => Some(OrderBookEngineKind::BTreeMap),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 enum BookApplyVariant {
     Current,
     PackedKey,
@@ -4047,6 +4382,7 @@ fn input_bytes_for_operation(operation: &str, fixture: &Fixture) -> u64 {
     if operation.contains("zstd") {
         fixture.aura1_zst_bytes
     } else if operation.starts_with("aura1-")
+        || operation.starts_with("orderbook-")
         || operation.contains("aura1-to-aura0")
         || operation.contains("aura1")
     {

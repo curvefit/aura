@@ -20,6 +20,7 @@ pub mod legacy;
 pub mod metadata;
 pub mod ohlcv;
 pub mod options;
+pub mod orderbook;
 pub mod plan;
 pub mod program;
 pub mod reader;
@@ -51,6 +52,10 @@ pub use instructions::{
 };
 pub use metadata::{AuraMetadata, SymbolMap};
 pub use options::{AuraFormat, AuraProfile, ConvertOptions, ReaderOptions, WriterOptions};
+pub use orderbook::{
+    BookApplyBreakdown, BookApplyStats, BookLevel, BookSide, BookStateHash, OrderBookApplyPlan,
+    OrderBookDelta, OrderBookEngine, OrderBookEngineKind,
+};
 pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 pub use program::{CompiledAuraField, CompiledAuraPlan};
 pub use reader::{
