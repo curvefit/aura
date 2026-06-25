@@ -110,6 +110,36 @@ pub struct BookLevel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderBookApplyMode {
+    Production,
+    Verify,
+}
+
+impl OrderBookApplyMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Verify => "verify",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderBookLifecycleMode {
+    Cold,
+    Prepared,
+}
+
+impl OrderBookLifecycleMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::Prepared => "prepared",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderBookEngineKind {
     Current,
     PackedKey,
@@ -166,17 +196,22 @@ impl SidePlan {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BookApplyBreakdown {
+    pub setup_ns: u128,
+    pub plan_build_ns: u128,
     pub instrument_lookup_ns: u128,
     pub side_lookup_ns: u128,
     pub price_lookup_ns: u128,
     pub update_remove_ns: u128,
     pub allocation_ns: u128,
+    pub reset_ns: u128,
     pub state_hash_ns: u128,
     pub loop_overhead_ns: u128,
 }
 
 #[derive(Debug, Clone)]
 pub struct BookApplyStats {
+    pub apply_mode: OrderBookApplyMode,
+    pub lifecycle_mode: OrderBookLifecycleMode,
     pub engine_kind: &'static str,
     pub book_levels: usize,
     pub instruments: usize,
@@ -190,6 +225,9 @@ pub struct BookApplyStats {
     pub bytes_allocated_proxy: usize,
     pub cache_shape: &'static str,
     pub breakdown: BookApplyBreakdown,
+    pub state_hash_checked: bool,
+    pub engine_reused: bool,
+    pub buffers_reused: bool,
 }
 
 #[derive(Debug)]
@@ -197,6 +235,31 @@ pub struct OrderBookEngine {
     plan: OrderBookApplyPlan,
     storage: EngineStorage,
     stats: MutableStats,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedOrderBookApplyPlan {
+    plan: OrderBookApplyPlan,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderBookEngineBuffers {
+    pub allocation_count_proxy: usize,
+    pub bytes_allocated_proxy: usize,
+    pub cache_shape: &'static str,
+}
+
+#[derive(Debug)]
+pub struct PreparedOrderBookEngine {
+    engine: OrderBookEngine,
+    buffers: OrderBookEngineBuffers,
+    replay_count: usize,
+}
+
+#[derive(Debug)]
+pub struct OrderBookReplaySession {
+    plan: PreparedOrderBookApplyPlan,
+    engine: PreparedOrderBookEngine,
 }
 
 #[derive(Debug)]
@@ -210,12 +273,27 @@ enum EngineStorage {
     BTree(BTreeBook),
 }
 
+impl EngineStorage {
+    fn reset(&mut self) {
+        match self {
+            Self::Current(book) => book.reset(),
+            Self::Packed(book) => book.reset(),
+            Self::Dense(book) => book.reset(),
+            Self::Direct(book) => book.reset(),
+            Self::RunLocality(book) => book.reset(),
+            Self::Paged(book) => book.reset(),
+            Self::BTree(book) => book.reset(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct MutableStats {
     adds: usize,
     modifies: usize,
     deletes: usize,
     zero_size_removes: usize,
+    active_levels: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -232,6 +310,49 @@ impl Default for BookKey {
             side: BookSide::Other(0),
             price: 0,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BookMutation {
+    instrument: i64,
+    side: BookSide,
+    price: i64,
+    size: i64,
+    operation: OrderBookOperation,
+    zero_size_remove: bool,
+}
+
+impl BookMutation {
+    fn new(instrument: i64, side: BookSide, price: i64, size: i64, action: i64) -> Self {
+        let operation = if size <= 0 || action == 2 {
+            OrderBookOperation::Remove
+        } else {
+            OrderBookOperation::Set
+        };
+        Self {
+            instrument,
+            side,
+            price,
+            size,
+            operation,
+            zero_size_remove: size <= 0,
+        }
+    }
+
+    fn from_delta(delta: OrderBookDelta) -> Self {
+        Self {
+            instrument: delta.instrument,
+            side: delta.side,
+            price: delta.price,
+            size: delta.size,
+            operation: delta.operation,
+            zero_size_remove: delta.is_zero_size_remove(),
+        }
+    }
+
+    const fn is_remove(self) -> bool {
+        matches!(self.operation, OrderBookOperation::Remove)
     }
 }
 
@@ -280,6 +401,8 @@ impl OrderBookApplyPlan {
         let mut side_lookup = vec![MISSING_INDEX; instruments.len().saturating_mul(SIDE_COUNT)];
         let mut side_plans = Vec::with_capacity(ranges.len());
         let mut total_slots = 0usize;
+        let mut ranges = ranges.into_iter().collect::<Vec<_>>();
+        ranges.sort_unstable_by_key(|((instrument, side), _)| (*instrument, side.raw()));
         for ((instrument, side), (min_price, max_price)) in ranges {
             let instrument_index =
                 instrument_lookup_index(instrument, instrument_min, &instrument_lookup)
@@ -325,19 +448,146 @@ impl OrderBookApplyPlan {
         self.total_slots
     }
 
-    fn side_index(&self, delta: OrderBookDelta) -> Result<usize> {
-        let instrument_index = instrument_lookup_index(
-            delta.instrument,
-            self.instrument_min,
-            &self.instrument_lookup,
-        )
-        .ok_or(AuraError::InvalidValue("instrument index"))?;
-        let side_index =
-            self.side_lookup[instrument_index * SIDE_COUNT + usize::from(delta.side.raw())];
+    fn side_index_raw(&self, instrument: i64, side: BookSide) -> Result<usize> {
+        let instrument_index =
+            instrument_lookup_index(instrument, self.instrument_min, &self.instrument_lookup)
+                .ok_or(AuraError::InvalidValue("instrument index"))?;
+        let side_index = self.side_lookup[instrument_index * SIDE_COUNT + usize::from(side.raw())];
         if side_index == MISSING_INDEX {
             return Err(AuraError::InvalidValue("book side index"));
         }
         Ok(side_index)
+    }
+}
+
+impl PreparedOrderBookApplyPlan {
+    pub fn build(deltas: &[OrderBookDelta], kind: OrderBookEngineKind) -> Result<Self> {
+        Ok(Self {
+            plan: OrderBookApplyPlan::compile(deltas, kind)?,
+        })
+    }
+
+    pub const fn plan(&self) -> &OrderBookApplyPlan {
+        &self.plan
+    }
+}
+
+impl PreparedOrderBookEngine {
+    pub fn with_capacity(plan: &PreparedOrderBookApplyPlan) -> Result<Self> {
+        let engine = OrderBookEngine::with_plan(plan.plan.clone())?;
+        let buffers = engine.buffers();
+        Ok(Self {
+            engine,
+            buffers,
+            replay_count: 0,
+        })
+    }
+
+    pub fn reset_for_replay(&mut self) {
+        self.engine.reset_for_replay();
+    }
+
+    pub fn apply_values(
+        &mut self,
+        instrument: i64,
+        side: i64,
+        price: i64,
+        size: i64,
+        action: i64,
+    ) -> Result<()> {
+        self.engine
+            .apply_values(instrument, side, price, size, action)
+    }
+
+    pub fn finish_profiled(
+        &mut self,
+        mode: OrderBookApplyMode,
+        expected_hash: Option<BookStateHash>,
+        update_remove_ns: u128,
+        reset_ns: u128,
+    ) -> Result<BookApplyStats> {
+        let engine_reused = true;
+        let buffers_reused = true;
+        let mut stats = self.engine.finish_profiled(
+            mode,
+            OrderBookLifecycleMode::Prepared,
+            expected_hash,
+            update_remove_ns,
+            engine_reused,
+            buffers_reused,
+        )?;
+        stats.allocation_count_proxy = self.buffers.allocation_count_proxy;
+        stats.bytes_allocated_proxy = self.buffers.bytes_allocated_proxy;
+        stats.cache_shape = self.buffers.cache_shape;
+        stats.breakdown.reset_ns = reset_ns;
+        self.replay_count = self.replay_count.saturating_add(1);
+        Ok(stats)
+    }
+
+    pub fn apply(
+        &mut self,
+        deltas: &[OrderBookDelta],
+        mode: OrderBookApplyMode,
+        expected_hash: Option<BookStateHash>,
+    ) -> Result<BookApplyStats> {
+        let reset_start = Instant::now();
+        self.reset_for_replay();
+        let reset_ns = reset_start.elapsed().as_nanos();
+        let engine_reused = true;
+        let buffers_reused = true;
+        let mut stats = match mode {
+            OrderBookApplyMode::Production => self.engine.apply_all_production_profiled(
+                deltas,
+                OrderBookLifecycleMode::Prepared,
+                engine_reused,
+                buffers_reused,
+            )?,
+            OrderBookApplyMode::Verify => self.engine.apply_all_verify_profiled(
+                deltas,
+                OrderBookLifecycleMode::Prepared,
+                engine_reused,
+                buffers_reused,
+                expected_hash,
+            )?,
+        };
+        stats.allocation_count_proxy = self.buffers.allocation_count_proxy;
+        stats.bytes_allocated_proxy = self.buffers.bytes_allocated_proxy;
+        stats.cache_shape = self.buffers.cache_shape;
+        stats.breakdown.reset_ns = reset_ns;
+        self.replay_count = self.replay_count.saturating_add(1);
+        Ok(stats)
+    }
+}
+
+impl OrderBookReplaySession {
+    pub fn prepare(deltas: &[OrderBookDelta], kind: OrderBookEngineKind) -> Result<Self> {
+        let plan = PreparedOrderBookApplyPlan::build(deltas, kind)?;
+        let engine = PreparedOrderBookEngine::with_capacity(&plan)?;
+        Ok(Self { plan, engine })
+    }
+
+    pub fn from_prepared(
+        plan: PreparedOrderBookApplyPlan,
+        engine: PreparedOrderBookEngine,
+    ) -> Self {
+        Self { plan, engine }
+    }
+
+    pub const fn plan(&self) -> &PreparedOrderBookApplyPlan {
+        &self.plan
+    }
+
+    pub fn engine_mut(&mut self) -> &mut PreparedOrderBookEngine {
+        &mut self.engine
+    }
+
+    pub fn replay(
+        &mut self,
+        deltas: &[OrderBookDelta],
+        mode: OrderBookApplyMode,
+        expected_hash: Option<BookStateHash>,
+    ) -> Result<BookApplyStats> {
+        self.engine.apply(deltas, mode, expected_hash)
     }
 }
 
@@ -356,8 +606,12 @@ impl OrderBookEngine {
             }
             OrderBookEngineKind::Optimized => {
                 let dense_limit = plan.record_count.saturating_mul(64).max(1_000_000);
-                if plan.total_slots <= dense_limit {
+                if (plan.instruments.len() <= 8 || plan.price_levels >= 8_192)
+                    && plan.total_slots <= dense_limit
+                {
                     EngineStorage::Dense(DenseBook::with_plan(&plan))
+                } else if plan.total_slots <= dense_limit {
+                    EngineStorage::Direct(DirectBook::with_plan(&plan))
                 } else {
                     EngineStorage::Paged(PagedBook::with_plan(&plan, 64))
                 }
@@ -372,16 +626,32 @@ impl OrderBookEngine {
     }
 
     pub fn apply(&mut self, delta: OrderBookDelta) -> Result<()> {
+        self.apply_mutation(BookMutation::from_delta(delta))
+    }
+
+    pub fn apply_values(
+        &mut self,
+        instrument: i64,
+        side: i64,
+        price: i64,
+        size: i64,
+        action: i64,
+    ) -> Result<()> {
+        let side = BookSide::try_from_i64(side)?;
+        self.apply_mutation(BookMutation::new(instrument, side, price, size, action))
+    }
+
+    fn apply_mutation(&mut self, mutation: BookMutation) -> Result<()> {
         let transition = match &mut self.storage {
-            EngineStorage::Current(book) => book.apply(delta),
-            EngineStorage::Packed(book) => book.apply(delta),
-            EngineStorage::Dense(book) => book.apply(&self.plan, delta),
-            EngineStorage::Direct(book) => book.apply(&self.plan, delta),
-            EngineStorage::RunLocality(book) => book.apply(&self.plan, delta),
-            EngineStorage::Paged(book) => book.apply(&self.plan, delta),
-            EngineStorage::BTree(book) => book.apply(delta),
+            EngineStorage::Current(book) => book.apply(mutation),
+            EngineStorage::Packed(book) => book.apply(mutation),
+            EngineStorage::Dense(book) => book.apply(&self.plan, mutation),
+            EngineStorage::Direct(book) => book.apply(&self.plan, mutation),
+            EngineStorage::RunLocality(book) => book.apply(&self.plan, mutation),
+            EngineStorage::Paged(book) => book.apply(&self.plan, mutation),
+            EngineStorage::BTree(book) => book.apply(mutation),
         }?;
-        self.stats.observe(delta, transition);
+        self.stats.observe(mutation, transition);
         Ok(())
     }
 
@@ -409,13 +679,160 @@ impl OrderBookEngine {
             state_hash_ns,
             ..BookApplyBreakdown::default()
         };
-        Ok(self.stats_from_parts(levels.len(), state_hash, breakdown))
+        Ok(self.stats_from_parts(
+            levels.len(),
+            state_hash,
+            breakdown,
+            OrderBookApplyMode::Verify,
+            OrderBookLifecycleMode::Cold,
+            true,
+            false,
+            false,
+        ))
+    }
+
+    pub fn apply_all_production_profiled(
+        &mut self,
+        deltas: &[OrderBookDelta],
+        lifecycle_mode: OrderBookLifecycleMode,
+        engine_reused: bool,
+        buffers_reused: bool,
+    ) -> Result<BookApplyStats> {
+        let loop_start = Instant::now();
+        for &delta in deltas {
+            self.apply(delta)?;
+        }
+        let update_remove_ns = loop_start.elapsed().as_nanos();
+        let breakdown = BookApplyBreakdown {
+            update_remove_ns,
+            ..BookApplyBreakdown::default()
+        };
+        Ok(self.stats_from_parts(
+            self.stats.active_levels,
+            BookStateHash(0),
+            breakdown,
+            OrderBookApplyMode::Production,
+            lifecycle_mode,
+            false,
+            engine_reused,
+            buffers_reused,
+        ))
+    }
+
+    pub fn apply_all_verify_profiled(
+        &mut self,
+        deltas: &[OrderBookDelta],
+        lifecycle_mode: OrderBookLifecycleMode,
+        engine_reused: bool,
+        buffers_reused: bool,
+        expected_hash: Option<BookStateHash>,
+    ) -> Result<BookApplyStats> {
+        let loop_start = Instant::now();
+        for &delta in deltas {
+            self.apply(delta)?;
+        }
+        let update_remove_ns = loop_start.elapsed().as_nanos();
+
+        let hash_start = Instant::now();
+        let levels = self.active_levels();
+        let state_hash = hash_book_levels(levels.iter().copied());
+        let state_hash_ns = hash_start.elapsed().as_nanos();
+        if let Some(expected_hash) = expected_hash {
+            if expected_hash != state_hash {
+                return Err(AuraError::InvalidValue("orderbook state hash"));
+            }
+        }
+
+        let breakdown = BookApplyBreakdown {
+            update_remove_ns,
+            state_hash_ns,
+            ..BookApplyBreakdown::default()
+        };
+        Ok(self.stats_from_parts(
+            levels.len(),
+            state_hash,
+            breakdown,
+            OrderBookApplyMode::Verify,
+            lifecycle_mode,
+            expected_hash.is_some(),
+            engine_reused,
+            buffers_reused,
+        ))
+    }
+
+    pub fn finish_profiled(
+        &self,
+        mode: OrderBookApplyMode,
+        lifecycle_mode: OrderBookLifecycleMode,
+        expected_hash: Option<BookStateHash>,
+        update_remove_ns: u128,
+        engine_reused: bool,
+        buffers_reused: bool,
+    ) -> Result<BookApplyStats> {
+        match mode {
+            OrderBookApplyMode::Production => {
+                let breakdown = BookApplyBreakdown {
+                    update_remove_ns,
+                    ..BookApplyBreakdown::default()
+                };
+                Ok(self.stats_from_parts(
+                    self.stats.active_levels,
+                    BookStateHash(0),
+                    breakdown,
+                    mode,
+                    lifecycle_mode,
+                    false,
+                    engine_reused,
+                    buffers_reused,
+                ))
+            }
+            OrderBookApplyMode::Verify => {
+                let hash_start = Instant::now();
+                let levels = self.active_levels();
+                let state_hash = hash_book_levels(levels.iter().copied());
+                let state_hash_ns = hash_start.elapsed().as_nanos();
+                if let Some(expected_hash) = expected_hash {
+                    if expected_hash != state_hash {
+                        return Err(AuraError::InvalidValue("orderbook state hash"));
+                    }
+                }
+                let breakdown = BookApplyBreakdown {
+                    update_remove_ns,
+                    state_hash_ns,
+                    ..BookApplyBreakdown::default()
+                };
+                Ok(self.stats_from_parts(
+                    levels.len(),
+                    state_hash,
+                    breakdown,
+                    mode,
+                    lifecycle_mode,
+                    expected_hash.is_some(),
+                    engine_reused,
+                    buffers_reused,
+                ))
+            }
+        }
+    }
+
+    pub fn reset_for_replay(&mut self) {
+        self.storage.reset();
+        self.stats = MutableStats::default();
     }
 
     pub fn stats(&self) -> BookApplyStats {
         let levels = self.active_levels();
         let state_hash = hash_book_levels(levels.iter().copied());
-        self.stats_from_parts(levels.len(), state_hash, BookApplyBreakdown::default())
+        self.stats_from_parts(
+            levels.len(),
+            state_hash,
+            BookApplyBreakdown::default(),
+            OrderBookApplyMode::Verify,
+            OrderBookLifecycleMode::Cold,
+            true,
+            false,
+            false,
+        )
     }
 
     fn stats_from_parts(
@@ -423,7 +840,36 @@ impl OrderBookEngine {
         book_levels: usize,
         state_hash: BookStateHash,
         breakdown: BookApplyBreakdown,
+        apply_mode: OrderBookApplyMode,
+        lifecycle_mode: OrderBookLifecycleMode,
+        state_hash_checked: bool,
+        engine_reused: bool,
+        buffers_reused: bool,
     ) -> BookApplyStats {
+        let buffers = self.buffers();
+        BookApplyStats {
+            apply_mode,
+            lifecycle_mode,
+            engine_kind: self.plan.kind.as_str(),
+            book_levels,
+            instruments: self.plan.instrument_count(),
+            price_levels: self.plan.price_level_count(),
+            adds: self.stats.adds,
+            modifies: self.stats.modifies,
+            deletes: self.stats.deletes,
+            zero_size_removes: self.stats.zero_size_removes,
+            state_hash,
+            allocation_count_proxy: buffers.allocation_count_proxy,
+            bytes_allocated_proxy: buffers.bytes_allocated_proxy,
+            cache_shape: buffers.cache_shape,
+            breakdown,
+            state_hash_checked,
+            engine_reused,
+            buffers_reused,
+        }
+    }
+
+    pub fn buffers(&self) -> OrderBookEngineBuffers {
         let (allocation_count_proxy, bytes_allocated_proxy, cache_shape) = match &self.storage {
             EngineStorage::Current(book) => (
                 book.slots.len(),
@@ -461,20 +907,10 @@ impl OrderBookEngine {
                 "btree-map",
             ),
         };
-        BookApplyStats {
-            engine_kind: self.plan.kind.as_str(),
-            book_levels,
-            instruments: self.plan.instrument_count(),
-            price_levels: self.plan.price_level_count(),
-            adds: self.stats.adds,
-            modifies: self.stats.modifies,
-            deletes: self.stats.deletes,
-            zero_size_removes: self.stats.zero_size_removes,
-            state_hash,
+        OrderBookEngineBuffers {
             allocation_count_proxy,
             bytes_allocated_proxy,
             cache_shape,
-            breakdown,
         }
     }
 
@@ -492,14 +928,21 @@ impl OrderBookEngine {
 }
 
 impl MutableStats {
-    fn observe(&mut self, delta: OrderBookDelta, transition: BookTransition) {
-        if delta.is_zero_size_remove() {
+    fn observe(&mut self, mutation: BookMutation, transition: BookTransition) {
+        if mutation.zero_size_remove {
             self.zero_size_removes = self.zero_size_removes.saturating_add(1);
         }
         match transition {
-            BookTransition::Add => self.adds = self.adds.saturating_add(1),
+            BookTransition::Add => {
+                self.adds = self.adds.saturating_add(1);
+                self.active_levels = self.active_levels.saturating_add(1);
+            }
             BookTransition::Modify => self.modifies = self.modifies.saturating_add(1),
-            BookTransition::Delete => self.deletes = self.deletes.saturating_add(1),
+            BookTransition::Delete => {
+                self.deletes = self.deletes.saturating_add(1);
+                self.active_levels = self.active_levels.saturating_sub(1);
+            }
+            BookTransition::RemoveMissing => self.deletes = self.deletes.saturating_add(1),
         }
     }
 }
@@ -509,6 +952,7 @@ enum BookTransition {
     Add,
     Modify,
     Delete,
+    RemoveMissing,
 }
 
 #[derive(Debug)]
@@ -529,17 +973,20 @@ impl CurrentBook {
         }
     }
 
-    fn apply(&mut self, delta: OrderBookDelta) -> Result<BookTransition> {
+    fn apply(&mut self, mutation: BookMutation) -> Result<BookTransition> {
         let key = BookKey {
-            instrument: delta.instrument,
-            side: delta.side,
-            price: delta.price,
+            instrument: mutation.instrument,
+            side: mutation.side,
+            price: mutation.price,
         };
-        if delta.is_remove() {
-            self.delete(key);
-            Ok(BookTransition::Delete)
+        if mutation.is_remove() {
+            Ok(if self.delete(key) {
+                BookTransition::Delete
+            } else {
+                BookTransition::RemoveMissing
+            })
         } else {
-            Ok(self.upsert(key, delta.size))
+            Ok(self.upsert(key, mutation.size))
         }
     }
 
@@ -554,6 +1001,13 @@ impl CurrentBook {
                 size: slot.size,
             })
             .collect()
+    }
+
+    fn reset(&mut self) {
+        for slot in &mut self.slots {
+            *slot = CurrentSlot::default();
+        }
+        self.level_count = 0;
     }
 
     fn upsert(&mut self, key: BookKey, size: i64) -> BookTransition {
@@ -574,13 +1028,16 @@ impl CurrentBook {
         }
     }
 
-    fn delete(&mut self, key: BookKey) {
+    fn delete(&mut self, key: BookKey) -> bool {
         let (index, found) = self.find_slot(key);
         if found {
             let slot = &mut self.slots[index];
             slot.size = 0;
             slot.state = 2;
             self.level_count = self.level_count.saturating_sub(1);
+            true
+        } else {
+            false
         }
     }
 
@@ -632,22 +1089,25 @@ impl PackedBook {
         }
     }
 
-    fn apply(&mut self, delta: OrderBookDelta) -> Result<BookTransition> {
+    fn apply(&mut self, mutation: BookMutation) -> Result<BookTransition> {
         let packed = pack_book_key(BookKey {
-            instrument: delta.instrument,
-            side: delta.side,
-            price: delta.price,
+            instrument: mutation.instrument,
+            side: mutation.side,
+            price: mutation.price,
         })?;
-        if delta.is_remove() {
-            self.levels.remove(&packed);
-            Ok(BookTransition::Delete)
+        if mutation.is_remove() {
+            Ok(if self.levels.remove(&packed).is_some() {
+                BookTransition::Delete
+            } else {
+                BookTransition::RemoveMissing
+            })
         } else if let std::collections::hash_map::Entry::Occupied(mut entry) =
             self.levels.entry(packed)
         {
-            entry.insert(delta.size);
+            entry.insert(mutation.size);
             Ok(BookTransition::Modify)
         } else {
-            self.levels.insert(packed, delta.size);
+            self.levels.insert(packed, mutation.size);
             Ok(BookTransition::Add)
         }
     }
@@ -665,6 +1125,10 @@ impl PackedBook {
             })
             .collect()
     }
+
+    fn reset(&mut self) {
+        self.levels.clear();
+    }
 }
 
 #[derive(Debug)]
@@ -679,22 +1143,25 @@ impl BTreeBook {
         }
     }
 
-    fn apply(&mut self, delta: OrderBookDelta) -> Result<BookTransition> {
+    fn apply(&mut self, mutation: BookMutation) -> Result<BookTransition> {
         let key = BookKey {
-            instrument: delta.instrument,
-            side: delta.side,
-            price: delta.price,
+            instrument: mutation.instrument,
+            side: mutation.side,
+            price: mutation.price,
         };
-        if delta.is_remove() {
-            self.levels.remove(&key);
-            Ok(BookTransition::Delete)
+        if mutation.is_remove() {
+            Ok(if self.levels.remove(&key).is_some() {
+                BookTransition::Delete
+            } else {
+                BookTransition::RemoveMissing
+            })
         } else if let std::collections::btree_map::Entry::Occupied(mut entry) =
             self.levels.entry(key)
         {
-            entry.insert(delta.size);
+            entry.insert(mutation.size);
             Ok(BookTransition::Modify)
         } else {
-            self.levels.insert(key, delta.size);
+            self.levels.insert(key, mutation.size);
             Ok(BookTransition::Add)
         }
     }
@@ -709,6 +1176,10 @@ impl BTreeBook {
                 size: *size,
             })
             .collect()
+    }
+
+    fn reset(&mut self) {
+        self.levels.clear();
     }
 }
 
@@ -731,17 +1202,17 @@ impl DenseBook {
     fn apply(
         &mut self,
         plan: &OrderBookApplyPlan,
-        delta: OrderBookDelta,
+        mutation: BookMutation,
     ) -> Result<BookTransition> {
-        let side_index = plan.side_index(delta)?;
+        let side_index = plan.side_index_raw(mutation.instrument, mutation.side)?;
         let side = plan.side_plans[side_index];
-        let offset = price_offset(side, delta.price)?;
+        let offset = price_offset(side, mutation.price)?;
         let slot = self
             .levels
             .get_mut(side_index)
             .and_then(|levels| levels.get_mut(offset))
             .ok_or(AuraError::UnexpectedEof)?;
-        Ok(apply_slot(slot, delta))
+        Ok(apply_slot(slot, mutation))
     }
 
     fn active_levels(&self, plan: &OrderBookApplyPlan) -> Vec<BookLevel> {
@@ -758,6 +1229,12 @@ impl DenseBook {
             }
         }
         out
+    }
+
+    fn reset(&mut self) {
+        for levels in &mut self.levels {
+            levels.fill(0);
+        }
     }
 }
 
@@ -776,11 +1253,11 @@ impl DirectBook {
     fn apply(
         &mut self,
         plan: &OrderBookApplyPlan,
-        delta: OrderBookDelta,
+        mutation: BookMutation,
     ) -> Result<BookTransition> {
-        let index = direct_level_index(plan, delta)?;
+        let index = direct_level_index(plan, mutation)?;
         let slot = self.levels.get_mut(index).ok_or(AuraError::UnexpectedEof)?;
-        Ok(apply_slot(slot, delta))
+        Ok(apply_slot(slot, mutation))
     }
 
     fn active_levels(&self, plan: &OrderBookApplyPlan) -> Vec<BookLevel> {
@@ -800,6 +1277,10 @@ impl DirectBook {
             }
         }
         out
+    }
+
+    fn reset(&mut self) {
+        self.levels.fill(0);
     }
 }
 
@@ -826,30 +1307,35 @@ impl RunLocalityBook {
     fn apply(
         &mut self,
         plan: &OrderBookApplyPlan,
-        delta: OrderBookDelta,
+        mutation: BookMutation,
     ) -> Result<BookTransition> {
         let side_index = if self.has_last
-            && self.last_instrument == delta.instrument
-            && self.last_side == delta.side
+            && self.last_instrument == mutation.instrument
+            && self.last_side == mutation.side
         {
             self.last_side_index
         } else {
-            let side_index = plan.side_index(delta)?;
-            self.last_instrument = delta.instrument;
-            self.last_side = delta.side;
+            let side_index = plan.side_index_raw(mutation.instrument, mutation.side)?;
+            self.last_instrument = mutation.instrument;
+            self.last_side = mutation.side;
             self.last_side_index = side_index;
             self.has_last = true;
             side_index
         };
         let side = plan.side_plans[side_index];
-        let offset = price_offset(side, delta.price)?;
+        let offset = price_offset(side, mutation.price)?;
         let index = side.base_offset + offset;
         let slot = self
             .direct
             .levels
             .get_mut(index)
             .ok_or(AuraError::UnexpectedEof)?;
-        Ok(apply_slot(slot, delta))
+        Ok(apply_slot(slot, mutation))
+    }
+
+    fn reset(&mut self) {
+        self.direct.reset();
+        self.has_last = false;
     }
 }
 
@@ -889,11 +1375,11 @@ impl PagedBook {
     fn apply(
         &mut self,
         plan: &OrderBookApplyPlan,
-        delta: OrderBookDelta,
+        mutation: BookMutation,
     ) -> Result<BookTransition> {
-        let side_index = plan.side_index(delta)?;
+        let side_index = plan.side_index_raw(mutation.instrument, mutation.side)?;
         let side_plan = plan.side_plans[side_index];
-        let offset = price_offset(side_plan, delta.price)?;
+        let offset = price_offset(side_plan, mutation.price)?;
         let page_index = offset / self.page_size;
         let page_offset = offset % self.page_size;
         let side = self
@@ -901,8 +1387,8 @@ impl PagedBook {
             .get_mut(side_index)
             .ok_or(AuraError::UnexpectedEof)?;
         if side.pages[page_index].is_none() {
-            if delta.is_remove() {
-                return Ok(BookTransition::Delete);
+            if mutation.is_remove() {
+                return Ok(BookTransition::RemoveMissing);
             }
             side.pages[page_index] = Some(vec![0; self.page_size].into_boxed_slice());
             self.allocated_pages = self.allocated_pages.saturating_add(1);
@@ -911,7 +1397,7 @@ impl PagedBook {
             .as_mut()
             .and_then(|page| page.get_mut(page_offset))
             .ok_or(AuraError::UnexpectedEof)?;
-        Ok(apply_slot(slot, delta))
+        Ok(apply_slot(slot, mutation))
     }
 
     fn active_levels(&self, plan: &OrderBookApplyPlan) -> Vec<BookLevel> {
@@ -938,25 +1424,38 @@ impl PagedBook {
         }
         out
     }
+
+    fn reset(&mut self) {
+        for side in &mut self.sides {
+            for page in &mut side.pages {
+                if let Some(page) = page {
+                    page.fill(0);
+                }
+            }
+        }
+    }
 }
 
-fn apply_slot(slot: &mut i64, delta: OrderBookDelta) -> BookTransition {
-    if delta.is_remove() {
+fn apply_slot(slot: &mut i64, mutation: BookMutation) -> BookTransition {
+    if mutation.is_remove() {
+        if *slot == 0 {
+            return BookTransition::RemoveMissing;
+        }
         *slot = 0;
         BookTransition::Delete
     } else if *slot == 0 {
-        *slot = delta.size;
+        *slot = mutation.size;
         BookTransition::Add
     } else {
-        *slot = delta.size;
+        *slot = mutation.size;
         BookTransition::Modify
     }
 }
 
-fn direct_level_index(plan: &OrderBookApplyPlan, delta: OrderBookDelta) -> Result<usize> {
-    let side_index = plan.side_index(delta)?;
+fn direct_level_index(plan: &OrderBookApplyPlan, mutation: BookMutation) -> Result<usize> {
+    let side_index = plan.side_index_raw(mutation.instrument, mutation.side)?;
     let side = plan.side_plans[side_index];
-    Ok(side.base_offset + price_offset(side, delta.price)?)
+    Ok(side.base_offset + price_offset(side, mutation.price)?)
 }
 
 fn price_offset(side: SidePlan, price: i64) -> Result<usize> {

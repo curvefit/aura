@@ -53,16 +53,18 @@ pub use instructions::{
 pub use metadata::{AuraMetadata, SymbolMap};
 pub use options::{AuraFormat, AuraProfile, ConvertOptions, ReaderOptions, WriterOptions};
 pub use orderbook::{
-    BookApplyBreakdown, BookApplyStats, BookLevel, BookSide, BookStateHash, OrderBookApplyPlan,
-    OrderBookDelta, OrderBookEngine, OrderBookEngineKind,
+    BookApplyBreakdown, BookApplyStats, BookLevel, BookSide, BookStateHash, OrderBookApplyMode,
+    OrderBookApplyPlan, OrderBookDelta, OrderBookEngine, OrderBookEngineBuffers,
+    OrderBookEngineKind, OrderBookLifecycleMode, OrderBookReplaySession,
+    PreparedOrderBookApplyPlan, PreparedOrderBookEngine,
 };
 pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 pub use program::{CompiledAuraField, CompiledAuraPlan};
 pub use reader::{
     Aura1FieldI64Iter, Aura1FixedBatchView, Aura1RowView, Aura1SelectedRowView, AuraBatchIter,
     AuraEventGroup, AuraGroupKey, AuraGroupStats, AuraI64Reader, AuraReader, AuraReaderSourceKind,
-    AuraReaderStats, AuraReplayBackend, AuraTypedReader, GroupBy, OrderBookDeltaBatch,
-    OrderBookDeltaSpec, OrderBookDeltaSpecBuilder,
+    AuraReaderStats, AuraReplayBackend, AuraTypedReader, FusedOrderBookReplayStats, GroupBy,
+    OrderBookDeltaBatch, OrderBookDeltaSpec, OrderBookDeltaSpecBuilder,
 };
 pub use records::{
     Aura0ByteLaneCodec, Aura0ByteLaneUse, DecodedI64ColumnsFile, DecodedI64File, DecodedTypedFile,

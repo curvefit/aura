@@ -13,9 +13,10 @@ use aura_codec::{
     AuraEventSourceStats, AuraFileSource, AuraFormat, AuraGroupStats, AuraLiveFrameSource,
     AuraLiveSource, AuraMemorySource, AuraProfile, AuraReader, AuraReaderSourceKind,
     AuraReaderStats, AuraRecordBatch, AuraReplayBackend, AuraSchema, AuraType, AuraWriter,
-    BookApplyBreakdown, BookApplyStats, CompiledAuraField, CompiledAuraPlan, ConvertOptions,
-    GroupBy, OrderBookApplyPlan, OrderBookDelta, OrderBookDeltaSpec, OrderBookEngine,
-    OrderBookEngineKind, WriterOptions,
+    BookApplyBreakdown, BookApplyStats, BookStateHash, CompiledAuraField, CompiledAuraPlan,
+    ConvertOptions, GroupBy, OrderBookApplyMode, OrderBookApplyPlan, OrderBookDelta,
+    OrderBookDeltaSpec, OrderBookEngine, OrderBookEngineKind, OrderBookLifecycleMode,
+    OrderBookReplaySession, PreparedOrderBookApplyPlan, PreparedOrderBookEngine, WriterOptions,
 };
 use serde_json::{json, Value};
 
@@ -62,6 +63,23 @@ struct ExtractedOrderBookDeltas {
     bytes_per_row: usize,
     bytes_scanned: usize,
     reader_stats: AuraReaderStats,
+}
+
+struct PreparedOrderBookBenchmark {
+    session: OrderBookReplaySession,
+    extracted: ExtractedOrderBookDeltas,
+    expected_hash: BookStateHash,
+    setup_ns: u128,
+    plan_build_ns: u128,
+    allocation_ns: u128,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrderBookBenchmarkSpec {
+    kind: OrderBookEngineKind,
+    apply_mode: OrderBookApplyMode,
+    lifecycle_mode: OrderBookLifecycleMode,
+    include_extract: bool,
 }
 
 impl StageBreakdown {
@@ -129,6 +147,12 @@ struct BenchOutput {
     bytes_allocated_proxy: usize,
     cache_shape: Option<&'static str>,
     apply_breakdown: Option<BookApplyBreakdown>,
+    apply_mode: Option<OrderBookApplyMode>,
+    lifecycle_mode: Option<OrderBookLifecycleMode>,
+    state_hash_checked: bool,
+    engine_reused: bool,
+    buffers_reused: bool,
+    fused_enabled: bool,
     benchmark_class: &'static str,
     stages: StageBreakdown,
 }
@@ -199,6 +223,12 @@ impl BenchOutput {
             bytes_allocated_proxy: 0,
             cache_shape: None,
             apply_breakdown: None,
+            apply_mode: None,
+            lifecycle_mode: None,
+            state_hash_checked: false,
+            engine_reused: false,
+            buffers_reused: false,
+            fused_enabled: false,
             benchmark_class: "other",
             stages: StageBreakdown::summed(),
         }
@@ -298,7 +328,17 @@ impl BenchOutput {
         self.bytes_allocated_proxy = stats.bytes_allocated_proxy;
         self.cache_shape = Some(stats.cache_shape);
         self.apply_breakdown = Some(stats.breakdown);
+        self.apply_mode = Some(stats.apply_mode);
+        self.lifecycle_mode = Some(stats.lifecycle_mode);
+        self.state_hash_checked = stats.state_hash_checked;
+        self.engine_reused = stats.engine_reused;
+        self.buffers_reused = stats.buffers_reused;
         self.benchmark_class = "orderbook apply";
+        self
+    }
+
+    fn with_fused_enabled(mut self) -> Self {
+        self.fused_enabled = true;
         self
     }
 
@@ -488,6 +528,10 @@ fn run_fixture_matrix(fixture: &Fixture, args: &Args) -> Result<Vec<Value>> {
         "orderbook-apply-only-run-locality",
         "orderbook-apply-only-optimized",
         "orderbook-apply-only-btree",
+        "orderbook-apply-only-optimized-production-cold",
+        "orderbook-apply-only-optimized-verify-cold",
+        "orderbook-apply-only-optimized-production-prepared",
+        "orderbook-apply-only-optimized-verify-prepared",
         "aura1-orderbook-extract-only",
         "aura1-orderbook-extract-plus-apply-current",
         "aura1-orderbook-extract-plus-apply-dense-ladder",
@@ -495,6 +539,12 @@ fn run_fixture_matrix(fixture: &Fixture, args: &Args) -> Result<Vec<Value>> {
         "aura1-orderbook-extract-plus-apply-direct-index",
         "aura1-orderbook-extract-plus-apply-run-locality",
         "aura1-orderbook-extract-plus-apply-optimized",
+        "aura1-orderbook-extract-plus-apply-optimized-production-cold",
+        "aura1-orderbook-extract-plus-apply-optimized-verify-cold",
+        "aura1-orderbook-extract-plus-apply-optimized-production-prepared",
+        "aura1-orderbook-extract-plus-apply-optimized-verify-prepared",
+        "aura1-orderbook-fused-extract-plus-apply-optimized-production-prepared",
+        "aura1-orderbook-fused-extract-plus-apply-optimized-verify-prepared",
         "aura1-replay-grouped-touch-selected",
         "aura1-replay-grouped-touch-all",
         "aura1-scan-raw",
@@ -597,10 +647,40 @@ fn bench_operation(
     aura1_zst: &[u8],
     result_path: &Path,
 ) -> Result<Value> {
-    let preextracted_orderbook = if orderbook_apply_only_kind(operation).is_some() {
+    let spec = orderbook_benchmark_spec(operation);
+    let fused_spec = fused_orderbook_benchmark_spec(operation);
+    let preextracted_orderbook = if orderbook_apply_only_kind(operation).is_some()
+        || matches!(
+            spec,
+            Some(OrderBookBenchmarkSpec {
+                include_extract: false,
+                lifecycle_mode: OrderBookLifecycleMode::Cold,
+                ..
+            })
+        ) {
         Some(extract_orderbook_deltas_for_engine(
             &fixture.aura1_path,
             args.batch_size,
+        )?)
+    } else {
+        None
+    };
+    let mut prepared_orderbook = if matches!(
+        spec.or(fused_spec),
+        Some(OrderBookBenchmarkSpec {
+            lifecycle_mode: OrderBookLifecycleMode::Prepared,
+            ..
+        }) | Some(OrderBookBenchmarkSpec {
+            apply_mode: OrderBookApplyMode::Verify,
+            ..
+        })
+    ) {
+        Some(prepare_orderbook_benchmark(
+            &fixture.aura1_path,
+            args.batch_size,
+            spec.or(fused_spec)
+                .ok_or_else(|| anyhow::anyhow!("missing orderbook benchmark spec"))?
+                .kind,
         )?)
     } else {
         None
@@ -617,6 +697,7 @@ fn bench_operation(
             aura1_zst,
             args,
             preextracted_orderbook.as_ref(),
+            prepared_orderbook.as_mut(),
         )?;
     }
     let mut samples = Vec::with_capacity(args.iterations);
@@ -632,6 +713,7 @@ fn bench_operation(
             aura1_zst,
             args,
             preextracted_orderbook.as_ref(),
+            prepared_orderbook.as_mut(),
         )?;
         samples.push((start.elapsed(), last_output.clone()));
     }
@@ -798,8 +880,26 @@ fn bench_operation(
     counters
         .entry("zero_size_removes")
         .or_insert(last_output.zero_size_removes as u64);
-    let command = std::env::args().collect::<Vec<_>>().join(" ");
     let breakdown = last_output.apply_breakdown.unwrap_or_default();
+    let setup_ms = nanos_to_ms(breakdown.setup_ns);
+    let plan_build_ms = nanos_to_ms(breakdown.plan_build_ns);
+    let allocation_ms = nanos_to_ms(breakdown.allocation_ns);
+    let reset_ms = nanos_to_ms(breakdown.reset_ns);
+    let apply_update_ms = nanos_to_ms(breakdown.update_remove_ns);
+    let state_hash_ms = nanos_to_ms(breakdown.state_hash_ns);
+    let production_total_ms = extract_ms + reset_ms + apply_update_ms;
+    let verify_total_ms = production_total_ms + state_hash_ms;
+    let production_records_per_sec = if production_total_ms > 0.0 {
+        records as f64 / (production_total_ms / 1000.0)
+    } else {
+        records_per_sec
+    };
+    let apply_records_per_sec = if apply_update_ms > 0.0 {
+        records as f64 / (apply_update_ms / 1000.0)
+    } else {
+        apply_recs_per_sec
+    };
+    let command = std::env::args().collect::<Vec<_>>().join(" ");
     Ok(json!({
         "operation": operation,
         "dataset": fixture.name,
@@ -853,10 +953,32 @@ fn bench_operation(
         "deletes": last_output.book_deletes,
         "zero_size_removes": last_output.zero_size_removes,
         "state_hash": last_output.state_hash,
+        "state_hash_checked": last_output.state_hash_checked,
         "engine_kind": last_output.engine_kind.unwrap_or("none"),
+        "fused_enabled": last_output.fused_enabled,
+        "apply_mode": last_output
+            .apply_mode
+            .map(OrderBookApplyMode::as_str)
+            .unwrap_or("none"),
+        "lifecycle_mode": last_output
+            .lifecycle_mode
+            .map(OrderBookLifecycleMode::as_str)
+            .unwrap_or("none"),
+        "engine_reused": last_output.engine_reused,
+        "buffers_reused": last_output.buffers_reused,
         "allocation_count_proxy": last_output.allocation_count_proxy,
         "bytes_allocated_proxy": last_output.bytes_allocated_proxy,
         "cache_shape": last_output.cache_shape.unwrap_or("none"),
+        "setup_ms": setup_ms,
+        "plan_build_ms": plan_build_ms,
+        "allocation_ms": allocation_ms,
+        "reset_ms": reset_ms,
+        "apply_update_ms": apply_update_ms,
+        "state_hash_ms": state_hash_ms,
+        "production_total_ms": production_total_ms,
+        "verify_total_ms": verify_total_ms,
+        "production_records_per_sec": production_records_per_sec,
+        "apply_records_per_sec": apply_records_per_sec,
         "instrument_lookup_ns": breakdown.instrument_lookup_ns,
         "side_lookup_ns": breakdown.side_lookup_ns,
         "price_lookup_ns": breakdown.price_lookup_ns,
@@ -938,6 +1060,7 @@ fn run_operation(
     aura1_zst: &[u8],
     args: &Args,
     preextracted_orderbook: Option<&ExtractedOrderBookDeltas>,
+    prepared_orderbook: Option<&mut PreparedOrderBookBenchmark>,
 ) -> Result<BenchOutput> {
     match operation {
         "sdk-write-aura1" => write_batch(schema, source_batch, WriterOptions::aura1()),
@@ -1005,6 +1128,22 @@ fn run_operation(
         }
         "aura1-event-source-live-frame-orderbook-apply" => {
             replay_event_source_live_frame_orderbook_apply(aura1, args.batch_size)
+        }
+        operation if fused_orderbook_benchmark_spec(operation).is_some() => {
+            let spec = fused_orderbook_benchmark_spec(operation).unwrap();
+            let prepared =
+                prepared_orderbook.ok_or_else(|| anyhow::anyhow!("missing prepared orderbook"))?;
+            replay_orderbook_fused_benchmark_spec(spec, aura1, args.batch_size, prepared)
+        }
+        operation if orderbook_benchmark_spec(operation).is_some() => {
+            let spec = orderbook_benchmark_spec(operation).unwrap();
+            replay_orderbook_benchmark_spec(
+                spec,
+                aura1_path,
+                args.batch_size,
+                preextracted_orderbook,
+                prepared_orderbook,
+            )
         }
         "aura1-orderbook-extract-only" => {
             replay_orderbook_extract_only_engine_path(aura1_path, args.batch_size)
@@ -2137,6 +2276,242 @@ fn apply_orderbook_preextracted(
         .with_stages(stages))
 }
 
+fn replay_orderbook_benchmark_spec(
+    spec: OrderBookBenchmarkSpec,
+    path: &Path,
+    batch_size: usize,
+    preextracted: Option<&ExtractedOrderBookDeltas>,
+    prepared: Option<&mut PreparedOrderBookBenchmark>,
+) -> Result<BenchOutput> {
+    match spec.lifecycle_mode {
+        OrderBookLifecycleMode::Cold => {
+            let mut stages = StageBreakdown::summed();
+            let extracted;
+            let extracted = if spec.include_extract {
+                let extract_start = Instant::now();
+                extracted = extract_orderbook_deltas_for_engine(path, batch_size)?;
+                stages.add_duration("orderbook_extract_ms", extract_start.elapsed());
+                &extracted
+            } else {
+                stages.add_ms("orderbook_extract_ms", 0.0);
+                preextracted.ok_or_else(|| anyhow::anyhow!("missing pre-extracted deltas"))?
+            };
+            let expected_hash = prepared.as_ref().map(|prepared| prepared.expected_hash);
+            let apply_start = Instant::now();
+            let stats = apply_orderbook_engine_mode(
+                &extracted.deltas,
+                spec.kind,
+                spec.apply_mode,
+                OrderBookLifecycleMode::Cold,
+                expected_hash,
+            )?;
+            stages.add_duration("orderbook_apply_ms", apply_start.elapsed());
+            orderbook_bench_output(extracted, stats, stages)
+        }
+        OrderBookLifecycleMode::Prepared => {
+            let prepared =
+                prepared.ok_or_else(|| anyhow::anyhow!("missing prepared orderbook session"))?;
+            let mut stages = StageBreakdown::summed();
+            let extracted;
+            let extracted = if spec.include_extract {
+                let extract_start = Instant::now();
+                extracted = extract_orderbook_deltas_for_engine(path, batch_size)?;
+                stages.add_duration("orderbook_extract_ms", extract_start.elapsed());
+                &extracted
+            } else {
+                stages.add_ms("orderbook_extract_ms", 0.0);
+                &prepared.extracted
+            };
+            let expected_hash = matches!(spec.apply_mode, OrderBookApplyMode::Verify)
+                .then_some(prepared.expected_hash);
+            let apply_start = Instant::now();
+            let mut stats =
+                prepared
+                    .session
+                    .replay(&extracted.deltas, spec.apply_mode, expected_hash)?;
+            stages.add_duration("orderbook_apply_ms", apply_start.elapsed());
+            stats.breakdown.setup_ns = prepared.setup_ns;
+            stats.breakdown.plan_build_ns = prepared.plan_build_ns;
+            stats.breakdown.allocation_ns = prepared.allocation_ns;
+            orderbook_bench_output(extracted, stats, stages)
+        }
+    }
+}
+
+fn replay_orderbook_fused_benchmark_spec(
+    spec: OrderBookBenchmarkSpec,
+    aura1: &[u8],
+    batch_size: usize,
+    prepared: &mut PreparedOrderBookBenchmark,
+) -> Result<BenchOutput> {
+    let mut stages = StageBreakdown::summed();
+    let reader_setup_start = Instant::now();
+    let reader = AuraReader::open(Cursor::new(aura1))?;
+    let delta_spec = default_orderbook_delta_spec(reader.schema())?;
+    let payload_fields = delta_spec.field_indices();
+    let bytes_per_row = selected_bytes_per_row(&reader, &payload_fields)?;
+    let reader_setup_ns = reader_setup_start.elapsed().as_nanos();
+    let reset_start = Instant::now();
+    prepared.session.engine_mut().reset_for_replay();
+    let reset_ns = reset_start.elapsed().as_nanos();
+    let expected_hash =
+        matches!(spec.apply_mode, OrderBookApplyMode::Verify).then_some(prepared.expected_hash);
+    let replay_start = Instant::now();
+    let fused_stats = reader.replay_orderbook_deltas_fused(
+        batch_size,
+        &delta_spec,
+        prepared.session.engine_mut(),
+    )?;
+    let replay_ns = replay_start.elapsed().as_nanos();
+    let extract_ns =
+        reader_setup_ns.saturating_add(replay_ns.saturating_sub(fused_stats.apply_update_ns));
+    stages.add_ms("orderbook_extract_ms", nanos_to_ms(extract_ns));
+    stages.add_ms(
+        "orderbook_apply_ms",
+        nanos_to_ms(fused_stats.apply_update_ns),
+    );
+    stages.add_ms(
+        "fused_decode_update_loop_ms",
+        nanos_to_ms(fused_stats.apply_update_ns),
+    );
+    stages.add_ms(
+        "fused_replay_residual_ms",
+        nanos_to_ms(replay_ns.saturating_sub(fused_stats.apply_update_ns)),
+    );
+    stages.add_counter("selected_fields", fused_stats.selected_fields);
+    stages.add_counter("values_decoded", fused_stats.values_decoded);
+    stages.add_counter("batches", fused_stats.batches);
+    stages.add_counter("callback_count", 0);
+    stages.add_counter("batch_size", batch_size);
+    stages.add_counter(
+        "delta_batch_structs_created",
+        fused_stats.delta_batch_structs_created,
+    );
+    stages.add_counter("temporary_buffer_bytes", fused_stats.temporary_buffer_bytes);
+    stages.add_counter("field_load_count", fused_stats.field_load_count);
+    stages.add_counter("timestamp_load_count", 0);
+    stages.add_counter("instrument_load_count", fused_stats.records);
+    stages.add_counter("side_load_count", fused_stats.records);
+    stages.add_counter("price_load_count", fused_stats.records);
+    stages.add_counter("size_load_count", fused_stats.records);
+    stages.add_counter(
+        "action_load_count",
+        fused_stats
+            .values_decoded
+            .saturating_sub(fused_stats.records.saturating_mul(4)),
+    );
+    stages.add_counter("flags_load_count", 0);
+    stages.add_counter("sequence_load_count", 0);
+    stages.add_counter("selected_field_kernel_dispatch_count", 0);
+    stages.add_counter("engine_apply_calls", fused_stats.engine_apply_calls);
+    stages.add_counter("rows_materialized", fused_stats.rows_materialized);
+    stages.add_counter("values_materialized", fused_stats.values_materialized);
+    stages.add_ms("timestamp_load_ms", 0.0);
+    stages.add_ms("instrument_side_price_size_action_load_ms", 0.0);
+    stages.add_ms("selected_field_kernel_dispatch_ms", 0.0);
+    stages.add_ms("orderbook_delta_batch_construction_ms", 0.0);
+    stages.add_ms("batch_callback_handoff_ms", 0.0);
+    stages.add_ms("checksum_state_update_ms", 0.0);
+
+    let mut stats = prepared.session.engine_mut().finish_profiled(
+        spec.apply_mode,
+        expected_hash,
+        fused_stats.apply_update_ns,
+        reset_ns,
+    )?;
+    stats.breakdown.setup_ns = prepared.setup_ns;
+    stats.breakdown.plan_build_ns = prepared.plan_build_ns;
+    stats.breakdown.allocation_ns = prepared.allocation_ns;
+    add_orderbook_stats_counters(&mut stages, &stats);
+    stages.add_ms("field_load_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
+
+    let reader_stats = reader.stats();
+    let mut output = BenchOutput::new(reader_stats.file_len, fused_stats.records)
+        .with_reader_stats(reader_stats);
+    output.bytes_scanned = reader_stats.bytes_read_during_replay;
+    Ok(output
+        .with_access(
+            payload_fields.len(),
+            fused_stats.values_decoded,
+            fused_stats.records.saturating_mul(bytes_per_row),
+            stats.state_hash.0,
+        )
+        .with_parse_counters(0, 0, 1, true)
+        .with_replay_mode("fused")
+        .with_book_stats(stats)
+        .with_fused_enabled()
+        .with_stages(stages))
+}
+
+fn orderbook_bench_output(
+    extracted: &ExtractedOrderBookDeltas,
+    stats: BookApplyStats,
+    mut stages: StageBreakdown,
+) -> Result<BenchOutput> {
+    add_orderbook_stats_counters(&mut stages, &stats);
+    stages.add_ms("field_load_ms", 0.0);
+    stages.add_ms("endian_decode_ms", 0.0);
+    stages.add_ms("checksum_mix_ms", 0.0);
+    let mut output = BenchOutput::new(extracted.reader_stats.file_len, extracted.deltas.len())
+        .with_reader_stats(extracted.reader_stats);
+    output.bytes_scanned = extracted.bytes_scanned;
+    Ok(output
+        .with_access(
+            extracted.payload_field_count,
+            extracted
+                .deltas
+                .len()
+                .saturating_mul(extracted.payload_field_count),
+            extracted
+                .deltas
+                .len()
+                .saturating_mul(extracted.bytes_per_row),
+            stats.state_hash.0,
+        )
+        .with_parse_counters(
+            selected_kernel_group_count(extracted.payload_field_count),
+            extracted.payload_field_count,
+            selected_kernel_group_count(extracted.payload_field_count),
+            true,
+        )
+        .with_replay_mode("batch")
+        .with_book_stats(stats)
+        .with_stages(stages))
+}
+
+fn prepare_orderbook_benchmark(
+    path: &Path,
+    batch_size: usize,
+    kind: OrderBookEngineKind,
+) -> Result<PreparedOrderBookBenchmark> {
+    let extracted = extract_orderbook_deltas_for_engine(path, batch_size)?;
+    let plan_start = Instant::now();
+    let plan = PreparedOrderBookApplyPlan::build(&extracted.deltas, kind)?;
+    let plan_build_ns = plan_start.elapsed().as_nanos();
+    let allocation_start = Instant::now();
+    let engine = PreparedOrderBookEngine::with_capacity(&plan)?;
+    let allocation_ns = allocation_start.elapsed().as_nanos();
+    let session = OrderBookReplaySession::from_prepared(plan, engine);
+    let expected_hash = apply_orderbook_engine_mode(
+        &extracted.deltas,
+        kind,
+        OrderBookApplyMode::Verify,
+        OrderBookLifecycleMode::Cold,
+        None,
+    )?
+    .state_hash;
+    Ok(PreparedOrderBookBenchmark {
+        session,
+        extracted,
+        expected_hash,
+        setup_ns: plan_build_ns.saturating_add(allocation_ns),
+        plan_build_ns,
+        allocation_ns,
+    })
+}
+
 fn extract_orderbook_deltas_for_engine(
     path: &Path,
     batch_size: usize,
@@ -2180,11 +2555,40 @@ fn apply_orderbook_engine(
     deltas: &[OrderBookDelta],
     kind: OrderBookEngineKind,
 ) -> Result<BookApplyStats> {
+    apply_orderbook_engine_mode(
+        deltas,
+        kind,
+        OrderBookApplyMode::Verify,
+        OrderBookLifecycleMode::Cold,
+        None,
+    )
+}
+
+fn apply_orderbook_engine_mode(
+    deltas: &[OrderBookDelta],
+    kind: OrderBookEngineKind,
+    mode: OrderBookApplyMode,
+    lifecycle: OrderBookLifecycleMode,
+    expected_hash: Option<BookStateHash>,
+) -> Result<BookApplyStats> {
     let setup_start = Instant::now();
+    let plan_start = Instant::now();
     let plan = OrderBookApplyPlan::compile(deltas, kind)?;
+    let plan_build_ns = plan_start.elapsed().as_nanos();
+    let allocation_start = Instant::now();
     let mut engine = OrderBookEngine::with_plan(plan)?;
-    let allocation_ns = setup_start.elapsed().as_nanos();
-    let mut stats = engine.apply_all_profiled(deltas)?;
+    let allocation_ns = allocation_start.elapsed().as_nanos();
+    let setup_ns = setup_start.elapsed().as_nanos();
+    let mut stats = match mode {
+        OrderBookApplyMode::Production => {
+            engine.apply_all_production_profiled(deltas, lifecycle, false, false)?
+        }
+        OrderBookApplyMode::Verify => {
+            engine.apply_all_verify_profiled(deltas, lifecycle, false, false, expected_hash)?
+        }
+    };
+    stats.breakdown.setup_ns = setup_ns;
+    stats.breakdown.plan_build_ns = plan_build_ns;
     stats.breakdown.allocation_ns = allocation_ns;
     Ok(stats)
 }
@@ -2232,6 +2636,110 @@ fn orderbook_apply_only_kind(operation: &str) -> Option<OrderBookEngineKind> {
         "orderbook-apply-only-btree" => Some(OrderBookEngineKind::BTreeMap),
         _ => None,
     }
+}
+
+fn orderbook_benchmark_spec(operation: &str) -> Option<OrderBookBenchmarkSpec> {
+    let (include_extract, rest) =
+        if let Some(rest) = operation.strip_prefix("aura1-orderbook-extract-plus-apply-") {
+            (true, rest)
+        } else if let Some(rest) = operation.strip_prefix("orderbook-apply-only-") {
+            (false, rest)
+        } else {
+            return None;
+        };
+
+    let (engine, mode, lifecycle) = rest
+        .strip_suffix("-production-prepared")
+        .map(|engine| {
+            (
+                engine,
+                OrderBookApplyMode::Production,
+                OrderBookLifecycleMode::Prepared,
+            )
+        })
+        .or_else(|| {
+            rest.strip_suffix("-verify-prepared").map(|engine| {
+                (
+                    engine,
+                    OrderBookApplyMode::Verify,
+                    OrderBookLifecycleMode::Prepared,
+                )
+            })
+        })
+        .or_else(|| {
+            rest.strip_suffix("-production-cold").map(|engine| {
+                (
+                    engine,
+                    OrderBookApplyMode::Production,
+                    OrderBookLifecycleMode::Cold,
+                )
+            })
+        })
+        .or_else(|| {
+            rest.strip_suffix("-verify-cold").map(|engine| {
+                (
+                    engine,
+                    OrderBookApplyMode::Verify,
+                    OrderBookLifecycleMode::Cold,
+                )
+            })
+        })?;
+    let kind = match engine {
+        "optimized" => OrderBookEngineKind::Optimized,
+        "direct-index" => OrderBookEngineKind::DirectIndex,
+        "dense-ladder" => OrderBookEngineKind::DenseLadder,
+        "run-locality" => OrderBookEngineKind::RunLocality,
+        "paged-ladder" => OrderBookEngineKind::PagedLadder { page_size: 64 },
+        "current" => OrderBookEngineKind::Current,
+        "packed-key" => OrderBookEngineKind::PackedKey,
+        "btree" => OrderBookEngineKind::BTreeMap,
+        _ => return None,
+    };
+    Some(OrderBookBenchmarkSpec {
+        kind,
+        apply_mode: mode,
+        lifecycle_mode: lifecycle,
+        include_extract,
+    })
+}
+
+fn fused_orderbook_benchmark_spec(operation: &str) -> Option<OrderBookBenchmarkSpec> {
+    let rest = operation.strip_prefix("aura1-orderbook-fused-extract-plus-apply-")?;
+    let (engine, mode, lifecycle) = rest
+        .strip_suffix("-production-prepared")
+        .map(|engine| {
+            (
+                engine,
+                OrderBookApplyMode::Production,
+                OrderBookLifecycleMode::Prepared,
+            )
+        })
+        .or_else(|| {
+            rest.strip_suffix("-verify-prepared").map(|engine| {
+                (
+                    engine,
+                    OrderBookApplyMode::Verify,
+                    OrderBookLifecycleMode::Prepared,
+                )
+            })
+        })?;
+    let kind = match engine {
+        "optimized" => OrderBookEngineKind::Optimized,
+        "direct-index" => OrderBookEngineKind::DirectIndex,
+        "dense-ladder" => OrderBookEngineKind::DenseLadder,
+        "run-locality" => OrderBookEngineKind::RunLocality,
+        "paged-ladder" => OrderBookEngineKind::PagedLadder { page_size: 64 },
+        "current" => OrderBookEngineKind::Current,
+        "packed-key" => OrderBookEngineKind::PackedKey,
+        "btree" => OrderBookEngineKind::BTreeMap,
+        _ => return None,
+    };
+    Some(OrderBookBenchmarkSpec {
+        kind,
+        apply_mode: mode,
+        lifecycle_mode: lifecycle,
+        include_extract: true,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4303,6 +4811,10 @@ fn percentile(times: &[Duration], percentile: f64) -> Duration {
 
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+fn nanos_to_ms(ns: u128) -> f64 {
+    ns as f64 / 1_000_000.0
 }
 
 fn mb_per_sec(bytes: usize, duration: Duration) -> f64 {

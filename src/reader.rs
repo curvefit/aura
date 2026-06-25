@@ -13,6 +13,7 @@ use crate::format::SEAL_MAGIC;
 use crate::header::AuraHeader;
 use crate::metadata::AuraMetadata;
 use crate::options::{AuraFormat, ReaderOptions};
+use crate::orderbook::PreparedOrderBookEngine;
 use crate::program::{CompiledAuraField, CompiledAuraPlan, CompiledFooter};
 use crate::records::{self, DecodedI64File, DecodedTypedFile};
 use crate::schema::{AuraSchema, AuraType, SchemaDescriptor};
@@ -310,6 +311,22 @@ pub struct OrderBookDeltaBatch<'a> {
     record_width: usize,
     row_count: usize,
     loads: OrderBookDeltaLoads,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FusedOrderBookReplayStats {
+    pub records: usize,
+    pub batches: usize,
+    pub selected_fields: usize,
+    pub values_decoded: usize,
+    pub field_load_count: usize,
+    pub delta_batch_structs_created: usize,
+    pub temporary_buffer_bytes: usize,
+    pub engine_apply_calls: usize,
+    pub compiled_plan_used: bool,
+    pub rows_materialized: usize,
+    pub values_materialized: usize,
+    pub apply_update_ns: u128,
 }
 
 impl OrderBookDeltaSpec {
@@ -1121,6 +1138,84 @@ fn aura1_field_slots(plan: &CompiledAuraPlan) -> Result<Vec<CompiledAuraField>> 
     Ok(slots)
 }
 
+fn fused_orderbook_validation_fields(loads: &OrderBookDeltaLoads) -> Vec<CompiledAuraField> {
+    let mut fields = vec![
+        CompiledAuraField {
+            field_index: loads.instrument.field_index,
+            offset: loads.instrument.offset,
+            width: load_width(loads.instrument),
+        },
+        CompiledAuraField {
+            field_index: loads.side.field_index,
+            offset: loads.side.offset,
+            width: load_width(loads.side),
+        },
+        CompiledAuraField {
+            field_index: loads.price.field_index,
+            offset: loads.price.offset,
+            width: load_width(loads.price),
+        },
+        CompiledAuraField {
+            field_index: loads.size.field_index,
+            offset: loads.size.offset,
+            width: load_width(loads.size),
+        },
+    ];
+    if let Some(action) = loads.action {
+        fields.push(CompiledAuraField {
+            field_index: action.field_index,
+            offset: action.offset,
+            width: load_width(action),
+        });
+    }
+    fields
+}
+
+const fn load_width(load: FixedFieldLoad) -> usize {
+    match load.kind {
+        FixedLoadKind::I8 => 1,
+        FixedLoadKind::I16 => 2,
+        FixedLoadKind::I32 => 4,
+        FixedLoadKind::I64 => 8,
+    }
+}
+
+/// Apply a prevalidated Aura1 orderbook body range directly to the prepared engine.
+///
+/// # Safety
+///
+/// Callers must validate `body` with `validate_fixed_body` for all loads used by
+/// this function and must pass the matching `record_width` and `row_count`.
+unsafe fn apply_fused_orderbook_range(
+    body: &[u8],
+    record_width: usize,
+    row_count: usize,
+    loads: &OrderBookDeltaLoads,
+    engine: &mut PreparedOrderBookEngine,
+) -> Result<()> {
+    if let Some(action_load) = loads.action {
+        for row_index in 0..row_count {
+            let row_ptr = unsafe { body.as_ptr().add(row_index * record_width) };
+            let instrument = unsafe { read_i64_unchecked(row_ptr, loads.instrument) };
+            let side = unsafe { read_i64_unchecked(row_ptr, loads.side) };
+            let price = unsafe { read_i64_unchecked(row_ptr, loads.price) };
+            let size = unsafe { read_i64_unchecked(row_ptr, loads.size) };
+            let action = unsafe { read_i64_unchecked(row_ptr, action_load) };
+            engine.apply_values(instrument, side, price, size, action)?;
+        }
+    } else {
+        for row_index in 0..row_count {
+            let row_ptr = unsafe { body.as_ptr().add(row_index * record_width) };
+            let instrument = unsafe { read_i64_unchecked(row_ptr, loads.instrument) };
+            let side = unsafe { read_i64_unchecked(row_ptr, loads.side) };
+            let price = unsafe { read_i64_unchecked(row_ptr, loads.price) };
+            let size = unsafe { read_i64_unchecked(row_ptr, loads.size) };
+            engine.apply_values(instrument, side, price, size, 0)?;
+        }
+    }
+    Ok(())
+}
+
 fn required_delta_field(
     schema: &AuraSchema,
     field_name: Option<&str>,
@@ -1804,6 +1899,134 @@ impl AuraReader {
                 Ok(rows_seen)
             }
         }
+    }
+
+    pub fn replay_orderbook_deltas_fused(
+        &self,
+        batch_size: usize,
+        spec: &OrderBookDeltaSpec,
+        engine: &mut PreparedOrderBookEngine,
+    ) -> Result<FusedOrderBookReplayStats> {
+        if batch_size == 0 {
+            return Err(AuraError::InvalidValue("batch size"));
+        }
+        if self.profile != Profile::Aura1 {
+            return Err(AuraError::InvalidValue("aura1 replay profile"));
+        }
+        let plan = self
+            .compiled_plan
+            .as_ref()
+            .ok_or(AuraError::InvalidValue("compiled plan"))?;
+        let loads = spec.compile_loads(plan)?;
+        let validation_fields = fused_orderbook_validation_fields(&loads);
+        let fields_loaded_per_row = 4usize + usize::from(loads.action.is_some());
+        let mut replay_stats = FusedOrderBookReplayStats {
+            selected_fields: spec.field_count(),
+            compiled_plan_used: true,
+            ..FusedOrderBookReplayStats::default()
+        };
+        match &self.source {
+            AuraReaderSource::Memory(bytes) => {
+                let stats = self.stats.get();
+                let body = bytes
+                    .get(stats.body_offset_from_header..stats.footer_offset_from_trailer)
+                    .ok_or(AuraError::UnexpectedEof)?;
+                while replay_stats.records < plan.record_count {
+                    let rows_to_visit = batch_size.min(plan.record_count - replay_stats.records);
+                    let byte_start = replay_stats
+                        .records
+                        .checked_mul(plan.aura1_record_width)
+                        .ok_or(AuraError::InvalidValue("row range"))?;
+                    let byte_len = rows_to_visit
+                        .checked_mul(plan.aura1_record_width)
+                        .ok_or(AuraError::InvalidValue("row range"))?;
+                    let byte_end = byte_start
+                        .checked_add(byte_len)
+                        .ok_or(AuraError::InvalidValue("row range"))?;
+                    let range = body
+                        .get(byte_start..byte_end)
+                        .ok_or(AuraError::UnexpectedEof)?;
+                    validate_fixed_body(
+                        range,
+                        plan.aura1_record_width,
+                        rows_to_visit,
+                        &validation_fields,
+                    )?;
+                    let update_start = std::time::Instant::now();
+                    unsafe {
+                        apply_fused_orderbook_range(
+                            range,
+                            plan.aura1_record_width,
+                            rows_to_visit,
+                            &loads,
+                            engine,
+                        )?;
+                    }
+                    replay_stats.apply_update_ns = replay_stats
+                        .apply_update_ns
+                        .saturating_add(update_start.elapsed().as_nanos());
+                    replay_stats.records = replay_stats.records.saturating_add(rows_to_visit);
+                    replay_stats.batches = replay_stats.batches.saturating_add(1);
+                }
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(replay_stats.records);
+                    stats.visitor_calls = stats.visitor_calls.saturating_add(replay_stats.batches);
+                    stats.bytes_read_during_replay = stats
+                        .bytes_read_during_replay
+                        .saturating_add(plan.aura1_body_size);
+                    stats.field_decode_count = stats
+                        .field_decode_count
+                        .saturating_add(replay_stats.records.saturating_mul(fields_loaded_per_row));
+                    stats.endian_load_count = stats
+                        .endian_load_count
+                        .saturating_add(replay_stats.records.saturating_mul(fields_loaded_per_row));
+                    stats.compiled_plan_used = true;
+                });
+            }
+            AuraReaderSource::FileRange(_) => {
+                while replay_stats.records < plan.record_count {
+                    let rows_to_read = batch_size.min(plan.record_count - replay_stats.records);
+                    let (body, rows_to_visit) =
+                        self.read_aura1_body_range(replay_stats.records, rows_to_read)?;
+                    validate_fixed_body(
+                        &body,
+                        plan.aura1_record_width,
+                        rows_to_visit,
+                        &validation_fields,
+                    )?;
+                    let update_start = std::time::Instant::now();
+                    unsafe {
+                        apply_fused_orderbook_range(
+                            &body,
+                            plan.aura1_record_width,
+                            rows_to_visit,
+                            &loads,
+                            engine,
+                        )?;
+                    }
+                    replay_stats.apply_update_ns = replay_stats
+                        .apply_update_ns
+                        .saturating_add(update_start.elapsed().as_nanos());
+                    replay_stats.records = replay_stats.records.saturating_add(rows_to_visit);
+                    replay_stats.batches = replay_stats.batches.saturating_add(1);
+                }
+                self.update_stats(|stats| {
+                    stats.rows_scanned = stats.rows_scanned.saturating_add(replay_stats.records);
+                    stats.visitor_calls = stats.visitor_calls.saturating_add(replay_stats.batches);
+                    stats.field_decode_count = stats
+                        .field_decode_count
+                        .saturating_add(replay_stats.records.saturating_mul(fields_loaded_per_row));
+                    stats.endian_load_count = stats
+                        .endian_load_count
+                        .saturating_add(replay_stats.records.saturating_mul(fields_loaded_per_row));
+                    stats.compiled_plan_used = true;
+                });
+            }
+        }
+        replay_stats.values_decoded = replay_stats.records.saturating_mul(fields_loaded_per_row);
+        replay_stats.field_load_count = replay_stats.values_decoded;
+        replay_stats.engine_apply_calls = replay_stats.records;
+        Ok(replay_stats)
     }
 
     pub fn replay_row_views<F>(&self, mut visitor: F) -> Result<usize>
