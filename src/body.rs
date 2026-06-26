@@ -651,7 +651,7 @@ impl<'a> GenericI64StreamCursorKind<'a> {
                     }
                     let remaining = *value_count - *produced;
                     let count = remaining.min(*block_size);
-                    let (next, next_offset) = read_block_local_cursor(*body, *offset, count)?;
+                    let (next, next_offset) = read_block_local_cursor(body, *offset, count)?;
                     *offset = next_offset;
                     *current = Some(Box::new(next));
                 }

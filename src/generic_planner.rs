@@ -708,6 +708,7 @@ pub(crate) fn try_decode_generic_i64_columns_body(
     Ok(columns)
 }
 
+#[allow(clippy::needless_range_loop)]
 fn try_decode_partitioned_sparse_i64_columns_body(
     plan: &GenericInstructionPlan,
     bytes: &[u8],
@@ -1169,7 +1170,7 @@ fn try_write_partitioned_sparse_i64_aura1_body(
     field_count: usize,
     aura1_plan: &Aura1Plan,
     out: &mut Vec<u8>,
-    mut output_guard: Option<&mut ByteGuard>,
+    output_guard: Option<&mut ByteGuard>,
 ) -> Result<bool> {
     try_write_partitioned_sparse_i64_aura1_body_inner(
         plan,
@@ -1178,7 +1179,7 @@ fn try_write_partitioned_sparse_i64_aura1_body(
         field_count,
         aura1_plan,
         out,
-        output_guard.as_deref_mut(),
+        output_guard,
         None,
         None,
     )
@@ -1192,7 +1193,7 @@ pub(crate) fn try_write_partitioned_sparse_i64_aura1_body_profiled(
     field_count: usize,
     aura1_plan: &Aura1Plan,
     out: &mut Vec<u8>,
-    mut output_guard: Option<&mut ByteGuard>,
+    output_guard: Option<&mut ByteGuard>,
     timings: &mut DirectAura1WriterTimings,
     stats: &mut DirectAura1WriterStats,
 ) -> Result<bool> {
@@ -1203,13 +1204,13 @@ pub(crate) fn try_write_partitioned_sparse_i64_aura1_body_profiled(
         field_count,
         aura1_plan,
         out,
-        output_guard.as_deref_mut(),
+        output_guard,
         Some(timings),
         Some(stats),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_option_as_deref, clippy::too_many_arguments)]
 fn try_write_partitioned_sparse_i64_aura1_body_inner(
     plan: &GenericInstructionPlan,
     stream_values: &BTreeMap<u16, Vec<i64>>,
@@ -1744,7 +1745,11 @@ pub(crate) fn try_write_generic_i64_aura1_body_from_streams_profiled(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::needless_option_as_deref,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments
+)]
 fn try_write_streaming_config_i64_aura1_body_from_streams(
     plan: &GenericInstructionPlan,
     stream_values: &BTreeMap<u16, Vec<i64>>,
@@ -2265,6 +2270,7 @@ fn try_write_streaming_config_i64_aura1_body_from_streams(
     Ok(true)
 }
 
+#[allow(clippy::needless_option_as_deref)]
 fn try_write_generic_i64_aura1_body_inner(
     plan: GenericInstructionPlan,
     bytes: &[u8],
@@ -2333,7 +2339,7 @@ fn try_write_generic_i64_aura1_body_inner(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_option_as_deref, clippy::too_many_arguments)]
 fn try_write_generic_i64_aura1_body_from_streams_inner(
     plan: &GenericInstructionPlan,
     stream_values: &BTreeMap<u16, Vec<i64>>,
@@ -3407,7 +3413,7 @@ pub(crate) fn decode_generic_i64_stream_values_profiled(
     }
     let validation_start = Instant::now();
     reader.finish()?;
-    if let Some(timings) = timings.as_deref_mut() {
+    if let Some(timings) = timings {
         timings.bounds_validation_ns = timings
             .bounds_validation_ns
             .saturating_add(validation_start.elapsed().as_nanos());
@@ -5374,6 +5380,7 @@ fn materialize_generic_i64_columns(
     }
 }
 
+#[allow(clippy::needless_range_loop)]
 fn materialize_partitioned_sparse_i64_columns(
     plan: &GenericInstructionPlan,
     stream_values: &BTreeMap<u16, Vec<i64>>,
@@ -7618,7 +7625,7 @@ impl PartialOrd for HuffmanHeapNode {
 }
 
 fn huffman_code_lengths(frequencies: &[u64]) -> Result<Vec<u8>> {
-    if frequencies.is_empty() || frequencies.iter().any(|frequency| *frequency == 0) {
+    if frequencies.is_empty() || frequencies.contains(&0) {
         return Err(AuraError::InvalidValue("huffman frequencies"));
     }
     if frequencies.len() == 1 {

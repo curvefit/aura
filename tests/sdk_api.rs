@@ -1150,7 +1150,7 @@ fn generated_reordered_wide_and_narrow_schemas_roundtrip() {
                 vec![
                     1_000_i64.into(),
                     7_u64.into(),
-                    123_45_i64.into(),
+                    12_345_i64.into(),
                     50_u64.into(),
                     true.into(),
                     3_u64.into(),
@@ -1161,7 +1161,7 @@ fn generated_reordered_wide_and_narrow_schemas_roundtrip() {
                 vec![
                     2_000_i64.into(),
                     8_u64.into(),
-                    123_50_i64.into(),
+                    12_350_i64.into(),
                     51_u64.into(),
                     false.into(),
                     2_u64.into(),

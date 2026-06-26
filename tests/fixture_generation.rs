@@ -75,7 +75,7 @@ fn aura_fixture_gen_writes_compatible_fixture_matrix() {
         assert_eq!(true, fixture["row_equality_verified"]);
         assert!(fixture["record_count"].as_u64().unwrap() > 0);
         assert!(fixture["schema_hash"].as_u64().unwrap() > 0);
-        assert!(fixture["schema_name"].as_str().unwrap().len() > 0);
+        assert!(!fixture["schema_name"].as_str().unwrap().is_empty());
         assert_eq!(
             fixture["field_count"].as_u64().unwrap() as usize,
             fixture["field_names"].as_array().unwrap().len()

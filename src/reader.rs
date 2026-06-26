@@ -722,8 +722,8 @@ impl<'a> Aura1FixedBatchView<'a> {
         out.clear();
         out.resize(self.field_offsets.len(), 0);
         let row = self.row_view(row_index)?;
-        for index in 0..self.field_offsets.len() {
-            out[index] = row.get_i64(index)?;
+        for (index, value) in out.iter_mut().enumerate().take(self.field_offsets.len()) {
+            *value = row.get_i64(index)?;
         }
         Ok(())
     }
@@ -1357,10 +1357,7 @@ impl AuraReader {
     }
 
     pub fn open_file_with_options(mut file: File, options: ReaderOptions) -> Result<Self> {
-        let parsed = match parse_file_backed_metadata(&mut file) {
-            Ok(parsed) => parsed,
-            Err(error) => return Err(error),
-        };
+        let parsed = parse_file_backed_metadata(&mut file)?;
         if parsed.header.profile != Profile::Aura1 {
             let bytes = read_file_exact_at(&mut file, 0, parsed.file_len)?;
             return Self::open_memory(bytes, options);
@@ -1465,11 +1462,7 @@ impl AuraReader {
             Profile::Ingest => AuraReaderState::LazyRows { rows: None },
         };
         let body_bytes = metadata.footer_start.saturating_sub(metadata.header_len);
-        let replay_backend = if metadata.header.profile == Profile::Aura1 {
-            AuraReplayBackend::Memory
-        } else {
-            AuraReplayBackend::Memory
-        };
+        let replay_backend = AuraReplayBackend::Memory;
         let row_width_from_plan = compiled_plan
             .as_ref()
             .map(|plan| plan.aura1_record_width)
@@ -2258,7 +2251,7 @@ impl AuraReader {
                 current_len = current_len.saturating_add(1);
             } else {
                 let group = self.group_from_i64_key(
-                    &group_indexes,
+                    group_indexes,
                     &current_key,
                     current_start,
                     current_len,
@@ -2275,7 +2268,7 @@ impl AuraReader {
 
         if current_len > 0 {
             let group =
-                self.group_from_i64_key(&group_indexes, &current_key, current_start, current_len)?;
+                self.group_from_i64_key(group_indexes, &current_key, current_start, current_len)?;
             visitor(&group)?;
             group_sizes.push(current_len);
         }
@@ -2424,6 +2417,7 @@ impl AuraReader {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_group_body<F>(
         &self,
         body: &[u8],

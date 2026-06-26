@@ -292,7 +292,7 @@ impl<R: Read> AuraEventSource for AuraLiveSource<R> {
                     self.batch_bytes.truncate(start + read);
                     self.bytes_copied = self.bytes_copied.saturating_add(read);
                     if self.batch_bytes.len() >= record_width
-                        && self.batch_bytes.len() % record_width == 0
+                        && self.batch_bytes.len().is_multiple_of(record_width)
                     {
                         break;
                     }
@@ -311,7 +311,7 @@ impl<R: Read> AuraEventSource for AuraLiveSource<R> {
         if self.batch_bytes.is_empty() {
             return Ok(None);
         }
-        if self.batch_bytes.len() % record_width != 0 {
+        if !self.batch_bytes.len().is_multiple_of(record_width) {
             return Err(AuraError::UnexpectedEof);
         }
         let row_count = self.batch_bytes.len() / record_width;
@@ -373,7 +373,7 @@ impl AuraLiveFrameSource {
         if record_width == 0 {
             return Err(AuraError::InvalidValue("live frame record width"));
         }
-        if body.is_empty() || body.len() % record_width != 0 {
+        if body.is_empty() || !body.len().is_multiple_of(record_width) {
             return Err(AuraError::UnexpectedEof);
         }
         let frame_bytes = batch_size
@@ -436,7 +436,7 @@ impl AuraEventSource for AuraLiveFrameSource {
                 }
                 let remaining = body.len() - self.cursor;
                 let frame_len = self.frame_bytes.min(remaining);
-                if frame_len == 0 || frame_len % record_width != 0 {
+                if frame_len == 0 || !frame_len.is_multiple_of(record_width) {
                     return Err(AuraError::UnexpectedEof);
                 }
                 let start = self.cursor;

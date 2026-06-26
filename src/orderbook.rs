@@ -835,6 +835,7 @@ impl OrderBookEngine {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn stats_from_parts(
         &self,
         book_levels: usize,
@@ -1427,10 +1428,8 @@ impl PagedBook {
 
     fn reset(&mut self) {
         for side in &mut self.sides {
-            for page in &mut side.pages {
-                if let Some(page) = page {
-                    page.fill(0);
-                }
+            for page in side.pages.iter_mut().flatten() {
+                page.fill(0);
             }
         }
     }

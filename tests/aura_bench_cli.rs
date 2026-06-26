@@ -194,7 +194,7 @@ fn aura_bench_reports_required_json_fields_for_core_operations() {
         assert!(json["result_path"].is_null());
         assert!(json["command_used"].as_str().unwrap().contains(operation));
         assert!(json["git_commit"].as_str().unwrap().len() >= 7);
-        assert!(json["machine_info"]["os"].as_str().unwrap().len() > 0);
+        assert!(!json["machine_info"]["os"].as_str().unwrap().is_empty());
     }
 
     fs::remove_dir_all(&dir).unwrap();

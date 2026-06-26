@@ -1129,6 +1129,7 @@ fn load_fair_bytes_context(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn measure_operation(
     operation: Operation,
     bytes: &[u8],
@@ -1543,6 +1544,7 @@ fn zstd_stats_json(stats: Option<&ZstdStats>) -> serde_json::Value {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_operation(
     operation: Operation,
     bytes: &[u8],
@@ -1747,6 +1749,7 @@ fn canonical_hash_i64_file(bytes: &[u8]) -> Result<(u64, usize)> {
     Ok((hash, decoded.rows.len()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transcode(
     bytes: &[u8],
     target: Profile,

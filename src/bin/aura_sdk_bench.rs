@@ -636,6 +636,7 @@ fn one_batch(reader: &AuraReader) -> Result<AuraRecordBatch> {
     Ok(batches.remove(0))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_operation(
     operation: &str,
     fixture: &Fixture,
@@ -1050,6 +1051,7 @@ fn bench_operation(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_operation(
     operation: &str,
     schema: &AuraSchema,
