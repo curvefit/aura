@@ -23,6 +23,10 @@ name = "aura-fixture-gen"
 path = "src/bin/aura_fixture_gen.rs"
 
 [[bin]]
+name = "aura-verify-random"
+path = "src/bin/aura_verify_random.rs"
+
+[[bin]]
 name = "aura-parquet-ohlcv"
 path = "src/bin/parquet_ohlcv.rs"
 

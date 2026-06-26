@@ -23,6 +23,7 @@ pub mod options;
 pub mod orderbook;
 pub mod plan;
 pub mod program;
+pub mod random_verify;
 pub mod reader;
 pub mod records;
 pub mod schema;
