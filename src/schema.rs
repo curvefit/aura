@@ -881,6 +881,7 @@ impl SchemaBuilder {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn field_with_relation_and_candidates(
         mut self,
         name: impl Into<String>,
@@ -1210,7 +1211,7 @@ fn schema_field_map_byte(
         {
             return Ok(SCHEMA_MAP_TIME_SLOT);
         }
-        FieldRole::Timestamp => return Err(AuraError::InvalidValue("schema time mapping")),
+        FieldRole::Timestamp => return Ok(SCHEMA_MAP_DO_NOT_ATTEMPT),
         FieldRole::Boolean if field.relation == FieldRelation::None => {
             return Ok(SCHEMA_MAP_BOOL_1BIT)
         }

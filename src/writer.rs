@@ -84,14 +84,18 @@ impl<W: Write> AuraWriter<W> {
         let header_comment = if let Some(metadata) = &self.options.metadata {
             Some(metadata.encode_header_comment()?)
         } else {
-            Some(
-                self.schema
-                    .fields()
-                    .iter()
-                    .map(|field| field.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            )
+            let field_names = self
+                .schema
+                .fields()
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            if field_names.len() <= u8::MAX as usize {
+                Some(field_names)
+            } else {
+                None
+            }
         };
         let ingest = records::encode_ingest_i64_file(I64FileInput {
             schema: self.schema.clone().into_descriptor(),

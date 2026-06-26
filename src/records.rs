@@ -142,17 +142,12 @@ impl TranscodePath {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Aura0EncoderPath {
+    #[default]
     Materialized,
     DirectStreams,
     ColumnFree,
-}
-
-impl Default for Aura0EncoderPath {
-    fn default() -> Self {
-        Self::Materialized
-    }
 }
 
 impl Aura0EncoderPath {
@@ -165,16 +160,11 @@ impl Aura0EncoderPath {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Aura0DecodePath {
+    #[default]
     Materialized,
     Cursor,
-}
-
-impl Default for Aura0DecodePath {
-    fn default() -> Self {
-        Self::Materialized
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,11 +375,13 @@ pub(crate) fn encode_ingest_i64_file_inner(input: I64FileInput) -> Result<Vec<u8
 
     let aura0_plan = Aura0Plan::from_schema_rows_stats(&input.schema, &stats, &input.rows)?;
     let aura1_plan = Aura1Plan::from_stats(&stats, 1);
-    let generic_aura0_plan = plan_generic_i64_rows(&input.schema, &input.rows)?;
-    let footer = AuraFooter::new(input.schema.clone(), stats)
+    let generic_aura0_plan = plan_generic_i64_rows(&input.schema, &input.rows).ok();
+    let mut footer = AuraFooter::new(input.schema.clone(), stats)
         .with_aura0_plan(aura0_plan)
-        .with_aura1_plan(aura1_plan)
-        .with_generic_aura0_plan(generic_aura0_plan);
+        .with_aura1_plan(aura1_plan);
+    if let Some(generic_aura0_plan) = generic_aura0_plan {
+        footer = footer.with_generic_aura0_plan(generic_aura0_plan);
+    }
     let body = encode_raw_body(input.schema.fields.len(), &input.rows)?;
     let base_time_ns = timestamp_index
         .and_then(|index| input.rows.first().and_then(|row| row.get(index)).copied())
@@ -2487,6 +2479,7 @@ fn encode_compiled_file(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_encode_compiled_file_with_body_writer<F>(
     profile: Profile,
     stream_id: u16,
@@ -2544,7 +2537,7 @@ where
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_option_as_deref, clippy::too_many_arguments)]
 fn try_encode_compiled_file_with_body_writer_inner<F>(
     profile: Profile,
     stream_id: u16,
@@ -3621,6 +3614,7 @@ fn encode_aura1_body_from_raw_body(
     Ok((out, record_count))
 }
 
+#[allow(clippy::needless_range_loop)]
 fn encode_aura1_body_from_columns(columns: &[Vec<i64>], plan: &Aura1Plan) -> Result<Vec<u8>> {
     let field_count = columns.len();
     let record_count = columns.first().map_or(0, Vec::len);
