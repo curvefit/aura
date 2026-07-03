@@ -19,6 +19,14 @@ name = "aura-bench"
 path = "src/bin/aura_bench.rs"
 
 [[bin]]
+name = "aura-fixture-gen"
+path = "src/bin/aura_fixture_gen.rs"
+
+[[bin]]
+name = "aura-verify-random"
+path = "src/bin/aura_verify_random.rs"
+
+[[bin]]
 name = "aura-parquet-ohlcv"
 path = "src/bin/parquet_ohlcv.rs"
 
@@ -26,8 +34,10 @@ path = "src/bin/parquet_ohlcv.rs"
 anyhow = "1"
 arrow = { version = "54", features = ["prettyprint"] }
 parquet = { version = "54", features = ["zstd"] }
+lz4_flex = "0.11.6"
 serde_json = "1"
 sha2 = "0.10"
+zstd = "0.13.3"
 
 [[bin]]
 name = "aura-json-i64"

@@ -4,11 +4,20 @@ use crate::footer::{CompressionDescriptor, CompressionKind};
 use crate::format::FORMAT_VERSION;
 use crate::instructions::GenericInstructionPlan;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
-use crate::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
+use crate::schema::{
+    decode_schema_block, encode_schema_block, AuraSchema, FieldType, SchemaDescriptor,
+};
 use crate::stats::PhysicalWidth;
 use crate::{AuraError, Result};
 
 pub const COMPILED_FOOTER_MAGIC: &[u8; 4] = b"AURP";
+pub const AURA1_BYTE_LANE_MAGIC: &[u8; 4] = b"AUBL";
+pub const AURA1_BYTE_LANE_VERSION: u8 = 1;
+pub const BYTE_LANE_CODEC_RAW: u8 = 0;
+pub const BYTE_LANE_CODEC_LZ4: u8 = 1;
+pub const BYTE_LANE_CODEC_ZSTD: u8 = 2;
+pub const BYTE_LANE_CHECKSUM_NONE: u8 = 0;
+pub const BYTE_LANE_CHECKSUM_BYTE_GUARD: u8 = 1;
 pub const FIELD_AUX_EXTENDED: u8 = 7;
 
 const OP_MASK: u16 = 0b1_1111;
@@ -457,6 +466,203 @@ impl DecodeProgram {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledAuraPlan {
+    pub format_version: u16,
+    pub schema_hash: u32,
+    pub record_count: usize,
+    pub field_count: usize,
+    pub block_capacity: u16,
+    pub aura0_plan: Aura0Plan,
+    pub aura1_plan: Aura1Plan,
+    pub generic_aura0_plan: Option<GenericInstructionPlan>,
+    pub aura1_record_width: usize,
+    pub aura1_body_size: usize,
+    pub canonical_field_order: Vec<u16>,
+    pub conversion_plan_hash: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompiledAuraField {
+    pub field_index: u16,
+    pub offset: usize,
+    pub width: usize,
+}
+
+impl CompiledAuraPlan {
+    pub fn from_footer(footer: &CompiledFooter) -> Result<Self> {
+        let field_count = footer.schema.fields.len();
+        let record_count = usize::try_from(footer.record_count)
+            .map_err(|_| AuraError::InvalidValue("record count"))?;
+        let aura0_plan = footer.aura0_program.to_aura0_plan()?;
+        let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+        validate_plan_fields(&aura0_plan.fields, field_count)?;
+        validate_plan_fields(&aura1_plan.fields, field_count)?;
+        let aura1_record_width = aura1_plan
+            .fields
+            .iter()
+            .map(|field| usize::from(field.width.byte_width()))
+            .try_fold(0usize, |acc, width| {
+                acc.checked_add(width)
+                    .ok_or(AuraError::InvalidValue("body length"))
+            })?;
+        let aura1_body_size = record_count
+            .checked_mul(aura1_record_width)
+            .ok_or(AuraError::InvalidValue("body length"))?;
+        let canonical_field_order = (0..field_count)
+            .map(|index| u16::try_from(index).map_err(|_| AuraError::InvalidValue("field index")))
+            .collect::<Result<Vec<_>>>()?;
+        let footer_bytes = footer.encode()?;
+        Ok(Self {
+            format_version: FORMAT_VERSION,
+            schema_hash: footer.schema.schema_id,
+            record_count,
+            field_count,
+            block_capacity: footer.block_capacity,
+            aura0_plan,
+            aura1_plan,
+            generic_aura0_plan: footer.generic_aura0_plan.clone(),
+            aura1_record_width,
+            aura1_body_size,
+            canonical_field_order,
+            conversion_plan_hash: plan_hash_bytes(&footer_bytes),
+        })
+    }
+
+    pub fn from_schema(schema: &AuraSchema) -> Result<Self> {
+        let descriptor = schema.descriptor();
+        let field_count = descriptor.fields.len();
+        if field_count == 0 {
+            return Err(AuraError::InvalidValue("schema fields"));
+        }
+        let fields = descriptor
+            .fields
+            .iter()
+            .map(|field| {
+                let width = physical_width_for_field_type(field.field_type)?;
+                Ok(PhysicalFieldPlan {
+                    field_index: field.index,
+                    encoding: FieldEncoding::Absolute,
+                    width,
+                    bit_width: 0,
+                    reference_field_index: None,
+                    base_value: 0,
+                    step: 0,
+                    estimated_bytes: 0,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        validate_plan_fields(&fields, field_count)?;
+        let aura0_plan = Aura0Plan {
+            fields: fields.clone(),
+        };
+        let aura1_plan = Aura1Plan {
+            block_capacity: 1,
+            fields,
+        };
+        let aura1_record_width = aura1_plan
+            .fields
+            .iter()
+            .map(|field| usize::from(field.width.byte_width()))
+            .sum();
+        let canonical_field_order = (0..field_count)
+            .map(|index| u16::try_from(index).map_err(|_| AuraError::InvalidValue("field index")))
+            .collect::<Result<Vec<_>>>()?;
+        let mut schema_bytes = Vec::new();
+        encode_schema_block(descriptor, &mut schema_bytes)?;
+        Ok(Self {
+            format_version: FORMAT_VERSION,
+            schema_hash: descriptor.schema_id,
+            record_count: 0,
+            field_count,
+            block_capacity: 1,
+            aura0_plan,
+            aura1_plan,
+            generic_aura0_plan: None,
+            aura1_record_width,
+            aura1_body_size: 0,
+            canonical_field_order,
+            conversion_plan_hash: plan_hash_bytes(&schema_bytes),
+        })
+    }
+
+    pub fn aura1_field_offsets(&self) -> Vec<CompiledAuraField> {
+        let mut offset = 0usize;
+        self.aura1_plan
+            .fields
+            .iter()
+            .map(|field| {
+                let width = usize::from(field.width.byte_width());
+                let compiled = CompiledAuraField {
+                    field_index: field.field_index,
+                    offset,
+                    width,
+                };
+                offset += width;
+                compiled
+            })
+            .collect()
+    }
+
+    pub fn aura1_field_offset(&self, field_index: u16) -> Option<CompiledAuraField> {
+        self.aura1_field_offsets()
+            .into_iter()
+            .find(|field| field.field_index == field_index)
+    }
+}
+
+fn physical_width_for_field_type(field_type: FieldType) -> Result<PhysicalWidth> {
+    match field_type {
+        FieldType::I8 | FieldType::U8 => Ok(PhysicalWidth::I8),
+        FieldType::I16 | FieldType::U16 => Ok(PhysicalWidth::I16),
+        FieldType::I32 | FieldType::U32 => Ok(PhysicalWidth::I32),
+        FieldType::I64 | FieldType::U64 | FieldType::TimestampNs => Ok(PhysicalWidth::I64),
+        FieldType::I128 | FieldType::Opaque16 => Ok(PhysicalWidth::I128),
+    }
+}
+
+fn validate_plan_fields(fields: &[PhysicalFieldPlan], field_count: usize) -> Result<()> {
+    if fields.len() != field_count {
+        return Err(AuraError::InvalidValue("program field count"));
+    }
+    let mut seen = vec![false; field_count];
+    for field in fields {
+        let index = usize::from(field.field_index);
+        if index >= field_count || seen[index] {
+            return Err(AuraError::InvalidValue("field index"));
+        }
+        seen[index] = true;
+    }
+    if seen.iter().any(|seen| !*seen) {
+        return Err(AuraError::InvalidValue("program field count"));
+    }
+    Ok(())
+}
+
+fn plan_hash_bytes(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325u64, |acc, byte| {
+        acc.wrapping_mul(0x100000001b3)
+            .wrapping_add(u64::from(*byte))
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Aura1ByteLaneDescriptor {
+    pub lane_version: u8,
+    pub codec_id: u8,
+    pub codec_level: u8,
+    pub block_index: u32,
+    pub row_start: u64,
+    pub row_count: u32,
+    pub aura1_output_offset: u64,
+    pub uncompressed_len: u64,
+    pub compressed_offset: u64,
+    pub compressed_len: u64,
+    pub checksum_kind: u8,
+    pub checksum: u64,
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledFooter {
     pub schema: SchemaDescriptor,
     pub compression: CompressionDescriptor,
@@ -466,6 +672,7 @@ pub struct CompiledFooter {
     pub aura1_program: DecodeProgram,
     pub generic_aura0_plan: Option<GenericInstructionPlan>,
     pub chunks: Vec<ChunkDescriptor>,
+    pub aura1_byte_lanes: Vec<Aura1ByteLaneDescriptor>,
 }
 
 impl CompiledFooter {
@@ -485,11 +692,17 @@ impl CompiledFooter {
             aura1_program,
             generic_aura0_plan: None,
             chunks: Vec::new(),
+            aura1_byte_lanes: Vec::new(),
         })
     }
 
     pub fn with_generic_aura0_plan(mut self, plan: GenericInstructionPlan) -> Self {
         self.generic_aura0_plan = Some(plan);
+        self
+    }
+
+    pub fn with_aura1_byte_lanes(mut self, lanes: Vec<Aura1ByteLaneDescriptor>) -> Self {
+        self.aura1_byte_lanes = lanes;
         self
     }
 
@@ -506,6 +719,7 @@ impl CompiledFooter {
         self.aura1_program.encode_to(&mut out)?;
         encode_generic_plan(&self.generic_aura0_plan, &mut out)?;
         encode_chunks(&self.chunks, &mut out)?;
+        encode_aura1_byte_lanes(&self.aura1_byte_lanes, &mut out)?;
         Ok(out)
     }
 
@@ -529,6 +743,7 @@ impl CompiledFooter {
         let aura1_program = DecodeProgram::decode_from(&mut reader)?;
         let generic_aura0_plan = decode_generic_plan(&mut reader)?;
         let chunks = decode_chunks(&mut reader)?;
+        let aura1_byte_lanes = decode_aura1_byte_lanes(&mut reader)?;
         reader.finish()?;
         Ok(Self {
             schema,
@@ -539,8 +754,69 @@ impl CompiledFooter {
             aura1_program,
             generic_aura0_plan,
             chunks,
+            aura1_byte_lanes,
         })
     }
+}
+
+fn encode_aura1_byte_lanes(lanes: &[Aura1ByteLaneDescriptor], out: &mut Vec<u8>) -> Result<()> {
+    if lanes.is_empty() {
+        return Ok(());
+    }
+    out.extend_from_slice(AURA1_BYTE_LANE_MAGIC);
+    put_u32_len(out, lanes.len(), "byte lane count")?;
+    for lane in lanes {
+        put_u8(out, lane.lane_version);
+        put_u8(out, lane.codec_id);
+        put_u8(out, lane.codec_level);
+        put_u8(out, lane.checksum_kind);
+        put_u32_le(out, lane.block_index);
+        put_u64_le(out, lane.row_start);
+        put_u32_le(out, lane.row_count);
+        put_u64_le(out, lane.aura1_output_offset);
+        put_u64_le(out, lane.uncompressed_len);
+        put_u64_le(out, lane.compressed_offset);
+        put_u64_le(out, lane.compressed_len);
+        put_u64_le(out, lane.checksum);
+        put_u32_le(out, lane.flags);
+    }
+    Ok(())
+}
+
+fn decode_aura1_byte_lanes(reader: &mut ByteReader<'_>) -> Result<Vec<Aura1ByteLaneDescriptor>> {
+    if reader.remaining() == 0 {
+        return Ok(Vec::new());
+    }
+    if reader.read_exact(4)? != AURA1_BYTE_LANE_MAGIC {
+        return Err(AuraError::InvalidMagic { expected: "AUBL" });
+    }
+    let lane_count = reader.read_u32_le()? as usize;
+    let mut lanes = Vec::with_capacity(lane_count);
+    for _ in 0..lane_count {
+        let lane_version = reader.read_u8()?;
+        if lane_version != AURA1_BYTE_LANE_VERSION {
+            return Err(AuraError::UnsupportedVersion(u16::from(lane_version)));
+        }
+        let codec_id = reader.read_u8()?;
+        let codec_level = reader.read_u8()?;
+        let checksum_kind = reader.read_u8()?;
+        lanes.push(Aura1ByteLaneDescriptor {
+            lane_version,
+            codec_id,
+            codec_level,
+            checksum_kind,
+            block_index: reader.read_u32_le()?,
+            row_start: reader.read_u64_le()?,
+            row_count: reader.read_u32_le()?,
+            aura1_output_offset: reader.read_u64_le()?,
+            uncompressed_len: reader.read_u64_le()?,
+            compressed_offset: reader.read_u64_le()?,
+            compressed_len: reader.read_u64_le()?,
+            checksum: reader.read_u64_le()?,
+            flags: reader.read_u32_le()?,
+        });
+    }
+    Ok(lanes)
 }
 
 fn encode_generic_plan(plan: &Option<GenericInstructionPlan>, out: &mut Vec<u8>) -> Result<()> {

@@ -102,16 +102,18 @@ impl RoughStepStats {
 
     pub fn observe_delta(&mut self, delta: i64) {
         let step_count = nearest_step_count(delta, self.step);
-        let residual = delta - self.step.saturating_mul(step_count);
+        let residual_i128 = i128::from(delta) - i128::from(self.step) * i128::from(step_count);
+        let residual = residual_i128.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        let residual_abs = residual_i128.unsigned_abs().min(u128::from(u64::MAX)) as u64;
         self.observed_deltas += 1;
         self.min_residual = self.min_residual.min(residual);
         self.max_residual = self.max_residual.max(residual);
-        self.max_abs_residual = self.max_abs_residual.max(residual.unsigned_abs());
+        self.max_abs_residual = self.max_abs_residual.max(residual_abs);
 
         let gap_steps = step_count.unsigned_abs();
         self.max_gap_steps = self.max_gap_steps.max(gap_steps);
         if gap_steps > 1 {
-            self.gap_count += gap_steps - 1;
+            self.gap_count = self.gap_count.saturating_add(gap_steps - 1);
         }
     }
 }

@@ -394,6 +394,7 @@ fn bitpacked_product_residual_plan(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bitpacked_proportional_residual_plan(
     field_index: u16,
     total_value_field_index: u16,

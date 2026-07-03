@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::mem;
+use std::time::Instant;
 
 use crate::bitpack::{
     bitpacked_byte_len, pack_signed_values, pack_unsigned_values, signed_bitpack_width_for_range,
@@ -29,6 +31,110 @@ pub fn encode_generic_stream_body(
         (GenericStreamOp::UuidConstMask { .. }, _) => Err(AuraError::InvalidValue("body type")),
         (_, GenericStreamBodyValue::I64(values)) => encode_i64_op(&instruction.op, values),
         (_, GenericStreamBodyValue::U128(_)) => Err(AuraError::InvalidValue("body type")),
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GenericI64EmitterEncodeStats {
+    pub value_count: usize,
+    pub temporary_buffer_bytes: usize,
+    pub encoder_allocations: usize,
+    pub frequency_pass_ns: u128,
+    pub direct_stream_emit_ns: u128,
+    pub compression_encoding_ns: u128,
+}
+
+pub(crate) fn encode_generic_i64_stream_body_from_emitter<F>(
+    instruction: &GenericStreamInstruction,
+    mut emit: F,
+    stats: &mut GenericI64EmitterEncodeStats,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut dyn FnMut(i64) -> Result<()>) -> Result<usize>,
+{
+    match &instruction.op {
+        GenericStreamOp::FixedStep { base, step } => {
+            encode_fixed_step_from_emitter(*base, *step, &mut emit, stats)
+        }
+        GenericStreamOp::BaseBitpack {
+            base,
+            unit,
+            bit_width,
+        } => encode_base_bitpack_from_emitter(*base, *unit, *bit_width, &mut emit, stats),
+        GenericStreamOp::PrevDelta {
+            base,
+            unit,
+            bit_width,
+        } => encode_prev_delta_from_emitter(*base, *unit, *bit_width, &mut emit, stats),
+        GenericStreamOp::PrevVarint { base, unit } => {
+            encode_prev_varint_from_emitter(*base, *unit, &mut emit, stats)
+        }
+        GenericStreamOp::BlockLocal {
+            block_size,
+            mode_count,
+        } => encode_block_local_from_emitter(*block_size, *mode_count, &mut emit, stats),
+        GenericStreamOp::PatchedBitpack {
+            base,
+            unit,
+            low_width,
+            high_width,
+            exception_count,
+        } => encode_patched_bitpack_from_emitter(
+            *base,
+            *unit,
+            *low_width,
+            *high_width,
+            *exception_count,
+            &mut emit,
+            stats,
+        ),
+        GenericStreamOp::Rle {
+            base,
+            unit,
+            bit_width,
+            run_count,
+        } => encode_rle_from_emitter(*base, *unit, *bit_width, *run_count, &mut emit, stats),
+        GenericStreamOp::BitplaneRle {
+            base,
+            unit,
+            bit_width,
+        } => encode_bitplane_rle_from_emitter(*base, *unit, *bit_width, &mut emit, stats),
+        GenericStreamOp::Dictionary {
+            unit,
+            entry_count,
+            code_width,
+        } => encode_dictionary_from_emitter(*unit, *entry_count, *code_width, &mut emit, stats),
+        GenericStreamOp::PackedDictionary {
+            base,
+            unit,
+            entry_count,
+            entry_width,
+            code_width,
+        } => encode_packed_dictionary_from_emitter(
+            *base,
+            *unit,
+            *entry_count,
+            *entry_width,
+            *code_width,
+            &mut emit,
+            stats,
+        ),
+        GenericStreamOp::HuffmanDictionary {
+            base,
+            unit,
+            entry_count,
+            entry_width,
+            code_lengths,
+        } => encode_huffman_dictionary_from_emitter(
+            *base,
+            *unit,
+            *entry_count,
+            *entry_width,
+            code_lengths,
+            &mut emit,
+            stats,
+        ),
+        GenericStreamOp::UuidConstMask { .. } => Err(AuraError::InvalidValue("body type")),
     }
 }
 
@@ -545,7 +651,7 @@ impl<'a> GenericI64StreamCursorKind<'a> {
                     }
                     let remaining = *value_count - *produced;
                     let count = remaining.min(*block_size);
-                    let (next, next_offset) = read_block_local_cursor(*body, *offset, count)?;
+                    let (next, next_offset) = read_block_local_cursor(body, *offset, count)?;
                     *offset = next_offset;
                     *current = Some(Box::new(next));
                 }
@@ -1016,6 +1122,558 @@ fn encode_i64_op(op: &GenericStreamOp, values: &[i64]) -> Result<Vec<u8>> {
         } => encode_huffman_dictionary(base, unit, entry_count, entry_width, code_lengths, values),
         GenericStreamOp::UuidConstMask { .. } => Err(AuraError::InvalidValue("body type")),
     }
+}
+
+fn add_temp_vec_bytes<T>(stats: &mut GenericI64EmitterEncodeStats, capacity: usize) {
+    stats.temporary_buffer_bytes = stats
+        .temporary_buffer_bytes
+        .saturating_add(capacity.saturating_mul(mem::size_of::<T>()));
+    stats.encoder_allocations = stats.encoder_allocations.saturating_add(1);
+}
+
+fn finish_emit_count(
+    stats: &mut GenericI64EmitterEncodeStats,
+    emitted: usize,
+    observed: usize,
+) -> Result<()> {
+    if emitted != observed {
+        return Err(AuraError::InvalidValue("stream value count"));
+    }
+    stats.value_count = emitted;
+    Ok(())
+}
+
+fn encode_fixed_step_from_emitter<F>(
+    base: i64,
+    step: i64,
+    emit: &mut F,
+    stats: &mut GenericI64EmitterEncodeStats,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut dyn FnMut(i64) -> Result<()>) -> Result<usize>,
+{
+    let emit_start = Instant::now();
+    let mut observed = 0usize;
+    let emitted = emit(&mut |value| {
+        if value != fixed_step_value(base, step, observed)? {
+            return Err(AuraError::InvalidValue("fixed step body"));
+        }
+        observed += 1;
+        Ok(())
+    })?;
+    stats.direct_stream_emit_ns = stats
+        .direct_stream_emit_ns
+        .saturating_add(emit_start.elapsed().as_nanos());
+    finish_emit_count(stats, emitted, observed)?;
+    Ok(Vec::new())
+}
+
+fn encode_base_bitpack_from_emitter<F>(
+    base: i64,
+    unit: i64,
+    bit_width: u8,
+    emit: &mut F,
+    stats: &mut GenericI64EmitterEncodeStats,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut dyn FnMut(i64) -> Result<()>) -> Result<usize>,
+{
+    let emit_start = Instant::now();
+    let mut scaled = Vec::new();
+    let emitted = emit(&mut |value| {
+        scaled.push(scaled_unsigned_offset(value, base, unit)?);
+        Ok(())
+    })?;
+    stats.direct_stream_emit_ns = stats
+        .direct_stream_emit_ns
+        .saturating_add(emit_start.elapsed().as_nanos());
+    finish_emit_count(stats, emitted, scaled.len())?;
+    add_temp_vec_bytes::<u64>(stats, scaled.capacity());
+
+    let compression_start = Instant::now();
+    let body = pack_unsigned_values(&scaled, bit_width)?;
+    stats.compression_encoding_ns = stats
+        .compression_encoding_ns
+        .saturating_add(compression_start.elapsed().as_nanos());
+    Ok(body)
+}
+
+fn encode_prev_delta_from_emitter<F>(
+    base: i64,
+    unit: i64,
+    bit_width: u8,
+    emit: &mut F,
+    stats: &mut GenericI64EmitterEncodeStats,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut dyn FnMut(i64) -> Result<()>) -> Result<usize>,
+{
+    let emit_start = Instant::now();
+    let mut previous = None;
+    let mut observed = 0usize;
+    let mut deltas = Vec::new();
+    let emitted = emit(&mut |value| {
+        if observed == 0 {
+            if value != base {
+                return Err(AuraError::InvalidValue("previous delta base"));
+            }
+        } else {
+            let previous = previous.ok_or(AuraError::InvalidValue("previous delta body"))?;
+            deltas.push(scaled_signed_delta(value, previous, unit)?);
+        }
+        previous = Some(value);
+        observed += 1;
+        Ok(())
+    })?;
+    stats.direct_stream_emit_ns = stats
+        .direct_stream_emit_ns
+        .saturating_add(emit_start.elapsed().as_nanos());
+    finish_emit_count(stats, emitted, observed)?;
+    add_temp_vec_bytes::<i64>(stats, deltas.capacity());
+
+    let compression_start = Instant::now();
+    let body = pack_signed_values(&deltas, bit_width)?;
+    stats.compression_encoding_ns = stats
+        .compression_encoding_ns
+        .saturating_add(compression_start.elapsed().as_nanos());
+    Ok(body)
+}
+
+fn encode_prev_varint_from_emitter<F>(
+    base: i64,
+    unit: i64,
+    emit: &mut F,
+    stats: &mut GenericI64EmitterEncodeStats,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut dyn FnMut(i64) -> Result<()>) -> Result<usize>,
+{
+    validate_unit(unit)?;
+    let emit_start = Instant::now();
+    let mut out = Vec::new();
+    let mut previous = None;
+    let mut observed = 0usize;
+    let emitted = emit(&mut |value| {
+        if observed == 0 {
+            if value != base {
+                return Err(AuraError::InvalidValue("previous varint base"));
+            }
+        } else {
+            let previous = previous.ok_or(AuraError::InvalidValue("previous varint body"))?;
+            varint::encode_i64(scaled_signed_delta(value, previous, unit)?, &mut out);
+        }
+        previous = Some(value);
+        observed += 1;
+        Ok(())
+    })?;
+    stats.direct_stream_emit_ns = stats
+        .direct_stream_emit_ns
+        .saturating_add(emit_start.elapsed().as_nanos());
+    finish_emit_count(stats, emitted, observed)?;
+    Ok(out)
+}
+
+fn encode_block_local_from_emitter<F>(
+    block_size: u16,
+    mode_count: u32,
+    emit: &mut F,
+    stats: &mut GenericI64EmitterEncodeStats,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut dyn FnMut(i64) -> Result<()>) -> Result<usize>,
+{
+    let block_size = usize::from(block_size);
+    if block_size == 0 {
+        return Err(AuraError::InvalidValue("block size"));
+    }
+
+    let emit_start = Instant::now();
+    let mut out = Vec::new();
+    let mut block = Vec::with_capacity(block_size);
+    let mut observed = 0usize;
+    let mut block_count = 0usize;
+    let emitted = emit(&mut |value| {
+        block.push(value);
+        observed += 1;
+        if block.len() == block_size {
+            let op = choose_local_op(&block)?;
+            encode_local_op_header(&op, &mut out)?;
+            out.extend(encode_i64_op(&op, &block)?);
+            block.clear();
+            block_count += 1;
+        }
+        Ok(())
+    })?;
+    if !block.is_empty() {
+        let op = choose_local_op(&block)?;
+        encode_local_op_header(&op, &mut out)?;
+        out.extend(encode_i64_op(&op, &block)?);
+        block_count += 1;
+    }
+    stats.direct_stream_emit_ns = stats
+        .direct_stream_emit_ns
+        .saturating_add(emit_start.elapsed().as_nanos());
+    finish_emit_count(stats, emitted, observed)?;
+    add_temp_vec_bytes::<i64>(stats, block_size);
+    if block_count != mode_count as usize {
+        return Err(AuraError::InvalidValue("block count"));
+    }
+    Ok(out)
+}
+
+fn encode_patched_bitpack_from_emitter<F>(
+    base: i64,
+    unit: i64,
+    low_width: u8,
+    high_width: u8,
+    exception_count: u32,
+    emit: &mut F,
+    stats: &mut GenericI64EmitterEncodeStats,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut dyn FnMut(i64) -> Result<()>) -> Result<usize>,
+{
+    let mask = low_mask(low_width)?;
+    let emit_start = Instant::now();
+    let mut lows = Vec::new();
+    let mut indexes = Vec::new();
+    let mut highs = Vec::new();
+    let mut observed = 0usize;
+    let emitted = emit(&mut |value| {
+        let residual = scaled_unsigned_offset(value, base, unit)?;
+        lows.push(residual & mask);
+        let high = if low_width == 64 {
+            0
+        } else {
+            residual >> low_width
+        };
+        if high != 0 {
+            indexes.push(u64::try_from(observed).map_err(|_| AuraError::InvalidValue("index"))?);
+            highs.push(high);
+        }
+        observed += 1;
+        Ok(())
+    })?;
+    stats.direct_stream_emit_ns = stats
+        .direct_stream_emit_ns
+        .saturating_add(emit_start.elapsed().as_nanos());
+    finish_emit_count(stats, emitted, observed)?;
+    add_temp_vec_bytes::<u64>(stats, lows.capacity());
+    add_temp_vec_bytes::<u64>(stats, indexes.capacity());
+    add_temp_vec_bytes::<u64>(stats, highs.capacity());
+
+    if indexes.len() != exception_count as usize {
+        return Err(AuraError::InvalidValue("exception count"));
+    }
+    for high in &highs {
+        ensure_unsigned_width(*high, high_width, "bitpacked value")?;
+    }
+
+    let compression_start = Instant::now();
+    let index_width = index_width(observed);
+    let mut out = pack_unsigned_values(&lows, low_width)?;
+    out.extend(pack_unsigned_values(&indexes, index_width)?);
+    out.extend(pack_unsigned_values(&highs, high_width)?);
+    stats.compression_encoding_ns = stats
+        .compression_encoding_ns
+        .saturating_add(compression_start.elapsed().as_nanos());
+    Ok(out)
+}
+
+fn encode_rle_from_emitter<F>(
+    base: i64,
+    unit: i64,
+    bit_width: u8,
+    run_count: u32,
+    emit: &mut F,
+    stats: &mut GenericI64EmitterEncodeStats,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut dyn FnMut(i64) -> Result<()>) -> Result<usize>,
+{
+    let emit_start = Instant::now();
+    let mut run_values = Vec::new();
+    let mut run_lengths = Vec::<usize>::new();
+    let mut previous = None;
+    let mut observed = 0usize;
+    let emitted = emit(&mut |value| {
+        let residual = scaled_unsigned_offset(value, base, unit)?;
+        ensure_unsigned_width(residual, bit_width, "bitpacked value")?;
+        match previous {
+            Some(previous) if previous == residual => {
+                let len = run_lengths
+                    .last_mut()
+                    .ok_or(AuraError::InvalidValue("run length"))?;
+                *len = len
+                    .checked_add(1)
+                    .ok_or(AuraError::InvalidValue("run length"))?;
+            }
+            _ => {
+                run_values.push(residual);
+                run_lengths.push(1);
+                previous = Some(residual);
+            }
+        }
+        observed += 1;
+        Ok(())
+    })?;
+    stats.direct_stream_emit_ns = stats
+        .direct_stream_emit_ns
+        .saturating_add(emit_start.elapsed().as_nanos());
+    finish_emit_count(stats, emitted, observed)?;
+    add_temp_vec_bytes::<u64>(stats, run_values.capacity());
+    add_temp_vec_bytes::<usize>(stats, run_lengths.capacity());
+
+    if run_values.len() != run_count as usize {
+        return Err(AuraError::InvalidValue("run count"));
+    }
+
+    let compression_start = Instant::now();
+    let mut out = pack_unsigned_values(&run_values, bit_width)?;
+    for len in run_lengths {
+        varint::encode_u64(len as u64, &mut out);
+    }
+    stats.compression_encoding_ns = stats
+        .compression_encoding_ns
+        .saturating_add(compression_start.elapsed().as_nanos());
+    Ok(out)
+}
+
+fn encode_bitplane_rle_from_emitter<F>(
+    base: i64,
+    unit: i64,
+    bit_width: u8,
+    emit: &mut F,
+    stats: &mut GenericI64EmitterEncodeStats,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut dyn FnMut(i64) -> Result<()>) -> Result<usize>,
+{
+    let emit_start = Instant::now();
+    let mut residuals = Vec::new();
+    let emitted = emit(&mut |value| {
+        let residual = scaled_unsigned_offset(value, base, unit)?;
+        ensure_unsigned_width(residual, bit_width, "bitplane value")?;
+        residuals.push(residual);
+        Ok(())
+    })?;
+    stats.direct_stream_emit_ns = stats
+        .direct_stream_emit_ns
+        .saturating_add(emit_start.elapsed().as_nanos());
+    finish_emit_count(stats, emitted, residuals.len())?;
+    add_temp_vec_bytes::<u64>(stats, residuals.capacity());
+
+    let compression_start = Instant::now();
+    let mut out = Vec::new();
+    if !residuals.is_empty() {
+        for bit in 0..bit_width {
+            let mut bit_value = ((residuals[0] >> bit) & 1) as u8;
+            put_u8(&mut out, bit_value);
+            let run_count_offset = out.len();
+            put_u32_le(&mut out, 0);
+            let mut run_count = 0u32;
+            let mut run_len = 0usize;
+            for residual in &residuals {
+                let next = ((*residual >> bit) & 1) as u8;
+                if next == bit_value {
+                    run_len += 1;
+                } else {
+                    varint::encode_u64(run_len as u64, &mut out);
+                    run_count = run_count
+                        .checked_add(1)
+                        .ok_or(AuraError::InvalidValue("run count"))?;
+                    bit_value = next;
+                    run_len = 1;
+                }
+            }
+            varint::encode_u64(run_len as u64, &mut out);
+            run_count = run_count
+                .checked_add(1)
+                .ok_or(AuraError::InvalidValue("run count"))?;
+            out[run_count_offset..run_count_offset + 4].copy_from_slice(&run_count.to_le_bytes());
+        }
+    }
+    stats.compression_encoding_ns = stats
+        .compression_encoding_ns
+        .saturating_add(compression_start.elapsed().as_nanos());
+    Ok(out)
+}
+
+fn encode_dictionary_from_emitter<F>(
+    unit: i64,
+    entry_count: u32,
+    code_width: u8,
+    emit: &mut F,
+    stats: &mut GenericI64EmitterEncodeStats,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut dyn FnMut(i64) -> Result<()>) -> Result<usize>,
+{
+    let emit_start = Instant::now();
+    let mut scaled_values = Vec::new();
+    let emitted = emit(&mut |value| {
+        scaled_values.push(scaled_signed_value(value, unit)?);
+        Ok(())
+    })?;
+    stats.direct_stream_emit_ns = stats
+        .direct_stream_emit_ns
+        .saturating_add(emit_start.elapsed().as_nanos());
+    finish_emit_count(stats, emitted, scaled_values.len())?;
+    add_temp_vec_bytes::<i64>(stats, scaled_values.capacity());
+
+    let compression_start = Instant::now();
+    let mut entries = scaled_values.clone();
+    add_temp_vec_bytes::<i64>(stats, entries.capacity());
+    entries.sort_unstable();
+    entries.dedup();
+    if entries.len() != entry_count as usize {
+        return Err(AuraError::InvalidValue("dictionary entry count"));
+    }
+    let entry_indexes = entries
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (*value, index as u64))
+        .collect::<BTreeMap<_, _>>();
+    let codes = scaled_values
+        .iter()
+        .map(|value| {
+            entry_indexes
+                .get(value)
+                .copied()
+                .ok_or(AuraError::InvalidValue("dictionary code"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    add_temp_vec_bytes::<u64>(stats, codes.capacity());
+
+    let mut out = Vec::new();
+    for entry in entries {
+        varint::encode_i64(entry, &mut out);
+    }
+    out.extend(pack_unsigned_values(&codes, code_width)?);
+    stats.compression_encoding_ns = stats
+        .compression_encoding_ns
+        .saturating_add(compression_start.elapsed().as_nanos());
+    Ok(out)
+}
+
+fn encode_packed_dictionary_from_emitter<F>(
+    base: i64,
+    unit: i64,
+    entry_count: u32,
+    entry_width: u8,
+    code_width: u8,
+    emit: &mut F,
+    stats: &mut GenericI64EmitterEncodeStats,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut dyn FnMut(i64) -> Result<()>) -> Result<usize>,
+{
+    let emit_start = Instant::now();
+    let mut scaled_values = Vec::new();
+    let emitted = emit(&mut |value| {
+        scaled_values.push(scaled_unsigned_offset(value, base, unit)?);
+        Ok(())
+    })?;
+    stats.direct_stream_emit_ns = stats
+        .direct_stream_emit_ns
+        .saturating_add(emit_start.elapsed().as_nanos());
+    finish_emit_count(stats, emitted, scaled_values.len())?;
+    add_temp_vec_bytes::<u64>(stats, scaled_values.capacity());
+
+    let compression_start = Instant::now();
+    let mut entries = scaled_values.clone();
+    add_temp_vec_bytes::<u64>(stats, entries.capacity());
+    entries.sort_unstable();
+    entries.dedup();
+    if entries.len() != entry_count as usize {
+        return Err(AuraError::InvalidValue("dictionary entry count"));
+    }
+    for entry in &entries {
+        ensure_unsigned_width(*entry, entry_width, "dictionary entry")?;
+    }
+    let entry_indexes = entries
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (*value, index as u64))
+        .collect::<BTreeMap<_, _>>();
+    let codes = scaled_values
+        .iter()
+        .map(|value| {
+            entry_indexes
+                .get(value)
+                .copied()
+                .ok_or(AuraError::InvalidValue("dictionary code"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    add_temp_vec_bytes::<u64>(stats, codes.capacity());
+
+    let mut out = pack_unsigned_values(&entries, entry_width)?;
+    out.extend(pack_unsigned_values(&codes, code_width)?);
+    stats.compression_encoding_ns = stats
+        .compression_encoding_ns
+        .saturating_add(compression_start.elapsed().as_nanos());
+    Ok(out)
+}
+
+fn encode_huffman_dictionary_from_emitter<F>(
+    base: i64,
+    unit: i64,
+    entry_count: u32,
+    entry_width: u8,
+    code_lengths: &[u8],
+    emit: &mut F,
+    stats: &mut GenericI64EmitterEncodeStats,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut dyn FnMut(i64) -> Result<()>) -> Result<usize>,
+{
+    let emit_start = Instant::now();
+    let mut scaled_values = Vec::new();
+    let emitted = emit(&mut |value| {
+        scaled_values.push(scaled_unsigned_offset(value, base, unit)?);
+        Ok(())
+    })?;
+    stats.direct_stream_emit_ns = stats
+        .direct_stream_emit_ns
+        .saturating_add(emit_start.elapsed().as_nanos());
+    finish_emit_count(stats, emitted, scaled_values.len())?;
+    add_temp_vec_bytes::<u64>(stats, scaled_values.capacity());
+
+    let compression_start = Instant::now();
+    let mut entries = scaled_values.clone();
+    add_temp_vec_bytes::<u64>(stats, entries.capacity());
+    entries.sort_unstable();
+    entries.dedup();
+    if entries.len() != entry_count as usize || code_lengths.len() != entries.len() {
+        return Err(AuraError::InvalidValue("dictionary entry count"));
+    }
+    for entry in &entries {
+        ensure_unsigned_width(*entry, entry_width, "dictionary entry")?;
+    }
+    let entry_indexes = entries
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (*value, index))
+        .collect::<BTreeMap<_, _>>();
+    let canonical_codes = canonical_huffman_codes(code_lengths)?;
+    let mut out = pack_unsigned_values(&entries, entry_width)?;
+    let mut writer = HuffmanBitWriter::new();
+    for value in scaled_values {
+        let index = entry_indexes
+            .get(&value)
+            .copied()
+            .ok_or(AuraError::InvalidValue("dictionary code"))?;
+        let code = canonical_codes
+            .get(index)
+            .and_then(|code| *code)
+            .ok_or(AuraError::InvalidValue("huffman code"))?;
+        writer.write_code(code)?;
+    }
+    out.extend(writer.finish());
+    stats.compression_encoding_ns = stats
+        .compression_encoding_ns
+        .saturating_add(compression_start.elapsed().as_nanos());
+    Ok(out)
 }
 
 fn encoded_i64_op_len(op: &GenericStreamOp, values: &[i64]) -> Result<usize> {

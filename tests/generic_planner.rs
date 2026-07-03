@@ -45,7 +45,7 @@ fn generic_planner_does_not_infer_shape_math_from_parent_hints() {
         matches!(
             group,
             GenericGroupInstruction::DerivedStream {
-                output_slot: 2 | 3 | 4,
+                output_slot: 2..=4,
                 op: DerivedOp::AddResidual,
                 input_slots,
                 ..

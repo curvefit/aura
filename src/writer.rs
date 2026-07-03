@@ -1,9 +1,149 @@
 use std::collections::BTreeSet;
+use std::io::Write;
 
 use crate::header::{DerivedExpression, DerivedExpressionOp, DerivedExpressionSource};
+use crate::options::{AuraFormat, AuraProfile, WriterOptions};
 use crate::records::{self, I64FileInput, TypedFileInput};
-use crate::schema::{FieldType, SchemaDescriptor};
-use crate::{AuraDiagnostic, AuraError, AuraTypedValue, Profile, Result};
+use crate::schema::{AuraSchema, FieldType, SchemaDescriptor};
+use crate::{
+    AuraBatch, AuraColumnBatch, AuraDiagnostic, AuraError, AuraRecordBatch, AuraTypedValue,
+    CompiledAuraPlan, Profile, Result,
+};
+
+/// Public SDK writer for dynamic Aura schemas.
+#[derive(Debug)]
+pub struct AuraWriter<W> {
+    output: W,
+    schema: AuraSchema,
+    options: WriterOptions,
+    compiled_plan: CompiledAuraPlan,
+    rows: Vec<Vec<i64>>,
+    finished: bool,
+}
+
+/// Summary returned by [`AuraWriter::finish`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuraWriteSummary {
+    pub format: AuraFormat,
+    pub row_count: usize,
+    pub output_bytes: usize,
+    pub schema_hash: u32,
+}
+
+impl<W: Write> AuraWriter<W> {
+    pub fn try_new(output: W, schema: AuraSchema, options: WriterOptions) -> Result<Self> {
+        validate_sdk_schema(&schema)?;
+        Ok(Self {
+            output,
+            compiled_plan: CompiledAuraPlan::from_schema(&schema)?,
+            schema,
+            options,
+            rows: Vec::new(),
+            finished: false,
+        })
+    }
+
+    pub fn schema(&self) -> &AuraSchema {
+        &self.schema
+    }
+
+    pub fn compiled_plan(&self) -> &CompiledAuraPlan {
+        &self.compiled_plan
+    }
+
+    pub fn write_batch<B: AuraBatch>(&mut self, batch: B) -> Result<&mut Self> {
+        let batch = batch.into_record_batch()?;
+        if batch.schema() != &self.schema {
+            return Err(AuraError::InvalidValue("batch schema"));
+        }
+        self.rows.extend(batch.to_i64_rows()?);
+        Ok(self)
+    }
+
+    pub fn write_column_batch(&mut self, batch: AuraColumnBatch) -> Result<&mut Self> {
+        self.write_batch(batch.into_record_batch()?)
+    }
+
+    pub fn write_i64_rows<I, R>(&mut self, rows: I) -> Result<&mut Self>
+    where
+        I: IntoIterator<Item = R>,
+        R: Into<Vec<i64>>,
+    {
+        let batch = AuraRecordBatch::from_i64_rows(
+            self.schema.clone(),
+            rows.into_iter().map(Into::into).collect(),
+        )?;
+        self.write_batch(batch)
+    }
+
+    pub fn finish(mut self) -> Result<AuraWriteSummary> {
+        if self.finished {
+            return Err(AuraError::InvalidValue("writer finished"));
+        }
+        let row_count = self.rows.len();
+        let header_comment = if let Some(metadata) = &self.options.metadata {
+            Some(metadata.encode_header_comment()?)
+        } else {
+            let field_names = self
+                .schema
+                .fields()
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            if field_names.len() <= u8::MAX as usize {
+                Some(field_names)
+            } else {
+                None
+            }
+        };
+        let ingest = records::encode_ingest_i64_file(I64FileInput {
+            schema: self.schema.clone().into_descriptor(),
+            rows: self.rows,
+            stream_id: self.options.stream_id,
+            dictionary_id: self.options.dictionary_id,
+            header_comment,
+        })?;
+        let bytes = match self.options.format {
+            AuraFormat::Aura => ingest,
+            AuraFormat::Aura1 => records::compile_i64_file(&ingest, Profile::Aura1)?,
+            AuraFormat::Aura0 => {
+                if self.options.aura0_profile == AuraProfile::Compact {
+                    records::compile_i64_file(&ingest, Profile::Aura0)?
+                } else {
+                    records::compile_i64_file_with_aura0_profile(
+                        &ingest,
+                        self.options.aura0_profile.aura0_file_profile(),
+                        self.options.byte_lane_codec,
+                    )?
+                }
+            }
+        };
+        let output_bytes = bytes.len();
+        self.output
+            .write_all(&bytes)
+            .map_err(|_| AuraError::InvalidValue("writer output"))?;
+        self.finished = true;
+        Ok(AuraWriteSummary {
+            format: self.options.format,
+            row_count,
+            output_bytes,
+            schema_hash: self.schema.hash(),
+        })
+    }
+}
+
+fn validate_sdk_schema(schema: &AuraSchema) -> Result<()> {
+    for field in schema.fields() {
+        if !field.aura_type.is_supported() {
+            return Err(AuraError::InvalidValue("unsupported aura type"));
+        }
+        if field.nullable {
+            return Err(AuraError::InvalidValue("nullable field"));
+        }
+    }
+    Ok(())
+}
 
 /// In-memory writer for positional i64 Aura ingest files.
 ///

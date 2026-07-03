@@ -9,6 +9,8 @@ use crate::{AuraError, Result};
 
 const SCHEMA_ENCODING_PARENT_VECTOR: u8 = 0;
 const SCHEMA_ENCODING_FULL_FIELDS: u8 = 1;
+const SCHEMA_ENCODING_NAMED_PARENT_VECTOR: u8 = 2;
+const SCHEMA_ENCODING_NAMED_FULL_FIELDS: u8 = 3;
 const DECODED_SCHEMA_NAME: &str = "schema";
 pub(crate) const SCHEMA_MAP_PARENT_MAX: u8 = 99;
 pub(crate) const SCHEMA_MAP_TIME_SLOT: u8 = 100;
@@ -21,6 +23,315 @@ pub(crate) const SCHEMA_MAP_BOOL_1BIT: u8 = 241;
 pub(crate) const SCHEMA_MAP_ENUM_2BIT: u8 = 242;
 pub(crate) const SCHEMA_MAP_BITFIELD_8BIT: u8 = 243;
 pub(crate) const SCHEMA_MAP_DO_NOT_ATTEMPT: u8 = u8::MAX;
+
+/// Public SDK field type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AuraType {
+    Bool,
+    U8,
+    U16,
+    U32,
+    U64,
+    I8,
+    I16,
+    I32,
+    I64,
+    TimestampNanos,
+    TimestampMicros,
+    I64Scaled { scale: i8 },
+    PriceI64Scaled { scale: i8 },
+    EnumU8,
+    FlagsU32,
+    F32,
+    F64,
+    Binary,
+    Utf8,
+}
+
+impl AuraType {
+    pub const fn is_supported(self) -> bool {
+        !matches!(self, Self::F32 | Self::F64 | Self::Binary | Self::Utf8)
+    }
+
+    pub const fn nullable_supported(self) -> bool {
+        let _ = self;
+        false
+    }
+
+    pub const fn byte_width(self) -> Option<usize> {
+        match self {
+            Self::Bool | Self::U8 | Self::I8 | Self::EnumU8 => Some(1),
+            Self::U16 | Self::I16 => Some(2),
+            Self::U32 | Self::I32 | Self::FlagsU32 | Self::F32 => Some(4),
+            Self::U64
+            | Self::I64
+            | Self::TimestampNanos
+            | Self::TimestampMicros
+            | Self::I64Scaled { .. }
+            | Self::PriceI64Scaled { .. }
+            | Self::F64 => Some(8),
+            Self::Binary | Self::Utf8 => None,
+        }
+    }
+
+    const fn field_type(self) -> Option<FieldType> {
+        match self {
+            Self::Bool | Self::U8 | Self::EnumU8 => Some(FieldType::U8),
+            Self::I8 => Some(FieldType::I8),
+            Self::U16 => Some(FieldType::U16),
+            Self::I16 => Some(FieldType::I16),
+            Self::U32 | Self::FlagsU32 => Some(FieldType::U32),
+            Self::I32 => Some(FieldType::I32),
+            Self::U64 => Some(FieldType::U64),
+            Self::I64 | Self::I64Scaled { .. } | Self::PriceI64Scaled { .. } => {
+                Some(FieldType::I64)
+            }
+            Self::TimestampNanos => Some(FieldType::TimestampNs),
+            Self::TimestampMicros => Some(FieldType::I64),
+            Self::F32 | Self::F64 | Self::Binary | Self::Utf8 => None,
+        }
+    }
+
+    const fn role(self) -> FieldRole {
+        match self {
+            Self::TimestampNanos | Self::TimestampMicros => FieldRole::Timestamp,
+            Self::PriceI64Scaled { .. } => FieldRole::Price,
+            Self::Bool => FieldRole::Boolean,
+            Self::EnumU8 => FieldRole::Enum,
+            Self::FlagsU32 => FieldRole::Bitfield,
+            _ => FieldRole::Value,
+        }
+    }
+
+    const fn scale(self) -> i8 {
+        match self {
+            Self::I64Scaled { scale } | Self::PriceI64Scaled { scale } => scale,
+            Self::TimestampMicros => -6,
+            _ => 0,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::U8 => "u8",
+            Self::U16 => "u16",
+            Self::U32 => "u32",
+            Self::U64 => "u64",
+            Self::I8 => "i8",
+            Self::I16 => "i16",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::TimestampNanos => "timestamp_nanos",
+            Self::TimestampMicros => "timestamp_micros",
+            Self::I64Scaled { .. } => "i64_scaled",
+            Self::PriceI64Scaled { .. } => "price_i64_scaled",
+            Self::EnumU8 => "enum_u8",
+            Self::FlagsU32 => "flags_u32",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+            Self::Binary => "binary",
+            Self::Utf8 => "utf8",
+        }
+    }
+}
+
+/// Public SDK schema field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuraField {
+    pub id: u16,
+    pub name: String,
+    pub aura_type: AuraType,
+    pub nullable: bool,
+}
+
+impl AuraField {
+    pub fn new(id: u16, name: impl Into<String>, aura_type: AuraType) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            aura_type,
+            nullable: false,
+        }
+    }
+
+    pub fn nullable(mut self, nullable: bool) -> Self {
+        self.nullable = nullable;
+        self
+    }
+}
+
+/// Public SDK dynamic schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuraSchema {
+    descriptor: SchemaDescriptor,
+    fields: Vec<AuraField>,
+}
+
+impl AuraSchema {
+    pub fn builder() -> AuraSchemaBuilder {
+        AuraSchemaBuilder::new("aura_schema")
+    }
+
+    pub fn named(name: impl Into<String>) -> AuraSchemaBuilder {
+        AuraSchemaBuilder::new(name)
+    }
+
+    pub const fn descriptor(&self) -> &SchemaDescriptor {
+        &self.descriptor
+    }
+
+    pub fn into_descriptor(self) -> SchemaDescriptor {
+        self.descriptor
+    }
+
+    pub fn fields(&self) -> &[AuraField] {
+        &self.fields
+    }
+
+    pub fn field(&self, name: &str) -> Option<&AuraField> {
+        self.fields.iter().find(|field| field.name == name)
+    }
+
+    pub const fn hash(&self) -> u32 {
+        self.descriptor.schema_id
+    }
+
+    pub fn field_count(&self) -> usize {
+        self.fields.len()
+    }
+}
+
+impl From<AuraSchema> for SchemaDescriptor {
+    fn from(schema: AuraSchema) -> Self {
+        schema.descriptor
+    }
+}
+
+impl From<SchemaDescriptor> for AuraSchema {
+    fn from(descriptor: SchemaDescriptor) -> Self {
+        let fields = descriptor
+            .fields
+            .iter()
+            .map(|field| AuraField {
+                id: field.index,
+                name: field.name.clone(),
+                aura_type: aura_type_from_descriptor(field),
+                nullable: field.nullable,
+            })
+            .collect();
+        Self { descriptor, fields }
+    }
+}
+
+/// Builder for public SDK schemas.
+#[derive(Debug, Clone)]
+pub struct AuraSchemaBuilder {
+    name: String,
+    fields: Vec<AuraField>,
+    next_id: u16,
+}
+
+impl AuraSchemaBuilder {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            fields: Vec::new(),
+            next_id: 0,
+        }
+    }
+
+    pub fn field(mut self, name: impl Into<String>, aura_type: AuraType) -> Self {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        self.fields.push(AuraField::new(id, name, aura_type));
+        self
+    }
+
+    pub fn field_with_id(mut self, id: u16, name: impl Into<String>, aura_type: AuraType) -> Self {
+        self.next_id = self.next_id.max(id.saturating_add(1));
+        self.fields.push(AuraField::new(id, name, aura_type));
+        self
+    }
+
+    pub fn nullable_field(mut self, name: impl Into<String>, aura_type: AuraType) -> Self {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        self.fields
+            .push(AuraField::new(id, name, aura_type).nullable(true));
+        self
+    }
+
+    pub fn build(self) -> Result<AuraSchema> {
+        if self.fields.is_empty() {
+            return Err(AuraError::InvalidValue("schema fields"));
+        }
+        let mut names = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        let mut builder = SchemaBuilder::new(self.name);
+        for (index, field) in self.fields.iter().enumerate() {
+            if !names.insert(field.name.as_str()) {
+                return Err(AuraError::InvalidValue("duplicate field name"));
+            }
+            if !ids.insert(field.id) {
+                return Err(AuraError::InvalidValue("duplicate field id"));
+            }
+            if !field.aura_type.is_supported() {
+                return Err(AuraError::InvalidValue("unsupported aura type"));
+            }
+            if field.nullable && !field.aura_type.nullable_supported() {
+                return Err(AuraError::InvalidValue("nullable field"));
+            }
+            let field_type = field
+                .aura_type
+                .field_type()
+                .ok_or(AuraError::InvalidValue("unsupported aura type"))?;
+            let role = if index != 0 && field.aura_type == AuraType::TimestampNanos {
+                FieldRole::Value
+            } else {
+                field.aura_type.role()
+            };
+            builder = builder.field_with_candidates(
+                field.name.clone(),
+                field_type,
+                role,
+                TransformCandidates::default_for_role(role),
+            );
+        }
+        let descriptor = builder.finish()?.with_field_scales(
+            self.fields
+                .iter()
+                .map(|field| field.aura_type.scale())
+                .collect(),
+        )?;
+        Ok(AuraSchema {
+            descriptor,
+            fields: self.fields,
+        })
+    }
+}
+
+fn aura_type_from_descriptor(field: &FieldDescriptor) -> AuraType {
+    match (field.field_type, field.role, field.scale) {
+        (FieldType::TimestampNs, _, _) => AuraType::TimestampNanos,
+        (FieldType::I64, FieldRole::Timestamp, -6) => AuraType::TimestampMicros,
+        (FieldType::I64, FieldRole::Price, scale) => AuraType::PriceI64Scaled { scale },
+        (FieldType::I64, _, scale) if scale != 0 => AuraType::I64Scaled { scale },
+        (FieldType::I8, _, _) => AuraType::I8,
+        (FieldType::U8, FieldRole::Boolean, _) => AuraType::Bool,
+        (FieldType::U8, FieldRole::Enum, _) => AuraType::EnumU8,
+        (FieldType::U8, _, _) => AuraType::U8,
+        (FieldType::I16, _, _) => AuraType::I16,
+        (FieldType::U16, _, _) => AuraType::U16,
+        (FieldType::I32, _, _) => AuraType::I32,
+        (FieldType::U32, FieldRole::Bitfield, _) => AuraType::FlagsU32,
+        (FieldType::U32, _, _) => AuraType::U32,
+        (FieldType::I64, _, _) => AuraType::I64,
+        (FieldType::U64, _, _) => AuraType::U64,
+        (FieldType::I128, _, _) => AuraType::I64,
+        (FieldType::Opaque16, _, _) => AuraType::Binary,
+    }
+}
 
 /// Logical field type recorded by an Aura schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -570,6 +881,7 @@ impl SchemaBuilder {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn field_with_relation_and_candidates(
         mut self,
         name: impl Into<String>,
@@ -899,7 +1211,7 @@ fn schema_field_map_byte(
         {
             return Ok(SCHEMA_MAP_TIME_SLOT);
         }
-        FieldRole::Timestamp => return Err(AuraError::InvalidValue("schema time mapping")),
+        FieldRole::Timestamp => return Ok(SCHEMA_MAP_DO_NOT_ATTEMPT),
         FieldRole::Boolean if field.relation == FieldRelation::None => {
             return Ok(SCHEMA_MAP_BOOL_1BIT)
         }
@@ -980,7 +1292,9 @@ fn validate_i64_schema_definition_header(schema_len: usize, comment_len: usize) 
 pub(crate) fn encode_schema_block(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Result<()> {
     let mut schema_encoding = Vec::new();
     if let Some(parent_slots) = parent_slots_for_generic_i64_schema(schema) {
-        put_u8(&mut schema_encoding, SCHEMA_ENCODING_PARENT_VECTOR);
+        put_u8(&mut schema_encoding, SCHEMA_ENCODING_NAMED_PARENT_VECTOR);
+        put_string(&mut schema_encoding, &schema.name)?;
+        put_u32_le(&mut schema_encoding, schema.schema_id);
         put_u8(&mut schema_encoding, parent_slots.len() as u8);
         schema_encoding.extend_from_slice(&parent_slots);
     } else {
@@ -999,6 +1313,10 @@ pub(crate) fn decode_schema_block(reader: &mut ByteReader<'_>) -> Result<SchemaD
     let schema = match schema_reader.read_u8()? {
         SCHEMA_ENCODING_PARENT_VECTOR => decode_parent_vector_schema(&mut schema_reader)?,
         SCHEMA_ENCODING_FULL_FIELDS => decode_full_field_schema(&mut schema_reader)?,
+        SCHEMA_ENCODING_NAMED_PARENT_VECTOR => {
+            decode_named_parent_vector_schema(&mut schema_reader)?
+        }
+        SCHEMA_ENCODING_NAMED_FULL_FIELDS => decode_named_full_field_schema(&mut schema_reader)?,
         _ => return Err(AuraError::InvalidValue("schema encoding")),
     };
     schema_reader.finish()?;
@@ -1053,8 +1371,24 @@ fn decode_parent_vector_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDesc
     generic_i64_parent_schema(DECODED_SCHEMA_NAME, parent_slots)
 }
 
+fn decode_named_parent_vector_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
+    let name = read_string(reader)?;
+    let schema_id = reader.read_u32_le()?;
+    let slot_count = reader.read_u8()? as usize;
+    let parent_slots = reader.read_exact(slot_count)?;
+    let mut schema = generic_i64_parent_schema(&name, parent_slots)?;
+    schema.schema_id = schema_id;
+    Ok(schema)
+}
+
 fn encode_full_field_schema(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Result<()> {
-    put_u8(out, SCHEMA_ENCODING_FULL_FIELDS);
+    put_u8(out, SCHEMA_ENCODING_NAMED_FULL_FIELDS);
+    put_string(out, &schema.name)?;
+    put_u32_le(out, schema.schema_id);
+    encode_full_field_schema_payload(schema, out)
+}
+
+fn encode_full_field_schema_payload(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Result<()> {
     put_u16_len(out, schema.fields.len(), "schema field count")?;
     for field in &schema.fields {
         put_u16_le(out, field.index);
@@ -1084,6 +1418,20 @@ fn encode_full_field_schema(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Res
 }
 
 fn decode_full_field_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
+    decode_full_field_schema_with_name(reader, DECODED_SCHEMA_NAME, None)
+}
+
+fn decode_named_full_field_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
+    let name = read_string(reader)?;
+    let schema_id = reader.read_u32_le()?;
+    decode_full_field_schema_with_name(reader, &name, Some(schema_id))
+}
+
+fn decode_full_field_schema_with_name(
+    reader: &mut ByteReader<'_>,
+    name: &str,
+    schema_id: Option<u32>,
+) -> Result<SchemaDescriptor> {
     let field_count = reader.read_u16_le()? as usize;
     let mut fields = Vec::with_capacity(field_count);
     for _ in 0..field_count {
@@ -1126,12 +1474,11 @@ fn decode_full_field_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescrip
         let len = reader.read_u16_le()? as usize;
         decode_derived_expression_table(reader.read_exact(len)?)?
     };
-    schema_from_fields(
-        DECODED_SCHEMA_NAME,
-        fields,
-        compact_schema_map,
-        derived_expressions,
-    )
+    let mut schema = schema_from_fields(name, fields, compact_schema_map, derived_expressions)?;
+    if let Some(schema_id) = schema_id {
+        schema.schema_id = schema_id;
+    }
+    Ok(schema)
 }
 
 fn schema_from_fields(

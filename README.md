@@ -45,6 +45,8 @@ payload samples, or production capture logic.
 
 ## Docs
 
+- [SDK](docs/SDK.md) explains the public schema, writer, reader, and converter API.
+- [Schema API](docs/SCHEMA.md), [writer API](docs/WRITER.md), [reader API](docs/READER.md), [conversion API](docs/CONVERSION.md), and [errors](docs/ERRORS.md) document the current library surface.
 - [Format levels](docs/tiers.md) explains ingest, Aura0, and Aura1.
 - [Aura container](docs/container.md) explains the header/body/footer shape.
 - [Field programs](docs/field-programs.md) explains compact decode instructions.

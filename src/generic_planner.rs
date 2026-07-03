@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use crate::bitpack::{signed_bitpack_width_for_range, unsigned_bitpack_width};
 use crate::body::{
-    decode_generic_stream_body, encode_generic_stream_body, try_generic_i64_stream_cursor,
+    decode_generic_stream_body, encode_generic_i64_stream_body_from_emitter,
+    encode_generic_stream_body, try_generic_i64_stream_cursor, GenericI64EmitterEncodeStats,
     GenericI64StreamCursor, GenericStreamBodyValue,
 };
 use crate::bytes::{put_u16_le, put_u32_le, put_u64_le, ByteGuard, ByteReader};
@@ -36,6 +37,23 @@ pub struct GenericEncodedStream {
     pub stream_id: u16,
     pub value_count: usize,
     pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GenericColumnEncodeStats {
+    pub column_vector_count: usize,
+    pub column_value_count: usize,
+    pub stream_count: usize,
+    pub stream_value_count: usize,
+    pub stream_vector_allocations: usize,
+    pub direct_stream_count: usize,
+    pub direct_stream_value_count: usize,
+    pub stream_body_bytes: usize,
+    pub temporary_buffer_bytes: usize,
+    pub encoder_allocations: usize,
+    pub frequency_pass_ns: u128,
+    pub direct_stream_emit_ns: u128,
+    pub compression_encoding_ns: u128,
 }
 
 struct PlannedI64Rows {
@@ -461,6 +479,111 @@ pub fn encode_generic_i64_rows_with_plan(
     })
 }
 
+pub fn encode_generic_i64_columns_with_plan(
+    schema: &SchemaDescriptor,
+    columns: &[Vec<i64>],
+    record_count: usize,
+    plan: GenericInstructionPlan,
+    stats: Option<&mut GenericColumnEncodeStats>,
+) -> Result<GenericEncodedI64Rows> {
+    validate_columns(schema, columns, record_count)?;
+    let _encoded_plan = plan.encode()?;
+    let mut stats = stats;
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.column_vector_count = columns.len();
+        stats.column_value_count = columns.iter().map(Vec::len).sum();
+    }
+    let mut streams = Vec::with_capacity(plan.streams.len());
+    for instruction in &plan.streams {
+        let values = stream_values_for_instruction_from_columns(
+            schema,
+            columns,
+            record_count,
+            &plan,
+            instruction,
+        )?;
+        let value_count = values.len();
+        let body = encode_generic_stream_body(instruction, &GenericStreamBodyValue::I64(values))?;
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.stream_count += 1;
+            stats.stream_value_count += value_count;
+            stats.stream_vector_allocations += 1;
+            stats.stream_body_bytes += body.len();
+        }
+        streams.push(GenericEncodedStream {
+            stream_id: instruction.stream_id,
+            value_count,
+            body,
+        });
+    }
+
+    Ok(GenericEncodedI64Rows {
+        plan,
+        streams,
+        record_count,
+        field_count: schema.fields.len(),
+    })
+}
+
+pub fn encode_generic_i64_columns_with_plan_direct_streams(
+    schema: &SchemaDescriptor,
+    columns: &[Vec<i64>],
+    record_count: usize,
+    plan: GenericInstructionPlan,
+    stats: Option<&mut GenericColumnEncodeStats>,
+) -> Result<GenericEncodedI64Rows> {
+    validate_columns(schema, columns, record_count)?;
+    let _encoded_plan = plan.encode()?;
+    let mut stats = stats;
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.column_vector_count = columns.len();
+        stats.column_value_count = columns.iter().map(Vec::len).sum();
+    }
+
+    let mut streams = Vec::with_capacity(plan.streams.len());
+    for instruction in &plan.streams {
+        let mut stream_stats = GenericI64EmitterEncodeStats::default();
+        let body = encode_generic_i64_stream_body_from_emitter(
+            instruction,
+            |sink| {
+                emit_stream_values_for_instruction_from_columns(
+                    schema,
+                    columns,
+                    record_count,
+                    &plan,
+                    instruction,
+                    sink,
+                )
+            },
+            &mut stream_stats,
+        )?;
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.stream_count += 1;
+            stats.stream_value_count += stream_stats.value_count;
+            stats.direct_stream_count += 1;
+            stats.direct_stream_value_count += stream_stats.value_count;
+            stats.stream_body_bytes += body.len();
+            stats.temporary_buffer_bytes += stream_stats.temporary_buffer_bytes;
+            stats.encoder_allocations += stream_stats.encoder_allocations;
+            stats.frequency_pass_ns += stream_stats.frequency_pass_ns;
+            stats.direct_stream_emit_ns += stream_stats.direct_stream_emit_ns;
+            stats.compression_encoding_ns += stream_stats.compression_encoding_ns;
+        }
+        streams.push(GenericEncodedStream {
+            stream_id: instruction.stream_id,
+            value_count: stream_stats.value_count,
+            body,
+        });
+    }
+
+    Ok(GenericEncodedI64Rows {
+        plan,
+        streams,
+        record_count,
+        field_count: schema.fields.len(),
+    })
+}
+
 pub fn encode_generic_i64_rows_body(encoded: &GenericEncodedI64Rows) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     put_u16_len(&mut out, encoded.streams.len(), "generic stream count")?;
@@ -585,6 +708,7 @@ pub(crate) fn try_decode_generic_i64_columns_body(
     Ok(columns)
 }
 
+#[allow(clippy::needless_range_loop)]
 fn try_decode_partitioned_sparse_i64_columns_body(
     plan: &GenericInstructionPlan,
     bytes: &[u8],
@@ -1046,7 +1170,7 @@ fn try_write_partitioned_sparse_i64_aura1_body(
     field_count: usize,
     aura1_plan: &Aura1Plan,
     out: &mut Vec<u8>,
-    mut output_guard: Option<&mut ByteGuard>,
+    output_guard: Option<&mut ByteGuard>,
 ) -> Result<bool> {
     try_write_partitioned_sparse_i64_aura1_body_inner(
         plan,
@@ -1055,7 +1179,7 @@ fn try_write_partitioned_sparse_i64_aura1_body(
         field_count,
         aura1_plan,
         out,
-        output_guard.as_deref_mut(),
+        output_guard,
         None,
         None,
     )
@@ -1069,7 +1193,7 @@ pub(crate) fn try_write_partitioned_sparse_i64_aura1_body_profiled(
     field_count: usize,
     aura1_plan: &Aura1Plan,
     out: &mut Vec<u8>,
-    mut output_guard: Option<&mut ByteGuard>,
+    output_guard: Option<&mut ByteGuard>,
     timings: &mut DirectAura1WriterTimings,
     stats: &mut DirectAura1WriterStats,
 ) -> Result<bool> {
@@ -1080,13 +1204,13 @@ pub(crate) fn try_write_partitioned_sparse_i64_aura1_body_profiled(
         field_count,
         aura1_plan,
         out,
-        output_guard.as_deref_mut(),
+        output_guard,
         Some(timings),
         Some(stats),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_option_as_deref, clippy::too_many_arguments)]
 fn try_write_partitioned_sparse_i64_aura1_body_inner(
     plan: &GenericInstructionPlan,
     stream_values: &BTreeMap<u16, Vec<i64>>,
@@ -1154,6 +1278,17 @@ fn try_write_partitioned_sparse_i64_aura1_body_inner(
     if base_values.len() != partition_order.len() {
         return Err(AuraError::InvalidValue("segmented base stream"));
     }
+    let mut base_by_partition = [None; 256];
+    for (partition_value, base) in partition_order
+        .iter()
+        .copied()
+        .zip(base_values.iter().copied())
+    {
+        let partition =
+            i8::try_from(partition_value).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+        let index = i16::from(partition) + 128;
+        base_by_partition[index as usize] = Some(base);
+    }
 
     let masks = stream_values
         .get(&config.presence_stream_id)
@@ -1170,6 +1305,8 @@ fn try_write_partitioned_sparse_i64_aura1_body_inner(
     let sparse5_bit = presence_bit_mask(config.sparse_presence_indices[0])?;
     let sparse6_bit = presence_bit_mask(config.sparse_presence_indices[1])?;
     let sparse_value_bit = presence_bit_mask(config.presence_value_index)?;
+    let presence_value_i8 =
+        i8::try_from(config.presence_value).map_err(|_| AuraError::InvalidValue("i8 value"))?;
     if let Some(timings) = timings.as_deref_mut() {
         timings.sparse_partition_traversal_ns = timings
             .sparse_partition_traversal_ns
@@ -1181,13 +1318,20 @@ fn try_write_partitioned_sparse_i64_aura1_body_inner(
         .checked_mul(ROW_WIDTH)
         .ok_or(AuraError::InvalidValue("body length"))?;
     let body_start = out.len();
+    let body_end = body_start
+        .checked_add(body_len)
+        .ok_or(AuraError::InvalidValue("body length"))?;
     let allocation_start = Instant::now();
-    out.resize(
-        body_start
-            .checked_add(body_len)
-            .ok_or(AuraError::InvalidValue("body length"))?,
-        0,
-    );
+    if output_guard.is_some() {
+        out.resize(body_end, 0);
+    } else {
+        out.reserve(body_len);
+    }
+    let body_ptr = if output_guard.is_none() {
+        Some(unsafe { out.as_mut_ptr().add(body_start) })
+    } else {
+        None
+    };
     if let Some(timings) = timings.as_deref_mut() {
         timings.allocation_reuse_ns = timings
             .allocation_reuse_ns
@@ -1233,6 +1377,7 @@ fn try_write_partitioned_sparse_i64_aura1_body_inner(
         let group0 = group0_values[event_index];
         let group1 = group1_values[event_index];
         let group2 = group2_values[event_index];
+        let group2_i32 = i32::try_from(group2).map_err(|_| AuraError::InvalidValue("i32 value"))?;
         for _ in 0..event_count {
             let count = *partition_counts
                 .get(run_index)
@@ -1251,11 +1396,13 @@ fn try_write_partitioned_sparse_i64_aura1_body_inner(
             let partition_value = *partition_values
                 .get(run_index)
                 .ok_or(AuraError::InvalidValue("partition value stream"))?;
-            let base_index = partition_order
-                .binary_search(&partition_value)
-                .map_err(|_| AuraError::InvalidValue("segmented base stream"))?;
+            let partition_value_i8 =
+                i8::try_from(partition_value).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+            let base_index = (i16::from(partition_value_i8) + 128) as usize;
+            let base_value = base_by_partition[base_index]
+                .ok_or(AuraError::InvalidValue("segmented base stream"))?;
             let mut value = checked_sum(
-                base_values[base_index],
+                base_value,
                 *first_values
                     .get(run_index)
                     .ok_or(AuraError::InvalidValue("segmented first stream"))?,
@@ -1300,23 +1447,51 @@ fn try_write_partitioned_sparse_i64_aura1_body_inner(
                 };
                 let offset = body_start + row * ROW_WIDTH;
                 let row_end = offset + ROW_WIDTH;
-                let values = [
-                    group0,
-                    group1,
-                    group2,
-                    partition_value,
-                    value,
-                    sparse5,
-                    sparse6,
-                    presence_value,
-                ];
                 if let Some(output_guard) = output_guard.as_deref_mut() {
+                    let values = [
+                        group0,
+                        group1,
+                        group2,
+                        partition_value,
+                        value,
+                        sparse5,
+                        sparse6,
+                        presence_value,
+                    ];
                     write_partitioned_sparse_aura1_row_guarded(
                         &mut out[offset..row_end],
                         values,
                         output_guard,
                     )?;
+                } else if let Some(body_ptr) = body_ptr {
+                    unsafe {
+                        write_partitioned_sparse_aura1_row_ptr_prechecked(
+                            body_ptr.add(row * ROW_WIDTH),
+                            group0,
+                            group1,
+                            group2_i32,
+                            partition_value_i8,
+                            value,
+                            sparse5,
+                            sparse6,
+                            if mask & sparse_value_bit == 0 {
+                                0
+                            } else {
+                                presence_value_i8
+                            },
+                        );
+                    }
                 } else {
+                    let values = [
+                        group0,
+                        group1,
+                        group2,
+                        partition_value,
+                        value,
+                        sparse5,
+                        sparse6,
+                        presence_value,
+                    ];
                     write_partitioned_sparse_aura1_row(&mut out[offset..row_end], values)?;
                 }
             }
@@ -1338,6 +1513,11 @@ fn try_write_partitioned_sparse_i64_aura1_body_inner(
         || sparse6_index != sparse6_values.len()
     {
         return Err(AuraError::InvalidValue("partition run length"));
+    }
+    if output_guard.is_none() {
+        unsafe {
+            out.set_len(body_end);
+        }
     }
     if let Some(timings) = timings.as_deref_mut() {
         timings.partition_finalization_ns = timings
@@ -1383,6 +1563,42 @@ fn write_partitioned_sparse_aura1_row(row: &mut [u8], values: [i64; 8]) -> Resul
     write_unaligned_i64_le(row, 37, values[6]);
     row[45] = v7 as u8;
     Ok(())
+}
+
+unsafe fn write_partitioned_sparse_aura1_row_ptr(row: *mut u8, values: [i64; 8]) -> Result<()> {
+    let v2 = i32::try_from(values[2]).map_err(|_| AuraError::InvalidValue("i32 value"))?;
+    let v3 = i8::try_from(values[3]).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+    let v7 = i8::try_from(values[7]).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+    unsafe {
+        write_partitioned_sparse_aura1_row_ptr_prechecked(
+            row, values[0], values[1], v2, v3, values[4], values[5], values[6], v7,
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn write_partitioned_sparse_aura1_row_ptr_prechecked(
+    row: *mut u8,
+    v0: i64,
+    v1: i64,
+    v2: i32,
+    v3: i8,
+    v4: i64,
+    v5: i64,
+    v6: i64,
+    v7: i8,
+) {
+    unsafe {
+        row.add(0).cast::<i64>().write_unaligned(v0.to_le());
+        row.add(8).cast::<i64>().write_unaligned(v1.to_le());
+        row.add(16).cast::<i32>().write_unaligned(v2.to_le());
+        row.add(20).write(v3 as u8);
+        row.add(21).cast::<i64>().write_unaligned(v4.to_le());
+        row.add(29).cast::<i64>().write_unaligned(v5.to_le());
+        row.add(37).cast::<i64>().write_unaligned(v6.to_le());
+        row.add(45).write(v7 as u8);
+    }
 }
 
 fn write_partitioned_sparse_aura1_row_guarded(
@@ -1504,6 +1720,557 @@ pub(crate) fn try_write_generic_i64_aura1_body_guarded(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_write_generic_i64_aura1_body_from_streams_profiled(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+    output_guard: Option<&mut ByteGuard>,
+    timings: &mut DirectAura1WriterTimings,
+    stats: &mut DirectAura1WriterStats,
+) -> Result<bool> {
+    try_write_generic_i64_aura1_body_from_streams_inner(
+        plan,
+        stream_values,
+        record_count,
+        field_count,
+        aura1_plan,
+        out,
+        output_guard,
+        Some(timings),
+        Some(stats),
+    )
+}
+
+#[allow(
+    clippy::needless_option_as_deref,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments
+)]
+fn try_write_streaming_config_i64_aura1_body_from_streams(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+    mut output_guard: Option<&mut ByteGuard>,
+    mut timings: Option<&mut DirectAura1WriterTimings>,
+    mut stats: Option<&mut DirectAura1WriterStats>,
+) -> Result<bool> {
+    let total_start = Instant::now();
+    let traversal_start = Instant::now();
+    if field_count != 8 || !is_partitioned_sparse_aura1_plan(aura1_plan) {
+        return Ok(false);
+    }
+    let Some(config) = StreamingAura1Config::from_plan(plan, field_count)? else {
+        return Ok(false);
+    };
+
+    let mut source_counts = [0u8; MAX_STREAMING_AURA1_FIELDS];
+    for slot in 0..field_count {
+        if config.direct_streams[slot].is_some() {
+            source_counts[slot] = source_counts[slot].saturating_add(1);
+        }
+        if config.group_value_streams[slot].is_some() {
+            source_counts[slot] = source_counts[slot].saturating_add(1);
+        }
+        if config.sparse_streams[slot].is_some() {
+            source_counts[slot] = source_counts[slot].saturating_add(1);
+        }
+        if config.presence_values[slot].is_some() {
+            source_counts[slot] = source_counts[slot].saturating_add(1);
+        }
+    }
+    let partition_slot = usize::from(config.partition.partition_slot);
+    if partition_slot >= field_count {
+        return Ok(false);
+    }
+    source_counts[partition_slot] = source_counts[partition_slot].saturating_add(1);
+    if let Some(segmented) = config.segmented {
+        let slot = usize::from(segmented.output_slot);
+        if slot >= field_count {
+            return Ok(false);
+        }
+        source_counts[slot] = source_counts[slot].saturating_add(1);
+    }
+    if source_counts[..field_count].iter().any(|count| *count != 1) {
+        return Ok(false);
+    }
+
+    let stream = |stream_id: u16, name: &'static str| -> Result<&[i64]> {
+        stream_values
+            .get(&stream_id)
+            .map(Vec::as_slice)
+            .ok_or(AuraError::InvalidValue(name))
+    };
+
+    let partition_values = stream(config.partition.value_stream_id, "partition value stream")?;
+    let partition_counts = stream(config.partition.count_stream_id, "partition run length")?;
+    let event_counts = match config.partition.event_count_stream_id {
+        Some(stream_id) => stream(stream_id, "partition event count stream")?,
+        None => return Ok(false),
+    };
+    if partition_values.len() != partition_counts.len() {
+        return Err(AuraError::InvalidValue("partition stream length"));
+    }
+
+    let segmented = match config.segmented {
+        Some(segmented) => segmented,
+        None => return Ok(false),
+    };
+    let first_values = stream(segmented.first_stream_id, "segmented first stream")?;
+    let delta_values = stream(segmented.delta_stream_id, "segmented delta stream")?;
+    if first_values.len() != partition_counts.len() {
+        return Err(AuraError::InvalidValue("segmented first stream"));
+    }
+    let mut segment_bases = Vec::new();
+    let mut segment_base_by_partition = [None; 256];
+    let mut segment_base_dense = partition_slot == 3;
+    if let Some(base_stream_id) = segmented.base_stream_id {
+        let base_values = stream(base_stream_id, "segmented base stream")?;
+        let mut partition_order = partition_values.to_vec();
+        partition_order.sort_unstable();
+        partition_order.dedup();
+        if base_values.len() != partition_order.len() {
+            return Err(AuraError::InvalidValue("segmented base stream"));
+        }
+        segment_bases.reserve(partition_order.len());
+        for (partition_value, base) in partition_order.into_iter().zip(base_values.iter().copied())
+        {
+            if segment_base_dense {
+                match i8::try_from(partition_value) {
+                    Ok(partition) => {
+                        let index = (i16::from(partition) + 128) as usize;
+                        segment_base_by_partition[index] = Some(base);
+                    }
+                    Err(_) => {
+                        segment_base_dense = false;
+                    }
+                }
+            }
+            segment_bases.push((partition_value, base));
+        }
+    }
+
+    let presence = match config.presence {
+        Some(presence) => presence,
+        None => return Ok(false),
+    };
+    let masks = stream(presence.stream_id, "presence stream body")?;
+    if masks.len() != record_count {
+        return Err(AuraError::InvalidValue("presence stream body"));
+    }
+
+    let mut direct_values: [Option<&[i64]>; MAX_STREAMING_AURA1_FIELDS] =
+        [None; MAX_STREAMING_AURA1_FIELDS];
+    let mut direct_slots = [0usize; MAX_STREAMING_AURA1_FIELDS];
+    let mut direct_slot_count = 0usize;
+    let mut group_values: [Option<&[i64]>; MAX_STREAMING_AURA1_FIELDS] =
+        [None; MAX_STREAMING_AURA1_FIELDS];
+    let mut group_slots = [0usize; MAX_STREAMING_AURA1_FIELDS];
+    let mut group_slot_count = 0usize;
+    let mut sparse_values: [Option<&[i64]>; MAX_STREAMING_AURA1_FIELDS] =
+        [None; MAX_STREAMING_AURA1_FIELDS];
+    let mut sparse_bits = [0i64; MAX_STREAMING_AURA1_FIELDS];
+    let mut sparse_indexes = [0usize; MAX_STREAMING_AURA1_FIELDS];
+    let mut sparse_slots = [0usize; MAX_STREAMING_AURA1_FIELDS];
+    let mut sparse_slot_count = 0usize;
+    let mut presence_values = [None; MAX_STREAMING_AURA1_FIELDS];
+    let mut presence_slots = [0usize; MAX_STREAMING_AURA1_FIELDS];
+    let mut presence_slot_count = 0usize;
+
+    for slot in 0..field_count {
+        if let Some(stream_id) = config.direct_streams[slot] {
+            let values = stream(stream_id, "stream body")?;
+            if values.len() != record_count {
+                return Err(AuraError::InvalidValue("stream value count"));
+            }
+            direct_values[slot] = Some(values);
+            direct_slots[direct_slot_count] = slot;
+            direct_slot_count += 1;
+        }
+        if let Some(stream_id) = config.group_value_streams[slot] {
+            let values = stream(stream_id, "group value stream")?;
+            if values.len() != event_counts.len() {
+                return Err(AuraError::InvalidValue("group value stream"));
+            }
+            group_values[slot] = Some(values);
+            group_slots[group_slot_count] = slot;
+            group_slot_count += 1;
+        }
+        if let Some(sparse) = config.sparse_streams[slot] {
+            if sparse.presence_group_id != presence.group_id {
+                return Ok(false);
+            }
+            sparse_values[usize::from(sparse.output_slot)] =
+                Some(stream(sparse.stream_id, "sparse stream body")?);
+            sparse_bits[usize::from(sparse.output_slot)] =
+                presence_bit_mask(sparse.presence_index)?;
+            sparse_slots[sparse_slot_count] = usize::from(sparse.output_slot);
+            sparse_slot_count += 1;
+        }
+        if let Some(value) = config.presence_values[slot] {
+            if value.presence_group_id != presence.group_id {
+                return Ok(false);
+            }
+            presence_values[usize::from(value.output_slot)] =
+                Some((presence_bit_mask(value.presence_index)?, value.value));
+            presence_slots[presence_slot_count] = usize::from(value.output_slot);
+            presence_slot_count += 1;
+        }
+    }
+
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.sparse_partition_traversal_ns = timings
+            .sparse_partition_traversal_ns
+            .saturating_add(traversal_start.elapsed().as_nanos());
+    }
+
+    const ROW_WIDTH: usize = 46;
+    let body_len = record_count
+        .checked_mul(ROW_WIDTH)
+        .ok_or(AuraError::InvalidValue("body length"))?;
+    let body_start = out.len();
+    let body_end = body_start
+        .checked_add(body_len)
+        .ok_or(AuraError::InvalidValue("body length"))?;
+    let allocation_start = Instant::now();
+    if output_guard.is_some() {
+        out.resize(body_end, 0);
+    } else {
+        out.reserve(body_len);
+    }
+    let body_ptr = if output_guard.is_none() {
+        Some(unsafe { out.as_mut_ptr().add(body_start) })
+    } else {
+        None
+    };
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.allocation_reuse_ns = timings
+            .allocation_reuse_ns
+            .saturating_add(allocation_start.elapsed().as_nanos());
+    }
+
+    let loop_start = Instant::now();
+    let mut row_index = 0usize;
+    let mut run_index = 0usize;
+    let mut event_index = 0usize;
+    let mut delta_index = 0usize;
+    let mut event_values = [0i64; MAX_STREAMING_AURA1_FIELDS];
+    let exact_no_guard = output_guard.is_none()
+        && !plan
+            .streams
+            .iter()
+            .any(|stream| matches!(stream.op, GenericStreamOp::HuffmanDictionary { .. }))
+        && direct_slot_count == 0
+        && group_slot_count == 3
+        && group_values[0].is_some()
+        && group_values[1].is_some()
+        && group_values[2].is_some()
+        && partition_slot == 3
+        && segment_base_dense
+        && usize::from(segmented.output_slot) == 4
+        && sparse_slot_count == 2
+        && sparse_values[5].is_some()
+        && sparse_values[6].is_some()
+        && presence_slot_count == 1
+        && presence_values[7].is_some()
+        && body_ptr.is_some();
+
+    if exact_no_guard {
+        let group0_values = group_values[0].ok_or(AuraError::InvalidValue("group value stream"))?;
+        let group1_values = group_values[1].ok_or(AuraError::InvalidValue("group value stream"))?;
+        let group2_values = group_values[2].ok_or(AuraError::InvalidValue("group value stream"))?;
+        let sparse5_values =
+            sparse_values[5].ok_or(AuraError::InvalidValue("sparse stream body"))?;
+        let sparse6_values =
+            sparse_values[6].ok_or(AuraError::InvalidValue("sparse stream body"))?;
+        let sparse5_bit = sparse_bits[5];
+        let sparse6_bit = sparse_bits[6];
+        let (presence7_bit, presence7_value) =
+            presence_values[7].ok_or(AuraError::InvalidValue("presence bit"))?;
+        let presence7_value_i8 =
+            i8::try_from(presence7_value).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+        let body_ptr = body_ptr.ok_or(AuraError::InvalidValue("body length"))?;
+
+        while event_index < event_counts.len() {
+            let event_count =
+                positive_i64_to_usize(event_counts[event_index], "partition event count stream")?;
+            let group0 = group0_values[event_index];
+            let group1 = group1_values[event_index];
+            let group2 = group2_values[event_index];
+            let group2_i32 =
+                i32::try_from(group2).map_err(|_| AuraError::InvalidValue("i32 value"))?;
+            for _ in 0..event_count {
+                let count = *partition_counts
+                    .get(run_index)
+                    .ok_or(AuraError::InvalidValue("partition run length"))?;
+                let count = positive_i64_to_usize(count, "partition run length")?;
+                let end = row_index
+                    .checked_add(count)
+                    .ok_or(AuraError::InvalidValue("partition run length"))?;
+                if end > record_count {
+                    return Err(AuraError::InvalidValue("partition run length"));
+                }
+                let partition_value = *partition_values
+                    .get(run_index)
+                    .ok_or(AuraError::InvalidValue("partition value stream"))?;
+                let partition_value_i8 = i8::try_from(partition_value)
+                    .map_err(|_| AuraError::InvalidValue("i8 value"))?;
+                let base_value = if segment_bases.is_empty() {
+                    0
+                } else if segment_base_dense {
+                    segment_base_by_partition[(i16::from(partition_value_i8) + 128) as usize]
+                        .ok_or(AuraError::InvalidValue("segmented base stream"))?
+                } else {
+                    lookup_segment_base(&segment_bases, segment_bases.len(), partition_value)?
+                };
+                let mut segmented_current = checked_sum(
+                    base_value,
+                    *first_values
+                        .get(run_index)
+                        .ok_or(AuraError::InvalidValue("segmented first stream"))?,
+                )?;
+
+                for row in row_index..end {
+                    if row != row_index {
+                        let delta = *delta_values
+                            .get(delta_index)
+                            .ok_or(AuraError::InvalidValue("segmented delta stream"))?;
+                        segmented_current = checked_sum(segmented_current, delta)?;
+                        delta_index += 1;
+                    }
+                    let mask = *masks
+                        .get(row)
+                        .ok_or(AuraError::InvalidValue("presence stream body"))?;
+                    if mask < 0 {
+                        return Err(AuraError::InvalidValue("presence bit"));
+                    }
+                    let sparse5 = if mask & sparse5_bit == 0 {
+                        0
+                    } else {
+                        let value = *sparse5_values
+                            .get(sparse_indexes[5])
+                            .ok_or(AuraError::InvalidValue("sparse stream body"))?;
+                        sparse_indexes[5] += 1;
+                        value
+                    };
+                    let sparse6 = if mask & sparse6_bit == 0 {
+                        0
+                    } else {
+                        let value = *sparse6_values
+                            .get(sparse_indexes[6])
+                            .ok_or(AuraError::InvalidValue("sparse stream body"))?;
+                        sparse_indexes[6] += 1;
+                        value
+                    };
+                    unsafe {
+                        write_partitioned_sparse_aura1_row_ptr_prechecked(
+                            body_ptr.add(row * ROW_WIDTH),
+                            group0,
+                            group1,
+                            group2_i32,
+                            partition_value_i8,
+                            segmented_current,
+                            sparse5,
+                            sparse6,
+                            if mask & presence7_bit == 0 {
+                                0
+                            } else {
+                                presence7_value_i8
+                            },
+                        );
+                    }
+                }
+                row_index = end;
+                run_index += 1;
+            }
+            event_index += 1;
+        }
+    } else {
+        while event_index < event_counts.len() {
+            let event_count =
+                positive_i64_to_usize(event_counts[event_index], "partition event count stream")?;
+            for slot in group_slots.iter().copied().take(group_slot_count) {
+                event_values[slot] = group_values[slot]
+                    .ok_or(AuraError::InvalidValue("group value stream"))?[event_index];
+            }
+            for _ in 0..event_count {
+                let count = *partition_counts
+                    .get(run_index)
+                    .ok_or(AuraError::InvalidValue("partition run length"))?;
+                let count = positive_i64_to_usize(count, "partition run length")?;
+                let end = row_index
+                    .checked_add(count)
+                    .ok_or(AuraError::InvalidValue("partition run length"))?;
+                if end > record_count {
+                    return Err(AuraError::InvalidValue("partition run length"));
+                }
+                let partition_value = *partition_values
+                    .get(run_index)
+                    .ok_or(AuraError::InvalidValue("partition value stream"))?;
+                let base_value = if segment_bases.is_empty() {
+                    0
+                } else if segment_base_dense {
+                    let partition_value_i8 = i8::try_from(partition_value)
+                        .map_err(|_| AuraError::InvalidValue("i8 value"))?;
+                    segment_base_by_partition[(i16::from(partition_value_i8) + 128) as usize]
+                        .ok_or(AuraError::InvalidValue("segmented base stream"))?
+                } else {
+                    lookup_segment_base(&segment_bases, segment_bases.len(), partition_value)?
+                };
+                let mut segmented_current = checked_sum(
+                    base_value,
+                    *first_values
+                        .get(run_index)
+                        .ok_or(AuraError::InvalidValue("segmented first stream"))?,
+                )?;
+
+                for row in row_index..end {
+                    if row != row_index {
+                        let delta = *delta_values
+                            .get(delta_index)
+                            .ok_or(AuraError::InvalidValue("segmented delta stream"))?;
+                        segmented_current = checked_sum(segmented_current, delta)?;
+                        delta_index += 1;
+                    }
+
+                    let mask = *masks
+                        .get(row)
+                        .ok_or(AuraError::InvalidValue("presence stream body"))?;
+                    if mask < 0 {
+                        return Err(AuraError::InvalidValue("presence bit"));
+                    }
+
+                    let mut row_values = [0i64; 8];
+                    for slot in direct_slots.iter().copied().take(direct_slot_count) {
+                        row_values[slot] =
+                            direct_values[slot].ok_or(AuraError::InvalidValue("stream body"))?[row];
+                    }
+                    for slot in group_slots.iter().copied().take(group_slot_count) {
+                        row_values[slot] = event_values[slot];
+                    }
+                    row_values[partition_slot] = partition_value;
+                    row_values[usize::from(segmented.output_slot)] = segmented_current;
+                    for slot in sparse_slots.iter().copied().take(sparse_slot_count) {
+                        row_values[slot] = if mask & sparse_bits[slot] == 0 {
+                            0
+                        } else {
+                            let values = sparse_values[slot]
+                                .ok_or(AuraError::InvalidValue("sparse stream body"))?;
+                            let value = *values
+                                .get(sparse_indexes[slot])
+                                .ok_or(AuraError::InvalidValue("sparse stream body"))?;
+                            sparse_indexes[slot] += 1;
+                            value
+                        };
+                    }
+                    for slot in presence_slots.iter().copied().take(presence_slot_count) {
+                        let (bit, value) =
+                            presence_values[slot].ok_or(AuraError::InvalidValue("presence bit"))?;
+                        row_values[slot] = if mask & bit != 0 { value } else { 0 };
+                    }
+
+                    let offset = body_start
+                        .checked_add(
+                            row.checked_mul(ROW_WIDTH)
+                                .ok_or(AuraError::InvalidValue("body length"))?,
+                        )
+                        .ok_or(AuraError::InvalidValue("body length"))?;
+                    let row_end = offset
+                        .checked_add(ROW_WIDTH)
+                        .ok_or(AuraError::InvalidValue("body length"))?;
+                    if let Some(output_guard) = output_guard.as_deref_mut() {
+                        write_partitioned_sparse_aura1_row_guarded(
+                            &mut out[offset..row_end],
+                            row_values,
+                            output_guard,
+                        )?;
+                    } else if let Some(body_ptr) = body_ptr {
+                        unsafe {
+                            write_partitioned_sparse_aura1_row_ptr(
+                                body_ptr.add(row * ROW_WIDTH),
+                                row_values,
+                            )?;
+                        }
+                    } else {
+                        write_partitioned_sparse_aura1_row(&mut out[offset..row_end], row_values)?;
+                    }
+                }
+
+                row_index = end;
+                run_index += 1;
+            }
+            event_index += 1;
+        }
+    }
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.output_byte_stores_ns = timings
+            .output_byte_stores_ns
+            .saturating_add(loop_start.elapsed().as_nanos());
+    }
+
+    let finalize_start = Instant::now();
+    if row_index != record_count || run_index != partition_counts.len() {
+        return Err(AuraError::InvalidValue("partition run length"));
+    }
+    if delta_index != delta_values.len() {
+        return Err(AuraError::InvalidValue("segmented delta stream"));
+    }
+    for slot in sparse_slots.iter().copied().take(sparse_slot_count) {
+        if sparse_indexes[slot]
+            != sparse_values[slot]
+                .ok_or(AuraError::InvalidValue("sparse stream body"))?
+                .len()
+        {
+            return Err(AuraError::InvalidValue("sparse stream body"));
+        }
+    }
+    if output_guard.is_none() {
+        unsafe {
+            out.set_len(body_end);
+        }
+    }
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.partition_finalization_ns = timings
+            .partition_finalization_ns
+            .saturating_add(finalize_start.elapsed().as_nanos());
+        timings.total_ns = total_start.elapsed().as_nanos();
+        timings.close_sum();
+    }
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.partition_count = partition_counts.len();
+        stats.records_per_partition_min = partition_counts
+            .iter()
+            .filter_map(|count| usize::try_from(*count).ok())
+            .min()
+            .unwrap_or(0);
+        stats.records_per_partition_max = partition_counts
+            .iter()
+            .filter_map(|count| usize::try_from(*count).ok())
+            .max()
+            .unwrap_or(0);
+        stats.output_slices = record_count;
+        stats.non_contiguous_writes = record_count;
+        stats.output_offset_calculations = record_count;
+        stats.bounds_checks = record_count;
+        stats.temporary_buffer_bytes = 0;
+        stats.copied_bytes = body_len;
+        stats.allocation_count = stats.allocation_count.saturating_add(1);
+        if output_guard.is_some() {
+            stats.guard_update_calls = stats.guard_update_calls.saturating_add(record_count * 8);
+            stats.guard_update_bytes = stats.guard_update_bytes.saturating_add(body_len);
+        }
+    }
+
+    Ok(true)
+}
+
+#[allow(clippy::needless_option_as_deref)]
 fn try_write_generic_i64_aura1_body_inner(
     plan: GenericInstructionPlan,
     bytes: &[u8],
@@ -1559,42 +2326,115 @@ fn try_write_generic_i64_aura1_body_inner(
         return Ok(true);
     }
 
-    let stage_start = profile.then(Instant::now);
+    try_write_generic_i64_aura1_body_from_streams_inner(
+        &plan,
+        &stream_values,
+        record_count,
+        field_count,
+        aura1_plan,
+        out,
+        output_guard.as_deref_mut(),
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::needless_option_as_deref, clippy::too_many_arguments)]
+fn try_write_generic_i64_aura1_body_from_streams_inner(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+    mut output_guard: Option<&mut ByteGuard>,
+    mut timings: Option<&mut DirectAura1WriterTimings>,
+    mut stats: Option<&mut DirectAura1WriterStats>,
+) -> Result<bool> {
+    if try_write_streaming_config_i64_aura1_body_from_streams(
+        plan,
+        stream_values,
+        record_count,
+        field_count,
+        aura1_plan,
+        out,
+        output_guard.as_deref_mut(),
+        timings.as_deref_mut(),
+        stats.as_deref_mut(),
+    )? {
+        return Ok(true);
+    }
+
+    let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
+    let total_start = Instant::now();
+    let measure_stages = profile || timings.is_some();
+
+    let stage_start = measure_stages.then(Instant::now);
     let partition_runs =
-        partition_run_lengths_from_streams(&plan, &stream_values, record_count, field_count)?;
-    if let Some(stage_start) = stage_start {
+        partition_run_lengths_from_streams(plan, stream_values, record_count, field_count)?;
+    let partition_runs_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or_else(|| total_start.elapsed().as_nanos());
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.sparse_partition_traversal_ns = timings
+            .sparse_partition_traversal_ns
+            .saturating_add(partition_runs_ns);
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 partition_runs_us={}",
             stage_start.elapsed().as_micros()
         );
     }
 
-    let stage_start = profile.then(Instant::now);
-    let presence_maps = presence_maps_by_group(&plan, &stream_values, record_count)?;
-    if let Some(stage_start) = stage_start {
+    let stage_start = measure_stages.then(Instant::now);
+    let presence_maps = presence_maps_by_group(plan, stream_values, record_count)?;
+    let presence_maps_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.branch_record_type_handling_ns = timings
+            .branch_record_type_handling_ns
+            .saturating_add(presence_maps_ns);
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 presence_maps_us={}",
             stage_start.elapsed().as_micros()
         );
     }
 
-    let stage_start = profile.then(Instant::now);
+    let stage_start = measure_stages.then(Instant::now);
     let mut sources = direct_aura1_slot_sources(
-        &plan,
-        &stream_values,
+        plan,
+        stream_values,
         &partition_runs,
         &presence_maps,
         record_count,
         field_count,
     )?;
-    if let Some(stage_start) = stage_start {
+    let sources_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.buffer_slicing_view_creation_ns = timings
+            .buffer_slicing_view_creation_ns
+            .saturating_add(sources_ns);
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 sources_us={}",
             stage_start.elapsed().as_micros()
         );
     }
 
-    let stage_start = profile.then(Instant::now);
+    let stage_start = measure_stages.then(Instant::now);
     let mut field_specs = Vec::with_capacity(aura1_plan.fields.len());
     let mut row_width = 0usize;
     for field_plan in &aura1_plan.fields {
@@ -1610,7 +2450,17 @@ fn try_write_generic_i64_aura1_body_inner(
             .ok_or(AuraError::InvalidValue("body length"))?;
         field_specs.push((slot, field_plan.width));
     }
-    if let Some(stage_start) = stage_start {
+    let field_specs_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.field_reconstruction_packing_ns = timings
+            .field_reconstruction_packing_ns
+            .saturating_add(field_specs_ns);
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 field_specs_us={} row_width={} fields={}",
             stage_start.elapsed().as_micros(),
@@ -1619,13 +2469,35 @@ fn try_write_generic_i64_aura1_body_inner(
         );
     }
 
-    let stage_start = profile.then(Instant::now);
-    out.reserve(
-        record_count
-            .checked_mul(row_width)
-            .ok_or(AuraError::InvalidValue("body length"))?,
-    );
-    if let Some(stage_start) = stage_start {
+    let stage_start = measure_stages.then(Instant::now);
+    let body_len = record_count
+        .checked_mul(row_width)
+        .ok_or(AuraError::InvalidValue("body length"))?;
+    let body_start = out.len();
+    if is_partitioned_sparse_aura1_plan(aura1_plan) && field_count == 8 {
+        for source in sources.iter().take(8) {
+            if !source.is_supported() {
+                return Ok(false);
+            }
+        }
+        out.resize(
+            body_start
+                .checked_add(body_len)
+                .ok_or(AuraError::InvalidValue("body length"))?,
+            0,
+        );
+    } else {
+        out.reserve(body_len);
+    }
+    let allocation_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.allocation_reuse_ns = timings.allocation_reuse_ns.saturating_add(allocation_ns);
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 reserve_us={} reserved_body_bytes={}",
             stage_start.elapsed().as_micros(),
@@ -1633,18 +2505,54 @@ fn try_write_generic_i64_aura1_body_inner(
         );
     }
 
-    let stage_start = profile.then(Instant::now);
-    for row_index in 0..record_count {
-        for (slot, width) in &field_specs {
-            let value = sources[*slot].value_at(row_index)?;
+    let stage_start = measure_stages.then(Instant::now);
+    let fixed_row_writer = is_partitioned_sparse_aura1_plan(aura1_plan) && field_count == 8;
+    if fixed_row_writer {
+        const ROW_WIDTH: usize = 46;
+        for row_index in 0..record_count {
+            let offset = body_start + row_index * ROW_WIDTH;
+            let row_end = offset + ROW_WIDTH;
+            let values = [
+                sources[0].value_at(row_index)?,
+                sources[1].value_at(row_index)?,
+                sources[2].value_at(row_index)?,
+                sources[3].value_at(row_index)?,
+                sources[4].value_at(row_index)?,
+                sources[5].value_at(row_index)?,
+                sources[6].value_at(row_index)?,
+                sources[7].value_at(row_index)?,
+            ];
             if let Some(output_guard) = output_guard.as_deref_mut() {
-                write_direct_i64_width_guarded(out, value, *width, output_guard)?;
+                write_partitioned_sparse_aura1_row_guarded(
+                    &mut out[offset..row_end],
+                    values,
+                    output_guard,
+                )?;
             } else {
-                write_direct_i64_width(out, value, *width)?;
+                write_partitioned_sparse_aura1_row(&mut out[offset..row_end], values)?;
+            }
+        }
+    } else {
+        for row_index in 0..record_count {
+            for (slot, width) in &field_specs {
+                let value = sources[*slot].value_at(row_index)?;
+                if let Some(output_guard) = output_guard.as_deref_mut() {
+                    write_direct_i64_width_guarded(out, value, *width, output_guard)?;
+                } else {
+                    write_direct_i64_width(out, value, *width)?;
+                }
             }
         }
     }
-    if let Some(stage_start) = stage_start {
+    let output_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.output_byte_stores_ns = timings.output_byte_stores_ns.saturating_add(output_ns);
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 emit_rows_us={} rows={}",
             stage_start.elapsed().as_micros(),
@@ -1652,17 +2560,64 @@ fn try_write_generic_i64_aura1_body_inner(
         );
     }
 
-    let stage_start = profile.then(Instant::now);
+    let stage_start = measure_stages.then(Instant::now);
     for source in &mut sources {
         source.finish()?;
     }
-    if let Some(stage_start) = stage_start {
+    let finish_ns = stage_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.partition_finalization_ns =
+            timings.partition_finalization_ns.saturating_add(finish_ns);
+        timings.total_ns = total_start.elapsed().as_nanos();
+        timings.close_sum();
+    }
+    if let Some(stats) = stats.as_deref_mut() {
+        let mut run_lengths = partition_runs
+            .values()
+            .flat_map(|runs| runs.iter().map(|run| run.end.saturating_sub(run.start)));
+        let first_run_len = run_lengths.next();
+        stats.partition_count = partition_runs.values().map(Vec::len).max().unwrap_or(1);
+        stats.records_per_partition_min = first_run_len
+            .into_iter()
+            .chain(run_lengths)
+            .min()
+            .unwrap_or(record_count);
+        stats.records_per_partition_max = partition_runs
+            .values()
+            .flat_map(|runs| runs.iter().map(|run| run.end.saturating_sub(run.start)))
+            .max()
+            .unwrap_or(record_count);
+        stats.output_slices = if fixed_row_writer {
+            record_count
+        } else {
+            field_specs.len() * record_count
+        };
+        stats.non_contiguous_writes = stats.output_slices;
+        stats.output_offset_calculations = if fixed_row_writer { record_count } else { 0 };
+        stats.bounds_checks = if fixed_row_writer {
+            record_count
+        } else {
+            field_specs.len() * record_count
+        };
+        stats.temporary_buffer_bytes = 0;
+        stats.copied_bytes = body_len;
+        stats.allocation_count = stats.allocation_count.saturating_add(1);
+        if output_guard.is_some() {
+            stats.guard_update_calls = stats
+                .guard_update_calls
+                .saturating_add(field_specs.len().saturating_mul(record_count));
+            stats.guard_update_bytes = stats.guard_update_bytes.saturating_add(body_len);
+        }
+    }
+    if profile {
+        let stage_start = stage_start.expect("profile stage timer");
         eprintln!(
             "direct_aura1 finish_us={} total_us={}",
             stage_start.elapsed().as_micros(),
-            total_start
-                .map(|start| start.elapsed().as_micros())
-                .unwrap_or(0)
+            total_start.elapsed().as_micros()
         );
     }
     Ok(true)
@@ -1675,10 +2630,33 @@ pub(crate) fn try_encode_generic_i64_aura1_body_streaming(
     field_count: usize,
     aura1_plan: &Aura1Plan,
 ) -> Result<Option<Vec<u8>>> {
+    let mut out = Vec::new();
+    if try_write_generic_i64_aura1_body_streaming(
+        plan,
+        bytes,
+        record_count,
+        field_count,
+        aura1_plan,
+        &mut out,
+    )? {
+        Ok(Some(out))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn try_write_generic_i64_aura1_body_streaming(
+    plan: GenericInstructionPlan,
+    bytes: &[u8],
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+) -> Result<bool> {
     if field_count > MAX_STREAMING_AURA1_FIELDS
         || aura1_plan.fields.len() > MAX_STREAMING_AURA1_FIELDS
     {
-        return Ok(None);
+        return Ok(false);
     }
     if plan.groups.iter().any(|group| {
         matches!(
@@ -1689,7 +2667,7 @@ pub(crate) fn try_encode_generic_i64_aura1_body_streaming(
                 | GenericGroupInstruction::ExpressionValue { .. }
         )
     }) {
-        return Ok(None);
+        return Ok(false);
     }
 
     let instructions = plan
@@ -1710,14 +2688,14 @@ pub(crate) fn try_encode_generic_i64_aura1_body_streaming(
             .get(&stream_id)
             .ok_or(AuraError::InvalidValue("stream id"))?;
         let Some(cursor) = try_generic_i64_stream_cursor(instruction, body, value_count)? else {
-            return Ok(None);
+            return Ok(false);
         };
         cursors.insert(stream_id, cursor);
     }
     reader.finish()?;
 
     let Some(config) = StreamingAura1Config::from_plan(&plan, field_count)? else {
-        return Ok(None);
+        return Ok(false);
     };
     let mut segment_bases = [(0i64, 0i64); MAX_STREAMING_AURA1_FIELDS];
     let mut segment_base_count = 0usize;
@@ -1729,10 +2707,10 @@ pub(crate) fn try_encode_generic_i64_aura1_body_streaming(
                     .get(&config.partition.value_stream_id)
                     .and_then(GenericI64StreamCursor::dictionary_values)
                 else {
-                    return Ok(None);
+                    return Ok(false);
                 };
                 if values.len() > partition_values.len() {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 for (index, value) in values.iter().copied().enumerate() {
                     partition_values[index] = value;
@@ -1857,7 +2835,7 @@ pub(crate) fn try_encode_generic_i64_aura1_body_streaming(
     for field_plan in &aura1_plan.fields {
         let slot = usize::from(field_plan.field_index);
         if slot >= field_count || !config.source_supported(slot) {
-            return Ok(None);
+            return Ok(false);
         }
         row_width = row_width
             .checked_add(usize::from(field_plan.width.byte_width()))
@@ -1866,11 +2844,21 @@ pub(crate) fn try_encode_generic_i64_aura1_body_streaming(
         field_spec_count += 1;
     }
 
-    let mut out = Vec::with_capacity(
-        record_count
-            .checked_mul(row_width)
-            .ok_or(AuraError::InvalidValue("body length"))?,
-    );
+    let body_len = record_count
+        .checked_mul(row_width)
+        .ok_or(AuraError::InvalidValue("body length"))?;
+    let fixed_row_writer = is_partitioned_sparse_aura1_plan(aura1_plan) && field_count == 8;
+    let body_start = out.len();
+    if fixed_row_writer {
+        out.resize(
+            body_start
+                .checked_add(body_len)
+                .ok_or(AuraError::InvalidValue("body length"))?,
+            0,
+        );
+    } else {
+        out.reserve(body_len);
+    }
     let mut event_values = [0i64; MAX_STREAMING_AURA1_FIELDS];
     let mut event_active = false;
     let mut event_runs_remaining = 0usize;
@@ -1983,7 +2971,7 @@ pub(crate) fn try_encode_generic_i64_aura1_body_streaming(
                 let sparse = config.sparse_streams[slot]
                     .ok_or(AuraError::InvalidValue("sparse stream body"))?;
                 if sparse.presence_group_id != presence.group_id {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 let bit = presence_bit_mask(sparse.presence_index)?;
                 row_values[usize::from(sparse.output_slot)] = if mask & bit == 0 {
@@ -2005,7 +2993,7 @@ pub(crate) fn try_encode_generic_i64_aura1_body_streaming(
                 let value =
                     config.presence_values[slot].ok_or(AuraError::InvalidValue("presence bit"))?;
                 if value.presence_group_id != presence.group_id {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 let bit = presence_bit_mask(value.presence_index)?;
                 row_values[usize::from(value.output_slot)] =
@@ -2013,8 +3001,34 @@ pub(crate) fn try_encode_generic_i64_aura1_body_streaming(
             }
         }
 
-        for (slot, width) in field_specs.iter().flatten().copied().take(field_spec_count) {
-            write_direct_i64_width(&mut out, row_values[slot], width)?;
+        if fixed_row_writer {
+            const ROW_WIDTH: usize = 46;
+            let offset = row_index
+                .checked_mul(ROW_WIDTH)
+                .ok_or(AuraError::InvalidValue("body length"))?;
+            let offset = body_start
+                .checked_add(offset)
+                .ok_or(AuraError::InvalidValue("body length"))?;
+            let row_end = offset
+                .checked_add(ROW_WIDTH)
+                .ok_or(AuraError::InvalidValue("body length"))?;
+            write_partitioned_sparse_aura1_row(
+                &mut out[offset..row_end],
+                [
+                    row_values[0],
+                    row_values[1],
+                    row_values[2],
+                    row_values[3],
+                    row_values[4],
+                    row_values[5],
+                    row_values[6],
+                    row_values[7],
+                ],
+            )?;
+        } else {
+            for (slot, width) in field_specs.iter().flatten().copied().take(field_spec_count) {
+                write_direct_i64_width(out, row_values[slot], width)?;
+            }
         }
 
         if row_index + 1 == run_end {
@@ -2055,7 +3069,7 @@ pub(crate) fn try_encode_generic_i64_aura1_body_streaming(
     for cursor in cursors.values_mut() {
         cursor.finish()?;
     }
-    Ok(Some(out))
+    Ok(true)
 }
 
 #[derive(Clone, Copy)]
@@ -2304,6 +3318,13 @@ fn next_positive_cursor_value(
     usize::try_from(value).map_err(|_| AuraError::InvalidValue(name))
 }
 
+fn positive_i64_to_usize(value: i64, name: &'static str) -> Result<usize> {
+    if value <= 0 {
+        return Err(AuraError::InvalidValue(name));
+    }
+    usize::try_from(value).map_err(|_| AuraError::InvalidValue(name))
+}
+
 fn lookup_segment_base(bases: &[(i64, i64)], count: usize, partition_value: i64) -> Result<i64> {
     bases
         .iter()
@@ -2392,7 +3413,7 @@ pub(crate) fn decode_generic_i64_stream_values_profiled(
     }
     let validation_start = Instant::now();
     reader.finish()?;
-    if let Some(timings) = timings.as_deref_mut() {
+    if let Some(timings) = timings {
         timings.bounds_validation_ns = timings
             .bounds_validation_ns
             .saturating_add(validation_start.elapsed().as_nanos());
@@ -2433,8 +3454,9 @@ fn add_decode_op_time(
                 timings.record_type_branching_ns.saturating_add(elapsed_ns);
         }
         GenericStreamOp::FixedStep { .. } => {
-            timings.temporary_buffer_writes_ns =
-                timings.temporary_buffer_writes_ns.saturating_add(elapsed_ns);
+            timings.temporary_buffer_writes_ns = timings
+                .temporary_buffer_writes_ns
+                .saturating_add(elapsed_ns);
         }
         GenericStreamOp::UuidConstMask { .. } => {
             timings.unclassified_ns = timings.unclassified_ns.saturating_add(elapsed_ns);
@@ -3503,6 +4525,646 @@ fn stream_values_for_instruction(
     Err(AuraError::InvalidValue("generic stream instruction"))
 }
 
+fn stream_values_for_instruction_from_columns(
+    schema: &SchemaDescriptor,
+    columns: &[Vec<i64>],
+    record_count: usize,
+    plan: &GenericInstructionPlan,
+    instruction: &GenericStreamInstruction,
+) -> Result<Vec<i64>> {
+    if let Some(slot) = instruction.target_slot {
+        return column_values_from_columns(columns, slot, record_count);
+    }
+
+    if let Some((output_slot, op, input_slots)) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::DerivedStream {
+            output_slot,
+            op,
+            input_slots,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some((*output_slot, *op, input_slots)),
+        _ => None,
+    }) {
+        return (0..record_count)
+            .map(|row_index| {
+                inverse_derive_value_from_columns(op, input_slots, output_slot, row_index, columns)
+            })
+            .collect();
+    }
+
+    if let Some((output_slot, op, input_slots, literals)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::ExpressionStream {
+                output_slot,
+                op,
+                input_slots,
+                literals,
+                stream_id,
+                ..
+            } if *stream_id == instruction.stream_id => {
+                Some((*output_slot, *op, input_slots, literals))
+            }
+            _ => None,
+        })
+    {
+        return (0..record_count)
+            .map(|row_index| {
+                inverse_expression_value_from_columns(
+                    op,
+                    input_slots,
+                    literals,
+                    output_slot,
+                    row_index,
+                    columns,
+                )
+            })
+            .collect();
+    }
+
+    if let Some(slots) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::PresenceMap {
+            slots, stream_id, ..
+        } if *stream_id == instruction.stream_id => Some(slots),
+        _ => None,
+    }) {
+        return (0..record_count)
+            .map(|row_index| {
+                slots
+                    .iter()
+                    .enumerate()
+                    .try_fold(0i64, |mask, (index, slot)| {
+                        if column_value(columns, row_index, *slot)? == 0 {
+                            Ok(mask)
+                        } else {
+                            let bit = 1i64
+                                .checked_shl(
+                                    u32::try_from(index)
+                                        .map_err(|_| AuraError::InvalidValue("presence bit"))?,
+                                )
+                                .ok_or(AuraError::InvalidValue("presence bit"))?;
+                            Ok(mask | bit)
+                        }
+                    })
+            })
+            .collect();
+    }
+
+    if let Some(output_slot) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::SparseStream {
+            output_slot,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some(*output_slot),
+        _ => None,
+    }) {
+        let values = column_values_from_columns(columns, output_slot, record_count)?
+            .into_iter()
+            .filter(|value| *value != 0)
+            .collect::<Vec<_>>();
+        return Ok(values);
+    }
+
+    if let Some((parent_group_id, partition_slot, fixed_order, stream_kind)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id,
+                count_stream_id,
+                event_count_stream_id: _,
+                ..
+            } if *value_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 0u8))
+            }
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id: _,
+                count_stream_id,
+                event_count_stream_id: _,
+                ..
+            } if *count_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 1u8))
+            }
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id: _,
+                count_stream_id: _,
+                event_count_stream_id: Some(event_count_stream_id),
+                ..
+            } if *event_count_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 2u8))
+            }
+            _ => None,
+        })
+    {
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        return match stream_kind {
+            0 if fixed_order => fixed_partition_run_order_from_columns(
+                columns,
+                record_count,
+                &event_slots,
+                partition_slot,
+            )?
+            .ok_or(AuraError::InvalidValue("fixed partition order")),
+            0 => Ok(partition_run_ranges_from_columns(
+                columns,
+                record_count,
+                &event_slots,
+                partition_slot,
+            )?
+            .into_iter()
+            .map(|run| run.value)
+            .collect()),
+            1 => partition_run_ranges_from_columns(
+                columns,
+                record_count,
+                &event_slots,
+                partition_slot,
+            )?
+            .into_iter()
+            .map(|run| {
+                i64::try_from(run.end - run.start)
+                    .map_err(|_| AuraError::InvalidValue("run length"))
+            })
+            .collect(),
+            2 => partition_run_event_counts_from_columns(
+                columns,
+                record_count,
+                &event_slots,
+                partition_slot,
+            ),
+            _ => Err(AuraError::InvalidValue("partition stream")),
+        };
+    }
+
+    if let Some((parent_group_id, output_slot, stream_kind, has_base_stream)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id,
+                first_stream_id,
+                delta_stream_id,
+                ..
+            } if base_stream_id == &Some(instruction.stream_id) => {
+                Some((*parent_group_id, *output_slot, 0u8, true))
+            }
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id,
+                first_stream_id,
+                delta_stream_id: _,
+                ..
+            } if *first_stream_id == instruction.stream_id => Some((
+                *parent_group_id,
+                *output_slot,
+                1u8,
+                base_stream_id.is_some(),
+            )),
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id: _,
+                first_stream_id: _,
+                delta_stream_id,
+                ..
+            } if *delta_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *output_slot, 2u8, false))
+            }
+            _ => None,
+        })
+    {
+        let runs =
+            partition_runs_for_group_from_columns(plan, columns, record_count, parent_group_id)?;
+        return match stream_kind {
+            0 => Ok(
+                partition_value_bases_from_columns(columns, &runs, output_slot)?
+                    .into_values()
+                    .collect(),
+            ),
+            1 => {
+                if has_base_stream {
+                    let bases = partition_value_bases_from_columns(columns, &runs, output_slot)?;
+                    runs.iter()
+                        .map(|run| {
+                            let base = bases
+                                .get(&run.value)
+                                .copied()
+                                .ok_or(AuraError::InvalidValue("partition base"))?;
+                            checked_delta(column_value(columns, run.start, output_slot)?, base)
+                        })
+                        .collect()
+                } else {
+                    runs.iter()
+                        .map(|run| column_value(columns, run.start, output_slot))
+                        .collect()
+                }
+            }
+            2 => {
+                let mut deltas = Vec::with_capacity(record_count.saturating_sub(runs.len()));
+                for run in runs {
+                    for row_index in run.start + 1..run.end {
+                        deltas.push(checked_delta(
+                            column_value(columns, row_index, output_slot)?,
+                            column_value(columns, row_index - 1, output_slot)?,
+                        )?);
+                    }
+                }
+                Ok(deltas)
+            }
+            _ => Err(AuraError::InvalidValue("segmented stream")),
+        };
+    }
+
+    if let Some((parent_group_id, output_slot)) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::GroupValueStream {
+            parent_group_id,
+            output_slot,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some((*parent_group_id, *output_slot)),
+        _ => None,
+    }) {
+        let parent_group_id = partition_parent_group_id(plan, parent_group_id)?;
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        return event_group_ranges_from_columns(columns, record_count, &event_slots)?
+            .into_iter()
+            .map(|(start, _)| column_value(columns, start, output_slot))
+            .collect();
+    }
+
+    if let Some(parent_group_id) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::PartitionRuns {
+            parent_group_id,
+            count_stream_id,
+            ..
+        } if *count_stream_id == instruction.stream_id => Some(*parent_group_id),
+        _ => None,
+    }) {
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        return event_group_lengths_from_columns(columns, record_count, &event_slots);
+    }
+
+    let _ = schema;
+    Err(AuraError::InvalidValue("generic stream instruction"))
+}
+
+fn emit_stream_values_for_instruction_from_columns(
+    schema: &SchemaDescriptor,
+    columns: &[Vec<i64>],
+    record_count: usize,
+    plan: &GenericInstructionPlan,
+    instruction: &GenericStreamInstruction,
+    sink: &mut dyn FnMut(i64) -> Result<()>,
+) -> Result<usize> {
+    let mut emitted = 0usize;
+    let mut emit = |value| {
+        sink(value)?;
+        emitted = emitted
+            .checked_add(1)
+            .ok_or(AuraError::InvalidValue("stream value count"))?;
+        Ok(())
+    };
+
+    if let Some(slot) = instruction.target_slot {
+        let values = column_slice(columns, slot)?;
+        if values.len() != record_count {
+            return Err(AuraError::InvalidValue("column length"));
+        }
+        for value in values {
+            emit(*value)?;
+        }
+        return Ok(emitted);
+    }
+
+    if let Some((output_slot, op, input_slots)) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::DerivedStream {
+            output_slot,
+            op,
+            input_slots,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some((*output_slot, *op, input_slots)),
+        _ => None,
+    }) {
+        for row_index in 0..record_count {
+            emit(inverse_derive_value_from_columns(
+                op,
+                input_slots,
+                output_slot,
+                row_index,
+                columns,
+            )?)?;
+        }
+        return Ok(emitted);
+    }
+
+    if let Some((output_slot, op, input_slots, literals)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::ExpressionStream {
+                output_slot,
+                op,
+                input_slots,
+                literals,
+                stream_id,
+                ..
+            } if *stream_id == instruction.stream_id => {
+                Some((*output_slot, *op, input_slots, literals))
+            }
+            _ => None,
+        })
+    {
+        for row_index in 0..record_count {
+            emit(inverse_expression_value_from_columns(
+                op,
+                input_slots,
+                literals,
+                output_slot,
+                row_index,
+                columns,
+            )?)?;
+        }
+        return Ok(emitted);
+    }
+
+    if let Some(slots) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::PresenceMap {
+            slots, stream_id, ..
+        } if *stream_id == instruction.stream_id => Some(slots),
+        _ => None,
+    }) {
+        for row_index in 0..record_count {
+            let mut mask = 0i64;
+            for (index, slot) in slots.iter().enumerate() {
+                if column_value(columns, row_index, *slot)? != 0 {
+                    let bit = 1i64
+                        .checked_shl(
+                            u32::try_from(index)
+                                .map_err(|_| AuraError::InvalidValue("presence bit"))?,
+                        )
+                        .ok_or(AuraError::InvalidValue("presence bit"))?;
+                    mask |= bit;
+                }
+            }
+            emit(mask)?;
+        }
+        return Ok(emitted);
+    }
+
+    if let Some(output_slot) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::SparseStream {
+            output_slot,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some(*output_slot),
+        _ => None,
+    }) {
+        let values = column_slice(columns, output_slot)?;
+        if values.len() != record_count {
+            return Err(AuraError::InvalidValue("column length"));
+        }
+        for value in values.iter().copied().filter(|value| *value != 0) {
+            emit(value)?;
+        }
+        return Ok(emitted);
+    }
+
+    if let Some((parent_group_id, partition_slot, fixed_order, stream_kind)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id,
+                count_stream_id,
+                event_count_stream_id: _,
+                ..
+            } if *value_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 0u8))
+            }
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id: _,
+                count_stream_id,
+                event_count_stream_id: _,
+                ..
+            } if *count_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 1u8))
+            }
+            GenericGroupInstruction::PartitionRunLengths {
+                parent_group_id,
+                partition_slot,
+                fixed_order,
+                value_stream_id: _,
+                count_stream_id: _,
+                event_count_stream_id: Some(event_count_stream_id),
+                ..
+            } if *event_count_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *partition_slot, *fixed_order, 2u8))
+            }
+            _ => None,
+        })
+    {
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        match stream_kind {
+            0 if fixed_order => {
+                let order = fixed_partition_run_order_from_columns(
+                    columns,
+                    record_count,
+                    &event_slots,
+                    partition_slot,
+                )?
+                .ok_or(AuraError::InvalidValue("fixed partition order"))?;
+                for value in order {
+                    emit(value)?;
+                }
+            }
+            0 => {
+                for run in partition_run_ranges_from_columns(
+                    columns,
+                    record_count,
+                    &event_slots,
+                    partition_slot,
+                )? {
+                    emit(run.value)?;
+                }
+            }
+            1 => {
+                for run in partition_run_ranges_from_columns(
+                    columns,
+                    record_count,
+                    &event_slots,
+                    partition_slot,
+                )? {
+                    emit(
+                        i64::try_from(run.end - run.start)
+                            .map_err(|_| AuraError::InvalidValue("run length"))?,
+                    )?;
+                }
+            }
+            2 => {
+                let partition_values = column_slice(columns, partition_slot)?;
+                if partition_values.len() != record_count {
+                    return Err(AuraError::InvalidValue("column length"));
+                }
+                for (group_start, group_end) in
+                    event_group_ranges_from_columns(columns, record_count, &event_slots)?
+                {
+                    if group_start >= group_end {
+                        emit(0)?;
+                        continue;
+                    }
+                    let mut count = 1usize;
+                    let mut value = partition_values[group_start];
+                    for next in partition_values
+                        .iter()
+                        .copied()
+                        .take(group_end)
+                        .skip(group_start + 1)
+                    {
+                        if next != value {
+                            value = next;
+                            count += 1;
+                        }
+                    }
+                    emit(
+                        i64::try_from(count)
+                            .map_err(|_| AuraError::InvalidValue("partition event count"))?,
+                    )?;
+                }
+            }
+            _ => return Err(AuraError::InvalidValue("partition stream")),
+        }
+        return Ok(emitted);
+    }
+
+    if let Some((parent_group_id, output_slot, stream_kind, has_base_stream)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id,
+                first_stream_id,
+                delta_stream_id,
+                ..
+            } if base_stream_id == &Some(instruction.stream_id) => {
+                Some((*parent_group_id, *output_slot, 0u8, true))
+            }
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id,
+                first_stream_id,
+                delta_stream_id: _,
+                ..
+            } if *first_stream_id == instruction.stream_id => Some((
+                *parent_group_id,
+                *output_slot,
+                1u8,
+                base_stream_id.is_some(),
+            )),
+            GenericGroupInstruction::SegmentedDeltaStream {
+                parent_group_id,
+                output_slot,
+                base_stream_id: _,
+                first_stream_id: _,
+                delta_stream_id,
+                ..
+            } if *delta_stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *output_slot, 2u8, false))
+            }
+            _ => None,
+        })
+    {
+        let runs =
+            partition_runs_for_group_from_columns(plan, columns, record_count, parent_group_id)?;
+        match stream_kind {
+            0 => {
+                for value in
+                    partition_value_bases_from_columns(columns, &runs, output_slot)?.into_values()
+                {
+                    emit(value)?;
+                }
+            }
+            1 => {
+                if has_base_stream {
+                    let bases = partition_value_bases_from_columns(columns, &runs, output_slot)?;
+                    for run in runs {
+                        let base = bases
+                            .get(&run.value)
+                            .copied()
+                            .ok_or(AuraError::InvalidValue("partition base"))?;
+                        emit(checked_delta(
+                            column_value(columns, run.start, output_slot)?,
+                            base,
+                        )?)?;
+                    }
+                } else {
+                    for run in runs {
+                        emit(column_value(columns, run.start, output_slot)?)?;
+                    }
+                }
+            }
+            2 => {
+                for run in runs {
+                    for row_index in run.start + 1..run.end {
+                        emit(checked_delta(
+                            column_value(columns, row_index, output_slot)?,
+                            column_value(columns, row_index - 1, output_slot)?,
+                        )?)?;
+                    }
+                }
+            }
+            _ => return Err(AuraError::InvalidValue("segmented stream")),
+        }
+        return Ok(emitted);
+    }
+
+    if let Some((parent_group_id, output_slot)) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::GroupValueStream {
+            parent_group_id,
+            output_slot,
+            stream_id,
+            ..
+        } if *stream_id == instruction.stream_id => Some((*parent_group_id, *output_slot)),
+        _ => None,
+    }) {
+        let parent_group_id = partition_parent_group_id(plan, parent_group_id)?;
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        for (start, _) in event_group_ranges_from_columns(columns, record_count, &event_slots)? {
+            emit(column_value(columns, start, output_slot)?)?;
+        }
+        return Ok(emitted);
+    }
+
+    if let Some(parent_group_id) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::PartitionRuns {
+            parent_group_id,
+            count_stream_id,
+            ..
+        } if *count_stream_id == instruction.stream_id => Some(*parent_group_id),
+        _ => None,
+    }) {
+        let event_slots = group_event_slots(plan, parent_group_id)?;
+        for (start, end) in event_group_ranges_from_columns(columns, record_count, &event_slots)? {
+            emit(i64::try_from(end - start).map_err(|_| AuraError::InvalidValue("group length"))?)?;
+        }
+        return Ok(emitted);
+    }
+
+    let _ = schema;
+    Err(AuraError::InvalidValue("generic stream instruction"))
+}
+
 fn inverse_derive_value(
     op: DerivedOp,
     input_slots: &[u16],
@@ -3718,6 +5380,7 @@ fn materialize_generic_i64_columns(
     }
 }
 
+#[allow(clippy::needless_range_loop)]
 fn materialize_partitioned_sparse_i64_columns(
     plan: &GenericInstructionPlan,
     stream_values: &BTreeMap<u16, Vec<i64>>,
@@ -5962,7 +7625,7 @@ impl PartialOrd for HuffmanHeapNode {
 }
 
 fn huffman_code_lengths(frequencies: &[u64]) -> Result<Vec<u8>> {
-    if frequencies.is_empty() || frequencies.iter().any(|frequency| *frequency == 0) {
+    if frequencies.is_empty() || frequencies.contains(&0) {
         return Err(AuraError::InvalidValue("huffman frequencies"));
     }
     if frequencies.len() == 1 {
@@ -6594,6 +8257,357 @@ fn column_values(rows: &[Vec<i64>], field_index: u16) -> Result<Vec<i64>> {
                 .ok_or(AuraError::InvalidValue("field index"))
         })
         .collect()
+}
+
+fn validate_columns(
+    schema: &SchemaDescriptor,
+    columns: &[Vec<i64>],
+    record_count: usize,
+) -> Result<()> {
+    if columns.len() != schema.fields.len() {
+        return Err(AuraError::InvalidValue("column count"));
+    }
+    if columns.iter().any(|column| column.len() != record_count) {
+        return Err(AuraError::InvalidValue("column length"));
+    }
+    Ok(())
+}
+
+fn column_values_from_columns(
+    columns: &[Vec<i64>],
+    field_index: u16,
+    record_count: usize,
+) -> Result<Vec<i64>> {
+    let column = column_slice(columns, field_index)?;
+    if column.len() != record_count {
+        return Err(AuraError::InvalidValue("column length"));
+    }
+    Ok(column.to_vec())
+}
+
+fn column_slice(columns: &[Vec<i64>], field_index: u16) -> Result<&[i64]> {
+    columns
+        .get(usize::from(field_index))
+        .map(Vec::as_slice)
+        .ok_or(AuraError::InvalidValue("field index"))
+}
+
+fn column_value(columns: &[Vec<i64>], row_index: usize, field_index: u16) -> Result<i64> {
+    column_slice(columns, field_index)?
+        .get(row_index)
+        .copied()
+        .ok_or(AuraError::InvalidValue("row index"))
+}
+
+fn inverse_derive_value_from_columns(
+    op: DerivedOp,
+    input_slots: &[u16],
+    output_slot: u16,
+    row_index: usize,
+    columns: &[Vec<i64>],
+) -> Result<i64> {
+    let output = column_value(columns, row_index, output_slot)?;
+    match op {
+        DerivedOp::AddResidual => {
+            let base = column_value(columns, row_index, input_slots[0])?;
+            checked_delta(output, base)
+        }
+        DerivedOp::SubtractResidual => {
+            let base = column_value(columns, row_index, input_slots[0])?;
+            checked_delta(base, output)
+        }
+        DerivedOp::MaxPlusResidual => {
+            let base = input_slots
+                .iter()
+                .map(|slot| column_value(columns, row_index, *slot))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .ok_or(AuraError::InvalidValue("input slots"))?;
+            checked_delta(output, base)
+        }
+        DerivedOp::MinMinusResidual => {
+            let base = input_slots
+                .iter()
+                .map(|slot| column_value(columns, row_index, *slot))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .min()
+                .ok_or(AuraError::InvalidValue("input slots"))?;
+            checked_delta(base, output)
+        }
+        DerivedOp::FirstOffsetThenDelta => {
+            if row_index == 0 {
+                Ok(output)
+            } else {
+                let base = column_value(columns, row_index - 1, input_slots[0])?;
+                checked_delta(output, base)
+            }
+        }
+    }
+}
+
+fn inverse_expression_value_from_columns(
+    op: DerivedExpressionOp,
+    input_slots: &[u16],
+    literals: &[i64],
+    output_slot: u16,
+    row_index: usize,
+    columns: &[Vec<i64>],
+) -> Result<i64> {
+    let output = column_value(columns, row_index, output_slot)?;
+    let predicted =
+        evaluate_expression_terms_from_columns(op, input_slots, literals, row_index, columns)?;
+    checked_delta(output, predicted)
+}
+
+fn evaluate_expression_terms_from_columns(
+    op: DerivedExpressionOp,
+    input_slots: &[u16],
+    literals: &[i64],
+    row_index: usize,
+    columns: &[Vec<i64>],
+) -> Result<i64> {
+    let mut terms = input_slots
+        .iter()
+        .map(|slot| column_value(columns, row_index, *slot))
+        .collect::<Result<Vec<_>>>()?;
+    terms.extend_from_slice(literals);
+    match op {
+        DerivedExpressionOp::Add => checked_add_terms(&terms),
+        DerivedExpressionOp::Sub => checked_sub_terms(&terms),
+        DerivedExpressionOp::Mul => checked_mul_terms(&terms),
+        DerivedExpressionOp::Div => checked_div_terms(&terms),
+        DerivedExpressionOp::Min => terms
+            .into_iter()
+            .min()
+            .ok_or(AuraError::InvalidValue("expression terms")),
+        DerivedExpressionOp::Max => terms
+            .into_iter()
+            .max()
+            .ok_or(AuraError::InvalidValue("expression terms")),
+        DerivedExpressionOp::AddResidual
+        | DerivedExpressionOp::SubtractResidual
+        | DerivedExpressionOp::MaxPlusResidual
+        | DerivedExpressionOp::MinMinusResidual
+        | DerivedExpressionOp::FirstOffsetThenDelta => {
+            Err(AuraError::InvalidValue("derived expression op"))
+        }
+    }
+}
+
+fn partition_runs_for_group_from_columns(
+    plan: &GenericInstructionPlan,
+    columns: &[Vec<i64>],
+    record_count: usize,
+    group_id: u16,
+) -> Result<Vec<PartitionRun>> {
+    let (parent_group_id, partition_slot) = plan
+        .groups
+        .iter()
+        .find_map(|group| match group {
+            GenericGroupInstruction::PartitionRunLengths {
+                group_id: candidate,
+                parent_group_id,
+                partition_slot,
+                ..
+            } if *candidate == group_id => Some((*parent_group_id, *partition_slot)),
+            _ => None,
+        })
+        .ok_or(AuraError::InvalidValue("partition run reference"))?;
+    let event_slots = group_event_slots(plan, parent_group_id)?;
+    partition_run_ranges_from_columns(columns, record_count, &event_slots, partition_slot)
+}
+
+fn partition_value_bases_from_columns(
+    columns: &[Vec<i64>],
+    runs: &[PartitionRun],
+    output_slot: u16,
+) -> Result<BTreeMap<i64, i64>> {
+    let values = column_slice(columns, output_slot)?;
+    let mut bases: BTreeMap<i64, i64> = BTreeMap::new();
+    for run in runs {
+        if run.start >= run.end || run.end > values.len() {
+            return Err(AuraError::InvalidValue("partition run"));
+        }
+        for value in &values[run.start..run.end] {
+            bases
+                .entry(run.value)
+                .and_modify(|base| *base = (*base).min(*value))
+                .or_insert(*value);
+        }
+    }
+    Ok(bases)
+}
+
+fn partition_run_ranges_from_columns(
+    columns: &[Vec<i64>],
+    record_count: usize,
+    event_slots: &[u16],
+    partition_slot: u16,
+) -> Result<Vec<PartitionRun>> {
+    let mut runs = Vec::new();
+    let partition_values = column_slice(columns, partition_slot)?;
+    if partition_values.len() != record_count {
+        return Err(AuraError::InvalidValue("column length"));
+    }
+    for (group_start, group_end) in
+        event_group_ranges_from_columns(columns, record_count, event_slots)?
+    {
+        if group_start >= group_end {
+            continue;
+        }
+        let mut run_start = group_start;
+        let mut value = partition_values[group_start];
+        for (row_index, next) in partition_values
+            .iter()
+            .copied()
+            .enumerate()
+            .take(group_end)
+            .skip(group_start + 1)
+        {
+            if next != value {
+                runs.push(PartitionRun {
+                    start: run_start,
+                    end: row_index,
+                    value,
+                });
+                run_start = row_index;
+                value = next;
+            }
+        }
+        runs.push(PartitionRun {
+            start: run_start,
+            end: group_end,
+            value,
+        });
+    }
+    Ok(runs)
+}
+
+fn partition_run_event_counts_from_columns(
+    columns: &[Vec<i64>],
+    record_count: usize,
+    event_slots: &[u16],
+    partition_slot: u16,
+) -> Result<Vec<i64>> {
+    let partition_values = column_slice(columns, partition_slot)?;
+    if partition_values.len() != record_count {
+        return Err(AuraError::InvalidValue("column length"));
+    }
+    event_group_ranges_from_columns(columns, record_count, event_slots)?
+        .into_iter()
+        .map(|(group_start, group_end)| {
+            if group_start >= group_end {
+                return Ok(0);
+            }
+            let mut count = 1usize;
+            let mut value = partition_values[group_start];
+            for next in partition_values
+                .iter()
+                .copied()
+                .take(group_end)
+                .skip(group_start + 1)
+            {
+                if next != value {
+                    value = next;
+                    count += 1;
+                }
+            }
+            i64::try_from(count).map_err(|_| AuraError::InvalidValue("partition event count"))
+        })
+        .collect()
+}
+
+fn fixed_partition_run_order_from_columns(
+    columns: &[Vec<i64>],
+    record_count: usize,
+    event_slots: &[u16],
+    partition_slot: u16,
+) -> Result<Option<Vec<i64>>> {
+    let groups = event_group_ranges_from_columns(columns, record_count, event_slots)?;
+    if groups.len() < 2 {
+        return Ok(None);
+    }
+    let partition_values = column_slice(columns, partition_slot)?;
+    let mut fixed_order: Option<Vec<i64>> = None;
+    for (group_start, group_end) in groups {
+        let mut order = Vec::new();
+        if group_start >= group_end {
+            continue;
+        }
+        let mut value = partition_values[group_start];
+        order.push(value);
+        for next in partition_values
+            .iter()
+            .copied()
+            .take(group_end)
+            .skip(group_start + 1)
+        {
+            if next != value {
+                value = next;
+                order.push(value);
+            }
+        }
+        if order.is_empty() {
+            return Ok(None);
+        }
+        if let Some(existing) = &fixed_order {
+            if existing != &order {
+                return Ok(None);
+            }
+        } else {
+            fixed_order = Some(order);
+        }
+    }
+    Ok(fixed_order)
+}
+
+fn event_group_lengths_from_columns(
+    columns: &[Vec<i64>],
+    record_count: usize,
+    event_slots: &[u16],
+) -> Result<Vec<i64>> {
+    event_group_ranges_from_columns(columns, record_count, event_slots)?
+        .into_iter()
+        .map(|(start, end)| {
+            i64::try_from(end - start).map_err(|_| AuraError::InvalidValue("group length"))
+        })
+        .collect()
+}
+
+fn event_group_ranges_from_columns(
+    columns: &[Vec<i64>],
+    record_count: usize,
+    event_slots: &[u16],
+) -> Result<Vec<(usize, usize)>> {
+    if record_count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    for index in 1..record_count {
+        if !same_slots_from_columns(columns, start, index, event_slots)? {
+            groups.push((start, index));
+            start = index;
+        }
+    }
+    groups.push((start, record_count));
+    Ok(groups)
+}
+
+fn same_slots_from_columns(
+    columns: &[Vec<i64>],
+    left_row: usize,
+    right_row: usize,
+    slots: &[u16],
+) -> Result<bool> {
+    for slot in slots {
+        if column_value(columns, left_row, *slot)? != column_value(columns, right_row, *slot)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn unsigned_offsets(values: &[i64], base: i64) -> Result<Vec<u64>> {

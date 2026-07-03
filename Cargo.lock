@@ -285,9 +285,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "lz4_flex",
  "parquet",
  "serde_json",
  "sha2",
+ "zstd",
 ]
 
 [[package]]
