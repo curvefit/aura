@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use aura_codec::records::{
     compile_i64_file, decode_i64_file, encode_ingest_i64_file, I64FileInput,
 };
-use aura_codec::schema::generic_i64_parent_schema;
+use aura_codec::schema::{decode_schema_map, generic_i64_parent_schema, FieldRelation};
 use aura_codec::Profile;
 use aura_codec::{DerivedExpression, DerivedExpressionOp, DerivedExpressionSource};
 use serde_json::Value;
@@ -80,7 +80,7 @@ fn main() -> Result<()> {
 
     println!("input={}", args.input.display());
     println!("rows={}", rows.len());
-    println!("slots={}", args.schema_header.len());
+    println!("slots={}", rows.first().map_or(0, Vec::len));
     println!("schema_header={:?}", args.schema_header);
     println!("derived_expressions={}", args.derived_expressions.len());
     println!(
@@ -174,7 +174,7 @@ fn read_positional_rows(
     let value: Value =
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
     let source_rows = value.as_array().context("top-level JSON array")?;
-    let field_count = schema_header.len();
+    let field_count = decode_schema_map(schema_header)?.len();
     let decimal_scales = infer_decimal_scales(source_rows, field_count, decimal_scale)?;
     let timestamp_slots = timestamp_slots(schema_header)?;
     let mut rows = Vec::with_capacity(source_rows.len());
@@ -385,32 +385,29 @@ fn power_of_ten(exponent: usize) -> Result<i64> {
 }
 
 fn timestamp_slots(schema_header: &[u8]) -> Result<Vec<bool>> {
-    let mut slots = vec![false; schema_header.len()];
+    let entries = decode_schema_map(schema_header)?;
+    let mut slots = vec![false; entries.len()];
     for (slot, is_timestamp) in slots.iter_mut().enumerate() {
-        *is_timestamp = timestamp_slot(schema_header, slot)?;
+        *is_timestamp = timestamp_slot(&entries, slot)?;
     }
     Ok(slots)
 }
 
-fn timestamp_slot(schema_header: &[u8], slot: usize) -> Result<bool> {
-    let value = schema_header[slot];
-    if value == 100 {
+fn timestamp_slot(entries: &[aura_codec::SchemaMapEntry], slot: usize) -> Result<bool> {
+    let entry = entries
+        .get(slot)
+        .context("schema slot outside logical field map")?;
+    if entry.is_timestamp {
         return Ok(true);
     }
-    let Some(parent) = parent_slot(value) else {
+    let FieldRelation::DeltaFromField(parent) = entry.relation else {
         return Ok(false);
     };
+    let parent = usize::from(parent);
     if parent >= slot {
         bail!("schema parent must refer to an earlier slot");
     }
-    timestamp_slot(schema_header, parent)
-}
-
-fn parent_slot(value: u8) -> Option<usize> {
-    match value {
-        1..=99 => Some(usize::from(value - 1)),
-        _ => None,
-    }
+    timestamp_slot(entries, parent)
 }
 
 fn parse_schema_header(raw: &str) -> Result<Vec<u8>> {
@@ -484,6 +481,14 @@ fn parse_derived_op(raw: &str) -> Result<DerivedExpressionOp> {
         "max_plus_residual" => Ok(DerivedExpressionOp::MaxPlusResidual),
         "min_minus_residual" => Ok(DerivedExpressionOp::MinMinusResidual),
         "first_offset_then_delta" => Ok(DerivedExpressionOp::FirstOffsetThenDelta),
+        "mul_div" => Ok(DerivedExpressionOp::MulDiv),
+        "previous_snapshot_same_key_residual" => {
+            Ok(DerivedExpressionOp::PreviousSnapshotSameKeyResidual)
+        }
+        "previous_mutation_same_key_residual" => {
+            Ok(DerivedExpressionOp::PreviousMutationSameKeyResidual)
+        }
+        "previous_output_by_key_residual" => Ok(DerivedExpressionOp::PreviousOutputByKeyResidual),
         _ => bail!("invalid derived expression op {raw}"),
     }
 }

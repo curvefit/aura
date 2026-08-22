@@ -3,7 +3,7 @@ use std::io::Write;
 
 use crate::header::{DerivedExpression, DerivedExpressionOp, DerivedExpressionSource};
 use crate::options::{AuraFormat, AuraProfile, WriterOptions};
-use crate::records::{self, I64FileInput, TypedFileInput};
+use crate::records::{self, I64Event, I64EventFileInput, I64FileInput, TypedFileInput};
 use crate::schema::{AuraSchema, FieldType, SchemaDescriptor};
 use crate::{
     AuraBatch, AuraColumnBatch, AuraDiagnostic, AuraError, AuraRecordBatch, AuraTypedValue,
@@ -159,6 +159,18 @@ pub struct AuraI64Writer {
     header_comment: Option<String>,
 }
 
+/// Source-event writer for schemas with event- and repeated-scope fields.
+/// Event boundaries and zero-child events are authoritative input, not inferred
+/// from adjacent row values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuraI64EventWriter {
+    schema: SchemaDescriptor,
+    events: Vec<I64Event>,
+    stream_id: u16,
+    dictionary_id: u16,
+    header_comment: Option<String>,
+}
+
 /// Declared-layout writer for typed row values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuraTypedWriter {
@@ -242,6 +254,94 @@ impl AuraI64Writer {
 
     pub fn finish(self) -> Result<Vec<u8>> {
         stamp_i64(self.into_input())
+    }
+
+    pub fn compile_profile(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
+        compile_i64(bytes, target_profile)
+    }
+}
+
+impl AuraI64EventWriter {
+    pub fn new(schema: SchemaDescriptor) -> Self {
+        Self {
+            schema,
+            events: Vec::new(),
+            stream_id: 0,
+            dictionary_id: 0,
+            header_comment: None,
+        }
+    }
+
+    pub fn from_input(input: I64EventFileInput) -> Self {
+        Self {
+            schema: input.schema,
+            events: input.events,
+            stream_id: input.stream_id,
+            dictionary_id: input.dictionary_id,
+            header_comment: input.header_comment,
+        }
+    }
+
+    pub fn with_stream(mut self, stream_id: u16, dictionary_id: u16) -> Self {
+        self.stream_id = stream_id;
+        self.dictionary_id = dictionary_id;
+        self
+    }
+
+    pub fn with_header_comment(mut self, comment: impl Into<String>) -> Self {
+        self.header_comment = Some(comment.into());
+        self
+    }
+
+    pub fn push_event(&mut self, event: I64Event) -> Result<&mut Self> {
+        let event_fields = self
+            .schema
+            .fields
+            .iter()
+            .filter(|field| field.scope == crate::schema::FieldScope::Event)
+            .count();
+        let repeated_fields = self
+            .schema
+            .fields
+            .iter()
+            .filter(|field| field.scope == crate::schema::FieldScope::Repeated)
+            .count();
+        if event.event_values.len() != event_fields
+            || event
+                .children
+                .iter()
+                .any(|child| child.len() != repeated_fields)
+        {
+            return Err(AuraError::InvalidValue("event field count"));
+        }
+        self.events.push(event);
+        Ok(self)
+    }
+
+    pub fn events(&self) -> &[I64Event] {
+        &self.events
+    }
+
+    pub fn into_input(self) -> I64EventFileInput {
+        I64EventFileInput {
+            schema: self.schema,
+            events: self.events,
+            stream_id: self.stream_id,
+            dictionary_id: self.dictionary_id,
+            header_comment: self.header_comment,
+        }
+    }
+
+    pub fn finish(self) -> Result<Vec<u8>> {
+        encode_i64_events(self.into_input())
+    }
+
+    pub fn finish_profile(self, target_profile: Profile) -> Result<Vec<u8>> {
+        let ingest = self.finish()?;
+        match target_profile {
+            Profile::Ingest => Ok(ingest),
+            Profile::Aura0 | Profile::Aura1 => compile_i64(&ingest, target_profile),
+        }
     }
 
     pub fn compile_profile(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
@@ -516,6 +616,10 @@ fn compute_internal_expression(
         DerivedExpressionOp::Sub => checked_sub_terms(&terms)?,
         DerivedExpressionOp::Mul => checked_mul_terms(&terms)?,
         DerivedExpressionOp::Div => checked_div_terms(&terms)?,
+        DerivedExpressionOp::MulDiv => checked_mul_div_terms(
+            &terms[..expression.input_slots.len()],
+            expression.literals[0],
+        )?,
         DerivedExpressionOp::Min => terms
             .into_iter()
             .min()
@@ -528,7 +632,10 @@ fn compute_internal_expression(
         | DerivedExpressionOp::SubtractResidual
         | DerivedExpressionOp::MaxPlusResidual
         | DerivedExpressionOp::MinMinusResidual
-        | DerivedExpressionOp::FirstOffsetThenDelta => {
+        | DerivedExpressionOp::FirstOffsetThenDelta
+        | DerivedExpressionOp::PreviousSnapshotSameKeyResidual
+        | DerivedExpressionOp::PreviousMutationSameKeyResidual
+        | DerivedExpressionOp::PreviousOutputByKeyResidual => {
             return Err(AuraError::InvalidValue("derived expression op"));
         }
     };
@@ -589,9 +696,28 @@ fn checked_div_terms(terms: &[i64]) -> Result<i64> {
     i64::try_from(value).map_err(|_| AuraError::InvalidValue("derived expression value"))
 }
 
+fn checked_mul_div_terms(terms: &[i64], divisor: i64) -> Result<i64> {
+    if terms.is_empty() || divisor == 0 {
+        return Err(AuraError::InvalidValue("derived expression terms"));
+    }
+    let product = terms.iter().try_fold(1i128, |product, term| {
+        product
+            .checked_mul(i128::from(*term))
+            .ok_or(AuraError::InvalidValue("derived expression value"))
+    })?;
+    let value = product
+        .checked_div(i128::from(divisor))
+        .ok_or(AuraError::InvalidValue("derived expression value"))?;
+    i64::try_from(value).map_err(|_| AuraError::InvalidValue("derived expression value"))
+}
+
 pub fn encode_i64(input: I64FileInput) -> Result<Vec<u8>> {
     validate_i64_input(&input.schema, &input.rows)?;
     records::encode_ingest_i64_file_inner(input)
+}
+
+pub fn encode_i64_events(input: I64EventFileInput) -> Result<Vec<u8>> {
+    records::encode_ingest_i64_events_file_inner(input)
 }
 
 pub fn encode_typed(input: TypedFileInput) -> Result<Vec<u8>> {

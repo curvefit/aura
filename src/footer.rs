@@ -1,6 +1,7 @@
 use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, put_u8, ByteReader};
 use crate::chunk::ChunkDescriptor;
 use crate::format::FORMAT_VERSION;
+use crate::generic_planner::validate_generic_plan_schema_authorization;
 use crate::instructions::GenericInstructionPlan;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 use crate::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
@@ -132,6 +133,9 @@ impl AuraFooter {
         let (aura0_plan, aura1_plan, generic_aura0_plan) = decode_plans(&mut reader)?;
         let chunks = decode_chunks(&mut reader)?;
         reader.finish()?;
+        if let Some(plan) = &generic_aura0_plan {
+            validate_generic_plan_schema_authorization(&schema, plan)?;
+        }
 
         Ok(Self {
             schema,

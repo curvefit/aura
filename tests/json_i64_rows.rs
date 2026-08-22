@@ -11,6 +11,56 @@ const DERIVED_SCHEMA_HEADER: &str = "100,101,102,103,2,0,1,107,0,6,110";
 const DERIVED_SCHEMA_BYTES: &[u8] = &[100, 101, 102, 103, 2, 0, 1, 107, 0, 6, 110];
 
 #[test]
+fn json_positional_rows_support_structural_dual_domain_control() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-json-i64") else {
+        panic!("missing aura-json-i64 binary");
+    };
+
+    let dir = std::env::temp_dir().join(format!("aura-json-i64-dual-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("book.json");
+    let output = dir.join("book.aura");
+    fs::write(&input, r#"[[1000,0,"100.0","2.0"],[1000,1,"100.1","3.0"]]"#).unwrap();
+
+    let result = Command::new(bin)
+        .arg("--schema")
+        .arg("100,200,203,2,0")
+        .arg("--timestamp-multiplier")
+        .arg("1")
+        .arg("--out")
+        .arg(&output)
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("slots=4"));
+
+    for path in [
+        output.clone(),
+        output.with_extension("aura0"),
+        output.with_extension("aura1"),
+    ] {
+        let decoded = records::decode_i64_file(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            &[100, 200, 203, 2, 0],
+            decoded.header.schema_mapping.as_slice()
+        );
+        assert_eq!(
+            vec![vec![1000, 0, 1000, 2], vec![1000, 1, 1001, 3]],
+            decoded.rows
+        );
+    }
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn json_positional_rows_encode_compile_and_decode_from_schema_header() {
     let Some(bin) = option_env!("CARGO_BIN_EXE_aura-json-i64") else {
         panic!("missing aura-json-i64 binary");

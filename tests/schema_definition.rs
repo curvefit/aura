@@ -59,3 +59,16 @@ fn code_defined_i64_schema_definition_validates_header_shape() {
     assert!(I64SchemaDefinition::from_field_names("bad", &["ts", "v1"], &[100, 2]).is_err());
     assert!(I64SchemaDefinition::from_field_names("bad", &["ts"], &[100, 0]).is_err());
 }
+
+#[test]
+fn code_defined_i64_schema_definition_ignores_structural_control_for_field_names() {
+    let definition = I64SchemaDefinition::from_field_names(
+        "dual_domain_book_v1",
+        &["ts", "side", "price", "quantity"],
+        &[100, 200, 203, 2, 0],
+    )
+    .unwrap();
+
+    assert_eq!(4, definition.schema().fields.len());
+    assert_eq!(&[100, 200, 203, 2, 0], definition.parent_slots());
+}

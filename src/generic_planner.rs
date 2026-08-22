@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::mem;
 use std::time::Instant;
 
 use crate::bitpack::{signed_bitpack_width_for_range, unsigned_bitpack_width};
@@ -16,6 +17,7 @@ use crate::instructions::{
 };
 use crate::plan::Aura1Plan;
 use crate::schema::{FieldRelation, FieldScope, SchemaDescriptor};
+use crate::varint;
 use crate::{AuraError, PhysicalWidth, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,10 +28,577 @@ pub struct GenericEncodedI64Rows {
     pub field_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericDecodedI64Events {
+    pub event_values: Vec<Vec<i64>>,
+    pub children: Vec<Vec<Vec<i64>>>,
+}
+
+/// Encode a source-event stream without flattening its boundaries into the
+/// schema. `event_values` use event-scope field order and each child row uses
+/// repeated-scope field order.
+pub fn encode_generic_i64_events(
+    schema: &SchemaDescriptor,
+    event_values: &[Vec<i64>],
+    children: &[Vec<Vec<i64>>],
+) -> Result<GenericEncodedI64Rows> {
+    if event_values.len() != children.len() {
+        return Err(AuraError::InvalidValue("event count"));
+    }
+    let event_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Event)
+        .map(|field| field.index)
+        .collect::<Vec<_>>();
+    let repeated_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Repeated)
+        .map(|field| field.index)
+        .collect::<Vec<_>>();
+    if repeated_slots.is_empty() {
+        return Err(AuraError::InvalidValue("repeated event fields"));
+    }
+    if event_values
+        .iter()
+        .any(|values| values.len() != event_slots.len())
+        || children
+            .iter()
+            .flatten()
+            .any(|values| values.len() != repeated_slots.len())
+    {
+        return Err(AuraError::InvalidValue("event field count"));
+    }
+
+    let record_count = children.iter().try_fold(0usize, |count, rows| {
+        count
+            .checked_add(rows.len())
+            .ok_or(AuraError::InvalidValue("record count"))
+    })?;
+    schema.validate_derived_expressions()?;
+    let mut instructions = Vec::new();
+    let mut streams = Vec::new();
+    let mut next_stream_id = 0u16;
+
+    let child_counts = children
+        .iter()
+        .map(|rows| i64::try_from(rows.len()).map_err(|_| AuraError::InvalidValue("child count")))
+        .collect::<Result<Vec<_>>>()?;
+    let child_count_stream_id = add_explicit_event_stream(
+        &mut instructions,
+        &mut streams,
+        &mut next_stream_id,
+        None,
+        child_counts,
+        None,
+    )?;
+    let root_group_id = 0;
+    let explicit_group_id = 1;
+    let mut groups = vec![
+        GenericGroupInstruction::Group {
+            group_id: root_group_id,
+            event_slots: event_slots.clone(),
+            repeated_slots: repeated_slots.clone(),
+        },
+        GenericGroupInstruction::ExplicitEvents {
+            group_id: explicit_group_id,
+            parent_group_id: root_group_id,
+            child_count_stream_id,
+        },
+    ];
+    let mut next_group_id = 2u16;
+    for (event_index, output_slot) in event_slots.iter().copied().enumerate() {
+        let values = event_values
+            .iter()
+            .map(|event| event[event_index])
+            .collect::<Vec<_>>();
+        let stream_id = add_explicit_event_stream(
+            &mut instructions,
+            &mut streams,
+            &mut next_stream_id,
+            None,
+            values,
+            None,
+        )?;
+        groups.push(GenericGroupInstruction::GroupValueStream {
+            group_id: next_group_id,
+            parent_group_id: explicit_group_id,
+            output_slot,
+            stream_id,
+        });
+        next_group_id = next_group_id
+            .checked_add(1)
+            .ok_or(AuraError::InvalidValue("group id"))?;
+    }
+    for (repeated_index, output_slot) in repeated_slots.iter().copied().enumerate() {
+        let values = children
+            .iter()
+            .flatten()
+            .map(|row| row[repeated_index])
+            .collect::<Vec<_>>();
+        let mut candidates = vec![direct_candidate(values.clone())?];
+        let state_expression = schema.derived_expressions.iter().find(|expression| {
+            expression.output_slot == output_slot
+                && matches!(
+                    expression.op,
+                    DerivedExpressionOp::PreviousMutationSameKeyResidual
+                        | DerivedExpressionOp::PreviousOutputByKeyResidual
+                )
+        });
+        if let Some(expression) = state_expression {
+            let op = match expression.op {
+                DerivedExpressionOp::PreviousMutationSameKeyResidual => {
+                    DerivedOp::PreviousMutationSameKeyResidual
+                }
+                DerivedExpressionOp::PreviousOutputByKeyResidual => {
+                    DerivedOp::PreviousOutputByKeyResidual
+                }
+                _ => unreachable!(),
+            };
+            if let Ok(residuals) = explicit_event_same_key_residuals(
+                expression,
+                event_values,
+                children,
+                &event_slots,
+                &repeated_slots,
+            ) {
+                candidates.push(derived_candidate(
+                    output_slot,
+                    op,
+                    expression.input_slots.clone(),
+                    residuals,
+                )?);
+            }
+        }
+
+        if let FieldRelation::DeltaFromField(parent_slot) =
+            schema.fields[usize::from(output_slot)].relation
+        {
+            if let Ok(parent_values) = explicit_event_slot_values(
+                parent_slot,
+                event_values,
+                children,
+                &event_slots,
+                &repeated_slots,
+            ) {
+                if let Ok(residuals) = values
+                    .iter()
+                    .zip(&parent_values)
+                    .map(|(value, parent)| checked_delta(*value, *parent))
+                    .collect::<Result<Vec<_>>>()
+                {
+                    candidates.push(derived_candidate(
+                        output_slot,
+                        DerivedOp::AddResidual,
+                        vec![parent_slot],
+                        residuals,
+                    )?);
+                }
+                if let Ok(residuals) = values
+                    .iter()
+                    .zip(&parent_values)
+                    .map(|(value, parent)| checked_delta(*parent, *value))
+                    .collect::<Result<Vec<_>>>()
+                {
+                    candidates.push(derived_candidate(
+                        output_slot,
+                        DerivedOp::SubtractResidual,
+                        vec![parent_slot],
+                        residuals,
+                    )?);
+                }
+            }
+        }
+
+        match best_slot_candidate(candidates)? {
+            SlotPlanCandidate::Direct {
+                values, stream_op, ..
+            } => {
+                add_explicit_event_stream(
+                    &mut instructions,
+                    &mut streams,
+                    &mut next_stream_id,
+                    Some(output_slot),
+                    values,
+                    Some(stream_op),
+                )?;
+            }
+            SlotPlanCandidate::Derived {
+                op,
+                input_slots,
+                values,
+                stream_op,
+                ..
+            } => {
+                let stream_id = add_explicit_event_stream(
+                    &mut instructions,
+                    &mut streams,
+                    &mut next_stream_id,
+                    None,
+                    values,
+                    Some(stream_op),
+                )?;
+                groups.push(GenericGroupInstruction::DerivedStream {
+                    group_id: next_group_id,
+                    parent_group_id: is_previous_same_key_op(op).then_some(root_group_id),
+                    output_slot,
+                    op,
+                    input_slots,
+                    stream_id,
+                });
+                next_group_id = next_group_id
+                    .checked_add(1)
+                    .ok_or(AuraError::InvalidValue("group id"))?;
+            }
+            _ => return Err(AuraError::InvalidValue("explicit event candidate")),
+        }
+    }
+    let plan = GenericInstructionPlan {
+        streams: instructions,
+        groups,
+    };
+    plan.validate()?;
+    validate_generic_plan_schema_authorization(schema, &plan)?;
+    Ok(GenericEncodedI64Rows {
+        plan,
+        streams,
+        record_count,
+        field_count: schema.fields.len(),
+    })
+}
+
+fn explicit_event_slot_values(
+    slot: u16,
+    event_values: &[Vec<i64>],
+    children: &[Vec<Vec<i64>>],
+    event_slots: &[u16],
+    repeated_slots: &[u16],
+) -> Result<Vec<i64>> {
+    if let Some(index) = repeated_slots
+        .iter()
+        .position(|candidate| *candidate == slot)
+    {
+        return Ok(children
+            .iter()
+            .flatten()
+            .map(|child| child[index])
+            .collect());
+    }
+    let index = event_slots
+        .iter()
+        .position(|candidate| *candidate == slot)
+        .ok_or(AuraError::InvalidValue("related field slot"))?;
+    let value_count = children.iter().try_fold(0usize, |count, child_rows| {
+        count
+            .checked_add(child_rows.len())
+            .ok_or(AuraError::InvalidValue("record count"))
+    })?;
+    let mut values = Vec::with_capacity(value_count);
+    for (event, child_rows) in event_values.iter().zip(children) {
+        values.extend(std::iter::repeat_n(event[index], child_rows.len()));
+    }
+    Ok(values)
+}
+
+fn add_explicit_event_stream(
+    instructions: &mut Vec<GenericStreamInstruction>,
+    streams: &mut Vec<GenericEncodedStream>,
+    next_stream_id: &mut u16,
+    target_slot: Option<u16>,
+    values: Vec<i64>,
+    op: Option<GenericStreamOp>,
+) -> Result<u16> {
+    let stream_id = *next_stream_id;
+    *next_stream_id = next_stream_id
+        .checked_add(1)
+        .ok_or(AuraError::InvalidValue("stream id"))?;
+    let instruction = GenericStreamInstruction {
+        stream_id,
+        target_slot,
+        op: op.unwrap_or(choose_i64_op(&values)?),
+    };
+    let body =
+        encode_generic_stream_body(&instruction, &GenericStreamBodyValue::I64(values.clone()))?;
+    instructions.push(instruction);
+    streams.push(GenericEncodedStream {
+        stream_id,
+        value_count: values.len(),
+        body,
+    });
+    Ok(stream_id)
+}
+
+fn explicit_event_same_key_residuals(
+    expression: &DerivedExpression,
+    event_values: &[Vec<i64>],
+    children: &[Vec<Vec<i64>>],
+    event_slots: &[u16],
+    repeated_slots: &[u16],
+) -> Result<Vec<i64>> {
+    let (&reset_slot, key_slots) = expression
+        .input_slots
+        .split_first()
+        .ok_or(AuraError::InvalidValue("previous mutation same-key slots"))?;
+    let reset_index = event_slots
+        .iter()
+        .position(|slot| *slot == reset_slot)
+        .ok_or(AuraError::InvalidValue("previous mutation same-key reset"))?;
+    let output_index = repeated_slots
+        .iter()
+        .position(|slot| *slot == expression.output_slot)
+        .ok_or(AuraError::InvalidValue("previous mutation same-key slot"))?;
+    let key_indices = key_slots
+        .iter()
+        .map(|key_slot| {
+            repeated_slots
+                .iter()
+                .position(|slot| slot == key_slot)
+                .ok_or(AuraError::InvalidValue("previous mutation same-key slot"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut state = BTreeMap::<Vec<i64>, i64>::new();
+    let mut residuals = Vec::with_capacity(children.iter().map(Vec::len).sum());
+    for (event, event_children) in event_values.iter().zip(children) {
+        if event
+            .get(reset_index)
+            .copied()
+            .ok_or(AuraError::InvalidValue("previous mutation same-key reset"))?
+            != 0
+        {
+            // This deliberately runs even when the source event has no child
+            // mutations. The explicit event boundary is authoritative.
+            state.clear();
+        }
+        for child in event_children {
+            let key = key_indices
+                .iter()
+                .map(|index| {
+                    child
+                        .get(*index)
+                        .copied()
+                        .ok_or(AuraError::InvalidValue("previous mutation same-key slot"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let output = child
+                .get(output_index)
+                .copied()
+                .ok_or(AuraError::InvalidValue("previous mutation same-key slot"))?;
+            residuals.push(checked_delta(
+                output,
+                state.get(&key).copied().unwrap_or(0),
+            )?);
+            match expression.op {
+                DerivedExpressionOp::PreviousMutationSameKeyResidual if output == 0 => {
+                    state.remove(&key);
+                }
+                DerivedExpressionOp::PreviousMutationSameKeyResidual
+                | DerivedExpressionOp::PreviousOutputByKeyResidual => {
+                    state.insert(key, output);
+                }
+                _ => {
+                    return Err(AuraError::InvalidValue(
+                        "previous mutation same-key expression",
+                    ))
+                }
+            }
+        }
+    }
+    Ok(residuals)
+}
+
+pub(crate) fn explicit_event_group(plan: &GenericInstructionPlan) -> Option<(u16, u16)> {
+    plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::ExplicitEvents {
+            group_id,
+            child_count_stream_id,
+            ..
+        } => Some((*group_id, *child_count_stream_id)),
+        _ => None,
+    })
+}
+
+fn validate_explicit_event_counts(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+) -> Result<()> {
+    let Some((_, child_count_stream_id)) = explicit_event_group(plan) else {
+        return Ok(());
+    };
+    let counts = stream_values
+        .get(&child_count_stream_id)
+        .ok_or(AuraError::InvalidValue("explicit event child count stream"))?;
+    let sum = counts.iter().try_fold(0usize, |sum, count| {
+        if *count < 0 {
+            return Err(AuraError::InvalidValue("explicit event child count"));
+        }
+        sum.checked_add(
+            usize::try_from(*count)
+                .map_err(|_| AuraError::InvalidValue("explicit event child count"))?,
+        )
+        .ok_or(AuraError::InvalidValue("explicit event child count"))
+    })?;
+    if sum != record_count {
+        return Err(AuraError::InvalidValue("explicit event child count"));
+    }
+    Ok(())
+}
+
 impl GenericEncodedI64Rows {
     pub fn encoded_body_len(&self) -> usize {
         self.streams.iter().map(|stream| stream.body.len()).sum()
     }
+}
+
+/// Validate schema-authorized stateful instructions after a footer has been
+/// decoded. Explicit event plans carry authoritative child counts; legacy row
+/// plans retain their adjacent-event-value contract. No synthetic ordinal is
+/// introduced.
+pub(crate) fn validate_generic_plan_schema_authorization(
+    schema: &SchemaDescriptor,
+    plan: &GenericInstructionPlan,
+) -> Result<()> {
+    schema.validate_derived_expressions()?;
+    let event_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Event)
+        .map(|field| field.index)
+        .collect::<Vec<_>>();
+    let repeated_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Repeated)
+        .map(|field| field.index)
+        .collect::<Vec<_>>();
+    let mut authorized_outputs = BTreeSet::new();
+
+    let explicit_groups = plan
+        .groups
+        .iter()
+        .filter_map(|group| match group {
+            GenericGroupInstruction::ExplicitEvents {
+                group_id,
+                parent_group_id,
+                ..
+            } => Some((*group_id, *parent_group_id)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if explicit_groups.len() > 1 {
+        return Err(AuraError::InvalidValue("explicit event plan"));
+    }
+    for (explicit_group_id, parent_group_id) in explicit_groups {
+        let exact_parent = plan.groups.iter().any(|candidate| {
+            matches!(
+                candidate,
+                GenericGroupInstruction::Group {
+                    group_id,
+                    event_slots: candidate_event_slots,
+                    repeated_slots: candidate_repeated_slots,
+                } if *group_id == parent_group_id
+                    && candidate_event_slots == &event_slots
+                    && candidate_repeated_slots == &repeated_slots
+            )
+        });
+        let mut actual_event_outputs = plan
+            .groups
+            .iter()
+            .filter_map(|candidate| match candidate {
+                GenericGroupInstruction::GroupValueStream {
+                    parent_group_id,
+                    output_slot,
+                    ..
+                } if *parent_group_id == explicit_group_id => Some(*output_slot),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        actual_event_outputs.sort_unstable();
+        let mut expected_event_outputs = event_slots.clone();
+        expected_event_outputs.sort_unstable();
+        let exact_event_outputs = actual_event_outputs == expected_event_outputs;
+        let unique_event_producers = event_slots.iter().all(|slot| {
+            plan.streams
+                .iter()
+                .filter(|stream| stream.target_slot == Some(*slot))
+                .count()
+                + plan
+                    .groups
+                    .iter()
+                    .filter(|group| group_output_slot(group) == Some(*slot))
+                    .count()
+                == 1
+        });
+        if !exact_parent || !exact_event_outputs || !unique_event_producers {
+            return Err(AuraError::InvalidValue("explicit event group contract"));
+        }
+    }
+
+    for group in &plan.groups {
+        let GenericGroupInstruction::DerivedStream {
+            parent_group_id,
+            output_slot,
+            op,
+            input_slots,
+            ..
+        } = group
+        else {
+            continue;
+        };
+        if !is_previous_same_key_op(*op) {
+            continue;
+        }
+        let declared_op = match op {
+            DerivedOp::PreviousSnapshotSameKeyResidual => {
+                DerivedExpressionOp::PreviousSnapshotSameKeyResidual
+            }
+            DerivedOp::PreviousMutationSameKeyResidual => {
+                DerivedExpressionOp::PreviousMutationSameKeyResidual
+            }
+            DerivedOp::PreviousOutputByKeyResidual => {
+                DerivedExpressionOp::PreviousOutputByKeyResidual
+            }
+            _ => unreachable!(),
+        };
+        if !schema.derived_expressions.iter().any(|expression| {
+            expression.op == declared_op
+                && expression.output_slot == *output_slot
+                && expression.input_slots == *input_slots
+        }) || !authorized_outputs.insert(*output_slot)
+        {
+            return Err(AuraError::InvalidValue(
+                "undeclared previous same-key residual",
+            ));
+        }
+        let parent_group_id =
+            parent_group_id.ok_or(AuraError::InvalidValue("previous snapshot same-key parent"))?;
+        let exact_parent = plan.groups.iter().any(|candidate| {
+            matches!(
+                candidate,
+                GenericGroupInstruction::Group {
+                    group_id,
+                    event_slots: candidate_event_slots,
+                    repeated_slots: candidate_repeated_slots,
+                } if *group_id == parent_group_id
+                    && candidate_event_slots == &event_slots
+                    && candidate_repeated_slots == &repeated_slots
+            )
+        });
+        if !exact_parent {
+            return Err(AuraError::InvalidValue("previous same-key group contract"));
+        }
+    }
+    Ok(())
+}
+
+const fn is_previous_same_key_op(op: DerivedOp) -> bool {
+    matches!(
+        op,
+        DerivedOp::PreviousSnapshotSameKeyResidual
+            | DerivedOp::PreviousMutationSameKeyResidual
+            | DerivedOp::PreviousOutputByKeyResidual
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,12 +770,14 @@ struct SegmentedDeltaCandidate {
 enum SlotPlanCandidate {
     Direct {
         values: Vec<i64>,
+        stream_op: GenericStreamOp,
         score: usize,
     },
     Derived {
         op: DerivedOp,
         input_slots: Vec<u16>,
         values: Vec<i64>,
+        stream_op: GenericStreamOp,
         score: usize,
     },
     Expression {
@@ -214,6 +785,7 @@ enum SlotPlanCandidate {
         input_slots: Vec<u16>,
         literals: Vec<i64>,
         values: Vec<i64>,
+        stream_op: GenericStreamOp,
         score: usize,
     },
     ExpressionValue {
@@ -221,6 +793,12 @@ enum SlotPlanCandidate {
         input_slots: Vec<u16>,
         literals: Vec<i64>,
         residual: i64,
+        score: usize,
+    },
+    QuotientRemainder {
+        divisor_slot: u16,
+        quotient_values: Vec<i64>,
+        remainder_values: Vec<i64>,
         score: usize,
     },
 }
@@ -231,13 +809,15 @@ impl SlotPlanCandidate {
             Self::Direct { score, .. }
             | Self::Derived { score, .. }
             | Self::Expression { score, .. }
-            | Self::ExpressionValue { score, .. } => *score,
+            | Self::ExpressionValue { score, .. }
+            | Self::QuotientRemainder { score, .. } => *score,
         }
     }
 }
 
 enum PendingDerivedInstruction<'a> {
     Residual {
+        parent_group_id: Option<u16>,
         output_slot: u16,
         op: DerivedOp,
         input_slots: &'a [u16],
@@ -256,6 +836,12 @@ enum PendingDerivedInstruction<'a> {
         input_slots: &'a [u16],
         literals: &'a [i64],
         residual: i64,
+    },
+    QuotientRemainder {
+        output_slot: u16,
+        divisor_slot: u16,
+        quotient_stream_id: u16,
+        remainder_stream_id: u16,
     },
 }
 
@@ -286,14 +872,36 @@ impl PlannerState {
         Ok(stream_id)
     }
 
+    fn add_stream_with_op(&mut self, target_slot: Option<u16>, op: GenericStreamOp) -> Result<u16> {
+        let stream_id = self.next_stream_id;
+        self.next_stream_id = self
+            .next_stream_id
+            .checked_add(1)
+            .ok_or(AuraError::InvalidValue("stream id"))?;
+        self.streams.push(GenericStreamInstruction {
+            stream_id,
+            target_slot,
+            op,
+        });
+        Ok(stream_id)
+    }
+
     fn add_derived(
         &mut self,
         output_slot: u16,
         op: DerivedOp,
         input_slots: Vec<u16>,
-        values: Vec<i64>,
+        stream_op: GenericStreamOp,
     ) -> Result<()> {
-        let stream_id = self.add_stream(None, values)?;
+        let parent_group_id = if is_previous_same_key_op(op) {
+            Some(
+                self.repeated_group_id
+                    .ok_or(AuraError::InvalidValue("previous snapshot same-key group"))?,
+            )
+        } else {
+            None
+        };
+        let stream_id = self.add_stream_with_op(None, stream_op)?;
         let group_id = self.next_group_id;
         self.next_group_id = self
             .next_group_id
@@ -301,7 +909,7 @@ impl PlannerState {
             .ok_or(AuraError::InvalidValue("group id"))?;
         self.groups.push(GenericGroupInstruction::DerivedStream {
             group_id,
-            parent_group_id: None,
+            parent_group_id,
             output_slot,
             op,
             input_slots,
@@ -317,9 +925,9 @@ impl PlannerState {
         op: DerivedExpressionOp,
         input_slots: Vec<u16>,
         literals: Vec<i64>,
-        values: Vec<i64>,
+        stream_op: GenericStreamOp,
     ) -> Result<()> {
-        let stream_id = self.add_stream(None, values)?;
+        let stream_id = self.add_stream_with_op(None, stream_op)?;
         let group_id = self.next_group_id;
         self.next_group_id = self
             .next_group_id
@@ -364,26 +972,53 @@ impl PlannerState {
         Ok(())
     }
 
+    fn add_quotient_remainder(
+        &mut self,
+        output_slot: u16,
+        divisor_slot: u16,
+        quotient_values: Vec<i64>,
+        remainder_values: Vec<i64>,
+    ) -> Result<()> {
+        let quotient_stream_id = self.add_stream(None, quotient_values)?;
+        let remainder_stream_id = self.add_stream(None, remainder_values)?;
+        let group_id = self.next_group_id;
+        self.next_group_id = self
+            .next_group_id
+            .checked_add(1)
+            .ok_or(AuraError::InvalidValue("group id"))?;
+        self.groups
+            .push(GenericGroupInstruction::QuotientRemainder {
+                group_id,
+                parent_group_id: None,
+                output_slot,
+                divisor_slot,
+                quotient_stream_id,
+                remainder_stream_id,
+            });
+        self.planned_slots.insert(output_slot);
+        Ok(())
+    }
+
     fn add_slot_candidate(&mut self, output_slot: u16, candidate: SlotPlanCandidate) -> Result<()> {
         match candidate {
-            SlotPlanCandidate::Direct { values, .. } => {
-                self.add_stream(Some(output_slot), values)?;
+            SlotPlanCandidate::Direct { stream_op, .. } => {
+                self.add_stream_with_op(Some(output_slot), stream_op)?;
                 self.planned_slots.insert(output_slot);
                 Ok(())
             }
             SlotPlanCandidate::Derived {
                 op,
                 input_slots,
-                values,
+                stream_op,
                 ..
-            } => self.add_derived(output_slot, op, input_slots, values),
+            } => self.add_derived(output_slot, op, input_slots, stream_op),
             SlotPlanCandidate::Expression {
                 op,
                 input_slots,
                 literals,
-                values,
+                stream_op,
                 ..
-            } => self.add_expression(output_slot, op, input_slots, literals, values),
+            } => self.add_expression(output_slot, op, input_slots, literals, stream_op),
             SlotPlanCandidate::ExpressionValue {
                 op,
                 input_slots,
@@ -391,6 +1026,17 @@ impl PlannerState {
                 residual,
                 ..
             } => self.add_expression_value(output_slot, op, input_slots, literals, residual),
+            SlotPlanCandidate::QuotientRemainder {
+                divisor_slot,
+                quotient_values,
+                remainder_values,
+                ..
+            } => self.add_quotient_remainder(
+                output_slot,
+                divisor_slot,
+                quotient_values,
+                remainder_values,
+            ),
         }
     }
 
@@ -626,6 +1272,108 @@ pub fn decode_generic_i64_rows_body(
     })
 }
 
+/// Decode the authoritative source-event boundaries carried by an explicit
+/// event plan. Returned values use event-scope and repeated-scope field order.
+pub fn decode_generic_i64_events_body(
+    schema: &SchemaDescriptor,
+    plan: GenericInstructionPlan,
+    bytes: &[u8],
+    record_count: usize,
+) -> Result<GenericDecodedI64Events> {
+    let (explicit_group_id, child_count_stream_id) =
+        explicit_event_group(&plan).ok_or(AuraError::InvalidValue("explicit event plan"))?;
+    let stream_values = decode_generic_i64_stream_values(&plan, bytes)?;
+    validate_explicit_event_counts(&plan, &stream_values, record_count)?;
+    let child_counts = stream_values
+        .get(&child_count_stream_id)
+        .ok_or(AuraError::InvalidValue("explicit event child count stream"))?;
+    let event_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Event)
+        .map(|field| field.index)
+        .collect::<Vec<_>>();
+    let repeated_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Repeated)
+        .map(|field| field.index)
+        .collect::<Vec<_>>();
+    let rows =
+        decode_generic_i64_rows_body(plan.clone(), bytes, record_count, schema.fields.len())?;
+    let mut event_streams = BTreeMap::new();
+    for group in &plan.groups {
+        if let GenericGroupInstruction::GroupValueStream {
+            parent_group_id,
+            output_slot,
+            stream_id,
+            ..
+        } = group
+        {
+            if *parent_group_id == explicit_group_id {
+                event_streams.insert(*output_slot, *stream_id);
+            }
+        }
+    }
+    if event_slots
+        .iter()
+        .any(|slot| !event_streams.contains_key(slot))
+    {
+        return Err(AuraError::InvalidValue("explicit event value stream"));
+    }
+
+    let mut cursor = 0usize;
+    let mut decoded_events = Vec::with_capacity(child_counts.len());
+    let mut decoded_children = Vec::with_capacity(child_counts.len());
+    for (event_index, count) in child_counts.iter().copied().enumerate() {
+        if count < 0 {
+            return Err(AuraError::InvalidValue("explicit event child count"));
+        }
+        let count = usize::try_from(count)
+            .map_err(|_| AuraError::InvalidValue("explicit event child count"))?;
+        let end = cursor
+            .checked_add(count)
+            .ok_or(AuraError::InvalidValue("explicit event child count"))?;
+        if end > rows.len() {
+            return Err(AuraError::InvalidValue("explicit event child count"));
+        }
+        let values = event_slots
+            .iter()
+            .map(|slot| {
+                let stream_id = event_streams[slot];
+                stream_values
+                    .get(&stream_id)
+                    .and_then(|values| values.get(event_index))
+                    .copied()
+                    .ok_or(AuraError::InvalidValue("explicit event value stream"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let child_rows = rows[cursor..end]
+            .iter()
+            .map(|row| {
+                repeated_slots
+                    .iter()
+                    .map(|slot| {
+                        row.get(usize::from(*slot))
+                            .copied()
+                            .ok_or(AuraError::InvalidValue("repeated slot"))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        decoded_events.push(values);
+        decoded_children.push(child_rows);
+        cursor = end;
+    }
+    if cursor != rows.len() || cursor != record_count {
+        return Err(AuraError::InvalidValue("explicit event child count"));
+    }
+    Ok(GenericDecodedI64Events {
+        event_values: decoded_events,
+        children: decoded_children,
+    })
+}
+
 pub(crate) fn try_decode_generic_i64_columns_body(
     plan: GenericInstructionPlan,
     bytes: &[u8],
@@ -695,6 +1443,7 @@ pub(crate) fn try_decode_generic_i64_columns_body(
         }
     }
     reader.finish()?;
+    validate_explicit_event_counts(&plan, &stream_values, record_count)?;
 
     let stage_start = Instant::now();
     let columns =
@@ -1063,9 +1812,11 @@ impl PartitionedSparseColumnsPlan {
                     }
                 }
                 GenericGroupInstruction::PartitionRuns { .. }
+                | GenericGroupInstruction::ExplicitEvents { .. }
                 | GenericGroupInstruction::DerivedStream { .. }
                 | GenericGroupInstruction::ExpressionStream { .. }
-                | GenericGroupInstruction::ExpressionValue { .. } => return Ok(None),
+                | GenericGroupInstruction::ExpressionValue { .. }
+                | GenericGroupInstruction::QuotientRemainder { .. } => return Ok(None),
             }
         }
 
@@ -2282,20 +3033,17 @@ fn try_write_generic_i64_aura1_body_inner(
 ) -> Result<bool> {
     let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
     let total_start = profile.then(Instant::now);
-    if plan.groups.iter().any(|group| {
-        matches!(
-            group,
-            GenericGroupInstruction::PartitionRuns { .. }
-                | GenericGroupInstruction::DerivedStream { .. }
-                | GenericGroupInstruction::ExpressionStream { .. }
-                | GenericGroupInstruction::ExpressionValue { .. }
-        )
-    }) {
+    if plan
+        .groups
+        .iter()
+        .any(|group| matches!(group, GenericGroupInstruction::PartitionRuns { .. }))
+    {
         return Ok(false);
     }
 
     let stage_start = profile.then(Instant::now);
     let stream_values = decode_generic_i64_stream_values(&plan, bytes)?;
+    validate_explicit_event_counts(&plan, &stream_values, record_count)?;
     if let Some(stage_start) = stage_start {
         eprintln!(
             "direct_aura1 decode_streams_us={} streams={}",
@@ -2351,6 +3099,7 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
     mut timings: Option<&mut DirectAura1WriterTimings>,
     mut stats: Option<&mut DirectAura1WriterStats>,
 ) -> Result<bool> {
+    validate_explicit_event_counts(plan, stream_values, record_count)?;
     if try_write_streaming_config_i64_aura1_body_from_streams(
         plan,
         stream_values,
@@ -2435,6 +3184,28 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
     }
 
     let stage_start = measure_stages.then(Instant::now);
+    if aura1_plan.fields.iter().any(|field_plan| {
+        let slot = usize::from(field_plan.field_index);
+        slot >= field_count || !sources[slot].is_supported()
+    }) {
+        if try_write_flat_derived_i64_aura1_body(
+            plan,
+            stream_values,
+            &mut sources,
+            record_count,
+            field_count,
+            aura1_plan,
+            out,
+            output_guard.as_deref_mut(),
+            timings.as_deref_mut(),
+            stats.as_deref_mut(),
+            total_start,
+        )? {
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
     let mut field_specs = Vec::with_capacity(aura1_plan.fields.len());
     let mut row_width = 0usize;
     for field_plan in &aura1_plan.fields {
@@ -2445,10 +3216,11 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
         if !sources[slot].is_supported() {
             return Ok(false);
         }
+        let offset = row_width;
         row_width = row_width
             .checked_add(usize::from(field_plan.width.byte_width()))
             .ok_or(AuraError::InvalidValue("body length"))?;
-        field_specs.push((slot, field_plan.width));
+        field_specs.push((slot, field_plan.width, offset));
     }
     let field_specs_ns = stage_start
         .as_ref()
@@ -2474,12 +3246,15 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
         .checked_mul(row_width)
         .ok_or(AuraError::InvalidValue("body length"))?;
     let body_start = out.len();
-    if is_partitioned_sparse_aura1_plan(aura1_plan) && field_count == 8 {
+    let fixed_row_writer = is_partitioned_sparse_aura1_plan(aura1_plan) && field_count == 8;
+    if fixed_row_writer {
         for source in sources.iter().take(8) {
             if !source.is_supported() {
                 return Ok(false);
             }
         }
+    }
+    if fixed_row_writer || output_guard.is_none() {
         out.resize(
             body_start
                 .checked_add(body_len)
@@ -2506,7 +3281,6 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
     }
 
     let stage_start = measure_stages.then(Instant::now);
-    let fixed_row_writer = is_partitioned_sparse_aura1_plan(aura1_plan) && field_count == 8;
     if fixed_row_writer {
         const ROW_WIDTH: usize = 46;
         for row_index in 0..record_count {
@@ -2532,15 +3306,32 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
                 write_partitioned_sparse_aura1_row(&mut out[offset..row_end], values)?;
             }
         }
+    } else if output_guard.is_none() {
+        for row_index in 0..record_count {
+            let row_start = body_start + row_index * row_width;
+            let row_end = row_start + row_width;
+            let row = &mut out[row_start..row_end];
+            for (slot, width, offset) in &field_specs {
+                write_direct_i64_width_at(
+                    row,
+                    *offset,
+                    sources[*slot].value_at(row_index)?,
+                    *width,
+                )?;
+            }
+        }
     } else {
         for row_index in 0..record_count {
-            for (slot, width) in &field_specs {
+            for (slot, width, _) in &field_specs {
                 let value = sources[*slot].value_at(row_index)?;
-                if let Some(output_guard) = output_guard.as_deref_mut() {
-                    write_direct_i64_width_guarded(out, value, *width, output_guard)?;
-                } else {
-                    write_direct_i64_width(out, value, *width)?;
-                }
+                write_direct_i64_width_guarded(
+                    out,
+                    value,
+                    *width,
+                    output_guard
+                        .as_deref_mut()
+                        .ok_or(AuraError::InvalidValue("output guard"))?,
+                )?;
             }
         }
     }
@@ -2621,6 +3412,550 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
         );
     }
     Ok(true)
+}
+
+enum FlatDerivedStep<'a> {
+    Derived {
+        output_slot: usize,
+        op: DerivedOp,
+        input_slots: &'a [u16],
+        residuals: &'a [i64],
+    },
+    ExpressionStream {
+        output_slot: usize,
+        op: DerivedExpressionOp,
+        input_slots: &'a [u16],
+        literals: &'a [i64],
+        residuals: &'a [i64],
+    },
+    ExpressionValue {
+        output_slot: usize,
+        op: DerivedExpressionOp,
+        input_slots: &'a [u16],
+        literals: &'a [i64],
+        residual: i64,
+    },
+    QuotientRemainder {
+        output_slot: usize,
+        divisor_slot: usize,
+        quotients: &'a [i64],
+        remainders: &'a [i64],
+    },
+}
+
+impl FlatDerivedStep<'_> {
+    fn output_slot(&self) -> usize {
+        match self {
+            Self::Derived { output_slot, .. }
+            | Self::ExpressionStream { output_slot, .. }
+            | Self::ExpressionValue { output_slot, .. }
+            | Self::QuotientRemainder { output_slot, .. } => *output_slot,
+        }
+    }
+
+    fn inputs_ready(&self, filled: &[bool]) -> bool {
+        match self {
+            Self::Derived {
+                op: DerivedOp::FirstOffsetThenDelta,
+                input_slots,
+                ..
+            } => input_slots.len() == 1 && usize::from(input_slots[0]) < filled.len(),
+            Self::Derived { input_slots, .. }
+            | Self::ExpressionStream { input_slots, .. }
+            | Self::ExpressionValue { input_slots, .. } => input_slots
+                .iter()
+                .all(|slot| filled.get(usize::from(*slot)) == Some(&true)),
+            Self::QuotientRemainder { divisor_slot, .. } => {
+                filled.get(*divisor_slot) == Some(&true)
+            }
+        }
+    }
+
+    fn value(&self, row_index: usize, row: &[i64], previous_row: &[i64]) -> Result<i64> {
+        match self {
+            Self::Derived {
+                op,
+                input_slots,
+                residuals,
+                ..
+            } => {
+                let residual = residuals[row_index];
+                match op {
+                    DerivedOp::AddResidual => {
+                        checked_sum(row[usize::from(input_slots[0])], residual)
+                    }
+                    DerivedOp::SubtractResidual => {
+                        checked_delta(row[usize::from(input_slots[0])], residual)
+                    }
+                    DerivedOp::MaxPlusResidual => {
+                        let base = input_slots
+                            .iter()
+                            .map(|slot| row[usize::from(*slot)])
+                            .max()
+                            .ok_or(AuraError::InvalidValue("input slots"))?;
+                        checked_sum(base, residual)
+                    }
+                    DerivedOp::MinMinusResidual => {
+                        let base = input_slots
+                            .iter()
+                            .map(|slot| row[usize::from(*slot)])
+                            .min()
+                            .ok_or(AuraError::InvalidValue("input slots"))?;
+                        checked_delta(base, residual)
+                    }
+                    DerivedOp::FirstOffsetThenDelta if row_index == 0 => Ok(residual),
+                    DerivedOp::FirstOffsetThenDelta => {
+                        checked_sum(previous_row[usize::from(input_slots[0])], residual)
+                    }
+                    DerivedOp::PreviousSnapshotSameKeyResidual
+                    | DerivedOp::PreviousMutationSameKeyResidual
+                    | DerivedOp::PreviousOutputByKeyResidual => {
+                        Err(AuraError::InvalidValue("previous same-key context"))
+                    }
+                }
+            }
+            Self::ExpressionStream {
+                op,
+                input_slots,
+                literals,
+                residuals,
+                ..
+            } => checked_sum(
+                evaluate_expression_row_value(*op, input_slots, literals, row)?,
+                residuals[row_index],
+            ),
+            Self::ExpressionValue {
+                op,
+                input_slots,
+                literals,
+                residual,
+                ..
+            } => checked_sum(
+                evaluate_expression_row_value(*op, input_slots, literals, row)?,
+                *residual,
+            ),
+            Self::QuotientRemainder {
+                divisor_slot,
+                quotients,
+                remainders,
+                ..
+            } => reconstruct_quotient_remainder(
+                row[*divisor_slot],
+                quotients[row_index],
+                remainders[row_index],
+            ),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_option_as_deref)]
+fn try_write_flat_derived_i64_aura1_body(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    sources: &mut [DirectAura1SlotSource<'_>],
+    record_count: usize,
+    field_count: usize,
+    aura1_plan: &Aura1Plan,
+    out: &mut Vec<u8>,
+    mut output_guard: Option<&mut ByteGuard>,
+    mut timings: Option<&mut DirectAura1WriterTimings>,
+    mut stats: Option<&mut DirectAura1WriterStats>,
+    total_start: Instant,
+) -> Result<bool> {
+    if plan.groups.is_empty()
+        || plan.groups.iter().any(|group| {
+            !matches!(
+                group,
+                GenericGroupInstruction::DerivedStream {
+                    parent_group_id: None,
+                    ..
+                } | GenericGroupInstruction::ExpressionStream {
+                    parent_group_id: None,
+                    ..
+                } | GenericGroupInstruction::ExpressionValue {
+                    parent_group_id: None,
+                    ..
+                } | GenericGroupInstruction::QuotientRemainder { .. }
+            )
+        })
+        || sources.iter().any(|source| {
+            !matches!(
+                source,
+                DirectAura1SlotSource::Missing | DirectAura1SlotSource::Direct(_)
+            )
+        })
+    {
+        return Ok(false);
+    }
+
+    let mut steps = Vec::with_capacity(plan.groups.len());
+    let mut produced_slots = sources
+        .iter()
+        .map(DirectAura1SlotSource::is_supported)
+        .collect::<Vec<_>>();
+    for group in &plan.groups {
+        let step = match group {
+            GenericGroupInstruction::DerivedStream {
+                output_slot,
+                op,
+                input_slots,
+                stream_id,
+                ..
+            } => FlatDerivedStep::Derived {
+                output_slot: usize::from(*output_slot),
+                op: *op,
+                input_slots,
+                residuals: stream_values
+                    .get(stream_id)
+                    .ok_or(AuraError::InvalidValue("stream body"))?,
+            },
+            GenericGroupInstruction::ExpressionStream {
+                output_slot,
+                op,
+                input_slots,
+                literals,
+                stream_id,
+                ..
+            } => FlatDerivedStep::ExpressionStream {
+                output_slot: usize::from(*output_slot),
+                op: *op,
+                input_slots,
+                literals,
+                residuals: stream_values
+                    .get(stream_id)
+                    .ok_or(AuraError::InvalidValue("stream body"))?,
+            },
+            GenericGroupInstruction::ExpressionValue {
+                output_slot,
+                op,
+                input_slots,
+                literals,
+                residual,
+                ..
+            } => FlatDerivedStep::ExpressionValue {
+                output_slot: usize::from(*output_slot),
+                op: *op,
+                input_slots,
+                literals,
+                residual: *residual,
+            },
+            GenericGroupInstruction::QuotientRemainder {
+                output_slot,
+                divisor_slot,
+                quotient_stream_id,
+                remainder_stream_id,
+                ..
+            } => FlatDerivedStep::QuotientRemainder {
+                output_slot: usize::from(*output_slot),
+                divisor_slot: usize::from(*divisor_slot),
+                quotients: stream_values
+                    .get(quotient_stream_id)
+                    .ok_or(AuraError::InvalidValue("quotient remainder"))?,
+                remainders: stream_values
+                    .get(remainder_stream_id)
+                    .ok_or(AuraError::InvalidValue("quotient remainder"))?,
+            },
+            _ => unreachable!(),
+        };
+        if step.output_slot() >= field_count {
+            return Err(AuraError::InvalidValue("target slot"));
+        }
+        if produced_slots[step.output_slot()] {
+            return Err(AuraError::InvalidValue("duplicate target slot"));
+        }
+        produced_slots[step.output_slot()] = true;
+        match &step {
+            FlatDerivedStep::Derived {
+                op:
+                    DerivedOp::AddResidual
+                    | DerivedOp::SubtractResidual
+                    | DerivedOp::FirstOffsetThenDelta,
+                input_slots,
+                ..
+            } if input_slots.len() != 1 => {
+                return Err(AuraError::InvalidValue("input slots"));
+            }
+            FlatDerivedStep::Derived {
+                op: DerivedOp::MaxPlusResidual | DerivedOp::MinMinusResidual,
+                input_slots: [],
+                ..
+            } => {
+                return Err(AuraError::InvalidValue("input slots"));
+            }
+            FlatDerivedStep::Derived { input_slots, .. }
+            | FlatDerivedStep::ExpressionStream { input_slots, .. }
+            | FlatDerivedStep::ExpressionValue { input_slots, .. }
+                if input_slots
+                    .iter()
+                    .any(|slot| usize::from(*slot) >= field_count) =>
+            {
+                return Err(AuraError::InvalidValue("input slots"));
+            }
+            FlatDerivedStep::Derived { residuals, .. }
+            | FlatDerivedStep::ExpressionStream { residuals, .. }
+                if residuals.len() != record_count =>
+            {
+                return Err(AuraError::InvalidValue("stream value count"));
+            }
+            FlatDerivedStep::QuotientRemainder {
+                divisor_slot,
+                quotients,
+                remainders,
+                ..
+            } if *divisor_slot >= field_count
+                || quotients.len() != record_count
+                || remainders.len() != record_count =>
+            {
+                return Err(AuraError::InvalidValue("quotient remainder"));
+            }
+            _ => {}
+        }
+        steps.push(step);
+    }
+
+    let direct_inputs = sources
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, source)| match source {
+            DirectAura1SlotSource::Direct(values) => Some((slot, *values)),
+            DirectAura1SlotSource::Missing => None,
+            _ => unreachable!("flat derived sources were checked above"),
+        })
+        .collect::<Vec<_>>();
+    if direct_inputs
+        .iter()
+        .any(|(_, values)| values.len() < record_count)
+    {
+        return Err(AuraError::InvalidValue("stream value count"));
+    }
+    let mut available_slots = sources
+        .iter()
+        .map(DirectAura1SlotSource::is_supported)
+        .collect::<Vec<_>>();
+    let mut scheduled_steps = vec![false; steps.len()];
+    let mut execution_order = Vec::with_capacity(steps.len());
+    for _ in 0..steps.len().saturating_add(1) {
+        let mut progress = false;
+        for (step_index, step) in steps.iter().enumerate() {
+            if scheduled_steps[step_index] || !step.inputs_ready(&available_slots) {
+                continue;
+            }
+            scheduled_steps[step_index] = true;
+            available_slots[step.output_slot()] = true;
+            execution_order.push(step_index);
+            progress = true;
+        }
+        if scheduled_steps.iter().all(|scheduled| *scheduled) || !progress {
+            break;
+        }
+    }
+    if scheduled_steps.iter().any(|scheduled| !*scheduled)
+        || available_slots.iter().any(|available| !*available)
+    {
+        return Err(AuraError::InvalidValue("derived dependency"));
+    }
+    let mut field_specs = Vec::with_capacity(aura1_plan.fields.len());
+    let mut row_width = 0usize;
+    for field in &aura1_plan.fields {
+        let slot = usize::from(field.field_index);
+        if slot >= field_count {
+            return Err(AuraError::InvalidValue("field index"));
+        }
+        let offset = row_width;
+        row_width = row_width
+            .checked_add(usize::from(field.width.byte_width()))
+            .ok_or(AuraError::InvalidValue("body length"))?;
+        field_specs.push((slot, field.width, offset));
+    }
+
+    let body_len = record_count
+        .checked_mul(row_width)
+        .ok_or(AuraError::InvalidValue("body length"))?;
+    let body_start = out.len();
+    if output_guard.is_none() {
+        out.resize(
+            body_start
+                .checked_add(body_len)
+                .ok_or(AuraError::InvalidValue("body length"))?,
+            0,
+        );
+    } else {
+        out.reserve(body_len);
+    }
+
+    let loop_start = Instant::now();
+    let mut row = vec![0i64; field_count];
+    let mut previous_row = vec![0i64; field_count];
+    for row_index in 0..record_count {
+        for (slot, values) in &direct_inputs {
+            row[*slot] = values[row_index];
+        }
+        for step_index in &execution_order {
+            let step = &steps[*step_index];
+            row[step.output_slot()] = step.value(row_index, &row, &previous_row)?;
+        }
+
+        if output_guard.is_none() {
+            let row_start = body_start + row_index * row_width;
+            let row_out = &mut out[row_start..row_start + row_width];
+            for (slot, width, offset) in &field_specs {
+                write_direct_i64_width_at(row_out, *offset, row[*slot], *width)?;
+            }
+        } else {
+            for (slot, width, _) in &field_specs {
+                write_direct_i64_width_guarded(
+                    out,
+                    row[*slot],
+                    *width,
+                    output_guard
+                        .as_deref_mut()
+                        .ok_or(AuraError::InvalidValue("output guard"))?,
+                )?;
+            }
+        }
+        previous_row.copy_from_slice(&row);
+    }
+    for source in sources {
+        source.finish()?;
+    }
+    let loop_ns = loop_start.elapsed().as_nanos();
+
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.field_reconstruction_packing_ns = timings
+            .field_reconstruction_packing_ns
+            .saturating_add(loop_ns);
+        timings.total_ns = total_start.elapsed().as_nanos();
+        timings.close_sum();
+    }
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.partition_count = 1;
+        stats.records_per_partition_min = record_count;
+        stats.records_per_partition_max = record_count;
+        stats.output_slices = field_specs.len().saturating_mul(record_count);
+        stats.non_contiguous_writes = stats.output_slices;
+        stats.bounds_checks = stats.output_slices;
+        stats.temporary_buffer_bytes = row
+            .capacity()
+            .saturating_add(previous_row.capacity())
+            .saturating_mul(mem::size_of::<i64>())
+            .saturating_add(produced_slots.capacity())
+            .saturating_add(available_slots.capacity())
+            .saturating_add(scheduled_steps.capacity())
+            .saturating_add(
+                direct_inputs
+                    .capacity()
+                    .saturating_mul(mem::size_of::<(usize, &[i64])>()),
+            )
+            .saturating_add(
+                execution_order
+                    .capacity()
+                    .saturating_mul(mem::size_of::<usize>()),
+            )
+            .saturating_add(
+                steps
+                    .capacity()
+                    .saturating_mul(mem::size_of::<FlatDerivedStep<'_>>()),
+            );
+        stats.copied_bytes = body_len;
+        stats.allocation_count = stats.allocation_count.saturating_add(8);
+        if output_guard.is_some() {
+            stats.guard_update_calls = stats.guard_update_calls.saturating_add(stats.output_slices);
+            stats.guard_update_bytes = stats.guard_update_bytes.saturating_add(body_len);
+        }
+    }
+    Ok(true)
+}
+
+fn evaluate_expression_row_value(
+    op: DerivedExpressionOp,
+    input_slots: &[u16],
+    literals: &[i64],
+    row: &[i64],
+) -> Result<i64> {
+    let input_terms = || {
+        input_slots.iter().map(|slot| {
+            row.get(usize::from(*slot))
+                .copied()
+                .ok_or(AuraError::InvalidValue("input slots"))
+        })
+    };
+    match op {
+        DerivedExpressionOp::Add => {
+            let sum = input_terms()
+                .chain(literals.iter().copied().map(Ok))
+                .try_fold(0i128, |sum, term| {
+                    sum.checked_add(i128::from(term?))
+                        .ok_or(AuraError::InvalidValue("expression value"))
+                })?;
+            i64::try_from(sum).map_err(|_| AuraError::InvalidValue("expression value"))
+        }
+        DerivedExpressionOp::Sub | DerivedExpressionOp::Div => {
+            let mut terms = input_terms().chain(literals.iter().copied().map(Ok));
+            let first = terms
+                .next()
+                .transpose()?
+                .ok_or(AuraError::InvalidValue("expression terms"))?;
+            let value = terms.try_fold(i128::from(first), |value, term| {
+                let term = i128::from(term?);
+                match op {
+                    DerivedExpressionOp::Sub => value
+                        .checked_sub(term)
+                        .ok_or(AuraError::InvalidValue("expression value")),
+                    DerivedExpressionOp::Div if term != 0 => value
+                        .checked_div(term)
+                        .ok_or(AuraError::InvalidValue("expression value")),
+                    _ => Err(AuraError::InvalidValue("expression value")),
+                }
+            })?;
+            i64::try_from(value).map_err(|_| AuraError::InvalidValue("expression value"))
+        }
+        DerivedExpressionOp::Mul => {
+            let product = input_terms()
+                .chain(literals.iter().copied().map(Ok))
+                .try_fold(1i128, |product, term| {
+                    product
+                        .checked_mul(i128::from(term?))
+                        .ok_or(AuraError::InvalidValue("expression value"))
+                })?;
+            i64::try_from(product).map_err(|_| AuraError::InvalidValue("expression value"))
+        }
+        DerivedExpressionOp::MulDiv => {
+            let divisor = *literals
+                .first()
+                .filter(|divisor| **divisor != 0)
+                .ok_or(AuraError::InvalidValue("expression terms"))?;
+            let product = input_terms().try_fold(1i128, |product, term| {
+                product
+                    .checked_mul(i128::from(term?))
+                    .ok_or(AuraError::InvalidValue("expression value"))
+            })?;
+            let value = product
+                .checked_div(i128::from(divisor))
+                .ok_or(AuraError::InvalidValue("expression value"))?;
+            i64::try_from(value).map_err(|_| AuraError::InvalidValue("expression value"))
+        }
+        DerivedExpressionOp::Min | DerivedExpressionOp::Max => input_terms()
+            .chain(literals.iter().copied().map(Ok))
+            .try_fold(None, |value, term| {
+                let term = term?;
+                Ok::<_, AuraError>(Some(value.map_or(term, |value: i64| match op {
+                    DerivedExpressionOp::Min => value.min(term),
+                    DerivedExpressionOp::Max => value.max(term),
+                    _ => unreachable!(),
+                })))
+            })?
+            .ok_or(AuraError::InvalidValue("expression terms")),
+        DerivedExpressionOp::AddResidual
+        | DerivedExpressionOp::SubtractResidual
+        | DerivedExpressionOp::MaxPlusResidual
+        | DerivedExpressionOp::MinMinusResidual
+        | DerivedExpressionOp::FirstOffsetThenDelta
+        | DerivedExpressionOp::PreviousSnapshotSameKeyResidual
+        | DerivedExpressionOp::PreviousMutationSameKeyResidual
+        | DerivedExpressionOp::PreviousOutputByKeyResidual => {
+            Err(AuraError::InvalidValue("derived expression op"))
+        }
+    }
 }
 
 pub(crate) fn try_encode_generic_i64_aura1_body_streaming(
@@ -3257,9 +4592,11 @@ impl StreamingAura1Config {
                     });
                 }
                 GenericGroupInstruction::PartitionRuns { .. }
+                | GenericGroupInstruction::ExplicitEvents { .. }
                 | GenericGroupInstruction::DerivedStream { .. }
                 | GenericGroupInstruction::ExpressionStream { .. }
-                | GenericGroupInstruction::ExpressionValue { .. } => return Ok(None),
+                | GenericGroupInstruction::ExpressionValue { .. }
+                | GenericGroupInstruction::QuotientRemainder { .. } => return Ok(None),
             }
         }
 
@@ -3348,6 +4685,10 @@ fn generic_op_name(op: &GenericStreamOp) -> &'static str {
         GenericStreamOp::PackedDictionary { .. } => "PackedDictionary",
         GenericStreamOp::HuffmanDictionary { .. } => "HuffmanDictionary",
         GenericStreamOp::UuidConstMask { .. } => "UuidConstMask",
+        GenericStreamOp::FixedStrideDelta { .. } => "FixedStrideDelta",
+        GenericStreamOp::DeltaOfDelta { .. } => "DeltaOfDelta",
+        GenericStreamOp::PreviousValueDelta { .. } => "PreviousValueDelta",
+        GenericStreamOp::ZstdVarint { .. } => "ZstdVarint",
     }
 }
 
@@ -3440,7 +4781,10 @@ fn add_decode_op_time(
         }
         GenericStreamOp::PrevDelta { .. }
         | GenericStreamOp::PrevVarint { .. }
-        | GenericStreamOp::BlockLocal { .. } => {
+        | GenericStreamOp::BlockLocal { .. }
+        | GenericStreamOp::FixedStrideDelta { .. }
+        | GenericStreamOp::DeltaOfDelta { .. }
+        | GenericStreamOp::PreviousValueDelta { .. } => {
             timings.delta_reconstruction_ns =
                 timings.delta_reconstruction_ns.saturating_add(elapsed_ns);
         }
@@ -3459,6 +4803,9 @@ fn add_decode_op_time(
                 .saturating_add(elapsed_ns);
         }
         GenericStreamOp::UuidConstMask { .. } => {
+            timings.unclassified_ns = timings.unclassified_ns.saturating_add(elapsed_ns);
+        }
+        GenericStreamOp::ZstdVarint { .. } => {
             timings.unclassified_ns = timings.unclassified_ns.saturating_add(elapsed_ns);
         }
     }
@@ -3703,12 +5050,14 @@ fn direct_aura1_slot_sources<'a>(
                     value: *value,
                 };
             }
-            GenericGroupInstruction::Group { .. } | GenericGroupInstruction::PresenceMap { .. } => {
-            }
+            GenericGroupInstruction::Group { .. }
+            | GenericGroupInstruction::ExplicitEvents { .. }
+            | GenericGroupInstruction::PresenceMap { .. } => {}
             GenericGroupInstruction::PartitionRuns { .. }
             | GenericGroupInstruction::DerivedStream { .. }
             | GenericGroupInstruction::ExpressionStream { .. }
-            | GenericGroupInstruction::ExpressionValue { .. } => return Ok(sources),
+            | GenericGroupInstruction::ExpressionValue { .. }
+            | GenericGroupInstruction::QuotientRemainder { .. } => return Ok(sources),
         }
     }
 
@@ -3929,6 +5278,58 @@ fn write_direct_i64_width(out: &mut Vec<u8>, value: i64, width: PhysicalWidth) -
     }
 }
 
+fn write_direct_i64_width_at(
+    row: &mut [u8],
+    offset: usize,
+    value: i64,
+    width: PhysicalWidth,
+) -> Result<()> {
+    let width_bytes = usize::from(width.byte_width());
+    let end = offset
+        .checked_add(width_bytes)
+        .ok_or(AuraError::InvalidValue("body length"))?;
+    if end > row.len() {
+        return Err(AuraError::InvalidValue("body length"));
+    }
+    let target = row[offset..end].as_mut_ptr();
+    match width {
+        PhysicalWidth::Zero => {
+            if value != 0 {
+                return Err(AuraError::InvalidValue("zero-width value"));
+            }
+        }
+        PhysicalWidth::I8 => {
+            let value = i8::try_from(value).map_err(|_| AuraError::InvalidValue("i8 value"))?;
+            // SAFETY: the target range was checked above and has one byte.
+            unsafe { target.write(value as u8) };
+        }
+        PhysicalWidth::I16 => {
+            let value = i16::try_from(value).map_err(|_| AuraError::InvalidValue("i16 value"))?;
+            // SAFETY: the target range was checked above; Aura1 fields are not
+            // required to be naturally aligned.
+            unsafe { target.cast::<i16>().write_unaligned(value.to_le()) };
+        }
+        PhysicalWidth::I32 => {
+            let value = i32::try_from(value).map_err(|_| AuraError::InvalidValue("i32 value"))?;
+            // SAFETY: see the I16 case.
+            unsafe { target.cast::<i32>().write_unaligned(value.to_le()) };
+        }
+        PhysicalWidth::I64 => {
+            // SAFETY: see the I16 case.
+            unsafe { target.cast::<i64>().write_unaligned(value.to_le()) };
+        }
+        PhysicalWidth::I128 => {
+            // SAFETY: see the I16 case.
+            unsafe {
+                target
+                    .cast::<i128>()
+                    .write_unaligned(i128::from(value).to_le())
+            };
+        }
+    }
+    Ok(())
+}
+
 fn write_direct_i64_width_guarded(
     out: &mut Vec<u8>,
     value: i64,
@@ -3980,6 +5381,7 @@ fn write_direct_i64_width_guarded(
 }
 
 pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Vec<i64>>> {
+    validate_quotient_remainder_decode_plan(encoded)?;
     let instructions = encoded
         .plan
         .streams
@@ -3998,6 +5400,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
             GenericStreamBodyValue::U128(_) => return Err(AuraError::InvalidValue("body type")),
         }
     }
+    validate_explicit_event_counts(&encoded.plan, &stream_values, encoded.record_count)?;
 
     let mut rows = vec![vec![0i64; encoded.field_count]; encoded.record_count];
     let mut filled = vec![vec![false; encoded.field_count]; encoded.record_count];
@@ -4119,12 +5522,14 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
         .iter()
         .filter_map(|group| match group {
             GenericGroupInstruction::DerivedStream {
+                parent_group_id,
                 output_slot,
                 op,
                 input_slots,
                 stream_id,
                 ..
             } => Some(PendingDerivedInstruction::Residual {
+                parent_group_id: *parent_group_id,
                 output_slot: *output_slot,
                 op: *op,
                 input_slots: input_slots.as_slice(),
@@ -4158,14 +5563,130 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                 literals: literals.as_slice(),
                 residual: *residual,
             }),
+            GenericGroupInstruction::QuotientRemainder {
+                output_slot,
+                divisor_slot,
+                quotient_stream_id,
+                remainder_stream_id,
+                ..
+            } => Some(PendingDerivedInstruction::QuotientRemainder {
+                output_slot: *output_slot,
+                divisor_slot: *divisor_slot,
+                quotient_stream_id: *quotient_stream_id,
+                remainder_stream_id: *remainder_stream_id,
+            }),
             _ => None,
         })
         .collect::<Vec<_>>();
 
     for _ in 0..encoded.field_count.saturating_mul(2).saturating_add(1) {
         let mut progress = false;
+        for derived in &derived {
+            let PendingDerivedInstruction::Residual {
+                parent_group_id: Some(parent_group_id),
+                output_slot,
+                op,
+                input_slots,
+                stream_id,
+            } = derived
+            else {
+                continue;
+            };
+            if !is_previous_same_key_op(*op) {
+                continue;
+            }
+            let output_index = usize::from(*output_slot);
+            if output_index >= encoded.field_count {
+                return Err(AuraError::InvalidValue("target slot"));
+            }
+            if filled
+                .iter()
+                .all(|row| row.get(output_index).copied().unwrap_or(false))
+            {
+                continue;
+            }
+            let event_slots = group_event_slots(&encoded.plan, *parent_group_id)?;
+            if !event_slots.iter().chain(input_slots.iter()).all(|slot| {
+                filled
+                    .iter()
+                    .all(|row| row.get(usize::from(*slot)).copied().unwrap_or(false))
+            }) {
+                continue;
+            }
+            let residuals = stream_values
+                .get(stream_id)
+                .ok_or(AuraError::InvalidValue("stream body"))?;
+            if residuals.len() != encoded.record_count {
+                return Err(AuraError::InvalidValue("stream value count"));
+            }
+            match op {
+                DerivedOp::PreviousSnapshotSameKeyResidual => {
+                    materialize_previous_snapshot_same_key(
+                        &event_slots,
+                        input_slots,
+                        *output_slot,
+                        residuals,
+                        &mut rows,
+                        &mut filled,
+                    )?;
+                }
+                DerivedOp::PreviousMutationSameKeyResidual => {
+                    if !materialize_explicit_previous_same_key(
+                        &encoded.plan,
+                        &stream_values,
+                        input_slots,
+                        *output_slot,
+                        residuals,
+                        true,
+                        &mut rows,
+                        &mut filled,
+                    )? {
+                        materialize_previous_mutation_same_key(
+                            &event_slots,
+                            input_slots,
+                            *output_slot,
+                            residuals,
+                            &mut rows,
+                            &mut filled,
+                        )?;
+                    }
+                }
+                DerivedOp::PreviousOutputByKeyResidual => {
+                    if !materialize_explicit_previous_same_key(
+                        &encoded.plan,
+                        &stream_values,
+                        input_slots,
+                        *output_slot,
+                        residuals,
+                        false,
+                        &mut rows,
+                        &mut filled,
+                    )? {
+                        materialize_previous_output_by_key(
+                            &event_slots,
+                            input_slots,
+                            *output_slot,
+                            residuals,
+                            &mut rows,
+                            &mut filled,
+                        )?;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            progress = true;
+        }
         for row_index in 0..encoded.record_count {
             for derived in &derived {
+                if matches!(
+                    derived,
+                    PendingDerivedInstruction::Residual {
+                        op,
+                        ..
+                    } if is_previous_same_key_op(*op)
+                ) {
+                    continue;
+                }
                 let (output_slot, stream_id) = match derived {
                     PendingDerivedInstruction::Residual {
                         output_slot,
@@ -4178,6 +5699,9 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                         ..
                     } => (*output_slot, Some(*stream_id)),
                     PendingDerivedInstruction::ExpressionValue { output_slot, .. } => {
+                        (*output_slot, None)
+                    }
+                    PendingDerivedInstruction::QuotientRemainder { output_slot, .. } => {
                         (*output_slot, None)
                     }
                 };
@@ -4199,11 +5723,44 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                 } else {
                     match derived {
                         PendingDerivedInstruction::ExpressionValue { residual, .. } => *residual,
+                        PendingDerivedInstruction::QuotientRemainder { .. } => 0,
                         _ => unreachable!(),
                     }
                 };
-                rows[row_index][output_slot] =
-                    derive_pending_value(derived, row_index, residual, &rows)?;
+                rows[row_index][output_slot] = match derived {
+                    PendingDerivedInstruction::QuotientRemainder {
+                        divisor_slot,
+                        quotient_stream_id,
+                        remainder_stream_id,
+                        ..
+                    } => {
+                        let quotients = stream_values
+                            .get(quotient_stream_id)
+                            .ok_or(AuraError::InvalidValue("quotient remainder"))?;
+                        let remainders = stream_values
+                            .get(remainder_stream_id)
+                            .ok_or(AuraError::InvalidValue("quotient remainder"))?;
+                        if quotients.len() != encoded.record_count
+                            || remainders.len() != encoded.record_count
+                        {
+                            return Err(AuraError::InvalidValue("quotient remainder"));
+                        }
+                        let quotient = quotients
+                            .get(row_index)
+                            .copied()
+                            .ok_or(AuraError::InvalidValue("quotient remainder"))?;
+                        let remainder = remainders
+                            .get(row_index)
+                            .copied()
+                            .ok_or(AuraError::InvalidValue("quotient remainder"))?;
+                        let divisor = rows[row_index]
+                            .get(usize::from(*divisor_slot))
+                            .copied()
+                            .ok_or(AuraError::InvalidValue("quotient remainder slot"))?;
+                        reconstruct_quotient_remainder(divisor, quotient, remainder)?
+                    }
+                    _ => derive_pending_value(derived, row_index, residual, &rows)?,
+                };
                 filled[row_index][output_slot] = true;
                 progress = true;
             }
@@ -4217,6 +5774,67 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
     }
 
     Err(AuraError::InvalidValue("derived streams"))
+}
+
+fn validate_quotient_remainder_decode_plan(encoded: &GenericEncodedI64Rows) -> Result<()> {
+    for group in &encoded.plan.groups {
+        let GenericGroupInstruction::QuotientRemainder {
+            output_slot,
+            divisor_slot,
+            quotient_stream_id,
+            remainder_stream_id,
+            ..
+        } = group
+        else {
+            continue;
+        };
+        if usize::from(*output_slot) >= encoded.field_count
+            || usize::from(*divisor_slot) >= encoded.field_count
+            || encoded
+                .plan
+                .streams
+                .iter()
+                .any(|stream| stream.target_slot == Some(*output_slot))
+            || [quotient_stream_id, remainder_stream_id]
+                .into_iter()
+                .any(|stream_id| {
+                    encoded
+                        .plan
+                        .streams
+                        .iter()
+                        .find(|stream| stream.stream_id == *stream_id)
+                        .is_none_or(|stream| stream.target_slot.is_some())
+                })
+            || encoded
+                .plan
+                .groups
+                .iter()
+                .filter(|candidate| group_output_slot(candidate) == Some(*output_slot))
+                .count()
+                != 1
+        {
+            return Err(AuraError::InvalidValue("quotient remainder plan"));
+        }
+    }
+    Ok(())
+}
+
+fn group_output_slot(group: &GenericGroupInstruction) -> Option<u16> {
+    match group {
+        GenericGroupInstruction::SegmentedDeltaStream { output_slot, .. }
+        | GenericGroupInstruction::GroupValueStream { output_slot, .. }
+        | GenericGroupInstruction::DerivedStream { output_slot, .. }
+        | GenericGroupInstruction::ExpressionStream { output_slot, .. }
+        | GenericGroupInstruction::ExpressionValue { output_slot, .. }
+        | GenericGroupInstruction::SparseStream { output_slot, .. }
+        | GenericGroupInstruction::PresenceValue { output_slot, .. }
+        | GenericGroupInstruction::QuotientRemainder { output_slot, .. } => Some(*output_slot),
+        GenericGroupInstruction::Group { .. }
+        | GenericGroupInstruction::ExplicitEvents { .. }
+        | GenericGroupInstruction::PartitionRuns { .. }
+        | GenericGroupInstruction::PartitionRunLengths { .. }
+        | GenericGroupInstruction::PresenceMap { .. } => None,
+    }
 }
 
 pub fn plan_uuid_const_mask_stream(
@@ -4254,16 +5872,55 @@ fn stream_values_for_instruction(
         return column_values(rows, slot);
     }
 
-    if let Some((output_slot, op, input_slots)) = plan.groups.iter().find_map(|group| match group {
-        GenericGroupInstruction::DerivedStream {
-            output_slot,
-            op,
-            input_slots,
-            stream_id,
-            ..
-        } if *stream_id == instruction.stream_id => Some((*output_slot, *op, input_slots)),
-        _ => None,
-    }) {
+    if let Some((parent_group_id, output_slot, op, input_slots)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::DerivedStream {
+                parent_group_id,
+                output_slot,
+                op,
+                input_slots,
+                stream_id,
+                ..
+            } if *stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *output_slot, *op, input_slots))
+            }
+            _ => None,
+        })
+    {
+        if is_previous_same_key_op(op) {
+            let event_slots = group_event_slots(
+                plan,
+                parent_group_id
+                    .ok_or(AuraError::InvalidValue("previous snapshot same-key parent"))?,
+            )?;
+            return match op {
+                DerivedOp::PreviousSnapshotSameKeyResidual => {
+                    previous_snapshot_same_key_residuals_for_slots(
+                        rows,
+                        &event_slots,
+                        input_slots,
+                        output_slot,
+                    )
+                }
+                DerivedOp::PreviousMutationSameKeyResidual => {
+                    previous_mutation_same_key_residuals_for_slots(
+                        rows,
+                        &event_slots,
+                        input_slots,
+                        output_slot,
+                    )
+                }
+                DerivedOp::PreviousOutputByKeyResidual => {
+                    previous_output_by_key_residuals_for_slots(
+                        rows,
+                        &event_slots,
+                        input_slots,
+                        output_slot,
+                    )
+                }
+                _ => unreachable!(),
+            };
+        }
         return rows
             .iter()
             .enumerate()
@@ -4293,6 +5950,52 @@ fn stream_values_for_instruction(
             .enumerate()
             .map(|(row_index, _)| {
                 inverse_expression_value(op, input_slots, literals, output_slot, row_index, rows)
+            })
+            .collect();
+    }
+
+    if let Some((output_slot, divisor_slot, quotient_stream_id, _remainder_stream_id)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::QuotientRemainder {
+                output_slot,
+                divisor_slot,
+                quotient_stream_id,
+                remainder_stream_id,
+                ..
+            } if *quotient_stream_id == instruction.stream_id
+                || *remainder_stream_id == instruction.stream_id =>
+            {
+                Some((
+                    *output_slot,
+                    *divisor_slot,
+                    *quotient_stream_id,
+                    *remainder_stream_id,
+                ))
+            }
+            _ => None,
+        })
+    {
+        let quotient = quotient_stream_id == instruction.stream_id;
+        return rows
+            .iter()
+            .map(|row| {
+                let value = row
+                    .get(usize::from(output_slot))
+                    .copied()
+                    .ok_or(AuraError::InvalidValue("quotient remainder slot"))?;
+                let divisor = row
+                    .get(usize::from(divisor_slot))
+                    .copied()
+                    .ok_or(AuraError::InvalidValue("quotient remainder slot"))?;
+                if quotient {
+                    value
+                        .checked_div_euclid(divisor)
+                        .ok_or(AuraError::InvalidValue("quotient remainder"))
+                } else {
+                    value
+                        .checked_rem_euclid(divisor)
+                        .ok_or(AuraError::InvalidValue("quotient remainder"))
+                }
             })
             .collect();
     }
@@ -4352,7 +6055,6 @@ fn stream_values_for_instruction(
                 fixed_order,
                 value_stream_id,
                 count_stream_id,
-                event_count_stream_id: _,
                 ..
             } if *value_stream_id == instruction.stream_id => {
                 Some((*parent_group_id, *partition_slot, *fixed_order, 0u8))
@@ -4363,7 +6065,6 @@ fn stream_values_for_instruction(
                 fixed_order,
                 value_stream_id: _,
                 count_stream_id,
-                event_count_stream_id: _,
                 ..
             } if *count_stream_id == instruction.stream_id => {
                 Some((*parent_group_id, *partition_slot, *fixed_order, 1u8))
@@ -4419,7 +6120,6 @@ fn stream_values_for_instruction(
                 output_slot,
                 base_stream_id,
                 first_stream_id,
-                delta_stream_id: _,
                 ..
             } if *first_stream_id == instruction.stream_id => Some((
                 *parent_group_id,
@@ -4536,16 +6236,58 @@ fn stream_values_for_instruction_from_columns(
         return column_values_from_columns(columns, slot, record_count);
     }
 
-    if let Some((output_slot, op, input_slots)) = plan.groups.iter().find_map(|group| match group {
-        GenericGroupInstruction::DerivedStream {
-            output_slot,
-            op,
-            input_slots,
-            stream_id,
-            ..
-        } if *stream_id == instruction.stream_id => Some((*output_slot, *op, input_slots)),
-        _ => None,
-    }) {
+    if let Some((parent_group_id, output_slot, op, input_slots)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::DerivedStream {
+                parent_group_id,
+                output_slot,
+                op,
+                input_slots,
+                stream_id,
+                ..
+            } if *stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *output_slot, *op, input_slots))
+            }
+            _ => None,
+        })
+    {
+        if is_previous_same_key_op(op) {
+            let event_slots = group_event_slots(
+                plan,
+                parent_group_id
+                    .ok_or(AuraError::InvalidValue("previous snapshot same-key parent"))?,
+            )?;
+            return match op {
+                DerivedOp::PreviousSnapshotSameKeyResidual => {
+                    previous_snapshot_same_key_residuals_from_columns(
+                        columns,
+                        record_count,
+                        &event_slots,
+                        input_slots,
+                        output_slot,
+                    )
+                }
+                DerivedOp::PreviousMutationSameKeyResidual => {
+                    previous_mutation_same_key_residuals_from_columns(
+                        columns,
+                        record_count,
+                        &event_slots,
+                        input_slots,
+                        output_slot,
+                    )
+                }
+                DerivedOp::PreviousOutputByKeyResidual => {
+                    previous_output_by_key_residuals_from_columns(
+                        columns,
+                        record_count,
+                        &event_slots,
+                        input_slots,
+                        output_slot,
+                    )
+                }
+                _ => unreachable!(),
+            };
+        }
         return (0..record_count)
             .map(|row_index| {
                 inverse_derive_value_from_columns(op, input_slots, output_slot, row_index, columns)
@@ -4577,6 +6319,21 @@ fn stream_values_for_instruction_from_columns(
                     output_slot,
                     row_index,
                     columns,
+                )
+            })
+            .collect();
+    }
+
+    if let Some((output_slot, divisor_slot, quotient_stream_id, _remainder_stream_id)) =
+        quotient_remainder_stream(plan, instruction.stream_id)
+    {
+        let quotient = quotient_stream_id == instruction.stream_id;
+        return (0..record_count)
+            .map(|row_index| {
+                quotient_remainder_component(
+                    column_value(columns, row_index, output_slot)?,
+                    column_value(columns, row_index, divisor_slot)?,
+                    quotient,
                 )
             })
             .collect();
@@ -4633,7 +6390,6 @@ fn stream_values_for_instruction_from_columns(
                 fixed_order,
                 value_stream_id,
                 count_stream_id,
-                event_count_stream_id: _,
                 ..
             } if *value_stream_id == instruction.stream_id => {
                 Some((*parent_group_id, *partition_slot, *fixed_order, 0u8))
@@ -4644,7 +6400,6 @@ fn stream_values_for_instruction_from_columns(
                 fixed_order,
                 value_stream_id: _,
                 count_stream_id,
-                event_count_stream_id: _,
                 ..
             } if *count_stream_id == instruction.stream_id => {
                 Some((*parent_group_id, *partition_slot, *fixed_order, 1u8))
@@ -4720,7 +6475,6 @@ fn stream_values_for_instruction_from_columns(
                 output_slot,
                 base_stream_id,
                 first_stream_id,
-                delta_stream_id: _,
                 ..
             } if *first_stream_id == instruction.stream_id => Some((
                 *parent_group_id,
@@ -4816,6 +6570,39 @@ fn stream_values_for_instruction_from_columns(
     Err(AuraError::InvalidValue("generic stream instruction"))
 }
 
+fn quotient_remainder_stream(
+    plan: &GenericInstructionPlan,
+    stream_id: u16,
+) -> Option<(u16, u16, u16, u16)> {
+    plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::QuotientRemainder {
+            output_slot,
+            divisor_slot,
+            quotient_stream_id,
+            remainder_stream_id,
+            ..
+        } if *quotient_stream_id == stream_id || *remainder_stream_id == stream_id => Some((
+            *output_slot,
+            *divisor_slot,
+            *quotient_stream_id,
+            *remainder_stream_id,
+        )),
+        _ => None,
+    })
+}
+
+fn quotient_remainder_component(value: i64, divisor: i64, quotient: bool) -> Result<i64> {
+    if quotient {
+        value
+            .checked_div_euclid(divisor)
+            .ok_or(AuraError::InvalidValue("quotient remainder"))
+    } else {
+        value
+            .checked_rem_euclid(divisor)
+            .ok_or(AuraError::InvalidValue("quotient remainder"))
+    }
+}
+
 fn emit_stream_values_for_instruction_from_columns(
     schema: &SchemaDescriptor,
     columns: &[Vec<i64>],
@@ -4844,16 +6631,62 @@ fn emit_stream_values_for_instruction_from_columns(
         return Ok(emitted);
     }
 
-    if let Some((output_slot, op, input_slots)) = plan.groups.iter().find_map(|group| match group {
-        GenericGroupInstruction::DerivedStream {
-            output_slot,
-            op,
-            input_slots,
-            stream_id,
-            ..
-        } if *stream_id == instruction.stream_id => Some((*output_slot, *op, input_slots)),
-        _ => None,
-    }) {
+    if let Some((parent_group_id, output_slot, op, input_slots)) =
+        plan.groups.iter().find_map(|group| match group {
+            GenericGroupInstruction::DerivedStream {
+                parent_group_id,
+                output_slot,
+                op,
+                input_slots,
+                stream_id,
+                ..
+            } if *stream_id == instruction.stream_id => {
+                Some((*parent_group_id, *output_slot, *op, input_slots))
+            }
+            _ => None,
+        })
+    {
+        if is_previous_same_key_op(op) {
+            let event_slots = group_event_slots(
+                plan,
+                parent_group_id
+                    .ok_or(AuraError::InvalidValue("previous snapshot same-key parent"))?,
+            )?;
+            let residuals = match op {
+                DerivedOp::PreviousSnapshotSameKeyResidual => {
+                    previous_snapshot_same_key_residuals_from_columns(
+                        columns,
+                        record_count,
+                        &event_slots,
+                        input_slots,
+                        output_slot,
+                    )
+                }
+                DerivedOp::PreviousMutationSameKeyResidual => {
+                    previous_mutation_same_key_residuals_from_columns(
+                        columns,
+                        record_count,
+                        &event_slots,
+                        input_slots,
+                        output_slot,
+                    )
+                }
+                DerivedOp::PreviousOutputByKeyResidual => {
+                    previous_output_by_key_residuals_from_columns(
+                        columns,
+                        record_count,
+                        &event_slots,
+                        input_slots,
+                        output_slot,
+                    )
+                }
+                _ => unreachable!(),
+            }?;
+            for residual in residuals {
+                emit(residual)?;
+            }
+            return Ok(emitted);
+        }
         for row_index in 0..record_count {
             emit(inverse_derive_value_from_columns(
                 op,
@@ -4889,6 +6722,20 @@ fn emit_stream_values_for_instruction_from_columns(
                 output_slot,
                 row_index,
                 columns,
+            )?)?;
+        }
+        return Ok(emitted);
+    }
+
+    if let Some((output_slot, divisor_slot, quotient_stream_id, _remainder_stream_id)) =
+        quotient_remainder_stream(plan, instruction.stream_id)
+    {
+        let quotient = quotient_stream_id == instruction.stream_id;
+        for row_index in 0..record_count {
+            emit(quotient_remainder_component(
+                column_value(columns, row_index, output_slot)?,
+                column_value(columns, row_index, divisor_slot)?,
+                quotient,
             )?)?;
         }
         return Ok(emitted);
@@ -4944,7 +6791,6 @@ fn emit_stream_values_for_instruction_from_columns(
                 fixed_order,
                 value_stream_id,
                 count_stream_id,
-                event_count_stream_id: _,
                 ..
             } if *value_stream_id == instruction.stream_id => {
                 Some((*parent_group_id, *partition_slot, *fixed_order, 0u8))
@@ -4955,7 +6801,6 @@ fn emit_stream_values_for_instruction_from_columns(
                 fixed_order,
                 value_stream_id: _,
                 count_stream_id,
-                event_count_stream_id: _,
                 ..
             } if *count_stream_id == instruction.stream_id => {
                 Some((*parent_group_id, *partition_slot, *fixed_order, 1u8))
@@ -5064,7 +6909,6 @@ fn emit_stream_values_for_instruction_from_columns(
                 output_slot,
                 base_stream_id,
                 first_stream_id,
-                delta_stream_id: _,
                 ..
             } if *first_stream_id == instruction.stream_id => Some((
                 *parent_group_id,
@@ -5210,6 +7054,11 @@ fn inverse_derive_value(
                 checked_delta(output, base)
             }
         }
+        DerivedOp::PreviousSnapshotSameKeyResidual
+        | DerivedOp::PreviousMutationSameKeyResidual
+        | DerivedOp::PreviousOutputByKeyResidual => {
+            Err(AuraError::InvalidValue("previous same-key context"))
+        }
     }
 }
 
@@ -5309,6 +7158,7 @@ fn materialize_generic_i64_columns(
     record_count: usize,
     field_count: usize,
 ) -> Result<Option<Vec<Vec<i64>>>> {
+    validate_explicit_event_counts(plan, stream_values, record_count)?;
     if let Some(columns) =
         materialize_partitioned_sparse_i64_columns(plan, stream_values, record_count, field_count)?
     {
@@ -5370,7 +7220,6 @@ fn materialize_generic_i64_columns(
         &mut columns,
         &mut filled_slots,
     )?;
-
     if filled_slots.iter().all(|slot| *slot)
         && columns.iter().all(|column| column.len() == record_count)
     {
@@ -5520,9 +7369,11 @@ fn materialize_partitioned_sparse_i64_columns(
                 }
             }
             GenericGroupInstruction::PartitionRuns { .. }
+            | GenericGroupInstruction::ExplicitEvents { .. }
             | GenericGroupInstruction::DerivedStream { .. }
             | GenericGroupInstruction::ExpressionStream { .. }
-            | GenericGroupInstruction::ExpressionValue { .. } => return Ok(None),
+            | GenericGroupInstruction::ExpressionValue { .. }
+            | GenericGroupInstruction::QuotientRemainder { .. } => return Ok(None),
         }
     }
 
@@ -6197,6 +8048,9 @@ fn materialize_group_value_streams(
             return Err(AuraError::InvalidValue("group value stream"));
         }
         for ((start, end), value) in event_ranges.into_iter().zip(values.iter().copied()) {
+            if start > end || end > rows.len() {
+                return Err(AuraError::InvalidValue("group value stream"));
+            }
             for row_index in start..end {
                 rows[row_index][output_slot] = value;
                 filled[row_index][output_slot] = true;
@@ -6305,6 +8159,34 @@ fn event_ranges_from_partition_runs(
     partition_runs: &BTreeMap<u16, Vec<PartitionRun>>,
     group_id: u16,
 ) -> Result<Vec<(usize, usize)>> {
+    if let Some(child_count_stream_id) = plan.groups.iter().find_map(|group| match group {
+        GenericGroupInstruction::ExplicitEvents {
+            group_id: candidate,
+            child_count_stream_id,
+            ..
+        } if *candidate == group_id => Some(*child_count_stream_id),
+        _ => None,
+    }) {
+        let counts = stream_values
+            .get(&child_count_stream_id)
+            .ok_or(AuraError::InvalidValue("explicit event child count stream"))?;
+        let mut cursor = 0usize;
+        return counts
+            .iter()
+            .map(|count| {
+                if *count < 0 {
+                    return Err(AuraError::InvalidValue("explicit event child count"));
+                }
+                let count = usize::try_from(*count)
+                    .map_err(|_| AuraError::InvalidValue("explicit event child count"))?;
+                let start = cursor;
+                cursor = cursor
+                    .checked_add(count)
+                    .ok_or(AuraError::InvalidValue("explicit event child count"))?;
+                Ok((start, cursor))
+            })
+            .collect();
+    }
     let (fixed_order, value_stream_id, event_count_stream_id) = plan
         .groups
         .iter()
@@ -6385,12 +8267,104 @@ fn event_ranges_from_partition_runs(
 
 fn plan_i64_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<PlannedI64Rows> {
     validate_rows(schema, rows)?;
+    let has_repeated = schema
+        .fields
+        .iter()
+        .any(|field| field.scope == FieldScope::Repeated);
+    let base_variants: &[(bool, bool)] = if has_repeated {
+        &[(false, false), (true, false), (false, true), (true, true)]
+    } else {
+        &[(false, false)]
+    };
+    let fixed_order = fixed_order_repeated_key(schema, rows)?;
+    let has_previous_same_key = schema.derived_expressions.iter().any(|expression| {
+        matches!(
+            expression.op,
+            DerivedExpressionOp::PreviousSnapshotSameKeyResidual
+                | DerivedExpressionOp::PreviousMutationSameKeyResidual
+                | DerivedExpressionOp::PreviousOutputByKeyResidual
+        )
+    });
+    let mut variants = base_variants
+        .iter()
+        .copied()
+        .map(|(partition, sparse)| (partition, sparse, None, true))
+        .collect::<Vec<_>>();
+    if has_previous_same_key {
+        variants.extend(
+            base_variants
+                .iter()
+                .copied()
+                .map(|(partition, sparse)| (partition, sparse, None, false)),
+        );
+    }
+    if let Some(fixed_order) = fixed_order {
+        variants.extend(
+            base_variants
+                .iter()
+                .copied()
+                .map(|(partition, sparse)| (partition, sparse, Some(fixed_order), true)),
+        );
+        if has_previous_same_key {
+            variants.extend(
+                base_variants
+                    .iter()
+                    .copied()
+                    .map(|(partition, sparse)| (partition, sparse, Some(fixed_order), false)),
+            );
+        }
+    }
+    let mut best: Option<(usize, usize, GenericInstructionPlan)> = None;
+    for (preference, (partition, sparse, fixed_order, enable_previous_same_key)) in
+        variants.iter().copied().enumerate()
+    {
+        let plan = build_i64_rows_plan(
+            schema,
+            rows,
+            partition,
+            sparse,
+            fixed_order,
+            enable_previous_same_key,
+        )?;
+        let score = complete_plan_score(schema, rows, &plan)?;
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, best_preference, _)| {
+                (score, preference) < (*best_score, *best_preference)
+            })
+        {
+            best = Some((score, preference, plan));
+        }
+    }
+    let (_, _, plan) = best.ok_or(AuraError::InvalidValue("planner variants"))?;
+    Ok(PlannedI64Rows { plan })
+}
+
+fn build_i64_rows_plan(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<i64>],
+    enable_partition: bool,
+    enable_sparse: bool,
+    fixed_order: Option<(u16, u16)>,
+    enable_previous_same_key: bool,
+) -> Result<GenericInstructionPlan> {
     let mut state = PlannerState::new();
-    let partition_runs = add_group_hints(schema, rows, &mut state)?;
-    add_schema_derived_hints(schema, rows, &mut state)?;
+    let partition_runs = add_group_hints(schema, rows, &mut state, enable_partition)?;
+    add_schema_derived_hints(
+        schema,
+        rows,
+        &mut state,
+        fixed_order,
+        enable_previous_same_key,
+    )?;
+    if let Some((key_slot, stride)) = fixed_order {
+        add_fixed_stride_delta_hints(schema, rows, &mut state, key_slot, stride)?;
+    }
     add_group_value_hints(schema, rows, &mut state, partition_runs.as_ref())?;
     add_segmented_delta_hints(schema, rows, &mut state, partition_runs.as_ref())?;
-    add_sparse_presence_hints(schema, rows, &mut state)?;
+    if enable_sparse {
+        add_sparse_presence_hints(schema, rows, &mut state)?;
+    }
 
     for field in &schema.fields {
         if state.planned_slots.contains(&field.index) {
@@ -6399,7 +8373,9 @@ fn plan_i64_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<Planned
         let values = column_values(rows, field.index)?;
         match field.relation {
             FieldRelation::DeltaFromField(parent_slot) => {
-                let candidate = best_parent_candidate(field.index, parent_slot, values, rows)?;
+                let fixed_stride = fixed_stride_for_slot(schema, field.index, fixed_order);
+                let candidate =
+                    best_parent_candidate(field.index, parent_slot, values, rows, fixed_stride)?;
                 state.add_slot_candidate(field.index, candidate)?;
             }
             FieldRelation::None => {
@@ -6409,31 +8385,159 @@ fn plan_i64_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<Planned
         }
     }
 
-    state.finish()
+    Ok(state.finish()?.plan)
+}
+
+fn add_fixed_stride_delta_hints(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<i64>],
+    state: &mut PlannerState,
+    key_slot: u16,
+    stride: u16,
+) -> Result<()> {
+    for field in &schema.fields {
+        if field.scope != FieldScope::Repeated
+            || field.index == key_slot
+            || !matches!(field.relation, FieldRelation::None)
+            || state.planned_slots.contains(&field.index)
+        {
+            continue;
+        }
+        let values = column_values(rows, field.index)?;
+        let op = choose_i64_op_with_fixed_stride(&values, stride)?;
+        if !matches!(op, GenericStreamOp::FixedStrideDelta { .. }) {
+            continue;
+        }
+        state.add_stream_with_op(Some(field.index), op)?;
+        state.planned_slots.insert(field.index);
+    }
+    Ok(())
+}
+
+fn fixed_order_repeated_key(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<i64>],
+) -> Result<Option<(u16, u16)>> {
+    let event_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Event)
+        .map(|field| field.index)
+        .collect::<Vec<_>>();
+    let groups = event_group_ranges(rows, &event_slots)?;
+    if groups.len() < 2 {
+        return Ok(None);
+    }
+    for field in schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Repeated)
+    {
+        let slot = usize::from(field.index);
+        let (first_start, first_end) = groups[0];
+        let first = rows[first_start..first_end]
+            .iter()
+            .map(|row| row[slot])
+            .collect::<Vec<_>>();
+        if first.len() < 2 || first.len() > usize::from(u16::MAX) {
+            continue;
+        }
+        let mut unique = first.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() != first.len() {
+            continue;
+        }
+        if groups.iter().skip(1).all(|(start, end)| {
+            rows[*start..*end]
+                .iter()
+                .map(|row| row[slot])
+                .eq(first.iter().copied())
+        }) {
+            return Ok(Some((field.index, first.len() as u16)));
+        }
+    }
+    Ok(None)
+}
+
+fn complete_plan_score(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<i64>],
+    plan: &GenericInstructionPlan,
+) -> Result<usize> {
+    let plan_bytes = plan.encode()?.len();
+    let mut body_bytes = 2usize;
+    for instruction in &plan.streams {
+        let values = stream_values_for_instruction(schema, rows, plan, instruction)?;
+        let stream_body =
+            encode_generic_stream_body(instruction, &GenericStreamBodyValue::I64(values))?;
+        body_bytes = body_bytes
+            .checked_add(2 + 8 + 4)
+            .and_then(|bytes| bytes.checked_add(stream_body.len()))
+            .ok_or(AuraError::InvalidValue("generic plan score"))?;
+    }
+    plan_bytes
+        .checked_add(body_bytes)
+        .ok_or(AuraError::InvalidValue("generic plan score"))
 }
 
 fn add_schema_derived_hints(
     schema: &SchemaDescriptor,
     rows: &[Vec<i64>],
     state: &mut PlannerState,
+    fixed_order: Option<(u16, u16)>,
+    enable_previous_same_key: bool,
 ) -> Result<()> {
     schema.validate_derived_expressions()?;
     for expression in &schema.derived_expressions {
+        if !enable_previous_same_key
+            && matches!(
+                expression.op,
+                DerivedExpressionOp::PreviousSnapshotSameKeyResidual
+                    | DerivedExpressionOp::PreviousMutationSameKeyResidual
+                    | DerivedExpressionOp::PreviousOutputByKeyResidual
+            )
+        {
+            continue;
+        }
         if state.planned_slots.contains(&expression.output_slot) {
             return Err(AuraError::InvalidValue("derived expression output"));
         }
+        let fixed_stride = fixed_stride_for_slot(schema, expression.output_slot, fixed_order);
         match derived_expression_op(expression)? {
             DeclaredExpressionPlanOp::Residual(op) => {
-                let candidate = best_declared_residual_candidate(expression, op, rows)?;
+                if op == DerivedOp::PreviousSnapshotSameKeyResidual {
+                    validate_previous_snapshot_same_key_rows(schema, expression, rows)?;
+                }
+                let candidate =
+                    best_declared_residual_candidate(schema, expression, op, rows, fixed_stride)?;
                 state.add_slot_candidate(expression.output_slot, candidate)?;
             }
             DeclaredExpressionPlanOp::Expression(op) => {
-                let candidate = best_declared_expression_candidate(expression, op, rows)?;
+                let candidate =
+                    best_declared_expression_candidate(expression, op, rows, fixed_stride)?;
                 state.add_slot_candidate(expression.output_slot, candidate)?;
             }
         }
     }
     Ok(())
+}
+
+fn fixed_stride_for_slot(
+    schema: &SchemaDescriptor,
+    output_slot: u16,
+    fixed_order: Option<(u16, u16)>,
+) -> Option<u16> {
+    let (key_slot, stride) = fixed_order?;
+    if output_slot == key_slot
+        || schema
+            .fields
+            .get(usize::from(output_slot))
+            .is_none_or(|field| field.scope != FieldScope::Repeated)
+    {
+        return None;
+    }
+    Some(stride)
 }
 
 fn constant_residual(values: &[i64]) -> Option<i64> {
@@ -6446,6 +8550,7 @@ fn best_parent_candidate(
     parent_slot: u16,
     values: Vec<i64>,
     rows: &[Vec<i64>],
+    fixed_stride: Option<u16>,
 ) -> Result<SlotPlanCandidate> {
     let mut candidates = vec![direct_candidate(values.clone())?];
     let parent_values = column_values(rows, parent_slot)?;
@@ -6487,34 +8592,79 @@ fn best_parent_candidate(
         )?);
     }
 
-    best_slot_candidate(candidates)
+    if parent_values.iter().all(|value| *value != 0) {
+        let mut quotient_values = Vec::with_capacity(values.len());
+        let mut remainder_values = Vec::with_capacity(values.len());
+        let mut valid = true;
+        for (value, divisor) in values.iter().copied().zip(parent_values.iter().copied()) {
+            let Some(quotient) = value.checked_div_euclid(divisor) else {
+                valid = false;
+                break;
+            };
+            let Some(remainder) = value.checked_rem_euclid(divisor) else {
+                valid = false;
+                break;
+            };
+            quotient_values.push(quotient);
+            remainder_values.push(remainder);
+        }
+        if valid {
+            candidates.push(quotient_remainder_candidate(
+                output_slot,
+                parent_slot,
+                quotient_values,
+                remainder_values,
+            )?);
+        }
+    }
+
+    best_slot_candidate_with_fixed_stride(output_slot, candidates, fixed_stride)
 }
 
 fn best_declared_residual_candidate(
+    schema: &SchemaDescriptor,
     expression: &DerivedExpression,
     op: DerivedOp,
     rows: &[Vec<i64>],
+    fixed_stride: Option<u16>,
 ) -> Result<SlotPlanCandidate> {
     let values = column_values(rows, expression.output_slot)?;
-    let residuals = derived_expression_residuals(expression, rows)?;
-    best_slot_candidate(vec![
-        direct_candidate(values)?,
-        derived_candidate(
+    let Ok(residuals) = derived_expression_residuals(schema, expression, rows) else {
+        return best_slot_candidate_with_fixed_stride(
             expression.output_slot,
-            op,
-            expression.input_slots.clone(),
-            residuals,
-        )?,
-    ])
+            vec![direct_candidate(values)?],
+            fixed_stride,
+        );
+    };
+    best_slot_candidate_with_fixed_stride(
+        expression.output_slot,
+        vec![
+            direct_candidate(values)?,
+            derived_candidate(
+                expression.output_slot,
+                op,
+                expression.input_slots.clone(),
+                residuals,
+            )?,
+        ],
+        fixed_stride,
+    )
 }
 
 fn best_declared_expression_candidate(
     expression: &DerivedExpression,
     op: DerivedExpressionOp,
     rows: &[Vec<i64>],
+    fixed_stride: Option<u16>,
 ) -> Result<SlotPlanCandidate> {
     let values = column_values(rows, expression.output_slot)?;
-    let residuals = expression_stream_residuals(expression, rows)?;
+    let Ok(residuals) = expression_stream_residuals(expression, rows) else {
+        return best_slot_candidate_with_fixed_stride(
+            expression.output_slot,
+            vec![direct_candidate(values)?],
+            fixed_stride,
+        );
+    };
     let expression_candidate = if let Some(residual) = constant_residual(&residuals) {
         expression_value_candidate(
             expression.output_slot,
@@ -6532,13 +8682,19 @@ fn best_declared_expression_candidate(
             residuals,
         )?
     };
-    best_slot_candidate(vec![direct_candidate(values)?, expression_candidate])
+    best_slot_candidate_with_fixed_stride(
+        expression.output_slot,
+        vec![direct_candidate(values)?, expression_candidate],
+        fixed_stride,
+    )
 }
 
 fn direct_candidate(values: Vec<i64>) -> Result<SlotPlanCandidate> {
+    let stream_op = choose_i64_op(&values)?;
     Ok(SlotPlanCandidate::Direct {
-        score: encoded_i64_score(&values)?,
+        score: encoded_i64_score_with_op(&stream_op, &values)?,
         values,
+        stream_op,
     })
 }
 
@@ -6549,11 +8705,13 @@ fn derived_candidate(
     values: Vec<i64>,
 ) -> Result<SlotPlanCandidate> {
     let group_score = derived_group_score(output_slot, op, &input_slots)?;
+    let stream_op = choose_i64_op(&values)?;
     Ok(SlotPlanCandidate::Derived {
-        score: encoded_i64_score(&values)?.saturating_add(group_score),
+        score: encoded_i64_score_with_op(&stream_op, &values)?.saturating_add(group_score),
         op,
         input_slots,
         values,
+        stream_op,
     })
 }
 
@@ -6565,12 +8723,14 @@ fn expression_candidate(
     values: Vec<i64>,
 ) -> Result<SlotPlanCandidate> {
     let group_score = expression_group_score(output_slot, op, &input_slots, &literals)?;
+    let stream_op = choose_i64_op(&values)?;
     Ok(SlotPlanCandidate::Expression {
-        score: encoded_i64_score(&values)?.saturating_add(group_score),
+        score: encoded_i64_score_with_op(&stream_op, &values)?.saturating_add(group_score),
         op,
         input_slots,
         literals,
         values,
+        stream_op,
     })
 }
 
@@ -6591,11 +8751,102 @@ fn expression_value_candidate(
     })
 }
 
+fn quotient_remainder_candidate(
+    output_slot: u16,
+    divisor_slot: u16,
+    quotient_values: Vec<i64>,
+    remainder_values: Vec<i64>,
+) -> Result<SlotPlanCandidate> {
+    const EXTRA_STREAM_BODY_FRAME_BYTES: usize = 2 + 8 + 4;
+    const EXTRA_STREAM_INSTRUCTION_PREFIX_BYTES: usize = 2 + 2;
+    let group_score = quotient_remainder_group_score(output_slot, divisor_slot)?;
+    let score = encoded_i64_score(&quotient_values)?
+        .saturating_add(encoded_i64_score(&remainder_values)?)
+        .saturating_add(group_score)
+        .saturating_add(EXTRA_STREAM_BODY_FRAME_BYTES)
+        .saturating_add(EXTRA_STREAM_INSTRUCTION_PREFIX_BYTES);
+    Ok(SlotPlanCandidate::QuotientRemainder {
+        divisor_slot,
+        quotient_values,
+        remainder_values,
+        score,
+    })
+}
+
 fn best_slot_candidate(candidates: Vec<SlotPlanCandidate>) -> Result<SlotPlanCandidate> {
     candidates
         .into_iter()
         .min_by_key(|candidate| (candidate.score(), slot_candidate_preference(candidate)))
         .ok_or(AuraError::InvalidValue("slot candidate"))
+}
+
+fn best_slot_candidate_with_fixed_stride(
+    output_slot: u16,
+    candidates: Vec<SlotPlanCandidate>,
+    fixed_stride: Option<u16>,
+) -> Result<SlotPlanCandidate> {
+    let Some(stride) = fixed_stride else {
+        return best_slot_candidate(candidates);
+    };
+    best_slot_candidate(
+        candidates
+            .into_iter()
+            .map(|candidate| compose_candidate_with_fixed_stride(output_slot, candidate, stride))
+            .collect::<Result<Vec<_>>>()?,
+    )
+}
+
+fn compose_candidate_with_fixed_stride(
+    output_slot: u16,
+    candidate: SlotPlanCandidate,
+    stride: u16,
+) -> Result<SlotPlanCandidate> {
+    match candidate {
+        SlotPlanCandidate::Direct { values, .. } => {
+            let stream_op = choose_i64_op_with_fixed_stride(&values, stride)?;
+            Ok(SlotPlanCandidate::Direct {
+                score: encoded_i64_score_with_op(&stream_op, &values)?,
+                values,
+                stream_op,
+            })
+        }
+        SlotPlanCandidate::Derived {
+            op,
+            input_slots,
+            values,
+            ..
+        } => {
+            let stream_op = choose_i64_op_with_fixed_stride(&values, stride)?;
+            let group_score = derived_group_score(output_slot, op, &input_slots)?;
+            Ok(SlotPlanCandidate::Derived {
+                score: encoded_i64_score_with_op(&stream_op, &values)?.saturating_add(group_score),
+                op,
+                input_slots,
+                values,
+                stream_op,
+            })
+        }
+        SlotPlanCandidate::Expression {
+            op,
+            input_slots,
+            literals,
+            values,
+            ..
+        } => {
+            let stream_op = choose_i64_op_with_fixed_stride(&values, stride)?;
+            let group_score = expression_group_score(output_slot, op, &input_slots, &literals)?;
+            Ok(SlotPlanCandidate::Expression {
+                score: encoded_i64_score_with_op(&stream_op, &values)?.saturating_add(group_score),
+                op,
+                input_slots,
+                literals,
+                values,
+                stream_op,
+            })
+        }
+        candidate @ (SlotPlanCandidate::ExpressionValue { .. }
+        | SlotPlanCandidate::QuotientRemainder { .. }) => Ok(candidate),
+    }
 }
 
 fn slot_candidate_preference(candidate: &SlotPlanCandidate) -> u8 {
@@ -6604,6 +8855,7 @@ fn slot_candidate_preference(candidate: &SlotPlanCandidate) -> u8 {
         SlotPlanCandidate::ExpressionValue { .. } => 1,
         SlotPlanCandidate::Derived { .. } => 2,
         SlotPlanCandidate::Expression { .. } => 3,
+        SlotPlanCandidate::QuotientRemainder { .. } => 4,
     }
 }
 
@@ -6613,6 +8865,54 @@ fn encoded_i64_score(values: &[i64]) -> Result<usize> {
 }
 
 fn derived_group_score(output_slot: u16, op: DerivedOp, input_slots: &[u16]) -> Result<usize> {
+    if is_previous_same_key_op(op) {
+        let stream = GenericStreamInstruction {
+            stream_id: 0,
+            target_slot: None,
+            op: GenericStreamOp::FixedStep { base: 0, step: 0 },
+        };
+        let (event_slots, mut repeated_slots) = match op {
+            DerivedOp::PreviousSnapshotSameKeyResidual => (vec![u16::MAX], input_slots.to_vec()),
+            DerivedOp::PreviousMutationSameKeyResidual | DerivedOp::PreviousOutputByKeyResidual => {
+                let (&reset_slot, key_slots) = input_slots
+                    .split_first()
+                    .ok_or(AuraError::InvalidValue("previous mutation same-key slots"))?;
+                (vec![reset_slot], key_slots.to_vec())
+            }
+            _ => unreachable!(),
+        };
+        repeated_slots.push(output_slot);
+        repeated_slots.sort_unstable();
+        repeated_slots.dedup();
+        let parent = GenericGroupInstruction::Group {
+            group_id: 0,
+            event_slots,
+            repeated_slots,
+        };
+        let without_derived = GenericInstructionPlan {
+            streams: vec![stream.clone()],
+            groups: vec![parent.clone()],
+        }
+        .encode()?
+        .len();
+        let with_derived = GenericInstructionPlan {
+            streams: vec![stream],
+            groups: vec![
+                parent,
+                GenericGroupInstruction::DerivedStream {
+                    group_id: 1,
+                    parent_group_id: Some(0),
+                    output_slot,
+                    op,
+                    input_slots: input_slots.to_vec(),
+                    stream_id: 0,
+                },
+            ],
+        }
+        .encode()?
+        .len();
+        return Ok(with_derived.saturating_sub(without_derived));
+    }
     group_score_with_optional_stream(GenericGroupInstruction::DerivedStream {
         group_id: 0,
         parent_group_id: None,
@@ -6656,6 +8956,41 @@ fn expression_value_group_score(
         literals: literals.to_vec(),
         residual,
     })
+}
+
+fn quotient_remainder_group_score(output_slot: u16, divisor_slot: u16) -> Result<usize> {
+    let streams = vec![
+        GenericStreamInstruction {
+            stream_id: 0,
+            target_slot: None,
+            op: GenericStreamOp::FixedStep { base: 0, step: 0 },
+        },
+        GenericStreamInstruction {
+            stream_id: 1,
+            target_slot: None,
+            op: GenericStreamOp::FixedStep { base: 0, step: 0 },
+        },
+    ];
+    let without_group = GenericInstructionPlan {
+        streams: streams.clone(),
+        groups: Vec::new(),
+    }
+    .encode()?
+    .len();
+    let with_group = GenericInstructionPlan {
+        streams,
+        groups: vec![GenericGroupInstruction::QuotientRemainder {
+            group_id: 0,
+            parent_group_id: None,
+            output_slot,
+            divisor_slot,
+            quotient_stream_id: 0,
+            remainder_stream_id: 1,
+        }],
+    }
+    .encode()?
+    .len();
+    Ok(with_group.saturating_sub(without_group))
 }
 
 fn group_score_with_optional_stream(group: GenericGroupInstruction) -> Result<usize> {
@@ -6717,9 +9052,19 @@ fn derived_expression_op(expression: &DerivedExpression) -> Result<DeclaredExpre
         DerivedExpressionOp::FirstOffsetThenDelta => Ok(DeclaredExpressionPlanOp::Residual(
             DerivedOp::FirstOffsetThenDelta,
         )),
+        DerivedExpressionOp::PreviousSnapshotSameKeyResidual => Ok(
+            DeclaredExpressionPlanOp::Residual(DerivedOp::PreviousSnapshotSameKeyResidual),
+        ),
+        DerivedExpressionOp::PreviousMutationSameKeyResidual => Ok(
+            DeclaredExpressionPlanOp::Residual(DerivedOp::PreviousMutationSameKeyResidual),
+        ),
+        DerivedExpressionOp::PreviousOutputByKeyResidual => Ok(DeclaredExpressionPlanOp::Residual(
+            DerivedOp::PreviousOutputByKeyResidual,
+        )),
         DerivedExpressionOp::Add
         | DerivedExpressionOp::Sub
         | DerivedExpressionOp::Mul
+        | DerivedExpressionOp::MulDiv
         | DerivedExpressionOp::Div
         | DerivedExpressionOp::Min
         | DerivedExpressionOp::Max => Ok(DeclaredExpressionPlanOp::Expression(expression.op)),
@@ -6727,9 +9072,19 @@ fn derived_expression_op(expression: &DerivedExpression) -> Result<DeclaredExpre
 }
 
 fn derived_expression_residuals(
+    schema: &SchemaDescriptor,
     expression: &DerivedExpression,
     rows: &[Vec<i64>],
 ) -> Result<Vec<i64>> {
+    if expression.op == DerivedExpressionOp::PreviousSnapshotSameKeyResidual {
+        return previous_snapshot_same_key_residuals(schema, expression, rows);
+    }
+    if expression.op == DerivedExpressionOp::PreviousMutationSameKeyResidual {
+        return previous_mutation_same_key_residuals(schema, expression, rows);
+    }
+    if expression.op == DerivedExpressionOp::PreviousOutputByKeyResidual {
+        return previous_output_by_key_residuals(schema, expression, rows);
+    }
     rows.iter()
         .enumerate()
         .map(|(row_index, _)| inverse_declared_derive_value(expression, row_index, rows))
@@ -6801,9 +9156,15 @@ fn inverse_declared_derive_value(
                 checked_delta(output, base)
             }
         }
+        DerivedExpressionOp::PreviousSnapshotSameKeyResidual
+        | DerivedExpressionOp::PreviousMutationSameKeyResidual
+        | DerivedExpressionOp::PreviousOutputByKeyResidual => {
+            Err(AuraError::InvalidValue("previous same-key expression"))
+        }
         DerivedExpressionOp::Add
         | DerivedExpressionOp::Sub
         | DerivedExpressionOp::Mul
+        | DerivedExpressionOp::MulDiv
         | DerivedExpressionOp::Div
         | DerivedExpressionOp::Min
         | DerivedExpressionOp::Max => Err(AuraError::InvalidValue("derived expression op")),
@@ -6814,6 +9175,7 @@ fn add_group_hints(
     schema: &SchemaDescriptor,
     rows: &[Vec<i64>],
     state: &mut PlannerState,
+    enable_partition: bool,
 ) -> Result<Option<PartitionRunPlan>> {
     let event_slots = schema
         .fields
@@ -6843,6 +9205,10 @@ fn add_group_hints(
     });
     state.repeated_group_id = Some(group_id);
     let parent_group_id = group_id;
+
+    if !enable_partition {
+        return Ok(None);
+    }
 
     if let Some(partition_slot) = fixed_order_partition_slot(rows, &event_slots, &repeated_slots)? {
         let counts = event_group_lengths(rows, &event_slots)?;
@@ -6994,7 +9360,15 @@ fn add_segmented_delta_hints(
             .base_values
             .map(|values| state.add_stream(None, values))
             .transpose()?;
-        let first_stream_id = state.add_stream(None, candidate.first_values)?;
+        let first_op = if let Some(stride) = partition_run_plan
+            .fixed_order_len
+            .and_then(|stride| u16::try_from(stride).ok())
+        {
+            choose_i64_op_with_fixed_stride(&candidate.first_values, stride)?
+        } else {
+            choose_i64_op(&candidate.first_values)?
+        };
+        let first_stream_id = state.add_stream_with_op(None, first_op)?;
         let delta_stream_id = state.add_stream(None, candidate.delta_values)?;
         let group_id = state.next_group_id;
         state.next_group_id = state
@@ -7237,6 +9611,10 @@ fn sparse_candidate_better(
 }
 
 fn choose_i64_op(values: &[i64]) -> Result<GenericStreamOp> {
+    choose_i64_op_inner(values, true)
+}
+
+fn choose_i64_op_inner(values: &[i64], allow_composed_delta: bool) -> Result<GenericStreamOp> {
     let mut candidates = Vec::new();
     if let Some(op) = derive_fixed_step(values)? {
         candidates.push(op);
@@ -7271,7 +9649,22 @@ fn choose_i64_op(values: &[i64]) -> Result<GenericStreamOp> {
             });
         }
     }
-
+    if allow_composed_delta && values.len() > 2 {
+        if let Ok(residuals) = previous_value_residuals(values) {
+            if let Ok(residual_op) = choose_i64_op_inner(&residuals, false) {
+                candidates.push(GenericStreamOp::PreviousValueDelta {
+                    residual_op: Box::new(residual_op),
+                });
+            }
+        }
+        if let Ok(residuals) = delta_of_delta_residuals(values) {
+            if let Ok(residual_op) = choose_i64_op_inner(&residuals, false) {
+                candidates.push(GenericStreamOp::DeltaOfDelta {
+                    residual_op: Box::new(residual_op),
+                });
+            }
+        }
+    }
     let mut scored = candidates
         .into_iter()
         .map(|op| {
@@ -7279,16 +9672,23 @@ fn choose_i64_op(values: &[i64]) -> Result<GenericStreamOp> {
             Ok((size, op_preference(&op), op))
         })
         .collect::<Result<Vec<_>>>()?;
-    let best_non_huffman_score = scored
+    let best_size = scored
         .iter()
-        .filter(|(_, _, op)| !matches!(op, GenericStreamOp::HuffmanDictionary { .. }))
         .map(|(size, _, _)| *size)
         .min()
         .ok_or(AuraError::InvalidValue("stream op"))?;
-    scored.retain(|(size, _, op)| {
-        !matches!(op, GenericStreamOp::HuffmanDictionary { .. })
-            || huffman_clears_speed_gate(*size, best_non_huffman_score)
-    });
+    if best_size < 1_024 {
+        return scored
+            .into_iter()
+            .min_by_key(|(size, preference, _)| (*size, *preference))
+            .map(|(_, _, op)| op)
+            .ok_or(AuraError::InvalidValue("stream op"));
+    }
+    let zstd_op = derive_zstd_varint(values)?;
+    let zstd_size = encoded_i64_score_with_op(&zstd_op, values)?;
+    if zstd_varint_meaningfully_wins(zstd_size, best_size) {
+        scored.push((zstd_size, op_preference(&zstd_op), zstd_op));
+    }
     scored
         .into_iter()
         .min_by_key(|(size, preference, _)| (*size, *preference))
@@ -7296,8 +9696,35 @@ fn choose_i64_op(values: &[i64]) -> Result<GenericStreamOp> {
         .ok_or(AuraError::InvalidValue("stream op"))
 }
 
-fn huffman_clears_speed_gate(huffman_score: usize, best_non_huffman_score: usize) -> bool {
-    huffman_score.saturating_mul(2) <= best_non_huffman_score
+fn zstd_varint_meaningfully_wins(candidate_size: usize, best_size: usize) -> bool {
+    let required_savings = best_size.div_ceil(100).max(32);
+    candidate_size
+        .checked_add(required_savings)
+        .is_some_and(|threshold| threshold <= best_size)
+}
+
+fn choose_i64_op_with_fixed_stride(values: &[i64], stride: u16) -> Result<GenericStreamOp> {
+    let direct_op = choose_i64_op(values)?;
+    if stride == 0 || values.len() <= usize::from(stride) {
+        return Ok(direct_op);
+    }
+    let Ok(residuals) = fixed_stride_residuals(values, usize::from(stride)) else {
+        return Ok(direct_op);
+    };
+    let Ok(residual_op) = choose_i64_op_inner(&residuals, false) else {
+        return Ok(direct_op);
+    };
+    let stride_op = GenericStreamOp::FixedStrideDelta {
+        stride,
+        residual_op: Box::new(residual_op),
+    };
+    if encoded_i64_score_with_op(&stride_op, values)?
+        < encoded_i64_score_with_op(&direct_op, values)?
+    {
+        Ok(stride_op)
+    } else {
+        Ok(direct_op)
+    }
 }
 
 fn encoded_i64_len(values: &[i64]) -> Result<usize> {
@@ -7335,7 +9762,42 @@ fn op_preference(op: &GenericStreamOp) -> u8 {
         GenericStreamOp::Dictionary { .. } => 9,
         GenericStreamOp::BlockLocal { .. } => 10,
         GenericStreamOp::UuidConstMask { .. } => 11,
+        GenericStreamOp::FixedStrideDelta { .. } => 12,
+        GenericStreamOp::DeltaOfDelta { .. } => 13,
+        GenericStreamOp::PreviousValueDelta { .. } => 14,
+        GenericStreamOp::ZstdVarint { .. } => 15,
     }
+}
+
+fn derive_zstd_varint(values: &[i64]) -> Result<GenericStreamOp> {
+    let candidate_unit = signed_gcd_unit(values);
+    let unit = if candidate_unit > 0
+        && values
+            .iter()
+            .all(|value| value.rem_euclid(candidate_unit) == 0)
+    {
+        candidate_unit
+    } else {
+        1
+    };
+    let raw_len = values.iter().try_fold(0u64, |len, value| {
+        let scaled = value
+            .checked_div(unit)
+            .ok_or(AuraError::InvalidValue("zstd varint scaled value"))?;
+        let encoded_len = u64::from(varint_len_u64(varint::zigzag_encode(scaled)));
+        len.checked_add(encoded_len)
+            .ok_or(AuraError::InvalidValue("zstd varint raw length"))
+    })?;
+    Ok(GenericStreamOp::ZstdVarint { unit, raw_len })
+}
+
+fn varint_len_u64(mut value: u64) -> u8 {
+    let mut len = 1u8;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
 }
 
 fn derive_fixed_step(values: &[i64]) -> Result<Option<GenericStreamOp>> {
@@ -8014,6 +10476,196 @@ fn event_group_ranges(rows: &[Vec<i64>], event_slots: &[u16]) -> Result<Vec<(usi
     Ok(groups)
 }
 
+fn previous_snapshot_event_slots(schema: &SchemaDescriptor) -> Vec<u16> {
+    schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Event)
+        .map(|field| field.index)
+        .collect()
+}
+
+fn snapshot_key(row: &[i64], key_slots: &[u16]) -> Result<Vec<i64>> {
+    key_slots
+        .iter()
+        .map(|slot| {
+            row.get(usize::from(*slot))
+                .copied()
+                .ok_or(AuraError::InvalidValue("previous snapshot same-key slot"))
+        })
+        .collect()
+}
+
+fn validate_previous_snapshot_same_key_rows(
+    schema: &SchemaDescriptor,
+    expression: &DerivedExpression,
+    rows: &[Vec<i64>],
+) -> Result<()> {
+    let event_slots = previous_snapshot_event_slots(schema);
+    for (start, end) in event_group_ranges(rows, &event_slots)? {
+        let mut keys = BTreeSet::new();
+        for row in &rows[start..end] {
+            if !keys.insert(snapshot_key(row, &expression.input_slots)?) {
+                return Err(AuraError::InvalidValue(
+                    "duplicate previous snapshot same-key key",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn previous_snapshot_same_key_residuals(
+    schema: &SchemaDescriptor,
+    expression: &DerivedExpression,
+    rows: &[Vec<i64>],
+) -> Result<Vec<i64>> {
+    let event_slots = previous_snapshot_event_slots(schema);
+    previous_snapshot_same_key_residuals_for_slots(
+        rows,
+        &event_slots,
+        &expression.input_slots,
+        expression.output_slot,
+    )
+}
+
+fn previous_snapshot_same_key_residuals_for_slots(
+    rows: &[Vec<i64>],
+    event_slots: &[u16],
+    key_slots: &[u16],
+    output_slot: u16,
+) -> Result<Vec<i64>> {
+    let mut previous = BTreeMap::<Vec<i64>, i64>::new();
+    let mut residuals = vec![0; rows.len()];
+    for (start, end) in event_group_ranges(rows, event_slots)? {
+        let mut current = BTreeMap::new();
+        for (row_index, residual) in residuals.iter_mut().enumerate().take(end).skip(start) {
+            let row = &rows[row_index];
+            let key = snapshot_key(row, key_slots)?;
+            let output = row
+                .get(usize::from(output_slot))
+                .copied()
+                .ok_or(AuraError::InvalidValue("previous snapshot same-key slot"))?;
+            if current.insert(key.clone(), output).is_some() {
+                return Err(AuraError::InvalidValue(
+                    "duplicate previous snapshot same-key key",
+                ));
+            }
+            *residual = checked_delta(output, previous.get(&key).copied().unwrap_or(0))?;
+        }
+        previous = current;
+    }
+    Ok(residuals)
+}
+
+fn previous_mutation_same_key_residuals(
+    schema: &SchemaDescriptor,
+    expression: &DerivedExpression,
+    rows: &[Vec<i64>],
+) -> Result<Vec<i64>> {
+    let event_slots = previous_snapshot_event_slots(schema);
+    previous_mutation_same_key_residuals_for_slots(
+        rows,
+        &event_slots,
+        &expression.input_slots,
+        expression.output_slot,
+    )
+}
+
+fn previous_mutation_same_key_residuals_for_slots(
+    rows: &[Vec<i64>],
+    event_slots: &[u16],
+    input_slots: &[u16],
+    output_slot: u16,
+) -> Result<Vec<i64>> {
+    let (&reset_slot, key_slots) = input_slots
+        .split_first()
+        .ok_or(AuraError::InvalidValue("previous mutation same-key slots"))?;
+    if key_slots.is_empty() {
+        return Err(AuraError::InvalidValue("previous mutation same-key slots"));
+    }
+    let mut state = BTreeMap::<Vec<i64>, i64>::new();
+    let mut residuals = vec![0; rows.len()];
+    for (start, end) in event_group_ranges(rows, event_slots)? {
+        if rows
+            .get(start)
+            .and_then(|row| row.get(usize::from(reset_slot)))
+            .copied()
+            .ok_or(AuraError::InvalidValue("previous mutation same-key reset"))?
+            != 0
+        {
+            state.clear();
+        }
+        for (row_index, residual) in residuals.iter_mut().enumerate().take(end).skip(start) {
+            let row = &rows[row_index];
+            let key = snapshot_key(row, key_slots)?;
+            let output = row
+                .get(usize::from(output_slot))
+                .copied()
+                .ok_or(AuraError::InvalidValue("previous mutation same-key slot"))?;
+            *residual = checked_delta(output, state.get(&key).copied().unwrap_or(0))?;
+            if output == 0 {
+                state.remove(&key);
+            } else {
+                state.insert(key, output);
+            }
+        }
+    }
+    Ok(residuals)
+}
+
+fn previous_output_by_key_residuals(
+    schema: &SchemaDescriptor,
+    expression: &DerivedExpression,
+    rows: &[Vec<i64>],
+) -> Result<Vec<i64>> {
+    let event_slots = previous_snapshot_event_slots(schema);
+    previous_output_by_key_residuals_for_slots(
+        rows,
+        &event_slots,
+        &expression.input_slots,
+        expression.output_slot,
+    )
+}
+
+fn previous_output_by_key_residuals_for_slots(
+    rows: &[Vec<i64>],
+    event_slots: &[u16],
+    input_slots: &[u16],
+    output_slot: u16,
+) -> Result<Vec<i64>> {
+    let (&reset_slot, key_slots) = input_slots
+        .split_first()
+        .ok_or(AuraError::InvalidValue("previous output by-key slots"))?;
+    if key_slots.is_empty() {
+        return Err(AuraError::InvalidValue("previous output by-key slots"));
+    }
+    let mut state = BTreeMap::<Vec<i64>, i64>::new();
+    let mut residuals = vec![0; rows.len()];
+    for (start, end) in event_group_ranges(rows, event_slots)? {
+        if rows
+            .get(start)
+            .and_then(|row| row.get(usize::from(reset_slot)))
+            .copied()
+            .ok_or(AuraError::InvalidValue("previous output by-key reset"))?
+            != 0
+        {
+            state.clear();
+        }
+        for (row_index, residual) in residuals.iter_mut().enumerate().take(end).skip(start) {
+            let row = &rows[row_index];
+            let key = snapshot_key(row, key_slots)?;
+            let output = row
+                .get(usize::from(output_slot))
+                .copied()
+                .ok_or(AuraError::InvalidValue("previous output by-key slot"))?;
+            *residual = checked_delta(output, state.get(&key).copied().unwrap_or(0))?;
+            state.insert(key, output);
+        }
+    }
+    Ok(residuals)
+}
+
 fn same_slots(left: &[i64], right: &[i64], slots: &[u16]) -> Result<bool> {
     for slot in slots {
         let slot = usize::from(*slot);
@@ -8037,11 +10689,11 @@ fn derived_inputs_ready(
             row_index == 0
                 || input_slots
                     .first()
-                    .is_some_and(|slot| filled[row_index - 1][usize::from(*slot)])
+                    .is_some_and(|slot| slot_is_filled(filled, row_index - 1, *slot))
         }
         _ => input_slots
             .iter()
-            .all(|slot| filled[row_index][usize::from(*slot)]),
+            .all(|slot| slot_is_filled(filled, row_index, *slot)),
     }
 }
 
@@ -8056,11 +10708,230 @@ fn pending_derived_inputs_ready(
         } => derived_inputs_ready(*op, input_slots, row_index, filled),
         PendingDerivedInstruction::Expression { input_slots, .. } => input_slots
             .iter()
-            .all(|slot| filled[row_index][usize::from(*slot)]),
+            .all(|slot| slot_is_filled(filled, row_index, *slot)),
         PendingDerivedInstruction::ExpressionValue { input_slots, .. } => input_slots
             .iter()
-            .all(|slot| filled[row_index][usize::from(*slot)]),
+            .all(|slot| slot_is_filled(filled, row_index, *slot)),
+        PendingDerivedInstruction::QuotientRemainder { divisor_slot, .. } => filled
+            .get(row_index)
+            .and_then(|row| row.get(usize::from(*divisor_slot)))
+            .copied()
+            .unwrap_or(false),
     }
+}
+
+fn slot_is_filled(filled: &[Vec<bool>], row_index: usize, slot: u16) -> bool {
+    filled
+        .get(row_index)
+        .and_then(|row| row.get(usize::from(slot)))
+        .copied()
+        .unwrap_or(false)
+}
+
+fn materialize_previous_snapshot_same_key(
+    event_slots: &[u16],
+    key_slots: &[u16],
+    output_slot: u16,
+    residuals: &[i64],
+    rows: &mut [Vec<i64>],
+    filled: &mut [Vec<bool>],
+) -> Result<()> {
+    let output_index = usize::from(output_slot);
+    let mut previous = BTreeMap::<Vec<i64>, i64>::new();
+    for (start, end) in event_group_ranges(rows, event_slots)? {
+        let mut current = BTreeMap::new();
+        for row_index in start..end {
+            let key = snapshot_key(&rows[row_index], key_slots)?;
+            let base = previous.get(&key).copied().unwrap_or(0);
+            let residual = residuals
+                .get(row_index)
+                .copied()
+                .ok_or(AuraError::InvalidValue("stream value count"))?;
+            let output = checked_sum(base, residual)?;
+            if current.insert(key, output).is_some() {
+                return Err(AuraError::InvalidValue(
+                    "duplicate previous snapshot same-key key",
+                ));
+            }
+            rows[row_index][output_index] = output;
+            filled[row_index][output_index] = true;
+        }
+        previous = current;
+    }
+    Ok(())
+}
+
+fn materialize_previous_mutation_same_key(
+    event_slots: &[u16],
+    input_slots: &[u16],
+    output_slot: u16,
+    residuals: &[i64],
+    rows: &mut [Vec<i64>],
+    filled: &mut [Vec<bool>],
+) -> Result<()> {
+    let (&reset_slot, key_slots) = input_slots
+        .split_first()
+        .ok_or(AuraError::InvalidValue("previous mutation same-key slots"))?;
+    if key_slots.is_empty() {
+        return Err(AuraError::InvalidValue("previous mutation same-key slots"));
+    }
+    let output_index = usize::from(output_slot);
+    let mut state = BTreeMap::<Vec<i64>, i64>::new();
+    for (start, end) in event_group_ranges(rows, event_slots)? {
+        if rows
+            .get(start)
+            .and_then(|row| row.get(usize::from(reset_slot)))
+            .copied()
+            .ok_or(AuraError::InvalidValue("previous mutation same-key reset"))?
+            != 0
+        {
+            state.clear();
+        }
+        for row_index in start..end {
+            let key = snapshot_key(&rows[row_index], key_slots)?;
+            let base = state.get(&key).copied().unwrap_or(0);
+            let residual = residuals
+                .get(row_index)
+                .copied()
+                .ok_or(AuraError::InvalidValue("stream value count"))?;
+            let output = checked_sum(base, residual)?;
+            rows[row_index][output_index] = output;
+            filled[row_index][output_index] = true;
+            if output == 0 {
+                state.remove(&key);
+            } else {
+                state.insert(key, output);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_explicit_previous_same_key(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    input_slots: &[u16],
+    output_slot: u16,
+    residuals: &[i64],
+    delete_zero: bool,
+    rows: &mut [Vec<i64>],
+    filled: &mut [Vec<bool>],
+) -> Result<bool> {
+    let Some((explicit_group_id, child_count_stream_id)) = explicit_event_group(plan) else {
+        return Ok(false);
+    };
+    let (&reset_slot, key_slots) = input_slots
+        .split_first()
+        .ok_or(AuraError::InvalidValue("previous mutation same-key slots"))?;
+    if key_slots.is_empty() {
+        return Err(AuraError::InvalidValue("previous mutation same-key slots"));
+    }
+    let reset_stream_id = plan
+        .groups
+        .iter()
+        .find_map(|group| match group {
+            GenericGroupInstruction::GroupValueStream {
+                parent_group_id,
+                output_slot,
+                stream_id,
+                ..
+            } if *parent_group_id == explicit_group_id && *output_slot == reset_slot => {
+                Some(*stream_id)
+            }
+            _ => None,
+        })
+        .ok_or(AuraError::InvalidValue("previous mutation same-key reset"))?;
+    let child_counts = stream_values
+        .get(&child_count_stream_id)
+        .ok_or(AuraError::InvalidValue("explicit event child count stream"))?;
+    let resets = stream_values
+        .get(&reset_stream_id)
+        .ok_or(AuraError::InvalidValue("previous mutation same-key reset"))?;
+    if child_counts.len() != resets.len() {
+        return Err(AuraError::InvalidValue("previous mutation same-key reset"));
+    }
+
+    let output_index = usize::from(output_slot);
+    let mut state = BTreeMap::<Vec<i64>, i64>::new();
+    let mut row_index = 0usize;
+    for (event_index, child_count) in child_counts.iter().copied().enumerate() {
+        if resets[event_index] != 0 {
+            // A zero-child reset is source state, not an empty no-op.
+            state.clear();
+        }
+        let child_count = usize::try_from(child_count)
+            .map_err(|_| AuraError::InvalidValue("explicit event child count"))?;
+        let event_end = row_index
+            .checked_add(child_count)
+            .ok_or(AuraError::InvalidValue("explicit event child count"))?;
+        if event_end > rows.len() {
+            return Err(AuraError::InvalidValue("explicit event child count"));
+        }
+        while row_index < event_end {
+            let key = snapshot_key(&rows[row_index], key_slots)?;
+            let base = state.get(&key).copied().unwrap_or(0);
+            let residual = residuals
+                .get(row_index)
+                .copied()
+                .ok_or(AuraError::InvalidValue("stream value count"))?;
+            let output = checked_sum(base, residual)?;
+            rows[row_index][output_index] = output;
+            filled[row_index][output_index] = true;
+            if delete_zero && output == 0 {
+                state.remove(&key);
+            } else {
+                state.insert(key, output);
+            }
+            row_index += 1;
+        }
+    }
+    if row_index != rows.len() || residuals.len() != rows.len() {
+        return Err(AuraError::InvalidValue("stream value count"));
+    }
+    Ok(true)
+}
+
+fn materialize_previous_output_by_key(
+    event_slots: &[u16],
+    input_slots: &[u16],
+    output_slot: u16,
+    residuals: &[i64],
+    rows: &mut [Vec<i64>],
+    filled: &mut [Vec<bool>],
+) -> Result<()> {
+    let (&reset_slot, key_slots) = input_slots
+        .split_first()
+        .ok_or(AuraError::InvalidValue("previous output by-key slots"))?;
+    if key_slots.is_empty() {
+        return Err(AuraError::InvalidValue("previous output by-key slots"));
+    }
+    let output_index = usize::from(output_slot);
+    let mut state = BTreeMap::<Vec<i64>, i64>::new();
+    for (start, end) in event_group_ranges(rows, event_slots)? {
+        if rows
+            .get(start)
+            .and_then(|row| row.get(usize::from(reset_slot)))
+            .copied()
+            .ok_or(AuraError::InvalidValue("previous output by-key reset"))?
+            != 0
+        {
+            state.clear();
+        }
+        for row_index in start..end {
+            let key = snapshot_key(&rows[row_index], key_slots)?;
+            let base = state.get(&key).copied().unwrap_or(0);
+            let residual = residuals
+                .get(row_index)
+                .copied()
+                .ok_or(AuraError::InvalidValue("stream value count"))?;
+            let output = checked_sum(base, residual)?;
+            rows[row_index][output_index] = output;
+            filled[row_index][output_index] = true;
+            state.insert(key, output);
+        }
+    }
+    Ok(())
 }
 
 fn derive_pending_value(
@@ -8091,7 +10962,23 @@ fn derive_pending_value(
             let predicted = evaluate_expression_terms(*op, input_slots, literals, row_index, rows)?;
             checked_sum(predicted, residual)
         }
+        PendingDerivedInstruction::QuotientRemainder { .. } => {
+            Err(AuraError::InvalidValue("quotient remainder"))
+        }
     }
+}
+
+fn reconstruct_quotient_remainder(divisor: i64, quotient: i64, remainder: i64) -> Result<i64> {
+    let divisor = i128::from(divisor);
+    let remainder = i128::from(remainder);
+    if divisor == 0 || remainder < 0 || remainder >= divisor.abs() {
+        return Err(AuraError::InvalidValue("quotient remainder"));
+    }
+    let value = divisor
+        .checked_mul(i128::from(quotient))
+        .and_then(|value| value.checked_add(remainder))
+        .ok_or(AuraError::InvalidValue("quotient remainder"))?;
+    i64::try_from(value).map_err(|_| AuraError::InvalidValue("quotient remainder"))
 }
 
 fn derive_value(
@@ -8133,6 +11020,11 @@ fn derive_value(
                 let base = rows[row_index - 1][usize::from(input_slots[0])];
                 checked_sum(base, residual)
             }
+        }
+        DerivedOp::PreviousSnapshotSameKeyResidual
+        | DerivedOp::PreviousMutationSameKeyResidual
+        | DerivedOp::PreviousOutputByKeyResidual => {
+            Err(AuraError::InvalidValue("previous same-key context"))
         }
     }
 }
@@ -8176,6 +11068,9 @@ fn evaluate_expression_terms(
         DerivedExpressionOp::Sub => checked_sub_terms(&terms),
         DerivedExpressionOp::Mul => checked_mul_terms(&terms),
         DerivedExpressionOp::Div => checked_div_terms(&terms),
+        DerivedExpressionOp::MulDiv => {
+            checked_mul_div_terms(&terms[..input_slots.len()], literals[0])
+        }
         DerivedExpressionOp::Min => terms
             .into_iter()
             .min()
@@ -8188,7 +11083,10 @@ fn evaluate_expression_terms(
         | DerivedExpressionOp::SubtractResidual
         | DerivedExpressionOp::MaxPlusResidual
         | DerivedExpressionOp::MinMinusResidual
-        | DerivedExpressionOp::FirstOffsetThenDelta => {
+        | DerivedExpressionOp::FirstOffsetThenDelta
+        | DerivedExpressionOp::PreviousSnapshotSameKeyResidual
+        | DerivedExpressionOp::PreviousMutationSameKeyResidual
+        | DerivedExpressionOp::PreviousOutputByKeyResidual => {
             Err(AuraError::InvalidValue("derived expression op"))
         }
     }
@@ -8236,6 +11134,21 @@ fn checked_div_terms(terms: &[i64]) -> Result<i64> {
             .checked_div(divisor)
             .ok_or(AuraError::InvalidValue("expression value"))
     })?;
+    i64::try_from(value).map_err(|_| AuraError::InvalidValue("expression value"))
+}
+
+fn checked_mul_div_terms(terms: &[i64], divisor: i64) -> Result<i64> {
+    if terms.is_empty() || divisor == 0 {
+        return Err(AuraError::InvalidValue("expression terms"));
+    }
+    let product = terms.iter().try_fold(1i128, |product, term| {
+        product
+            .checked_mul(i128::from(*term))
+            .ok_or(AuraError::InvalidValue("expression value"))
+    })?;
+    let value = product
+        .checked_div(i128::from(divisor))
+        .ok_or(AuraError::InvalidValue("expression value"))?;
     i64::try_from(value).map_err(|_| AuraError::InvalidValue("expression value"))
 }
 
@@ -8344,6 +11257,11 @@ fn inverse_derive_value_from_columns(
                 checked_delta(output, base)
             }
         }
+        DerivedOp::PreviousSnapshotSameKeyResidual
+        | DerivedOp::PreviousMutationSameKeyResidual
+        | DerivedOp::PreviousOutputByKeyResidual => {
+            Err(AuraError::InvalidValue("previous same-key context"))
+        }
     }
 }
 
@@ -8378,6 +11296,9 @@ fn evaluate_expression_terms_from_columns(
         DerivedExpressionOp::Sub => checked_sub_terms(&terms),
         DerivedExpressionOp::Mul => checked_mul_terms(&terms),
         DerivedExpressionOp::Div => checked_div_terms(&terms),
+        DerivedExpressionOp::MulDiv => {
+            checked_mul_div_terms(&terms[..input_slots.len()], literals[0])
+        }
         DerivedExpressionOp::Min => terms
             .into_iter()
             .min()
@@ -8390,7 +11311,10 @@ fn evaluate_expression_terms_from_columns(
         | DerivedExpressionOp::SubtractResidual
         | DerivedExpressionOp::MaxPlusResidual
         | DerivedExpressionOp::MinMinusResidual
-        | DerivedExpressionOp::FirstOffsetThenDelta => {
+        | DerivedExpressionOp::FirstOffsetThenDelta
+        | DerivedExpressionOp::PreviousSnapshotSameKeyResidual
+        | DerivedExpressionOp::PreviousMutationSameKeyResidual
+        | DerivedExpressionOp::PreviousOutputByKeyResidual => {
             Err(AuraError::InvalidValue("derived expression op"))
         }
     }
@@ -8596,6 +11520,103 @@ fn event_group_ranges_from_columns(
     Ok(groups)
 }
 
+fn previous_snapshot_same_key_residuals_from_columns(
+    columns: &[Vec<i64>],
+    record_count: usize,
+    event_slots: &[u16],
+    key_slots: &[u16],
+    output_slot: u16,
+) -> Result<Vec<i64>> {
+    let mut previous = BTreeMap::<Vec<i64>, i64>::new();
+    let mut residuals = vec![0; record_count];
+    for (start, end) in event_group_ranges_from_columns(columns, record_count, event_slots)? {
+        let mut current = BTreeMap::new();
+        for (row_index, residual) in residuals.iter_mut().enumerate().take(end).skip(start) {
+            let key = key_slots
+                .iter()
+                .map(|slot| column_value(columns, row_index, *slot))
+                .collect::<Result<Vec<_>>>()?;
+            let output = column_value(columns, row_index, output_slot)?;
+            if current.insert(key.clone(), output).is_some() {
+                return Err(AuraError::InvalidValue(
+                    "duplicate previous snapshot same-key key",
+                ));
+            }
+            *residual = checked_delta(output, previous.get(&key).copied().unwrap_or(0))?;
+        }
+        previous = current;
+    }
+    Ok(residuals)
+}
+
+fn previous_mutation_same_key_residuals_from_columns(
+    columns: &[Vec<i64>],
+    record_count: usize,
+    event_slots: &[u16],
+    input_slots: &[u16],
+    output_slot: u16,
+) -> Result<Vec<i64>> {
+    let (&reset_slot, key_slots) = input_slots
+        .split_first()
+        .ok_or(AuraError::InvalidValue("previous mutation same-key slots"))?;
+    if key_slots.is_empty() {
+        return Err(AuraError::InvalidValue("previous mutation same-key slots"));
+    }
+    let mut state = BTreeMap::<Vec<i64>, i64>::new();
+    let mut residuals = vec![0; record_count];
+    for (start, end) in event_group_ranges_from_columns(columns, record_count, event_slots)? {
+        if column_value(columns, start, reset_slot)? != 0 {
+            state.clear();
+        }
+        for (row_index, residual) in residuals.iter_mut().enumerate().take(end).skip(start) {
+            let key = key_slots
+                .iter()
+                .map(|slot| column_value(columns, row_index, *slot))
+                .collect::<Result<Vec<_>>>()?;
+            let output = column_value(columns, row_index, output_slot)?;
+            *residual = checked_delta(output, state.get(&key).copied().unwrap_or(0))?;
+            if output == 0 {
+                state.remove(&key);
+            } else {
+                state.insert(key, output);
+            }
+        }
+    }
+    Ok(residuals)
+}
+
+fn previous_output_by_key_residuals_from_columns(
+    columns: &[Vec<i64>],
+    record_count: usize,
+    event_slots: &[u16],
+    input_slots: &[u16],
+    output_slot: u16,
+) -> Result<Vec<i64>> {
+    let (&reset_slot, key_slots) = input_slots
+        .split_first()
+        .ok_or(AuraError::InvalidValue("previous output by-key slots"))?;
+    if key_slots.is_empty() {
+        return Err(AuraError::InvalidValue("previous output by-key slots"));
+    }
+    let mut state = BTreeMap::<Vec<i64>, i64>::new();
+    let mut residuals = vec![0; record_count];
+    for (start, end) in event_group_ranges_from_columns(columns, record_count, event_slots)? {
+        if column_value(columns, start, reset_slot)? != 0 {
+            state.clear();
+        }
+        for (row_index, residual) in residuals.iter_mut().enumerate().take(end).skip(start) {
+            let key = key_slots
+                .iter()
+                .map(|slot| column_value(columns, row_index, *slot))
+                .collect::<Result<Vec<_>>>()?;
+            let output = column_value(columns, row_index, output_slot)?;
+            *residual = checked_delta(output, state.get(&key).copied().unwrap_or(0))?;
+            state.insert(key, output);
+        }
+    }
+    Ok(residuals)
+}
+
 fn same_slots_from_columns(
     columns: &[Vec<i64>],
     left_row: usize,
@@ -8637,6 +11658,55 @@ fn scaled_unsigned_offset(value: i64, base: i64, unit: i64) -> Result<u64> {
 fn checked_delta(value: i64, base: i64) -> Result<i64> {
     let delta = i128::from(value) - i128::from(base);
     i64::try_from(delta).map_err(|_| AuraError::InvalidValue("delta"))
+}
+
+fn fixed_stride_residuals(values: &[i64], stride: usize) -> Result<Vec<i64>> {
+    if stride == 0 {
+        return Err(AuraError::InvalidValue("fixed stride delta"));
+    }
+    values
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, value)| {
+            if index < stride {
+                Ok(value)
+            } else {
+                checked_delta(value, values[index - stride])
+            }
+        })
+        .collect()
+}
+
+fn delta_of_delta_residuals(values: &[i64]) -> Result<Vec<i64>> {
+    let mut residuals = Vec::with_capacity(values.len());
+    let Some(first) = values.first().copied() else {
+        return Ok(residuals);
+    };
+    residuals.push(first);
+    let Some(second) = values.get(1).copied() else {
+        return Ok(residuals);
+    };
+    let mut previous_delta = checked_delta(second, first)?;
+    residuals.push(previous_delta);
+    for pair in values.windows(2).skip(1) {
+        let delta = checked_delta(pair[1], pair[0])?;
+        residuals.push(checked_delta(delta, previous_delta)?);
+        previous_delta = delta;
+    }
+    Ok(residuals)
+}
+
+fn previous_value_residuals(values: &[i64]) -> Result<Vec<i64>> {
+    let mut residuals = Vec::with_capacity(values.len());
+    let Some(first) = values.first().copied() else {
+        return Ok(residuals);
+    };
+    residuals.push(first);
+    for pair in values.windows(2) {
+        residuals.push(checked_delta(pair[1], pair[0])?);
+    }
+    Ok(residuals)
 }
 
 fn checked_sum(base: i64, delta: i64) -> Result<i64> {
@@ -8739,6 +11809,29 @@ fn put_u32_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> 
 mod tests {
     use super::*;
 
+    fn contains_zstd_varint(op: &GenericStreamOp) -> bool {
+        match op {
+            GenericStreamOp::ZstdVarint { .. } => true,
+            GenericStreamOp::FixedStrideDelta { residual_op, .. }
+            | GenericStreamOp::DeltaOfDelta { residual_op }
+            | GenericStreamOp::PreviousValueDelta { residual_op } => {
+                contains_zstd_varint(residual_op)
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn small_native_streams_do_not_select_zstd_varint() {
+        let values = (0..128i64)
+            .map(|index| ((index * 73) % 127) - 63)
+            .collect::<Vec<_>>();
+        let op = choose_i64_op(&values).unwrap();
+
+        assert!(encoded_i64_score_with_op(&op, &values).unwrap() < 1_024);
+        assert!(!contains_zstd_varint(&op));
+    }
+
     #[test]
     fn stream_score_counts_compact_huffman_footer_bytes() {
         let values = [10, 10, 10, 20, 10, 30, 40, 20, 10];
@@ -8806,6 +11899,131 @@ mod tests {
 
         assert_eq!(rows, decoded_rows);
         assert_eq!(decoded_rows, column_rows);
+    }
+
+    #[test]
+    fn flat_derived_aura1_body_matches_mixed_width_rows() {
+        let direct_values = [100, 110, 120, 130];
+        let side_values = [-2, -1, 0, 1];
+        let residuals = [-1, 0, 1, 2];
+        let plan = GenericInstructionPlan {
+            streams: vec![
+                GenericStreamInstruction {
+                    stream_id: 0,
+                    target_slot: Some(0),
+                    op: GenericStreamOp::FixedStep {
+                        base: 100,
+                        step: 10,
+                    },
+                },
+                GenericStreamInstruction {
+                    stream_id: 1,
+                    target_slot: Some(1),
+                    op: GenericStreamOp::BaseBitpack {
+                        base: -2,
+                        unit: 1,
+                        bit_width: 2,
+                    },
+                },
+                GenericStreamInstruction {
+                    stream_id: 2,
+                    target_slot: None,
+                    op: GenericStreamOp::BaseBitpack {
+                        base: -1,
+                        unit: 1,
+                        bit_width: 2,
+                    },
+                },
+            ],
+            groups: vec![GenericGroupInstruction::DerivedStream {
+                group_id: 0,
+                parent_group_id: None,
+                output_slot: 2,
+                op: DerivedOp::AddResidual,
+                input_slots: vec![0],
+                stream_id: 2,
+            }],
+        };
+        let streams = [
+            (0, &direct_values[..]),
+            (1, &side_values[..]),
+            (2, &residuals[..]),
+        ]
+        .into_iter()
+        .map(|(stream_id, values)| {
+            let instruction = &plan.streams[usize::from(stream_id)];
+            Ok(GenericEncodedStream {
+                stream_id,
+                value_count: values.len(),
+                body: encode_generic_stream_body(
+                    instruction,
+                    &GenericStreamBodyValue::I64(values.to_vec()),
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+        let encoded = GenericEncodedI64Rows {
+            plan,
+            streams,
+            record_count: direct_values.len(),
+            field_count: 3,
+        };
+        let aura1_plan = Aura1Plan {
+            block_capacity: 1,
+            fields: vec![
+                crate::plan::PhysicalFieldPlan {
+                    field_index: 0,
+                    encoding: crate::plan::FieldEncoding::Absolute,
+                    width: PhysicalWidth::I16,
+                    bit_width: 0,
+                    reference_field_index: None,
+                    base_value: 0,
+                    step: 0,
+                    estimated_bytes: 0,
+                },
+                crate::plan::PhysicalFieldPlan {
+                    field_index: 1,
+                    encoding: crate::plan::FieldEncoding::Absolute,
+                    width: PhysicalWidth::I8,
+                    bit_width: 0,
+                    reference_field_index: None,
+                    base_value: 0,
+                    step: 0,
+                    estimated_bytes: 0,
+                },
+                crate::plan::PhysicalFieldPlan {
+                    field_index: 2,
+                    encoding: crate::plan::FieldEncoding::Absolute,
+                    width: PhysicalWidth::I16,
+                    bit_width: 0,
+                    reference_field_index: None,
+                    base_value: 0,
+                    step: 0,
+                    estimated_bytes: 0,
+                },
+            ],
+        };
+        let body = encode_generic_i64_rows_body(&encoded).unwrap();
+        let actual = try_encode_generic_i64_aura1_body(
+            encoded.plan,
+            &body,
+            encoded.record_count,
+            encoded.field_count,
+            &aura1_plan,
+        )
+        .unwrap()
+        .expect("flat derived Aura1 body");
+        let mut expected = Vec::new();
+        for row_index in 0..direct_values.len() {
+            expected.extend_from_slice(&(direct_values[row_index] as i16).to_le_bytes());
+            expected.push(side_values[row_index] as i8 as u8);
+            expected.extend_from_slice(
+                &((direct_values[row_index] + residuals[row_index]) as i16).to_le_bytes(),
+            );
+        }
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

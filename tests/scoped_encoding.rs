@@ -35,3 +35,21 @@ fn grouped_i64_rows_round_trip_without_field_names() {
     assert_eq!(rows, decoded);
     assert!(encoded.len() < rows.len() * rows[0].len() * 8);
 }
+
+#[test]
+fn dual_domain_control_round_trips_without_becoming_a_payload_slot() {
+    let schema =
+        generic_i64_parent_schema("dual_domain_book_v1", &[100, 200, 204, 2, 0, 0]).unwrap();
+    let rows = vec![
+        vec![1_000, 0, 100_000, 5_000, 2],
+        vec![1_000, 0, 99_900, 4_000, 1],
+        vec![1_000, 1, 100_100, 6_000, 3],
+        vec![1_000, 1, 100_200, 3_000, 1],
+        vec![2_000, 0, 100_100, 7_000, 2],
+        vec![2_000, 1, 100_200, 8_000, 2],
+    ];
+
+    assert_eq!(5, schema.fields.len());
+    let encoded = encode_grouped_i64_rows(&schema, &rows).unwrap();
+    assert_eq!(rows, decode_grouped_i64_rows(&schema, &encoded).unwrap());
+}

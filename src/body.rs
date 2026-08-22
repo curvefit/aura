@@ -69,6 +69,9 @@ where
         GenericStreamOp::PrevVarint { base, unit } => {
             encode_prev_varint_from_emitter(*base, *unit, &mut emit, stats)
         }
+        GenericStreamOp::ZstdVarint { unit, raw_len } => {
+            encode_zstd_varint_from_emitter(*unit, *raw_len, &mut emit, stats)
+        }
         GenericStreamOp::BlockLocal {
             block_size,
             mode_count,
@@ -134,6 +137,24 @@ where
             &mut emit,
             stats,
         ),
+        GenericStreamOp::FixedStrideDelta { .. }
+        | GenericStreamOp::DeltaOfDelta { .. }
+        | GenericStreamOp::PreviousValueDelta { .. } => {
+            let mut values = Vec::new();
+            let emitted = emit(&mut |value| {
+                values.push(value);
+                Ok(())
+            })?;
+            if emitted != values.len() {
+                return Err(AuraError::InvalidValue("stream value count"));
+            }
+            stats.value_count = values.len();
+            stats.temporary_buffer_bytes = stats
+                .temporary_buffer_bytes
+                .saturating_add(values.capacity().saturating_mul(mem::size_of::<i64>()));
+            stats.encoder_allocations = stats.encoder_allocations.saturating_add(1);
+            encode_i64_op(&instruction.op, &values)
+        }
         GenericStreamOp::UuidConstMask { .. } => Err(AuraError::InvalidValue("body type")),
     }
 }
@@ -163,7 +184,12 @@ pub(crate) fn try_generic_i64_stream_cursor<'a>(
     value_count: usize,
 ) -> Result<Option<GenericI64StreamCursor<'a>>> {
     match instruction.op {
-        GenericStreamOp::UuidConstMask { .. } | GenericStreamOp::BitplaneRle { .. } => Ok(None),
+        GenericStreamOp::UuidConstMask { .. }
+        | GenericStreamOp::BitplaneRle { .. }
+        | GenericStreamOp::ZstdVarint { .. }
+        | GenericStreamOp::FixedStrideDelta { .. }
+        | GenericStreamOp::DeltaOfDelta { .. }
+        | GenericStreamOp::PreviousValueDelta { .. } => Ok(None),
         _ => GenericI64StreamCursor::try_new(&instruction.op, bytes, value_count),
     }
 }
@@ -469,7 +495,12 @@ impl<'a> GenericI64StreamCursorKind<'a> {
                     value_count,
                 }
             }
-            GenericStreamOp::BitplaneRle { .. } | GenericStreamOp::UuidConstMask { .. } => {
+            GenericStreamOp::BitplaneRle { .. }
+            | GenericStreamOp::ZstdVarint { .. }
+            | GenericStreamOp::UuidConstMask { .. }
+            | GenericStreamOp::FixedStrideDelta { .. }
+            | GenericStreamOp::DeltaOfDelta { .. }
+            | GenericStreamOp::PreviousValueDelta { .. } => {
                 return Ok(None);
             }
         }))
@@ -1079,6 +1110,7 @@ fn encode_i64_op(op: &GenericStreamOp, values: &[i64]) -> Result<Vec<u8>> {
             bit_width,
         } => encode_prev_delta(base, unit, bit_width, values),
         GenericStreamOp::PrevVarint { base, unit } => encode_prev_varint(base, unit, values),
+        GenericStreamOp::ZstdVarint { unit, raw_len } => encode_zstd_varint(unit, raw_len, values),
         GenericStreamOp::BlockLocal {
             block_size,
             mode_count,
@@ -1120,6 +1152,21 @@ fn encode_i64_op(op: &GenericStreamOp, values: &[i64]) -> Result<Vec<u8>> {
             entry_width,
             ref code_lengths,
         } => encode_huffman_dictionary(base, unit, entry_count, entry_width, code_lengths, values),
+        GenericStreamOp::FixedStrideDelta {
+            stride,
+            ref residual_op,
+        } => {
+            let residuals = fixed_stride_residuals(values, usize::from(stride))?;
+            encode_i64_op(residual_op, &residuals)
+        }
+        GenericStreamOp::DeltaOfDelta { ref residual_op } => {
+            let residuals = delta_of_delta_residuals(values)?;
+            encode_i64_op(residual_op, &residuals)
+        }
+        GenericStreamOp::PreviousValueDelta { ref residual_op } => {
+            let residuals = previous_value_residuals(values)?;
+            encode_i64_op(residual_op, &residuals)
+        }
         GenericStreamOp::UuidConstMask { .. } => Err(AuraError::InvalidValue("body type")),
     }
 }
@@ -1271,6 +1318,49 @@ where
         .saturating_add(emit_start.elapsed().as_nanos());
     finish_emit_count(stats, emitted, observed)?;
     Ok(out)
+}
+
+fn encode_zstd_varint_from_emitter<F>(
+    unit: i64,
+    raw_len: u64,
+    emit: &mut F,
+    stats: &mut GenericI64EmitterEncodeStats,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&mut dyn FnMut(i64) -> Result<()>) -> Result<usize>,
+{
+    validate_unit(unit)?;
+    let raw_len =
+        usize::try_from(raw_len).map_err(|_| AuraError::InvalidValue("zstd varint raw length"))?;
+    let mut raw = Vec::new();
+    let emit_start = Instant::now();
+    let mut observed = 0usize;
+    let emitted = emit(&mut |value| {
+        append_scaled_varint(&mut raw, value, unit, raw_len)?;
+        observed = observed
+            .checked_add(1)
+            .ok_or(AuraError::InvalidValue("stream value count"))?;
+        Ok(())
+    })?;
+    stats.direct_stream_emit_ns = stats
+        .direct_stream_emit_ns
+        .saturating_add(emit_start.elapsed().as_nanos());
+    finish_emit_count(stats, emitted, observed)?;
+    if validate_zstd_varint_raw_len(
+        u64::try_from(raw_len).map_err(|_| AuraError::InvalidValue("zstd varint raw length"))?,
+        observed,
+    )? != raw.len()
+    {
+        return Err(AuraError::InvalidValue("zstd varint raw length"));
+    }
+    add_temp_vec_bytes::<u8>(stats, raw.capacity());
+
+    let compression_start = Instant::now();
+    let body = compress_zstd_varint_raw(&raw)?;
+    stats.compression_encoding_ns = stats
+        .compression_encoding_ns
+        .saturating_add(compression_start.elapsed().as_nanos());
+    Ok(body)
 }
 
 fn encode_block_local_from_emitter<F>(
@@ -1778,6 +1868,7 @@ fn decode_i64_op(
     reader: &mut ByteReader<'_>,
     value_count: usize,
 ) -> Result<Vec<i64>> {
+    validate_i64_decode_value_count(value_count)?;
     match *op {
         GenericStreamOp::FixedStep { base, step } => decode_fixed_step(base, step, value_count),
         GenericStreamOp::BaseBitpack {
@@ -1792,6 +1883,9 @@ fn decode_i64_op(
         } => decode_prev_delta(base, unit, bit_width, reader, value_count),
         GenericStreamOp::PrevVarint { base, unit } => {
             decode_prev_varint(base, unit, reader, value_count)
+        }
+        GenericStreamOp::ZstdVarint { unit, raw_len } => {
+            decode_zstd_varint(unit, raw_len, reader, value_count)
         }
         GenericStreamOp::BlockLocal {
             block_size,
@@ -1858,8 +1952,145 @@ fn decode_i64_op(
             reader,
             value_count,
         ),
+        GenericStreamOp::FixedStrideDelta {
+            stride,
+            ref residual_op,
+        } => {
+            let residuals = decode_i64_op(residual_op, reader, value_count)?;
+            undo_fixed_stride_residuals(residuals, usize::from(stride))
+        }
+        GenericStreamOp::DeltaOfDelta { ref residual_op } => {
+            let residuals = decode_i64_op(residual_op, reader, value_count)?;
+            undo_delta_of_delta_residuals(residuals)
+        }
+        GenericStreamOp::PreviousValueDelta { ref residual_op } => {
+            let residuals = decode_i64_op(residual_op, reader, value_count)?;
+            undo_previous_value_residuals(residuals)
+        }
         GenericStreamOp::UuidConstMask { .. } => Err(AuraError::InvalidValue("body type")),
     }
+}
+
+fn validate_i64_decode_value_count(value_count: usize) -> Result<()> {
+    value_count
+        .checked_mul(std::mem::size_of::<i64>())
+        .filter(|byte_len| *byte_len <= isize::MAX as usize)
+        .map(|_| ())
+        .ok_or(AuraError::InvalidValue("stream value count"))
+}
+
+fn fixed_stride_residuals(values: &[i64], stride: usize) -> Result<Vec<i64>> {
+    if stride == 0 {
+        return Err(AuraError::InvalidValue("fixed stride delta"));
+    }
+    values
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, value)| {
+            if index < stride {
+                Ok(value)
+            } else {
+                value
+                    .checked_sub(values[index - stride])
+                    .ok_or(AuraError::InvalidValue("fixed stride delta"))
+            }
+        })
+        .collect()
+}
+
+fn undo_fixed_stride_residuals(mut values: Vec<i64>, stride: usize) -> Result<Vec<i64>> {
+    if stride == 0 {
+        return Err(AuraError::InvalidValue("fixed stride delta"));
+    }
+    for index in stride..values.len() {
+        values[index] = values[index - stride]
+            .checked_add(values[index])
+            .ok_or(AuraError::InvalidValue("fixed stride delta"))?;
+    }
+    Ok(values)
+}
+
+fn delta_of_delta_residuals(values: &[i64]) -> Result<Vec<i64>> {
+    let mut residuals = Vec::with_capacity(values.len());
+    let Some(first) = values.first().copied() else {
+        return Ok(residuals);
+    };
+    residuals.push(first);
+    let Some(second) = values.get(1).copied() else {
+        return Ok(residuals);
+    };
+    let mut previous_delta = second
+        .checked_sub(first)
+        .ok_or(AuraError::InvalidValue("delta of delta"))?;
+    residuals.push(previous_delta);
+    for pair in values.windows(2).skip(1) {
+        let delta = pair[1]
+            .checked_sub(pair[0])
+            .ok_or(AuraError::InvalidValue("delta of delta"))?;
+        residuals.push(
+            delta
+                .checked_sub(previous_delta)
+                .ok_or(AuraError::InvalidValue("delta of delta"))?,
+        );
+        previous_delta = delta;
+    }
+    Ok(residuals)
+}
+
+fn undo_delta_of_delta_residuals(residuals: Vec<i64>) -> Result<Vec<i64>> {
+    let Some(first) = residuals.first().copied() else {
+        return Ok(residuals);
+    };
+    let mut values = Vec::with_capacity(residuals.len());
+    values.push(first);
+    let Some(mut delta) = residuals.get(1).copied() else {
+        return Ok(values);
+    };
+    values.push(
+        first
+            .checked_add(delta)
+            .ok_or(AuraError::InvalidValue("delta of delta"))?,
+    );
+    for delta_change in residuals.iter().copied().skip(2) {
+        delta = delta
+            .checked_add(delta_change)
+            .ok_or(AuraError::InvalidValue("delta of delta"))?;
+        values.push(
+            values
+                .last()
+                .copied()
+                .ok_or(AuraError::InvalidValue("delta of delta"))?
+                .checked_add(delta)
+                .ok_or(AuraError::InvalidValue("delta of delta"))?,
+        );
+    }
+    Ok(values)
+}
+
+fn previous_value_residuals(values: &[i64]) -> Result<Vec<i64>> {
+    let mut residuals = Vec::with_capacity(values.len());
+    let Some(first) = values.first().copied() else {
+        return Ok(residuals);
+    };
+    residuals.push(first);
+    for pair in values.windows(2) {
+        residuals.push(
+            pair[1]
+                .checked_sub(pair[0])
+                .ok_or(AuraError::InvalidValue("previous value delta"))?,
+        );
+    }
+    Ok(residuals)
+}
+
+fn undo_previous_value_residuals(mut residuals: Vec<i64>) -> Result<Vec<i64>> {
+    for index in 1..residuals.len() {
+        residuals[index] = residuals[index - 1]
+            .checked_add(residuals[index])
+            .ok_or(AuraError::InvalidValue("previous value delta"))?;
+    }
+    Ok(residuals)
 }
 
 fn encode_fixed_step(base: i64, step: i64, values: &[i64]) -> Result<Vec<u8>> {
@@ -1872,9 +2103,14 @@ fn encode_fixed_step(base: i64, step: i64, values: &[i64]) -> Result<Vec<u8>> {
 }
 
 fn decode_fixed_step(base: i64, step: i64, value_count: usize) -> Result<Vec<i64>> {
-    (0..value_count)
-        .map(|index| fixed_step_value(base, step, index))
-        .collect()
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(value_count)
+        .map_err(|_| AuraError::InvalidValue("stream value count"))?;
+    for index in 0..value_count {
+        values.push(fixed_step_value(base, step, index)?);
+    }
+    Ok(values)
 }
 
 fn encode_base_bitpack(base: i64, unit: i64, bit_width: u8, values: &[i64]) -> Result<Vec<u8>> {
@@ -1970,6 +2206,129 @@ fn decode_prev_varint(
         values.push(reconstruct_signed_delta(previous, unit, delta)?);
     }
     Ok(values)
+}
+
+fn encode_zstd_varint(unit: i64, raw_len: u64, values: &[i64]) -> Result<Vec<u8>> {
+    validate_unit(unit)?;
+    let raw_len = validate_zstd_varint_raw_len(raw_len, values.len())?;
+    let actual_len = values.iter().try_fold(0usize, |len, value| {
+        let scaled = scaled_signed_value(*value, unit)?;
+        len.checked_add(varint_u64_len(varint::zigzag_encode(scaled)))
+            .ok_or(AuraError::InvalidValue("zstd varint raw length"))
+    })?;
+    if actual_len != raw_len {
+        return Err(AuraError::InvalidValue("zstd varint raw length"));
+    }
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(raw_len)
+        .map_err(|_| AuraError::InvalidValue("zstd varint raw length"))?;
+    for value in values {
+        append_scaled_varint(&mut raw, *value, unit, raw_len)?;
+    }
+    compress_zstd_varint_raw(&raw)
+}
+
+fn append_scaled_varint(raw: &mut Vec<u8>, value: i64, unit: i64, limit: usize) -> Result<()> {
+    let scaled = scaled_signed_value(value, unit)?;
+    let encoded_len = varint_u64_len(varint::zigzag_encode(scaled));
+    if raw
+        .len()
+        .checked_add(encoded_len)
+        .is_none_or(|len| len > limit)
+    {
+        return Err(AuraError::InvalidValue("zstd varint raw length"));
+    }
+    raw.try_reserve(encoded_len)
+        .map_err(|_| AuraError::InvalidValue("zstd varint raw length"))?;
+    varint::encode_i64(scaled, raw);
+    Ok(())
+}
+
+fn compress_zstd_varint_raw(raw: &[u8]) -> Result<Vec<u8>> {
+    zstd::bulk::compress(raw, 3).map_err(|_| AuraError::InvalidValue("zstd varint frame"))
+}
+
+fn decode_zstd_varint(
+    unit: i64,
+    raw_len: u64,
+    reader: &mut ByteReader<'_>,
+    value_count: usize,
+) -> Result<Vec<i64>> {
+    validate_unit(unit)?;
+    let stamped_raw_len = raw_len;
+    let raw_len = validate_zstd_varint_raw_len(stamped_raw_len, value_count)?;
+    let compressed = reader.read_exact(reader.remaining())?;
+    if !compressed.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        return Err(AuraError::InvalidValue("zstd varint frame"));
+    }
+    let frame_len = zstd::zstd_safe::find_frame_compressed_size(compressed)
+        .map_err(|_| AuraError::InvalidValue("zstd varint frame"))?;
+    if frame_len != compressed.len() {
+        return Err(AuraError::InvalidValue("zstd varint frame"));
+    }
+    match zstd::zstd_safe::get_frame_content_size(compressed) {
+        Ok(Some(frame_raw_len)) if frame_raw_len == stamped_raw_len => {}
+        _ => return Err(AuraError::InvalidValue("zstd varint frame content size")),
+    }
+
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(raw_len)
+        .map_err(|_| AuraError::InvalidValue("zstd varint raw length"))?;
+    raw.resize(raw_len, 0);
+    let written = zstd::bulk::decompress_to_buffer(compressed, raw.as_mut_slice())
+        .map_err(|_| AuraError::InvalidValue("zstd varint frame"))?;
+    if written != raw_len {
+        return Err(AuraError::InvalidValue("zstd varint raw length"));
+    }
+
+    let mut raw_reader = ByteReader::new(&raw);
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(value_count)
+        .map_err(|_| AuraError::InvalidValue("stream value count"))?;
+    for _ in 0..value_count {
+        let scaled = decode_canonical_zigzag_uleb128(&mut raw_reader)?;
+        values.push(reconstruct_scaled_value(scaled, unit)?);
+    }
+    raw_reader.finish()?;
+    Ok(values)
+}
+
+fn validate_zstd_varint_raw_len(raw_len: u64, value_count: usize) -> Result<usize> {
+    validate_i64_decode_value_count(value_count)?;
+    let raw_len =
+        usize::try_from(raw_len).map_err(|_| AuraError::InvalidValue("zstd varint raw length"))?;
+    let maximum = value_count
+        .checked_mul(10)
+        .ok_or(AuraError::InvalidValue("zstd varint raw length"))?;
+    let valid = if value_count == 0 {
+        raw_len == 0
+    } else {
+        raw_len >= value_count && raw_len <= maximum
+    };
+    if !valid || raw_len > isize::MAX as usize {
+        return Err(AuraError::InvalidValue("zstd varint raw length"));
+    }
+    Ok(raw_len)
+}
+
+fn decode_canonical_zigzag_uleb128(reader: &mut ByteReader<'_>) -> Result<i64> {
+    let mut value = 0u64;
+    for byte_index in 0..10u32 {
+        let byte = reader.read_u8()?;
+        let payload = byte & 0x7f;
+        if byte_index == 9 && payload > 1 {
+            return Err(AuraError::InvalidValue("zstd varint value"));
+        }
+        value |= u64::from(payload) << (byte_index * 7);
+        if byte & 0x80 == 0 {
+            if byte_index != 0 && payload == 0 {
+                return Err(AuraError::InvalidValue("zstd varint canonical"));
+            }
+            return Ok(varint::zigzag_decode(value));
+        }
+    }
+    Err(AuraError::InvalidValue("zstd varint value"))
 }
 
 fn encode_patched_bitpack(
@@ -2479,17 +2838,162 @@ fn decode_block_local(
         return Err(AuraError::InvalidValue("block count"));
     }
     let mut out = Vec::with_capacity(value_count);
-    for block_index in 0..block_count {
+    for _ in 0..block_count {
         let remaining = value_count - out.len();
         let count = remaining.min(block_size);
         let op = decode_local_op_header(reader)?;
-        let values = decode_i64_op(&op, reader, count)?;
-        if block_index + 1 == block_count && values.len() != count {
-            return Err(AuraError::InvalidValue("block local body"));
-        }
-        out.extend(values);
+        decode_local_i64_op_into(&op, reader, count, &mut out)?;
     }
     Ok(out)
+}
+
+fn decode_local_i64_op_into(
+    op: &GenericStreamOp,
+    reader: &mut ByteReader<'_>,
+    value_count: usize,
+    out: &mut Vec<i64>,
+) -> Result<()> {
+    let start_len = out.len();
+    out.reserve(value_count);
+    match *op {
+        GenericStreamOp::FixedStep { base, step } => {
+            for index in 0..value_count {
+                out.push(fixed_step_value(base, step, index)?);
+            }
+        }
+        GenericStreamOp::BaseBitpack {
+            base,
+            unit,
+            bit_width,
+        } => {
+            let scaled = read_bitpacked_unsigned(reader, bit_width, value_count)?;
+            for value in scaled {
+                out.push(reconstruct_unsigned_offset(base, unit, value)?);
+            }
+        }
+        GenericStreamOp::PrevDelta {
+            base,
+            unit,
+            bit_width,
+        } => {
+            if value_count != 0 {
+                let deltas = read_bitpacked_signed(reader, bit_width, value_count - 1)?;
+                out.push(base);
+                let mut previous = base;
+                for delta in deltas {
+                    previous = reconstruct_signed_delta(previous, unit, delta)?;
+                    out.push(previous);
+                }
+            }
+        }
+        GenericStreamOp::PatchedBitpack {
+            base,
+            unit,
+            low_width,
+            high_width,
+            exception_count,
+        } => decode_patched_bitpack_into(
+            base,
+            unit,
+            low_width,
+            high_width,
+            exception_count,
+            reader,
+            value_count,
+            out,
+        )?,
+        GenericStreamOp::Rle {
+            base,
+            unit,
+            bit_width,
+            run_count,
+        } => decode_rle_into(base, unit, bit_width, run_count, reader, value_count, out)?,
+        _ => return Err(AuraError::InvalidValue("block local mode")),
+    }
+    if out.len() - start_len != value_count {
+        return Err(AuraError::InvalidValue("block local body"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_patched_bitpack_into(
+    base: i64,
+    unit: i64,
+    low_width: u8,
+    high_width: u8,
+    exception_count: u32,
+    reader: &mut ByteReader<'_>,
+    value_count: usize,
+    out: &mut Vec<i64>,
+) -> Result<()> {
+    let exception_count = exception_count as usize;
+    if exception_count > value_count {
+        return Err(AuraError::InvalidValue("exception count"));
+    }
+    let mut lows = read_bitpack_unsigned_cursor(reader, low_width, value_count)?;
+    let mut indexes =
+        read_bitpack_unsigned_cursor(reader, index_width(value_count), exception_count)?;
+    let mut highs = read_bitpack_unsigned_cursor(reader, high_width, exception_count)?;
+    let mut next_exception = read_next_patch_exception(&mut indexes, &mut highs)?;
+    let mut exceptions_remaining = exception_count;
+    out.reserve(value_count);
+    for index in 0..value_count {
+        let mut residual = lows.next()?;
+        if let Some((exception_index, high)) = next_exception {
+            match exception_index.cmp(&index) {
+                Ordering::Less => return Err(AuraError::InvalidValue("exception index")),
+                Ordering::Equal => {
+                    let shifted = if low_width == 64 {
+                        if high != 0 {
+                            return Err(AuraError::InvalidValue("exception high"));
+                        }
+                        0
+                    } else {
+                        high.checked_shl(u32::from(low_width))
+                            .ok_or(AuraError::InvalidValue("exception high"))?
+                    };
+                    residual |= shifted;
+                    exceptions_remaining = exceptions_remaining.saturating_sub(1);
+                    next_exception = read_next_patch_exception(&mut indexes, &mut highs)?;
+                }
+                Ordering::Greater => {}
+            }
+        }
+        out.push(reconstruct_unsigned_offset(base, unit, residual)?);
+    }
+    if exceptions_remaining != 0 || next_exception.is_some() {
+        return Err(AuraError::InvalidValue("exception count"));
+    }
+    Ok(())
+}
+
+fn decode_rle_into(
+    base: i64,
+    unit: i64,
+    bit_width: u8,
+    run_count: u32,
+    reader: &mut ByteReader<'_>,
+    value_count: usize,
+    out: &mut Vec<i64>,
+) -> Result<()> {
+    let mut run_values = read_bitpack_unsigned_cursor(reader, bit_width, run_count as usize)?;
+    let start_len = out.len();
+    out.reserve(value_count);
+    for _ in 0..run_count {
+        let value = reconstruct_unsigned_offset(base, unit, run_values.next()?)?;
+        let len = usize::try_from(varint::decode_u64(reader)?)
+            .map_err(|_| AuraError::InvalidValue("run length"))?;
+        let produced = out.len() - start_len;
+        if len == 0 || produced.saturating_add(len) > value_count {
+            return Err(AuraError::InvalidValue("run length"));
+        }
+        out.resize(out.len() + len, value);
+    }
+    if out.len() - start_len != value_count {
+        return Err(AuraError::InvalidValue("run length"));
+    }
+    Ok(())
 }
 
 fn choose_local_op(values: &[i64]) -> Result<GenericStreamOp> {
@@ -3668,6 +4172,110 @@ mod tests {
                 encode_i64_op(&op, &values).unwrap().len(),
                 encoded_i64_op_len(&op, &values).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn local_patched_and_rle_decode_append_without_intermediate_output() {
+        let cases = [
+            (
+                GenericStreamOp::PatchedBitpack {
+                    base: 10,
+                    unit: 2,
+                    low_width: 2,
+                    high_width: 3,
+                    exception_count: 2,
+                },
+                vec![10, 12, 14, 42, 16, 58],
+            ),
+            (
+                GenericStreamOp::Rle {
+                    base: 10,
+                    unit: 2,
+                    bit_width: 3,
+                    run_count: 3,
+                },
+                vec![10, 10, 12, 12, 12, 18],
+            ),
+        ];
+
+        for (op, values) in cases {
+            let body = encode_i64_op(&op, &values).unwrap();
+            let mut reader = ByteReader::new(&body);
+            let mut out = vec![-1];
+            decode_local_i64_op_into(&op, &mut reader, values.len(), &mut out).unwrap();
+            reader.finish().unwrap();
+            assert_eq!(out[0], -1);
+            assert_eq!(&out[1..], values);
+        }
+    }
+
+    #[test]
+    fn local_patched_decode_rejects_noncanonical_exception_indexes() {
+        let malformed = [
+            (
+                4usize,
+                vec![1, 1],
+                vec![1, 1],
+                AuraError::InvalidValue("exception index"),
+            ),
+            (
+                4usize,
+                vec![2, 1],
+                vec![1, 1],
+                AuraError::InvalidValue("exception index"),
+            ),
+            (
+                3usize,
+                vec![3],
+                vec![1],
+                AuraError::InvalidValue("exception count"),
+            ),
+        ];
+
+        for (value_count, indexes, highs, expected) in malformed {
+            let mut body = pack_unsigned_values(&vec![0; value_count], 1).unwrap();
+            body.extend(pack_unsigned_values(&indexes, index_width(value_count)).unwrap());
+            body.extend(pack_unsigned_values(&highs, 1).unwrap());
+            let mut reader = ByteReader::new(&body);
+            let result = decode_patched_bitpack_into(
+                0,
+                1,
+                1,
+                1,
+                indexes.len() as u32,
+                &mut reader,
+                value_count,
+                &mut Vec::new(),
+            );
+            assert_eq!(Err(expected), result);
+        }
+    }
+
+    #[test]
+    fn local_rle_decode_rejects_invalid_run_lengths() {
+        let malformed = [
+            (vec![0], vec![0]),
+            (vec![0, 1], vec![1, 1]),
+            (vec![0], vec![4]),
+        ];
+
+        for (run_values, run_lengths) in malformed {
+            let mut body = pack_unsigned_values(&run_values, 1).unwrap();
+            for run_length in run_lengths {
+                varint::encode_u64(run_length, &mut body);
+            }
+            let mut reader = ByteReader::new(&body);
+            let result = decode_rle_into(
+                0,
+                1,
+                1,
+                run_values.len() as u32,
+                &mut reader,
+                3,
+                &mut Vec::new(),
+            );
+            assert_eq!(Err(AuraError::InvalidValue("run length")), result);
         }
     }
 }

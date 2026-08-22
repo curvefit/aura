@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::bitpack::{
     bitpacked_byte_len, pack_unsigned_values, unpack_unsigned_values, unsigned_bitpack_width,
 };
-use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u8, ByteReader};
+use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, put_u8, ByteReader};
 use crate::header::DerivedExpressionOp;
 use crate::{AuraError, Result};
 
@@ -60,7 +60,7 @@ impl GenericInstructionPlan {
         Ok(plan)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let mut stream_ids = BTreeSet::new();
         for stream in &self.streams {
             stream.validate()?;
@@ -92,7 +92,6 @@ impl GenericInstructionPlan {
                     value_stream_id,
                     count_stream_id,
                     event_count_stream_id,
-                    fixed_order: _,
                     ..
                 } => {
                     ensure_group_ref(&group_ids, *parent_group_id)?;
@@ -134,10 +133,83 @@ impl GenericInstructionPlan {
                 }
                 GenericGroupInstruction::DerivedStream {
                     parent_group_id,
+                    output_slot,
+                    op,
+                    input_slots,
                     stream_id,
                     ..
+                } => {
+                    if let Some(parent_group_id) = parent_group_id {
+                        ensure_group_ref(&group_ids, *parent_group_id)?;
+                    }
+                    ensure_stream_ref(&stream_ids, *stream_id)?;
+                    if matches!(
+                        op,
+                        DerivedOp::PreviousSnapshotSameKeyResidual
+                            | DerivedOp::PreviousMutationSameKeyResidual
+                            | DerivedOp::PreviousOutputByKeyResidual
+                    ) {
+                        let parent_group_id = parent_group_id
+                            .ok_or(AuraError::InvalidValue("previous same-key parent"))?;
+                        let (event_slots, repeated_slots) = self
+                            .groups
+                            .iter()
+                            .find_map(|group| match group {
+                                GenericGroupInstruction::Group {
+                                    group_id,
+                                    event_slots,
+                                    repeated_slots,
+                                    ..
+                                } if *group_id == parent_group_id => {
+                                    Some((event_slots, repeated_slots))
+                                }
+                                _ => None,
+                            })
+                            .ok_or(AuraError::InvalidValue("previous same-key parent"))?;
+                        let unique = input_slots.iter().copied().collect::<BTreeSet<_>>();
+                        let valid = match op {
+                            DerivedOp::PreviousSnapshotSameKeyResidual => {
+                                !input_slots.is_empty()
+                                    && input_slots.iter().all(|slot| {
+                                        *slot != *output_slot && repeated_slots.contains(slot)
+                                    })
+                            }
+                            DerivedOp::PreviousMutationSameKeyResidual
+                            | DerivedOp::PreviousOutputByKeyResidual => {
+                                input_slots.len() >= 2
+                                    && event_slots.contains(&input_slots[0])
+                                    && input_slots[1..].iter().all(|slot| {
+                                        *slot != *output_slot && repeated_slots.contains(slot)
+                                    })
+                            }
+                            _ => unreachable!(),
+                        };
+                        if !repeated_slots.contains(output_slot)
+                            || unique.len() != input_slots.len()
+                            || !valid
+                            || self
+                                .streams
+                                .iter()
+                                .find(|stream| stream.stream_id == *stream_id)
+                                .is_none_or(|stream| stream.target_slot.is_some())
+                            || self
+                                .streams
+                                .iter()
+                                .any(|stream| stream.target_slot == Some(*output_slot))
+                            || self
+                                .groups
+                                .iter()
+                                .filter(|candidate| {
+                                    instruction_group_output_slot(candidate) == Some(*output_slot)
+                                })
+                                .count()
+                                != 1
+                        {
+                            return Err(AuraError::InvalidValue("previous same-key slots"));
+                        }
+                    }
                 }
-                | GenericGroupInstruction::ExpressionStream {
+                GenericGroupInstruction::ExpressionStream {
                     parent_group_id,
                     stream_id,
                     ..
@@ -172,11 +244,125 @@ impl GenericInstructionPlan {
                     ensure_group_ref(&group_ids, *parent_group_id)?;
                     ensure_group_ref(&group_ids, *presence_group_id)?;
                 }
+                GenericGroupInstruction::QuotientRemainder {
+                    parent_group_id,
+                    output_slot,
+                    quotient_stream_id,
+                    remainder_stream_id,
+                    ..
+                } => {
+                    if let Some(parent_group_id) = parent_group_id {
+                        ensure_group_ref(&group_ids, *parent_group_id)?;
+                    }
+                    ensure_stream_ref(&stream_ids, *quotient_stream_id)?;
+                    ensure_stream_ref(&stream_ids, *remainder_stream_id)?;
+                    if self
+                        .streams
+                        .iter()
+                        .any(|stream| stream.target_slot == Some(*output_slot))
+                        || [quotient_stream_id, remainder_stream_id]
+                            .into_iter()
+                            .any(|stream_id| {
+                                self.streams
+                                    .iter()
+                                    .find(|stream| stream.stream_id == *stream_id)
+                                    .is_none_or(|stream| stream.target_slot.is_some())
+                            })
+                        || self
+                            .groups
+                            .iter()
+                            .filter(|candidate| {
+                                instruction_group_output_slot(candidate) == Some(*output_slot)
+                            })
+                            .count()
+                            != 1
+                    {
+                        return Err(AuraError::InvalidValue("quotient remainder plan"));
+                    }
+                }
+                GenericGroupInstruction::ExplicitEvents {
+                    parent_group_id,
+                    child_count_stream_id,
+                    ..
+                } => {
+                    ensure_group_ref(&group_ids, *parent_group_id)?;
+                    ensure_stream_ref(&stream_ids, *child_count_stream_id)?;
+                    if self
+                        .streams
+                        .iter()
+                        .find(|stream| stream.stream_id == *child_count_stream_id)
+                        .is_none_or(|stream| stream.target_slot.is_some())
+                    {
+                        return Err(AuraError::InvalidValue("explicit event child count stream"));
+                    }
+                    let Some(event_slots) =
+                        self.groups.iter().find_map(|candidate| match candidate {
+                            GenericGroupInstruction::Group {
+                                group_id,
+                                event_slots,
+                                ..
+                            } if group_id == parent_group_id => Some(event_slots),
+                            _ => None,
+                        })
+                    else {
+                        return Err(AuraError::InvalidValue("explicit event parent"));
+                    };
+                    let mut group_value_outputs = self
+                        .groups
+                        .iter()
+                        .filter_map(|candidate| match candidate {
+                            GenericGroupInstruction::GroupValueStream {
+                                parent_group_id: candidate_parent,
+                                output_slot,
+                                ..
+                            } if *candidate_parent == group.group_id() => Some(*output_slot),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    group_value_outputs.sort_unstable();
+                    let mut expected_outputs = event_slots.clone();
+                    expected_outputs.sort_unstable();
+                    let unique_producers = event_slots.iter().all(|slot| {
+                        self.streams
+                            .iter()
+                            .filter(|stream| stream.target_slot == Some(*slot))
+                            .count()
+                            + self
+                                .groups
+                                .iter()
+                                .filter(|candidate| {
+                                    instruction_group_output_slot(candidate) == Some(*slot)
+                                })
+                                .count()
+                            == 1
+                    });
+                    if group_value_outputs != expected_outputs || !unique_producers {
+                        return Err(AuraError::InvalidValue("explicit event group contract"));
+                    }
+                }
                 GenericGroupInstruction::Group { .. } => {}
             }
         }
 
         Ok(())
+    }
+}
+
+fn instruction_group_output_slot(group: &GenericGroupInstruction) -> Option<u16> {
+    match group {
+        GenericGroupInstruction::SegmentedDeltaStream { output_slot, .. }
+        | GenericGroupInstruction::GroupValueStream { output_slot, .. }
+        | GenericGroupInstruction::DerivedStream { output_slot, .. }
+        | GenericGroupInstruction::ExpressionStream { output_slot, .. }
+        | GenericGroupInstruction::ExpressionValue { output_slot, .. }
+        | GenericGroupInstruction::SparseStream { output_slot, .. }
+        | GenericGroupInstruction::PresenceValue { output_slot, .. }
+        | GenericGroupInstruction::QuotientRemainder { output_slot, .. } => Some(*output_slot),
+        GenericGroupInstruction::Group { .. }
+        | GenericGroupInstruction::ExplicitEvents { .. }
+        | GenericGroupInstruction::PartitionRuns { .. }
+        | GenericGroupInstruction::PartitionRunLengths { .. }
+        | GenericGroupInstruction::PresenceMap { .. } => None,
     }
 }
 
@@ -280,6 +466,28 @@ pub enum GenericStreamOp {
     UuidConstMask {
         constant_bits: u8,
         variable_bits: u8,
+    },
+    /// Delta each value from the value at the same position in the previous
+    /// fixed-order repeated group, then encode that residual stream normally.
+    FixedStrideDelta {
+        stride: u16,
+        residual_op: Box<GenericStreamOp>,
+    },
+    /// Store the first value, the first delta, then changes between successive
+    /// deltas; encode that reversible residual stream with another operation.
+    DeltaOfDelta {
+        residual_op: Box<GenericStreamOp>,
+    },
+    /// Store the first value followed by deltas from the previous value, then
+    /// encode those residuals with an independently selected operation.
+    PreviousValueDelta {
+        residual_op: Box<GenericStreamOp>,
+    },
+    /// ZigZag and canonical-ULEB128 encode exact `value / unit` integers, then
+    /// compress the complete byte stream as one Zstandard level-3 frame.
+    ZstdVarint {
+        unit: i64,
+        raw_len: u64,
     },
 }
 
@@ -407,11 +615,36 @@ impl GenericStreamOp {
                 put_u8(out, constant_bits);
                 put_u8(out, variable_bits);
             }
+            Self::FixedStrideDelta {
+                stride,
+                ref residual_op,
+            } => {
+                put_u8(out, 13);
+                put_u16_le(out, stride);
+                residual_op.encode_to(out)?;
+            }
+            Self::DeltaOfDelta { ref residual_op } => {
+                put_u8(out, 14);
+                residual_op.encode_to(out)?;
+            }
+            Self::PreviousValueDelta { ref residual_op } => {
+                put_u8(out, 15);
+                residual_op.encode_to(out)?;
+            }
+            Self::ZstdVarint { unit, raw_len } => {
+                put_u8(out, 16);
+                put_i64_le(out, unit);
+                put_u64_le(out, raw_len);
+            }
         }
         Ok(())
     }
 
     fn decode_from(reader: &mut ByteReader<'_>) -> Result<Self> {
+        Self::decode_from_with_stride(reader, true)
+    }
+
+    fn decode_from_with_stride(reader: &mut ByteReader<'_>, allow_stride: bool) -> Result<Self> {
         let op = match reader.read_u8()? {
             0 => Self::FixedStep {
                 base: reader.read_i64_le()?,
@@ -498,6 +731,20 @@ impl GenericStreamOp {
             8 => Self::UuidConstMask {
                 constant_bits: reader.read_u8()?,
                 variable_bits: reader.read_u8()?,
+            },
+            13 if allow_stride => Self::FixedStrideDelta {
+                stride: reader.read_u16_le()?,
+                residual_op: Box::new(Self::decode_from_with_stride(reader, false)?),
+            },
+            14 if allow_stride => Self::DeltaOfDelta {
+                residual_op: Box::new(Self::decode_from_with_stride(reader, false)?),
+            },
+            15 if allow_stride => Self::PreviousValueDelta {
+                residual_op: Box::new(Self::decode_from_with_stride(reader, false)?),
+            },
+            16 => Self::ZstdVarint {
+                unit: reader.read_i64_le()?,
+                raw_len: reader.read_u64_le()?,
             },
             _ => return Err(AuraError::InvalidValue("stream instruction op")),
         };
@@ -588,6 +835,48 @@ impl GenericStreamOp {
                     Ok(())
                 }
             }
+            Self::FixedStrideDelta {
+                stride,
+                ref residual_op,
+            } => {
+                if stride == 0
+                    || matches!(
+                        **residual_op,
+                        Self::FixedStrideDelta { .. }
+                            | Self::DeltaOfDelta { .. }
+                            | Self::PreviousValueDelta { .. }
+                            | Self::UuidConstMask { .. }
+                    )
+                {
+                    return Err(AuraError::InvalidValue("fixed stride delta"));
+                }
+                residual_op.validate()
+            }
+            Self::DeltaOfDelta { ref residual_op } => {
+                if matches!(
+                    **residual_op,
+                    Self::FixedStrideDelta { .. }
+                        | Self::DeltaOfDelta { .. }
+                        | Self::PreviousValueDelta { .. }
+                        | Self::UuidConstMask { .. }
+                ) {
+                    return Err(AuraError::InvalidValue("delta of delta"));
+                }
+                residual_op.validate()
+            }
+            Self::PreviousValueDelta { ref residual_op } => {
+                if matches!(
+                    **residual_op,
+                    Self::FixedStrideDelta { .. }
+                        | Self::DeltaOfDelta { .. }
+                        | Self::PreviousValueDelta { .. }
+                        | Self::UuidConstMask { .. }
+                ) {
+                    return Err(AuraError::InvalidValue("previous value delta"));
+                }
+                residual_op.validate()
+            }
+            Self::ZstdVarint { unit, .. } => validate_unit(unit),
         }
     }
 
@@ -606,6 +895,9 @@ pub enum DerivedOp {
     MaxPlusResidual = 2,
     MinMinusResidual = 3,
     FirstOffsetThenDelta = 4,
+    PreviousSnapshotSameKeyResidual = 5,
+    PreviousMutationSameKeyResidual = 6,
+    PreviousOutputByKeyResidual = 7,
 }
 
 impl DerivedOp {
@@ -616,6 +908,9 @@ impl DerivedOp {
             2 => Ok(Self::MaxPlusResidual),
             3 => Ok(Self::MinMinusResidual),
             4 => Ok(Self::FirstOffsetThenDelta),
+            5 => Ok(Self::PreviousSnapshotSameKeyResidual),
+            6 => Ok(Self::PreviousMutationSameKeyResidual),
+            7 => Ok(Self::PreviousOutputByKeyResidual),
             _ => Err(AuraError::InvalidValue("derived op")),
         }
     }
@@ -706,6 +1001,22 @@ pub enum GenericGroupInstruction {
         presence_index: u16,
         value: i64,
     },
+    QuotientRemainder {
+        group_id: u16,
+        parent_group_id: Option<u16>,
+        output_slot: u16,
+        divisor_slot: u16,
+        quotient_stream_id: u16,
+        remainder_stream_id: u16,
+    },
+    /// Binds an authoritative source-event child-count stream to a logical
+    /// repeated group. This preserves zero-child and adjacent-identical events
+    /// without adding an ordinal to the logical schema.
+    ExplicitEvents {
+        group_id: u16,
+        parent_group_id: u16,
+        child_count_stream_id: u16,
+    },
 }
 
 impl GenericGroupInstruction {
@@ -721,7 +1032,9 @@ impl GenericGroupInstruction {
             | Self::ExpressionStream { group_id, .. }
             | Self::ExpressionValue { group_id, .. }
             | Self::SparseStream { group_id, .. }
-            | Self::PresenceValue { group_id, .. } => group_id,
+            | Self::PresenceValue { group_id, .. }
+            | Self::QuotientRemainder { group_id, .. } => group_id,
+            Self::ExplicitEvents { group_id, .. } => group_id,
         }
     }
 
@@ -894,6 +1207,32 @@ impl GenericGroupInstruction {
                 put_u16_le(out, *presence_index);
                 put_i64_le(out, *value);
             }
+            Self::QuotientRemainder {
+                group_id,
+                parent_group_id,
+                output_slot,
+                divisor_slot,
+                quotient_stream_id,
+                remainder_stream_id,
+            } => {
+                put_u8(out, 11);
+                put_u16_le(out, *group_id);
+                put_u16_le(out, encode_optional_group(*parent_group_id));
+                put_u16_le(out, *output_slot);
+                put_u16_le(out, *divisor_slot);
+                put_u16_le(out, *quotient_stream_id);
+                put_u16_le(out, *remainder_stream_id);
+            }
+            Self::ExplicitEvents {
+                group_id,
+                parent_group_id,
+                child_count_stream_id,
+            } => {
+                put_u8(out, 12);
+                put_u16_le(out, *group_id);
+                put_u16_le(out, *parent_group_id);
+                put_u16_le(out, *child_count_stream_id);
+            }
         }
         Ok(())
     }
@@ -991,6 +1330,19 @@ impl GenericGroupInstruction {
                 literals: read_i64_vec(reader)?,
                 residual: reader.read_i64_le()?,
             },
+            11 => Self::QuotientRemainder {
+                group_id: reader.read_u16_le()?,
+                parent_group_id: decode_optional_group(reader.read_u16_le()?),
+                output_slot: reader.read_u16_le()?,
+                divisor_slot: reader.read_u16_le()?,
+                quotient_stream_id: reader.read_u16_le()?,
+                remainder_stream_id: reader.read_u16_le()?,
+            },
+            12 => Self::ExplicitEvents {
+                group_id: reader.read_u16_le()?,
+                parent_group_id: reader.read_u16_le()?,
+                child_count_stream_id: reader.read_u16_le()?,
+            },
             _ => return Err(AuraError::InvalidValue("group instruction op")),
         };
         group.validate()?;
@@ -1013,8 +1365,20 @@ impl GenericGroupInstruction {
                     return Err(AuraError::InvalidValue("presence slots"));
                 }
             }
-            Self::DerivedStream { input_slots, .. } => {
-                if input_slots.is_empty() {
+            Self::DerivedStream {
+                parent_group_id,
+                op,
+                input_slots,
+                ..
+            } => {
+                if input_slots.is_empty()
+                    || (matches!(
+                        op,
+                        DerivedOp::PreviousSnapshotSameKeyResidual
+                            | DerivedOp::PreviousMutationSameKeyResidual
+                            | DerivedOp::PreviousOutputByKeyResidual
+                    ) && parent_group_id.is_none())
+                {
                     return Err(AuraError::InvalidValue("input slots"));
                 }
             }
@@ -1031,10 +1395,22 @@ impl GenericGroupInstruction {
                 ..
             } => validate_expression_terms(*op, input_slots, literals)?,
             Self::SparseStream { .. } | Self::PresenceValue { .. } => {}
+            Self::QuotientRemainder {
+                output_slot,
+                divisor_slot,
+                quotient_stream_id,
+                remainder_stream_id,
+                ..
+            } => {
+                if output_slot == divisor_slot || quotient_stream_id == remainder_stream_id {
+                    return Err(AuraError::InvalidValue("quotient remainder"));
+                }
+            }
             Self::PartitionRuns { .. } => {}
             Self::PartitionRunLengths { .. }
             | Self::SegmentedDeltaStream { .. }
-            | Self::GroupValueStream { .. } => {}
+            | Self::GroupValueStream { .. }
+            | Self::ExplicitEvents { .. } => {}
         }
         Ok(())
     }
@@ -1213,11 +1589,19 @@ fn validate_expression_terms(
                 return Err(AuraError::InvalidValue("expression terms"));
             }
         }
+        DerivedExpressionOp::MulDiv => {
+            if input_slots.is_empty() || literals.len() != 1 || literals[0] == 0 {
+                return Err(AuraError::InvalidValue("expression terms"));
+            }
+        }
         DerivedExpressionOp::AddResidual
         | DerivedExpressionOp::SubtractResidual
         | DerivedExpressionOp::MaxPlusResidual
         | DerivedExpressionOp::MinMinusResidual
-        | DerivedExpressionOp::FirstOffsetThenDelta => {
+        | DerivedExpressionOp::FirstOffsetThenDelta
+        | DerivedExpressionOp::PreviousSnapshotSameKeyResidual
+        | DerivedExpressionOp::PreviousMutationSameKeyResidual
+        | DerivedExpressionOp::PreviousOutputByKeyResidual => {
             return Err(AuraError::InvalidValue("expression op"));
         }
     }

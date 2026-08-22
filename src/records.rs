@@ -4,37 +4,61 @@ use crate::bitpack::{
     bitpacked_byte_len, pack_signed_values, pack_unsigned_values, unpack_signed_values,
     unpack_unsigned_values,
 };
+use crate::body::{decode_generic_stream_body, encode_generic_stream_body, GenericStreamBodyValue};
 use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, ByteGuard, ByteReader};
 use crate::footer::AuraFooter;
 use crate::format::SEAL_MAGIC;
 use crate::generic_planner::{
-    decode_generic_i64_rows_body, decode_generic_i64_stream_values_profiled,
-    encode_generic_i64_columns_with_plan, encode_generic_i64_columns_with_plan_direct_streams,
-    encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan, plan_generic_i64_rows,
+    decode_generic_i64_events_body, decode_generic_i64_rows, decode_generic_i64_rows_body,
+    decode_generic_i64_stream_values_profiled, encode_generic_i64_columns_with_plan,
+    encode_generic_i64_columns_with_plan_direct_streams, encode_generic_i64_events,
+    encode_generic_i64_rows, encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan,
+    explicit_event_group, plan_generic_i64_rows, plan_uuid_const_mask_stream,
     try_decode_generic_i64_columns_body, try_encode_generic_i64_aura1_body,
     try_encode_generic_i64_aura1_body_streaming, try_write_generic_i64_aura1_body,
     try_write_generic_i64_aura1_body_from_streams_profiled,
     try_write_generic_i64_aura1_body_guarded, try_write_generic_i64_aura1_body_streaming,
     try_write_partitioned_sparse_i64_aura1_body_profiled, DirectAura1DecodeStats,
     DirectAura1DecodeTimings, DirectAura1WriterStats, DirectAura1WriterTimings,
-    GenericColumnEncodeStats,
+    GenericColumnEncodeStats, GenericEncodedI64Rows, GenericEncodedStream,
 };
 use crate::header::{AuraHeader, LEGACY_HEADER_PREFIX_SIZE};
-use crate::instructions::GenericInstructionPlan;
-use crate::plan::{unpack_ref_divisor, unpack_two_refs, Aura0Plan, Aura1Plan, FieldEncoding};
+use crate::instructions::{GenericInstructionPlan, GenericStreamOp};
+use crate::plan::{
+    unpack_ref_divisor, unpack_two_refs, Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan,
+};
 use crate::program::{
     Aura1ByteLaneDescriptor, CompiledAuraPlan, CompiledFooter, DecodeProgram,
     AURA1_BYTE_LANE_MAGIC, AURA1_BYTE_LANE_VERSION, BYTE_LANE_CHECKSUM_BYTE_GUARD,
     BYTE_LANE_CHECKSUM_NONE, BYTE_LANE_CODEC_LZ4, BYTE_LANE_CODEC_RAW, BYTE_LANE_CODEC_ZSTD,
 };
-use crate::schema::{schema_parent_mapping, FieldRole, FieldType, SchemaDescriptor};
+use crate::schema::{schema_parent_mapping, FieldRole, FieldScope, FieldType, SchemaDescriptor};
 use crate::stats::IngestStats;
+use crate::varint::{decode_i64 as decode_varint_i64, decode_u64 as decode_varint_u64};
+use crate::varint::{encode_i64 as encode_varint_i64, encode_u64 as encode_varint_u64};
 use crate::{AuraError, AuraTypedValue, PhysicalWidth, Profile, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct I64FileInput {
     pub schema: SchemaDescriptor,
     pub rows: Vec<Vec<i64>>,
+    pub stream_id: u16,
+    pub dictionary_id: u16,
+    pub header_comment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct I64Event {
+    /// Values in schema event-scope field order.
+    pub event_values: Vec<i64>,
+    /// Child rows in schema repeated-scope field order.
+    pub children: Vec<Vec<i64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct I64EventFileInput {
+    pub schema: SchemaDescriptor,
+    pub events: Vec<I64Event>,
     pub stream_id: u16,
     pub dictionary_id: u16,
     pub header_comment: Option<String>,
@@ -56,6 +80,15 @@ pub struct DecodedI64File {
     pub ingest_footer: Option<AuraFooter>,
     pub compiled_footer: Option<CompiledFooter>,
     pub rows: Vec<Vec<i64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedI64EventFile {
+    pub header: AuraHeader,
+    pub schema: SchemaDescriptor,
+    pub ingest_footer: Option<AuraFooter>,
+    pub compiled_footer: Option<CompiledFooter>,
+    pub events: Vec<I64Event>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +356,10 @@ pub fn encode_ingest_i64_file(input: I64FileInput) -> Result<Vec<u8>> {
     crate::writer::encode_i64(input)
 }
 
+pub fn encode_ingest_i64_events_file(input: I64EventFileInput) -> Result<Vec<u8>> {
+    encode_ingest_i64_events_file_inner(input)
+}
+
 pub fn encode_ingest_typed_file(input: TypedFileInput) -> Result<Vec<u8>> {
     crate::writer::encode_typed(input)
 }
@@ -399,8 +436,176 @@ pub(crate) fn encode_ingest_i64_file_inner(input: I64FileInput) -> Result<Vec<u8
     )
 }
 
+pub(crate) fn encode_ingest_i64_events_file_inner(input: I64EventFileInput) -> Result<Vec<u8>> {
+    let event_values = input
+        .events
+        .iter()
+        .map(|event| event.event_values.clone())
+        .collect::<Vec<_>>();
+    let children = input
+        .events
+        .iter()
+        .map(|event| event.children.clone())
+        .collect::<Vec<_>>();
+    let encoded = encode_generic_i64_events(&input.schema, &event_values, &children)?;
+    let rows = flatten_i64_events(&input.schema, &input.events)?;
+    let mut stats = IngestStats::new_for_schema(&input.schema)?;
+    let event_slots = input
+        .schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Event)
+        .map(|field| field.index)
+        .collect::<Vec<_>>();
+    let repeated_slots = input
+        .schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Repeated)
+        .map(|field| field.index)
+        .collect::<Vec<_>>();
+    for event in &input.events {
+        for (slot, value) in event_slots.iter().copied().zip(&event.event_values) {
+            stats.observe_i64(slot, *value)?;
+        }
+        for related in &mut stats.related_fields {
+            let field_scope = input.schema.fields[usize::from(related.field_index)].scope;
+            let parent_scope = input.schema.fields[usize::from(related.related_field_index)].scope;
+            if field_scope == FieldScope::Event && parent_scope == FieldScope::Event {
+                let field_position = event_slots
+                    .iter()
+                    .position(|slot| *slot == related.field_index)
+                    .ok_or(AuraError::InvalidValue("related field index"))?;
+                let parent_position = event_slots
+                    .iter()
+                    .position(|slot| *slot == related.related_field_index)
+                    .ok_or(AuraError::InvalidValue("related field index"))?;
+                related.observe(
+                    event.event_values[field_position],
+                    event.event_values[parent_position],
+                );
+            }
+        }
+        for child in &event.children {
+            stats.observe_record();
+            for (slot, value) in repeated_slots.iter().copied().zip(child) {
+                stats.observe_i64(slot, *value)?;
+            }
+            for related in &mut stats.related_fields {
+                let field_scope = input.schema.fields[usize::from(related.field_index)].scope;
+                let parent_scope =
+                    input.schema.fields[usize::from(related.related_field_index)].scope;
+                if field_scope == FieldScope::Event && parent_scope == FieldScope::Event {
+                    continue;
+                }
+                let value_for = |slot: u16, scope: FieldScope| -> Result<i64> {
+                    let (slots, values) = if scope == FieldScope::Event {
+                        (&event_slots, &event.event_values)
+                    } else {
+                        (&repeated_slots, child)
+                    };
+                    let position = slots
+                        .iter()
+                        .position(|candidate| *candidate == slot)
+                        .ok_or(AuraError::InvalidValue("related field index"))?;
+                    values
+                        .get(position)
+                        .copied()
+                        .ok_or(AuraError::InvalidValue("related field index"))
+                };
+                related.observe(
+                    value_for(related.field_index, field_scope)?,
+                    value_for(related.related_field_index, parent_scope)?,
+                );
+            }
+        }
+    }
+    let timestamp_index = timestamp_field_index(&input.schema);
+    if let Some(timestamp_index) = timestamp_index {
+        observe_timestamp_runs(&mut stats, &rows, timestamp_index);
+    }
+    let aura0_plan = Aura0Plan::from_schema_rows_stats(&input.schema, &stats, &rows)?;
+    let aura1_plan = Aura1Plan::from_stats(&stats, 1);
+    let footer = AuraFooter::new(input.schema.clone(), stats)
+        .with_aura0_plan(aura0_plan)
+        .with_aura1_plan(aura1_plan)
+        .with_generic_aura0_plan(encoded.plan.clone());
+    let body = encode_generic_i64_rows_body(&encoded)?;
+    let timestamp_event_index = timestamp_index.and_then(|slot| {
+        input
+            .schema
+            .fields
+            .iter()
+            .filter(|field| field.scope == FieldScope::Event)
+            .position(|field| usize::from(field.index) == slot)
+    });
+    let base_time_ns = timestamp_event_index
+        .and_then(|index| input.events.first()?.event_values.get(index).copied())
+        .unwrap_or(0);
+    encode_file(
+        Profile::Ingest,
+        input.stream_id,
+        input.dictionary_id,
+        base_time_ns,
+        input.header_comment.as_deref().unwrap_or(""),
+        body,
+        footer,
+    )
+}
+
+fn flatten_i64_events(schema: &SchemaDescriptor, events: &[I64Event]) -> Result<Vec<Vec<i64>>> {
+    let event_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Event)
+        .map(|field| usize::from(field.index))
+        .collect::<Vec<_>>();
+    let repeated_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Repeated)
+        .map(|field| usize::from(field.index))
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for event in events {
+        if event.event_values.len() != event_slots.len()
+            || event
+                .children
+                .iter()
+                .any(|child| child.len() != repeated_slots.len())
+        {
+            return Err(AuraError::InvalidValue("event field count"));
+        }
+        for child in &event.children {
+            let mut row = vec![0i64; schema.fields.len()];
+            for (slot, value) in event_slots.iter().copied().zip(&event.event_values) {
+                row[slot] = *value;
+            }
+            for (slot, value) in repeated_slots.iter().copied().zip(child) {
+                row[slot] = *value;
+            }
+            rows.push(row);
+        }
+    }
+    validate_rows(schema, &rows)?;
+    Ok(rows)
+}
+
 pub fn compile_i64_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
     crate::writer::compile_i64(bytes, target_profile)
+}
+
+/// Compile a typed file containing flat `Opaque16` fields into Aura0 or Aura1.
+///
+/// Opaque values remain one logical field and are encoded by the generic UUID
+/// constant-mask operation in Aura0 and one final 16-byte slot in Aura1. Wide
+/// arithmetic (`I128`) and repeated-field schemas remain unsupported until they
+/// have an exact typed reconstruction path of their own.
+pub fn compile_typed_file(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
+    if !schema_has_wide_fields_from_sealed_file(bytes)? {
+        return compile_i64_file(bytes, target_profile);
+    }
+    compile_typed_file_inner(bytes, target_profile)
 }
 
 pub fn compile_i64_file_with_aura0_profile(
@@ -609,6 +814,9 @@ pub(crate) fn compile_i64_file_inner(bytes: &[u8], target_profile: Profile) -> R
     if target_profile == Profile::Ingest {
         return Err(AuraError::InvalidValue("target profile"));
     }
+    if let Some(compiled) = try_compile_explicit_i64_events(bytes, target_profile)? {
+        return Ok(compiled);
+    }
     let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
     let total_start = Instant::now();
     let stage_start = Instant::now();
@@ -685,6 +893,279 @@ pub(crate) fn compile_i64_file_inner(bytes: &[u8], target_profile: Profile) -> R
         );
     }
     Ok(out)
+}
+
+fn try_compile_explicit_i64_events(
+    bytes: &[u8],
+    target_profile: Profile,
+) -> Result<Option<Vec<u8>>> {
+    let metadata = decode_i64_file_metadata(bytes)?;
+    let plan = metadata
+        .ingest_footer
+        .as_ref()
+        .and_then(|footer| footer.generic_aura0_plan.clone())
+        .or_else(|| {
+            metadata
+                .compiled_footer
+                .as_ref()
+                .and_then(|footer| footer.generic_aura0_plan.clone())
+        });
+    let Some(plan) = plan else {
+        return Ok(None);
+    };
+    if explicit_event_group(&plan).is_none() {
+        return Ok(None);
+    }
+    if metadata.header.profile == target_profile {
+        return Ok(Some(bytes.to_vec()));
+    }
+    let full_body = &bytes[metadata.header_len..metadata.footer_start];
+    if metadata.header.profile == Profile::Aura0 {
+        let footer = metadata
+            .compiled_footer
+            .as_ref()
+            .ok_or(AuraError::InvalidValue("compiled footer"))?;
+        if aura0_semantic_body_len(footer, full_body.len())? == 0 {
+            let aura1 = decode_aura1_byte_lanes_from_body(full_body, footer, false)?;
+            decode_i64_events_file(&aura1)?;
+            return Ok(Some(aura1));
+        }
+    }
+    let events = match metadata.header.profile {
+        Profile::Ingest => {
+            let decoded = decode_generic_i64_events_body(
+                &metadata.schema,
+                plan.clone(),
+                full_body,
+                metadata.record_count,
+            )?;
+            decoded
+                .event_values
+                .into_iter()
+                .zip(decoded.children)
+                .map(|(event_values, children)| I64Event {
+                    event_values,
+                    children,
+                })
+                .collect::<Vec<_>>()
+        }
+        Profile::Aura0 => {
+            let footer = metadata
+                .compiled_footer
+                .as_ref()
+                .ok_or(AuraError::InvalidValue("compiled footer"))?;
+            let semantic_len = aura0_semantic_body_len(footer, full_body.len())?;
+            let decoded = decode_generic_i64_events_body(
+                &metadata.schema,
+                plan.clone(),
+                &full_body[..semantic_len],
+                metadata.record_count,
+            )?;
+            decoded
+                .event_values
+                .into_iter()
+                .zip(decoded.children)
+                .map(|(event_values, children)| I64Event {
+                    event_values,
+                    children,
+                })
+                .collect::<Vec<_>>()
+        }
+        Profile::Aura1 => {
+            let (fixed_body, sidecar) = split_explicit_event_sidecar(full_body, Some(&plan))?;
+            let footer = metadata
+                .compiled_footer
+                .as_ref()
+                .ok_or(AuraError::InvalidValue("compiled footer"))?;
+            let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+            let rows = decode_aura1_body(
+                fixed_body,
+                &aura1_plan,
+                metadata.record_count,
+                metadata.schema.fields.len(),
+            )?;
+            decode_explicit_event_sidecar(
+                &metadata.schema,
+                &rows,
+                sidecar.ok_or(AuraError::InvalidValue("explicit event sidecar"))?,
+            )?
+        }
+    };
+    let event_values = events
+        .iter()
+        .map(|event| event.event_values.clone())
+        .collect::<Vec<_>>();
+    let children = events
+        .iter()
+        .map(|event| event.children.clone())
+        .collect::<Vec<_>>();
+    let encoded = encode_generic_i64_events(&metadata.schema, &event_values, &children)?;
+    let compact_body = encode_generic_i64_rows_body(&encoded)?;
+    let rows = flatten_i64_events(&metadata.schema, &events)?;
+    let mut footer = if let Some(footer) = metadata.compiled_footer.clone() {
+        footer
+    } else {
+        compiled_footer_from_ingest_footer(
+            metadata
+                .ingest_footer
+                .as_ref()
+                .ok_or(AuraError::InvalidValue("ingest footer"))?,
+            metadata.record_count,
+        )?
+    };
+    footer.generic_aura0_plan = Some(encoded.plan);
+    let body = match target_profile {
+        Profile::Aura0 => compact_body,
+        Profile::Aura1 => {
+            let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+            let event_field_count = metadata
+                .schema
+                .fields
+                .iter()
+                .filter(|field| field.scope == FieldScope::Event)
+                .count();
+            append_explicit_event_sidecar(
+                encode_aura1_body(&rows, &aura1_plan)?,
+                &events,
+                event_field_count,
+            )?
+        }
+        Profile::Ingest => unreachable!(),
+    };
+    encode_compiled_file(
+        target_profile,
+        metadata.header.stream_id,
+        metadata.header.dictionary_id,
+        metadata.header.base_time_ns,
+        metadata.header.comment.as_str(),
+        body,
+        footer,
+    )
+    .map(Some)
+}
+
+fn compile_typed_file_inner(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
+    if target_profile == Profile::Ingest {
+        return Err(AuraError::InvalidValue("typed target profile"));
+    }
+    if sealed_profile(bytes)? == target_profile {
+        return Ok(bytes.to_vec());
+    }
+    let decoded = decode_typed_file_inner(bytes)?;
+    validate_flat_opaque16_schema(&decoded.schema)?;
+
+    let mut rows = Vec::with_capacity(decoded.rows.len());
+    for typed_row in &decoded.rows {
+        let mut row = Vec::with_capacity(typed_row.len());
+        for (field, value) in decoded.schema.fields.iter().zip(typed_row) {
+            row.push(match field.field_type {
+                FieldType::Opaque16 => 0,
+                FieldType::I128 => return Err(AuraError::InvalidValue("typed i128 compiled")),
+                _ => typed_value_i64_for_field(field.field_type, value)?,
+            });
+        }
+        rows.push(row);
+    }
+
+    let (body, generic_aura0_plan) = match target_profile {
+        Profile::Aura0 => encode_typed_aura0_body(&decoded.schema, &decoded.rows, &rows)?,
+        Profile::Aura1 => {
+            let plan = absolute_typed_field_plans(&decoded.schema, decoded.rows.len())?;
+            let body = encode_typed_aura1_body(&decoded.schema, &decoded.rows, &plan)?;
+            let generic_plan = decoded
+                .compiled_footer
+                .as_ref()
+                .and_then(|footer| footer.generic_aura0_plan.clone());
+            (body, generic_plan)
+        }
+        Profile::Ingest => unreachable!(),
+    };
+    let footer = compiled_typed_footer(&decoded.schema, decoded.rows.len(), generic_aura0_plan)?;
+    encode_compiled_file(
+        target_profile,
+        decoded.header.stream_id,
+        decoded.header.dictionary_id,
+        decoded.header.base_time_ns,
+        decoded.header.comment.as_str(),
+        body,
+        footer,
+    )
+}
+
+fn encode_typed_aura0_body(
+    schema: &SchemaDescriptor,
+    typed_rows: &[Vec<AuraTypedValue>],
+    placeholder_rows: &[Vec<i64>],
+) -> Result<(Vec<u8>, Option<GenericInstructionPlan>)> {
+    let mut encoded = encode_generic_i64_rows(schema, placeholder_rows)?;
+    if !encoded.plan.groups.is_empty() {
+        return Err(AuraError::InvalidValue("typed aura0 group plan"));
+    }
+    for field in schema
+        .fields
+        .iter()
+        .filter(|field| field.field_type == FieldType::Opaque16)
+    {
+        let instruction_indexes = encoded
+            .plan
+            .streams
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instruction)| {
+                (instruction.target_slot == Some(field.index)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if instruction_indexes.len() != 1 {
+            return Err(AuraError::InvalidValue("opaque16 stream"));
+        }
+        let instruction_index = instruction_indexes[0];
+        let stream_id = encoded.plan.streams[instruction_index].stream_id;
+        let values = typed_rows
+            .iter()
+            .map(|row| match row.get(usize::from(field.index)) {
+                Some(AuraTypedValue::Opaque16(value)) => Ok(u128::from_le_bytes(*value)),
+                _ => Err(AuraError::InvalidValue("typed value")),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let instruction = plan_uuid_const_mask_stream(stream_id, Some(field.index), &values)?;
+        let body = encode_generic_stream_body(&instruction, &GenericStreamBodyValue::U128(values))?;
+        encoded.plan.streams[instruction_index] = instruction;
+        let stream = encoded
+            .streams
+            .iter_mut()
+            .find(|stream| stream.stream_id == stream_id)
+            .ok_or(AuraError::InvalidValue("opaque16 stream"))?;
+        stream.value_count = typed_rows.len();
+        stream.body = body;
+    }
+    let body = encode_generic_i64_rows_body(&encoded)?;
+    Ok((body, Some(encoded.plan)))
+}
+
+fn compiled_typed_footer(
+    schema: &SchemaDescriptor,
+    record_count: usize,
+    generic_aura0_plan: Option<GenericInstructionPlan>,
+) -> Result<CompiledFooter> {
+    let field_plans = absolute_typed_field_plans(schema, record_count)?;
+    let aura0_plan = Aura0Plan {
+        fields: field_plans.clone(),
+    };
+    let aura1_plan = Aura1Plan {
+        block_capacity: 1,
+        fields: field_plans,
+    };
+    let mut footer = CompiledFooter::new(
+        schema.clone(),
+        u64::try_from(record_count).map_err(|_| AuraError::InvalidValue("record count"))?,
+        1,
+        DecodeProgram::from_aura0_plan(&aura0_plan, schema.fields.len())?,
+        DecodeProgram::from_aura1_plan(&aura1_plan, schema.fields.len())?,
+    )?;
+    if let Some(plan) = generic_aura0_plan {
+        footer = footer.with_generic_aura0_plan(plan);
+    }
+    Ok(footer)
 }
 
 fn try_compile_i64_fast(bytes: &[u8], target_profile: Profile) -> Result<Option<Vec<u8>>> {
@@ -775,6 +1256,9 @@ fn try_compile_aura0_to_aura1_fast(
     }
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
     validate_header_schema_agreement(&header, &footer.schema)?;
+    if compiled_footer_has_explicit_events(&footer) {
+        return Ok(None);
+    }
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
@@ -974,6 +1458,9 @@ fn try_compile_aura0_to_aura1_fast_guarded(
 
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
     validate_header_schema_agreement(&header, &footer.schema)?;
+    if compiled_footer_has_explicit_events(&footer) {
+        return Ok(None);
+    }
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
@@ -1091,6 +1578,9 @@ fn try_compile_aura0_to_aura1_fast_profiled(
     }
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
     validate_header_schema_agreement(&header, &footer.schema)?;
+    if compiled_footer_has_explicit_events(&footer) {
+        return Ok(None);
+    }
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
@@ -1366,6 +1856,9 @@ fn try_compile_aura1_to_aura0_direct_profiled(
     let metadata_start = Instant::now();
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
     validate_header_schema_agreement(&header, &footer.schema)?;
+    if compiled_footer_has_explicit_events(&footer) {
+        return Ok(None);
+    }
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
@@ -1528,6 +2021,94 @@ pub fn decode_i64_file(bytes: &[u8]) -> Result<DecodedI64File> {
     crate::reader::decode_i64(bytes)
 }
 
+pub fn decode_i64_events_file(bytes: &[u8]) -> Result<DecodedI64EventFile> {
+    let metadata = decode_i64_file_metadata(bytes)?;
+    let plan = metadata
+        .ingest_footer
+        .as_ref()
+        .and_then(|footer| footer.generic_aura0_plan.clone())
+        .or_else(|| {
+            metadata
+                .compiled_footer
+                .as_ref()
+                .and_then(|footer| footer.generic_aura0_plan.clone())
+        })
+        .ok_or(AuraError::InvalidValue("explicit event plan"))?;
+    if explicit_event_group(&plan).is_none() {
+        return Err(AuraError::InvalidValue("explicit event plan"));
+    }
+    let body = &bytes[metadata.header_len..metadata.footer_start];
+    if metadata.header.profile == Profile::Aura0 {
+        let footer = metadata
+            .compiled_footer
+            .as_ref()
+            .ok_or(AuraError::InvalidValue("compiled footer"))?;
+        if aura0_semantic_body_len(footer, body.len())? == 0 {
+            let aura1 = decode_aura1_byte_lanes_from_body(body, footer, false)?;
+            return decode_i64_events_file(&aura1);
+        }
+    }
+    let events = match metadata.header.profile {
+        Profile::Ingest => {
+            decode_compact_i64_events(&metadata.schema, plan, body, metadata.record_count)?
+        }
+        Profile::Aura0 => {
+            let footer = metadata
+                .compiled_footer
+                .as_ref()
+                .ok_or(AuraError::InvalidValue("compiled footer"))?;
+            let semantic_len = aura0_semantic_body_len(footer, body.len())?;
+            decode_compact_i64_events(
+                &metadata.schema,
+                plan,
+                &body[..semantic_len],
+                metadata.record_count,
+            )?
+        }
+        Profile::Aura1 => {
+            let (fixed_body, sidecar) = split_explicit_event_sidecar(body, Some(&plan))?;
+            let sidecar = sidecar.ok_or(AuraError::InvalidValue("explicit event sidecar"))?;
+            let footer = metadata
+                .compiled_footer
+                .as_ref()
+                .ok_or(AuraError::InvalidValue("compiled footer"))?;
+            let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+            let rows = decode_aura1_body(
+                fixed_body,
+                &aura1_plan,
+                metadata.record_count,
+                metadata.schema.fields.len(),
+            )?;
+            decode_explicit_event_sidecar(&metadata.schema, &rows, sidecar)?
+        }
+    };
+    Ok(DecodedI64EventFile {
+        header: metadata.header,
+        schema: metadata.schema,
+        ingest_footer: metadata.ingest_footer,
+        compiled_footer: metadata.compiled_footer,
+        events,
+    })
+}
+
+fn decode_compact_i64_events(
+    schema: &SchemaDescriptor,
+    plan: GenericInstructionPlan,
+    body: &[u8],
+    record_count: usize,
+) -> Result<Vec<I64Event>> {
+    let decoded = decode_generic_i64_events_body(schema, plan, body, record_count)?;
+    Ok(decoded
+        .event_values
+        .into_iter()
+        .zip(decoded.children)
+        .map(|(event_values, children)| I64Event {
+            event_values,
+            children,
+        })
+        .collect())
+}
+
 pub fn decode_i64_file_metadata(bytes: &[u8]) -> Result<DecodedI64FileMetadata> {
     if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
         return Err(AuraError::UnexpectedEof);
@@ -1687,13 +2268,19 @@ pub fn aura1_fixed_layout_info(bytes: &[u8]) -> Result<Aura1FixedLayoutInfo> {
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
+    if compiled_footer_has_explicit_events(&footer) {
+        decode_i64_events_file(bytes)?;
+    }
     let compiled_plan = CompiledAuraPlan::from_footer(&footer)?;
+    let physical_body = &bytes[header_len..footer_start];
+    let (fixed_body, _) =
+        split_explicit_event_sidecar(physical_body, footer.generic_aura0_plan.as_ref())?;
     Ok(Aura1FixedLayoutInfo {
         record_count: compiled_plan.record_count,
         field_count: compiled_plan.field_count,
         record_width: compiled_plan.aura1_record_width,
         body_offset: header_len,
-        body_bytes: footer_start - header_len,
+        body_bytes: fixed_body.len(),
         footer_offset: footer_start,
         output_size: bytes.len(),
         conversion_plan_hash: compiled_plan.conversion_plan_hash,
@@ -1735,9 +2322,18 @@ where
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
+    if compiled_footer_has_explicit_events(&footer) {
+        decode_i64_events_file(bytes)?;
+    }
     let compiled_plan = CompiledAuraPlan::from_footer(&footer)?;
+    let physical_body = &bytes[header_len..footer_start];
+    let (fixed_body, sidecar) =
+        split_explicit_event_sidecar(physical_body, footer.generic_aura0_plan.as_ref())?;
+    if compiled_footer_has_explicit_events(&footer) && sidecar.is_none() {
+        return Err(AuraError::InvalidValue("explicit event sidecar"));
+    }
     visit_aura1_body(
-        &bytes[header_len..footer_start],
+        fixed_body,
         &compiled_plan.aura1_plan,
         compiled_plan.record_count,
         compiled_plan.field_count,
@@ -1754,9 +2350,6 @@ pub fn visit_i64_rows_file_range<F>(
 where
     F: FnMut(&[i64]) -> Result<()>,
 {
-    if max_rows == 0 {
-        return Ok(0);
-    }
     if bytes.len() < LEGACY_HEADER_PREFIX_SIZE + FOOTER_LEN_SIZE + SEAL_MAGIC.len() {
         return Err(AuraError::UnexpectedEof);
     }
@@ -1787,6 +2380,9 @@ where
     validate_header_schema_agreement(&header, &footer.schema)?;
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
+    }
+    if compiled_footer_has_explicit_events(&footer) {
+        decode_i64_events_file(bytes)?;
     }
     let compiled_plan = CompiledAuraPlan::from_footer(&footer)?;
     if start_row > compiled_plan.record_count {
@@ -1853,7 +2449,20 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
             if schema_has_wide_fields(&footer.schema) {
                 return Err(AuraError::InvalidValue("i64 schema"));
             }
-            let rows = decode_raw_body(body)?;
+            let rows = if let Some(plan) = footer
+                .generic_aura0_plan
+                .clone()
+                .filter(|plan| explicit_event_group(plan).is_some())
+            {
+                decode_generic_i64_rows_body(
+                    plan,
+                    body,
+                    footer.stats.record_count as usize,
+                    footer.schema.fields.len(),
+                )?
+            } else {
+                decode_raw_body(body)?
+            };
             validate_rows(&footer.schema, &rows)?;
             Ok(DecodedI64File {
                 header,
@@ -1905,12 +2514,26 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
                 return Err(AuraError::InvalidValue("i64 schema"));
             }
             let plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+            let (fixed_body, event_sidecar) =
+                split_explicit_event_sidecar(body, footer.generic_aura0_plan.as_ref())?;
+            if footer
+                .generic_aura0_plan
+                .as_ref()
+                .and_then(explicit_event_group)
+                .is_some()
+                && event_sidecar.is_none()
+            {
+                return Err(AuraError::InvalidValue("explicit event sidecar"));
+            }
             let rows = decode_aura1_body(
-                body,
+                fixed_body,
                 &plan,
                 footer.record_count as usize,
                 footer.schema.fields.len(),
             )?;
+            if let Some(sidecar) = event_sidecar {
+                decode_explicit_event_sidecar(&footer.schema, &rows, sidecar)?;
+            }
             validate_rows(&footer.schema, &rows)?;
             Ok(DecodedI64File {
                 header,
@@ -1965,6 +2588,64 @@ pub(crate) fn decode_typed_file_inner(bytes: &[u8]) -> Result<DecodedTypedFile> 
                 rows,
             })
         }
+        Profile::Aura0
+            if schema_has_wide_fields_in_compiled_footer(
+                &bytes[footer_start..footer_len_offset],
+            )? =>
+        {
+            let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+            validate_header_schema_agreement(&header, &footer.schema)?;
+            validate_flat_opaque16_schema(&footer.schema)?;
+            let semantic_len = aura0_semantic_body_len(&footer, body.len())?;
+            if semantic_len == 0 {
+                return Err(AuraError::InvalidValue("typed aura0 semantic lane"));
+            }
+            let plan = footer
+                .generic_aura0_plan
+                .clone()
+                .ok_or(AuraError::InvalidValue("typed aura0 plan"))?;
+            let encoded = decode_generic_encoded_rows_body(
+                plan,
+                &body[..semantic_len],
+                usize::try_from(footer.record_count)
+                    .map_err(|_| AuraError::InvalidValue("record count"))?,
+                footer.schema.fields.len(),
+            )?;
+            let rows = decode_typed_generic_rows(&footer.schema, encoded)?;
+            validate_typed_rows(&footer.schema, &rows)?;
+            Ok(DecodedTypedFile {
+                header,
+                schema: footer.schema.clone(),
+                ingest_footer: None,
+                compiled_footer: Some(footer),
+                rows,
+            })
+        }
+        Profile::Aura1
+            if schema_has_wide_fields_in_compiled_footer(
+                &bytes[footer_start..footer_len_offset],
+            )? =>
+        {
+            let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
+            validate_header_schema_agreement(&header, &footer.schema)?;
+            validate_flat_opaque16_schema(&footer.schema)?;
+            let plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
+            let rows = decode_typed_aura1_body(
+                &footer.schema,
+                body,
+                &plan,
+                usize::try_from(footer.record_count)
+                    .map_err(|_| AuraError::InvalidValue("record count"))?,
+            )?;
+            validate_typed_rows(&footer.schema, &rows)?;
+            Ok(DecodedTypedFile {
+                header,
+                schema: footer.schema.clone(),
+                ingest_footer: None,
+                compiled_footer: Some(footer),
+                rows,
+            })
+        }
         Profile::Aura0 | Profile::Aura1 => {
             let decoded = decode_i64_file_inner(bytes)?;
             Ok(DecodedTypedFile {
@@ -1978,7 +2659,332 @@ pub(crate) fn decode_typed_file_inner(bytes: &[u8]) -> Result<DecodedTypedFile> 
     }
 }
 
+fn schema_has_wide_fields_in_compiled_footer(bytes: &[u8]) -> Result<bool> {
+    Ok(schema_has_wide_fields(
+        &CompiledFooter::decode(bytes)?.schema,
+    ))
+}
+
+fn decode_generic_encoded_rows_body(
+    plan: GenericInstructionPlan,
+    bytes: &[u8],
+    record_count: usize,
+    field_count: usize,
+) -> Result<GenericEncodedI64Rows> {
+    let mut reader = ByteReader::new(bytes);
+    let stream_count = usize::from(reader.read_u16_le()?);
+    let mut streams = Vec::with_capacity(stream_count);
+    for _ in 0..stream_count {
+        let stream_id = reader.read_u16_le()?;
+        let value_count = usize::try_from(reader.read_u64_le()?)
+            .map_err(|_| AuraError::InvalidValue("stream value count"))?;
+        let body_len = reader.read_u32_le()? as usize;
+        streams.push(GenericEncodedStream {
+            stream_id,
+            value_count,
+            body: reader.read_exact(body_len)?.to_vec(),
+        });
+    }
+    reader.finish()?;
+    Ok(GenericEncodedI64Rows {
+        plan,
+        streams,
+        record_count,
+        field_count,
+    })
+}
+
+fn decode_typed_generic_rows(
+    schema: &SchemaDescriptor,
+    mut encoded: GenericEncodedI64Rows,
+) -> Result<Vec<Vec<AuraTypedValue>>> {
+    validate_flat_opaque16_schema(schema)?;
+    let mut opaque_columns = Vec::new();
+    for field in schema
+        .fields
+        .iter()
+        .filter(|field| field.field_type == FieldType::Opaque16)
+    {
+        let instruction_indexes = encoded
+            .plan
+            .streams
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instruction)| {
+                (instruction.target_slot == Some(field.index)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if instruction_indexes.len() != 1 {
+            return Err(AuraError::InvalidValue("opaque16 stream"));
+        }
+        let instruction_index = instruction_indexes[0];
+        if !matches!(
+            encoded.plan.streams[instruction_index].op,
+            GenericStreamOp::UuidConstMask { .. }
+        ) {
+            return Err(AuraError::InvalidValue("opaque16 stream operation"));
+        }
+        let stream_id = encoded.plan.streams[instruction_index].stream_id;
+        let stream_index = encoded
+            .streams
+            .iter()
+            .position(|stream| stream.stream_id == stream_id)
+            .ok_or(AuraError::InvalidValue("opaque16 stream"))?;
+        if encoded.streams[stream_index].value_count != encoded.record_count {
+            return Err(AuraError::InvalidValue("opaque16 stream value count"));
+        }
+        let values = match decode_typed_uuid_stream(
+            &encoded.plan.streams[instruction_index],
+            &encoded.streams[stream_index],
+        )? {
+            GenericStreamBodyValue::U128(values) => values,
+            GenericStreamBodyValue::I64(_) => {
+                return Err(AuraError::InvalidValue("opaque16 stream body"));
+            }
+        };
+        opaque_columns.push((field.index, values));
+
+        let replacement = crate::instructions::GenericStreamInstruction {
+            stream_id,
+            target_slot: Some(field.index),
+            op: GenericStreamOp::FixedStep { base: 0, step: 0 },
+        };
+        encoded.streams[stream_index].body.clear();
+        encoded.plan.streams[instruction_index] = replacement;
+    }
+
+    if encoded
+        .plan
+        .streams
+        .iter()
+        .any(|instruction| matches!(instruction.op, GenericStreamOp::UuidConstMask { .. }))
+    {
+        return Err(AuraError::InvalidValue("opaque16 target slot"));
+    }
+    let mut rows = i64_rows_to_typed(decode_generic_i64_rows(&encoded)?);
+    for (slot, values) in opaque_columns {
+        for (row, value) in rows.iter_mut().zip(values) {
+            row[usize::from(slot)] = AuraTypedValue::Opaque16(value.to_le_bytes());
+        }
+    }
+    Ok(rows)
+}
+
+fn decode_typed_uuid_stream(
+    instruction: &crate::instructions::GenericStreamInstruction,
+    stream: &GenericEncodedStream,
+) -> Result<GenericStreamBodyValue> {
+    if matches!(
+        instruction.op,
+        GenericStreamOp::UuidConstMask {
+            constant_bits: 0,
+            variable_bits: 128
+        }
+    ) {
+        let mut reader = ByteReader::new(&stream.body);
+        if reader.read_exact(32)?.iter().any(|byte| *byte != 0) {
+            return Err(AuraError::InvalidValue("uuid bit mask"));
+        }
+        let mut values = Vec::with_capacity(stream.value_count);
+        for _ in 0..stream.value_count {
+            let bytes = reader.read_exact(16)?;
+            values.push(u128::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
+            ]));
+        }
+        reader.finish()?;
+        return Ok(GenericStreamBodyValue::U128(values));
+    }
+    decode_generic_stream_body(instruction, &stream.body, stream.value_count)
+}
+
 const FOOTER_LEN_SIZE: usize = 4;
+const EXPLICIT_EVENT_SIDECAR_MAGIC: &[u8; 4] = b"AUEV";
+const EXPLICIT_EVENT_SIDECAR_TRAILER: usize = 12;
+
+fn append_explicit_event_sidecar(
+    mut body: Vec<u8>,
+    events: &[I64Event],
+    event_field_count: usize,
+) -> Result<Vec<u8>> {
+    let mut sidecar = Vec::new();
+    encode_varint_u64(
+        u64::try_from(events.len()).map_err(|_| AuraError::InvalidValue("event count"))?,
+        &mut sidecar,
+    );
+    encode_varint_u64(
+        u64::try_from(event_field_count)
+            .map_err(|_| AuraError::InvalidValue("event field count"))?,
+        &mut sidecar,
+    );
+    for event in events {
+        if event.event_values.len() != event_field_count {
+            return Err(AuraError::InvalidValue("event field count"));
+        }
+        encode_varint_u64(
+            u64::try_from(event.children.len())
+                .map_err(|_| AuraError::InvalidValue("child count"))?,
+            &mut sidecar,
+        );
+    }
+    // Nonempty event headers are already present on their first fixed Aura1
+    // child row. Store only headers that otherwise have no physical row.
+    for event in events.iter().filter(|event| event.children.is_empty()) {
+        for value in &event.event_values {
+            encode_varint_i64(*value, &mut sidecar);
+        }
+    }
+    body.extend_from_slice(&sidecar);
+    put_u64_le(
+        &mut body,
+        u64::try_from(sidecar.len())
+            .map_err(|_| AuraError::InvalidValue("explicit event sidecar length"))?,
+    );
+    body.extend_from_slice(EXPLICIT_EVENT_SIDECAR_MAGIC);
+    Ok(body)
+}
+
+fn decode_explicit_event_sidecar(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<i64>],
+    sidecar: &[u8],
+) -> Result<Vec<I64Event>> {
+    let mut reader = ByteReader::new(sidecar);
+    let event_count = usize::try_from(decode_varint_u64(&mut reader)?)
+        .map_err(|_| AuraError::InvalidValue("event count"))?;
+    let event_field_count = usize::try_from(decode_varint_u64(&mut reader)?)
+        .map_err(|_| AuraError::InvalidValue("event field count"))?;
+    let event_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Event)
+        .map(|field| usize::from(field.index))
+        .collect::<Vec<_>>();
+    let repeated_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Repeated)
+        .map(|field| usize::from(field.index))
+        .collect::<Vec<_>>();
+    if event_field_count != event_slots.len() {
+        return Err(AuraError::InvalidValue("event field count"));
+    }
+    if event_count > reader.remaining() {
+        return Err(AuraError::InvalidValue("event count"));
+    }
+    let mut counts = Vec::new();
+    counts
+        .try_reserve(event_count)
+        .map_err(|_| AuraError::InvalidValue("event count"))?;
+    for _ in 0..event_count {
+        counts.push(
+            usize::try_from(decode_varint_u64(&mut reader)?)
+                .map_err(|_| AuraError::InvalidValue("child count"))?,
+        );
+    }
+    let mut cursor = 0usize;
+    let mut events = Vec::new();
+    events
+        .try_reserve(event_count)
+        .map_err(|_| AuraError::InvalidValue("event count"))?;
+    for count in counts {
+        let end = cursor
+            .checked_add(count)
+            .ok_or(AuraError::InvalidValue("child count"))?;
+        if end > rows.len() {
+            return Err(AuraError::InvalidValue("child count"));
+        }
+        let event_values = if count == 0 {
+            (0..event_field_count)
+                .map(|_| decode_varint_i64(&mut reader))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            event_slots
+                .iter()
+                .map(|slot| {
+                    rows[cursor]
+                        .get(*slot)
+                        .copied()
+                        .ok_or(AuraError::InvalidValue("event slot"))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        for row in &rows[cursor..end] {
+            for (event_index, slot) in event_slots.iter().copied().enumerate() {
+                if row.get(slot).copied() != Some(event_values[event_index]) {
+                    return Err(AuraError::InvalidValue("event value mismatch"));
+                }
+            }
+        }
+        let children = rows[cursor..end]
+            .iter()
+            .map(|row| {
+                repeated_slots
+                    .iter()
+                    .map(|slot| {
+                        row.get(*slot)
+                            .copied()
+                            .ok_or(AuraError::InvalidValue("repeated slot"))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        events.push(I64Event {
+            event_values,
+            children,
+        });
+        cursor = end;
+    }
+    if cursor != rows.len() {
+        return Err(AuraError::InvalidValue("child count"));
+    }
+    reader.finish()?;
+    Ok(events)
+}
+
+pub(crate) fn split_explicit_event_sidecar<'a>(
+    body: &'a [u8],
+    plan: Option<&GenericInstructionPlan>,
+) -> Result<(&'a [u8], Option<&'a [u8]>)> {
+    if plan.and_then(explicit_event_group).is_none() {
+        return Ok((body, None));
+    }
+    if body.len() < EXPLICIT_EVENT_SIDECAR_TRAILER
+        || &body[body.len() - EXPLICIT_EVENT_SIDECAR_MAGIC.len()..] != EXPLICIT_EVENT_SIDECAR_MAGIC
+    {
+        return Ok((body, None));
+    }
+    let length_offset = body.len() - EXPLICIT_EVENT_SIDECAR_TRAILER;
+    let length_bytes = &body[length_offset..length_offset + 8];
+    let sidecar_len = usize::try_from(u64::from_le_bytes([
+        length_bytes[0],
+        length_bytes[1],
+        length_bytes[2],
+        length_bytes[3],
+        length_bytes[4],
+        length_bytes[5],
+        length_bytes[6],
+        length_bytes[7],
+    ]))
+    .map_err(|_| AuraError::InvalidValue("explicit event sidecar length"))?;
+    let sidecar_start = length_offset
+        .checked_sub(sidecar_len)
+        .ok_or(AuraError::UnexpectedEof)?;
+    Ok((
+        &body[..sidecar_start],
+        Some(&body[sidecar_start..length_offset]),
+    ))
+}
+
+pub(crate) fn compiled_footer_has_explicit_events(footer: &CompiledFooter) -> bool {
+    footer
+        .generic_aura0_plan
+        .as_ref()
+        .and_then(explicit_event_group)
+        .is_some()
+}
 const MAX_VISITOR_FIELDS: usize = 64;
 
 struct CompiledFileParts<'a> {
@@ -2162,21 +3168,20 @@ fn decode_aura1_byte_lanes_from_descriptors(
         let compressed = body
             .get(compressed_start..compressed_end)
             .ok_or(AuraError::UnexpectedEof)?;
-        let decoded = decode_aura1_byte_lane_payload(lane, compressed)?;
         let expected_len = usize::try_from(lane.uncompressed_len)
             .map_err(|_| AuraError::InvalidValue("byte lane length"))?;
-        if decoded.len() != expected_len {
-            return Err(AuraError::InvalidValue("byte lane length"));
-        }
-        if validate_checksum {
-            validate_aura1_byte_lane_checksum(lane, &decoded)?;
-        }
         let output_start = usize::try_from(lane.aura1_output_offset)
             .map_err(|_| AuraError::InvalidValue("byte lane offset"))?;
         let output_end = output_start
-            .checked_add(decoded.len())
+            .checked_add(expected_len)
             .ok_or(AuraError::UnexpectedEof)?;
-        output[output_start..output_end].copy_from_slice(&decoded);
+        let decoded = output
+            .get_mut(output_start..output_end)
+            .ok_or(AuraError::UnexpectedEof)?;
+        decode_aura1_byte_lane_payload_into(lane, compressed, decoded)?;
+        if validate_checksum {
+            validate_aura1_byte_lane_checksum(lane, decoded)?;
+        }
     }
     Ok(output)
 }
@@ -2185,16 +3190,51 @@ fn decode_aura1_byte_lane_payload(
     lane: &Aura1ByteLaneDescriptor,
     compressed: &[u8],
 ) -> Result<Vec<u8>> {
+    let expected_len = usize::try_from(lane.uncompressed_len)
+        .map_err(|_| AuraError::InvalidValue("byte lane length"))?;
+    let mut decoded = vec![0u8; expected_len];
+    decode_aura1_byte_lane_payload_into(lane, compressed, &mut decoded)?;
+    Ok(decoded)
+}
+
+fn decode_aura1_byte_lane_payload_into(
+    lane: &Aura1ByteLaneDescriptor,
+    compressed: &[u8],
+    decoded: &mut [u8],
+) -> Result<()> {
     match (lane.codec_id, lane.codec_level) {
-        (BYTE_LANE_CODEC_RAW, 0) => Ok(compressed.to_vec()),
-        (BYTE_LANE_CODEC_LZ4, 0) => lz4_flex::decompress_size_prepended(compressed)
-            .map_err(|_| AuraError::InvalidValue("byte lane lz4")),
-        (BYTE_LANE_CODEC_ZSTD, 1 | 3 | 9) => {
-            zstd::stream::decode_all(std::io::Cursor::new(compressed))
-                .map_err(|_| AuraError::InvalidValue("byte lane zstd"))
+        (BYTE_LANE_CODEC_RAW, 0) => {
+            if compressed.len() != decoded.len() {
+                return Err(AuraError::InvalidValue("byte lane length"));
+            }
+            decoded.copy_from_slice(compressed);
         }
-        _ => Err(AuraError::InvalidValue("byte lane codec")),
+        (BYTE_LANE_CODEC_LZ4, 0) => {
+            let size = compressed
+                .get(..4)
+                .ok_or(AuraError::InvalidValue("byte lane lz4"))?;
+            let stamped_len =
+                usize::try_from(u32::from_le_bytes([size[0], size[1], size[2], size[3]]))
+                    .map_err(|_| AuraError::InvalidValue("byte lane length"))?;
+            if stamped_len != decoded.len() {
+                return Err(AuraError::InvalidValue("byte lane length"));
+            }
+            let written = lz4_flex::block::decompress_into(&compressed[4..], decoded)
+                .map_err(|_| AuraError::InvalidValue("byte lane lz4"))?;
+            if written != decoded.len() {
+                return Err(AuraError::InvalidValue("byte lane length"));
+            }
+        }
+        (BYTE_LANE_CODEC_ZSTD, 1 | 3 | 9) => {
+            let written = zstd::bulk::decompress_to_buffer(compressed, decoded)
+                .map_err(|_| AuraError::InvalidValue("byte lane zstd"))?;
+            if written != decoded.len() {
+                return Err(AuraError::InvalidValue("byte lane length"));
+            }
+        }
+        _ => return Err(AuraError::InvalidValue("byte lane codec")),
     }
+    Ok(())
 }
 
 fn try_decode_aura1_byte_lane_from_footer_tail(
@@ -2686,6 +3726,56 @@ fn encode_typed_body(schema: &SchemaDescriptor, rows: &[Vec<AuraTypedValue>]) ->
     Ok(out)
 }
 
+fn encode_typed_aura1_body(
+    schema: &SchemaDescriptor,
+    rows: &[Vec<AuraTypedValue>],
+    plan: &[PhysicalFieldPlan],
+) -> Result<Vec<u8>> {
+    if plan.len() != schema.fields.len() {
+        return Err(AuraError::InvalidValue("program field count"));
+    }
+    let record_width = plan.iter().try_fold(0usize, |width, field| {
+        width
+            .checked_add(usize::from(field.width.byte_width()))
+            .ok_or(AuraError::InvalidValue("body length"))
+    })?;
+    let mut out = Vec::with_capacity(
+        rows.len()
+            .checked_mul(record_width)
+            .ok_or(AuraError::InvalidValue("body length"))?,
+    );
+    for row in rows {
+        for field_plan in plan {
+            if field_plan.encoding != FieldEncoding::Absolute {
+                return Err(AuraError::InvalidValue("typed aura1 field encoding"));
+            }
+            let field = schema
+                .fields
+                .get(usize::from(field_plan.field_index))
+                .ok_or(AuraError::InvalidValue("field index"))?;
+            let value = row
+                .get(usize::from(field.index))
+                .ok_or(AuraError::InvalidValue("record field count"))?;
+            match (field.field_type, value) {
+                (FieldType::Opaque16, AuraTypedValue::Opaque16(value)) => {
+                    if field_plan.width != PhysicalWidth::I128 {
+                        return Err(AuraError::InvalidValue("opaque16 physical width"));
+                    }
+                    out.extend_from_slice(value);
+                }
+                (FieldType::Opaque16, _) => return Err(AuraError::InvalidValue("typed value")),
+                (FieldType::I128, _) => return Err(AuraError::InvalidValue("typed i128 aura1")),
+                (_, value) => write_i64_width(
+                    &mut out,
+                    typed_value_i64_for_field(field.field_type, value)?,
+                    field_plan.width,
+                )?,
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn decode_raw_body(bytes: &[u8]) -> Result<Vec<Vec<i64>>> {
     let mut reader = ByteReader::new(bytes);
     let record_count = reader.read_u64_le()? as usize;
@@ -2732,6 +3822,49 @@ fn decode_typed_body(schema: &SchemaDescriptor, bytes: &[u8]) -> Result<Vec<Vec<
                 }
                 _ => AuraTypedValue::I64(reader.read_i64_le()?),
             });
+        }
+        rows.push(row);
+    }
+    reader.finish()?;
+    Ok(rows)
+}
+
+fn decode_typed_aura1_body(
+    schema: &SchemaDescriptor,
+    bytes: &[u8],
+    plan: &Aura1Plan,
+    record_count: usize,
+) -> Result<Vec<Vec<AuraTypedValue>>> {
+    if plan.fields.len() != schema.fields.len() {
+        return Err(AuraError::InvalidValue("program field count"));
+    }
+    let mut reader = ByteReader::new(bytes);
+    let mut rows = Vec::with_capacity(record_count);
+    for _ in 0..record_count {
+        let mut row = vec![AuraTypedValue::I64(0); schema.fields.len()];
+        for field_plan in &plan.fields {
+            if field_plan.encoding != FieldEncoding::Absolute {
+                return Err(AuraError::InvalidValue("typed aura1 field encoding"));
+            }
+            let field = schema
+                .fields
+                .get(usize::from(field_plan.field_index))
+                .ok_or(AuraError::InvalidValue("field index"))?;
+            row[usize::from(field.index)] = match field.field_type {
+                FieldType::Opaque16 => {
+                    if field_plan.width != PhysicalWidth::I128 {
+                        return Err(AuraError::InvalidValue("opaque16 physical width"));
+                    }
+                    let bytes = reader.read_exact(16)?;
+                    AuraTypedValue::Opaque16([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+                        bytes[14], bytes[15],
+                    ])
+                }
+                FieldType::I128 => return Err(AuraError::InvalidValue("typed i128 aura1")),
+                _ => AuraTypedValue::I64(read_i64_width(&mut reader, field_plan.width)?),
+            };
         }
         rows.push(row);
     }
@@ -4016,8 +5149,192 @@ fn schema_has_wide_fields(schema: &SchemaDescriptor) -> bool {
         .any(|field| matches!(field.field_type, FieldType::I128 | FieldType::Opaque16))
 }
 
+fn schema_has_wide_fields_from_sealed_file(bytes: &[u8]) -> Result<bool> {
+    let profile = sealed_profile(bytes)?;
+    let offsets = parse_sealed_file_offsets(bytes, profile)?;
+    let schema = match profile {
+        Profile::Ingest => {
+            let footer =
+                AuraFooter::decode(&bytes[offsets.footer_start..offsets.footer_len_offset])?;
+            validate_header_schema_agreement(&offsets.header, &footer.schema)?;
+            footer.schema
+        }
+        Profile::Aura0 | Profile::Aura1 => {
+            let footer =
+                CompiledFooter::decode(&bytes[offsets.footer_start..offsets.footer_len_offset])?;
+            validate_header_schema_agreement(&offsets.header, &footer.schema)?;
+            footer.schema
+        }
+    };
+    Ok(schema_has_wide_fields(&schema))
+}
+
+fn validate_flat_opaque16_schema(schema: &SchemaDescriptor) -> Result<()> {
+    if schema
+        .fields
+        .iter()
+        .any(|field| field.scope != FieldScope::Event)
+    {
+        return Err(AuraError::InvalidValue("typed compiled repeated field"));
+    }
+    if schema.fields.iter().any(|field| field.nullable) {
+        return Err(AuraError::InvalidValue("typed compiled nullable field"));
+    }
+    if schema
+        .fields
+        .iter()
+        .any(|field| field.field_type == FieldType::I128)
+    {
+        return Err(AuraError::InvalidValue("typed i128 compiled"));
+    }
+    let opaque_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.field_type == FieldType::Opaque16)
+        .map(|field| field.index)
+        .collect::<Vec<_>>();
+    if opaque_slots.is_empty() {
+        return Err(AuraError::InvalidValue("typed opaque16 schema"));
+    }
+    if schema.derived_expressions.iter().any(|expression| {
+        opaque_slots.contains(&expression.output_slot)
+            || expression
+                .input_slots
+                .iter()
+                .any(|slot| opaque_slots.contains(slot))
+    }) {
+        return Err(AuraError::InvalidValue("opaque16 derived expression"));
+    }
+    Ok(())
+}
+
+fn absolute_typed_field_plans(
+    schema: &SchemaDescriptor,
+    record_count: usize,
+) -> Result<Vec<PhysicalFieldPlan>> {
+    schema
+        .fields
+        .iter()
+        .map(|field| {
+            let width = match field.field_type {
+                FieldType::I8 => PhysicalWidth::I8,
+                FieldType::U8 | FieldType::I16 => PhysicalWidth::I16,
+                FieldType::U16 | FieldType::I32 => PhysicalWidth::I32,
+                FieldType::U32 => PhysicalWidth::I64,
+                FieldType::I64 | FieldType::U64 | FieldType::TimestampNs => PhysicalWidth::I64,
+                FieldType::I128 | FieldType::Opaque16 => PhysicalWidth::I128,
+            };
+            Ok(PhysicalFieldPlan {
+                field_index: field.index,
+                encoding: FieldEncoding::Absolute,
+                width,
+                bit_width: 0,
+                reference_field_index: None,
+                base_value: 0,
+                step: 0,
+                estimated_bytes: u64::try_from(record_count)
+                    .map_err(|_| AuraError::InvalidValue("record count"))?
+                    .saturating_mul(u64::from(width.byte_width())),
+            })
+        })
+        .collect()
+}
+
 fn put_u16_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> {
     let len = u16::try_from(len).map_err(|_| AuraError::InvalidValue(name))?;
     put_u16_le(out, len);
     Ok(())
+}
+
+#[cfg(test)]
+mod byte_lane_tests {
+    use super::*;
+
+    #[test]
+    fn typed_uuid_decoder_rejects_uuid_stream_targeting_numeric_slot() {
+        let schema = crate::schema::SchemaBuilder::new("malformed_uuid_target")
+            .field("price", FieldType::I64, FieldRole::Price)
+            .field("exec_id", FieldType::Opaque16, FieldRole::Identifier)
+            .finish()
+            .unwrap();
+        let uuid = plan_uuid_const_mask_stream(0, Some(0), &[1]).unwrap();
+        let opaque_placeholder = crate::instructions::GenericStreamInstruction {
+            stream_id: 1,
+            target_slot: Some(1),
+            op: GenericStreamOp::FixedStep { base: 0, step: 0 },
+        };
+        let encoded = GenericEncodedI64Rows {
+            plan: GenericInstructionPlan {
+                streams: vec![uuid.clone(), opaque_placeholder.clone()],
+                groups: Vec::new(),
+            },
+            streams: vec![
+                GenericEncodedStream {
+                    stream_id: 0,
+                    value_count: 1,
+                    body: encode_generic_stream_body(&uuid, &GenericStreamBodyValue::U128(vec![1]))
+                        .unwrap(),
+                },
+                GenericEncodedStream {
+                    stream_id: 1,
+                    value_count: 1,
+                    body: encode_generic_stream_body(
+                        &opaque_placeholder,
+                        &GenericStreamBodyValue::I64(vec![0]),
+                    )
+                    .unwrap(),
+                },
+            ],
+            record_count: 1,
+            field_count: 2,
+        };
+
+        assert!(decode_typed_generic_rows(&schema, encoded).is_err());
+    }
+
+    #[test]
+    fn mixed_byte_lanes_decode_into_exact_output_ranges() {
+        let left = b"left-";
+        let right = b"right";
+        let left_compressed = lz4_flex::compress_prepend_size(left);
+        let right_compressed = zstd::bulk::compress(right, 3).unwrap();
+        let mut body = left_compressed.clone();
+        body.extend_from_slice(&right_compressed);
+
+        let lanes = [
+            Aura1ByteLaneDescriptor {
+                lane_version: AURA1_BYTE_LANE_VERSION,
+                codec_id: BYTE_LANE_CODEC_LZ4,
+                codec_level: 0,
+                block_index: 0,
+                row_start: 0,
+                row_count: 1,
+                aura1_output_offset: 0,
+                uncompressed_len: left.len() as u64,
+                compressed_offset: 0,
+                compressed_len: left_compressed.len() as u64,
+                checksum_kind: BYTE_LANE_CHECKSUM_BYTE_GUARD,
+                checksum: bytes_guard_value(left),
+                flags: 0,
+            },
+            Aura1ByteLaneDescriptor {
+                lane_version: AURA1_BYTE_LANE_VERSION,
+                codec_id: BYTE_LANE_CODEC_ZSTD,
+                codec_level: 3,
+                block_index: 1,
+                row_start: 1,
+                row_count: 1,
+                aura1_output_offset: left.len() as u64,
+                uncompressed_len: right.len() as u64,
+                compressed_offset: left_compressed.len() as u64,
+                compressed_len: right_compressed.len() as u64,
+                checksum_kind: BYTE_LANE_CHECKSUM_BYTE_GUARD,
+                checksum: bytes_guard_value(right),
+                flags: 0,
+            },
+        ];
+
+        let decoded = decode_aura1_byte_lanes_from_descriptors(&body, &lanes, true).unwrap();
+        assert_eq!(b"left-right", decoded.as_slice());
+    }
 }

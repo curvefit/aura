@@ -608,7 +608,7 @@ pub enum SchemaMapHint {
     Parent { parent_index: u16 },
     Timestamp,
     DerivedExpression { expression_index: u8 },
-    DualDomainGroup,
+    DualDomainGroup { width: u8 },
     Group { width: u8 },
     Boolean { bits: u8 },
     Enum { bits: u8 },
@@ -711,7 +711,7 @@ impl I64SchemaDefinition {
     }
 
     pub fn from_field_names(name: &str, field_names: &[&str], parent_slots: &[u8]) -> Result<Self> {
-        if field_names.len() != parent_slots.len() {
+        if field_names.len() != decode_schema_map(parent_slots)?.len() {
             return Err(AuraError::InvalidValue("schema field names"));
         }
         Self::new(name, field_names.join(","), parent_slots)
@@ -994,9 +994,11 @@ pub fn generic_i64_schema(
 /// A byte of `100` marks the timestamp slot, normally at slot 0. If no
 /// timestamp marker is present, the schema is treated as non-time-series data.
 /// `0` means root, `1..99` means parent slot `value - 1`, `101..199`
-/// references a header-declared derived expression `value - 100`, `201..239`
-/// marks a repeated group width, `241..243` mark compact leaf types, and `255`
-/// marks an opaque do-not-attempt slot.
+/// references a header-declared derived expression `value - 100`, `200`
+/// marks the immediately following repeated group as dual-domain without
+/// consuming a logical field, `201..239` marks a repeated group width,
+/// `241..243` marks compact leaf types, and `255` marks an opaque
+/// do-not-attempt slot.
 pub fn generic_i64_parent_schema(name: &str, parent_slots: &[u8]) -> Result<SchemaDescriptor> {
     let entries = decode_schema_map(parent_slots)?;
     if entries.len() > u16::MAX as usize {
@@ -1045,10 +1047,25 @@ pub fn decode_schema_map(parent_slots: &[u8]) -> Result<Vec<SchemaMapEntry>> {
     let mut entries = Vec::with_capacity(parent_slots.len());
     let mut time_slot = None;
     let mut repeated_until = None;
-    for (field_index, parent_slot) in parent_slots.iter().copied().enumerate() {
+    let mut dual_domain_group = false;
+    for (raw_index, parent_slot) in parent_slots.iter().copied().enumerate() {
+        let in_group = repeated_until.is_some_and(|end| raw_index < end);
+        if parent_slot == SCHEMA_MAP_DUAL_DOMAIN_GROUP {
+            if dual_domain_group
+                || in_group
+                || !parent_slots
+                    .get(raw_index + 1)
+                    .is_some_and(|next| matches!(*next, 201..=SCHEMA_MAP_GROUP_MAX))
+            {
+                return Err(AuraError::InvalidValue("dual-domain group"));
+            }
+            dual_domain_group = true;
+            continue;
+        }
+
+        let field_index = entries.len();
         let field_index_u16 =
             u16::try_from(field_index).map_err(|_| AuraError::InvalidValue("field index"))?;
-        let in_group = repeated_until.is_some_and(|end| field_index < end);
         let entry = match parent_slot {
             SCHEMA_MAP_TIME_SLOT => {
                 if time_slot.replace(field_index).is_some() || field_index != 0 {
@@ -1095,17 +1112,9 @@ pub fn decode_schema_map(parent_slots: &[u8]) -> Result<Vec<SchemaMapEntry>> {
                     expression_index: parent_slot - SCHEMA_MAP_DERIVED_EXPR_BASE,
                 },
             },
-            SCHEMA_MAP_DUAL_DOMAIN_GROUP => SchemaMapEntry {
-                field_index: field_index_u16,
-                raw_byte: parent_slot,
-                scope: FieldScope::Repeated,
-                is_timestamp: false,
-                relation: FieldRelation::None,
-                hint: SchemaMapHint::DualDomainGroup,
-            },
             201..=SCHEMA_MAP_GROUP_MAX => {
                 let width = parent_slot - SCHEMA_MAP_GROUP_BASE;
-                let end = field_index
+                let end = raw_index
                     .checked_add(usize::from(width))
                     .ok_or(AuraError::InvalidValue("group width"))?;
                 if end > parent_slots.len() {
@@ -1113,13 +1122,19 @@ pub fn decode_schema_map(parent_slots: &[u8]) -> Result<Vec<SchemaMapEntry>> {
                 }
                 repeated_until =
                     Some(repeated_until.map_or(end, |current: usize| current.max(end)));
+                let hint = if dual_domain_group {
+                    dual_domain_group = false;
+                    SchemaMapHint::DualDomainGroup { width }
+                } else {
+                    SchemaMapHint::Group { width }
+                };
                 SchemaMapEntry {
                     field_index: field_index_u16,
                     raw_byte: parent_slot,
                     scope: FieldScope::Repeated,
                     is_timestamp: false,
                     relation: FieldRelation::None,
-                    hint: SchemaMapHint::Group { width },
+                    hint,
                 }
             }
             SCHEMA_MAP_BOOL_1BIT => leaf_entry(
@@ -1149,6 +1164,9 @@ pub fn decode_schema_map(parent_slots: &[u8]) -> Result<Vec<SchemaMapEntry>> {
             _ => return Err(AuraError::InvalidValue("schema map byte")),
         };
         entries.push(entry);
+    }
+    if dual_domain_group {
+        return Err(AuraError::InvalidValue("dual-domain group"));
     }
     Ok(entries)
 }
@@ -1530,6 +1548,47 @@ fn validate_schema_derived_expressions(
                 return Err(AuraError::InvalidValue("derived expression input"));
             }
         }
+        if expression.op == DerivedExpressionOp::PreviousSnapshotSameKeyResidual
+            && (fields[usize::from(expression.output_slot)].scope != FieldScope::Repeated
+                || expression.input_slots.iter().any(|input_slot| {
+                    fields[usize::from(*input_slot)].scope != FieldScope::Repeated
+                        || *input_slot == expression.output_slot
+                })
+                || expression
+                    .input_slots
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != expression.input_slots.len())
+        {
+            return Err(AuraError::InvalidValue(
+                "previous snapshot same-key expression",
+            ));
+        }
+        if matches!(
+            expression.op,
+            DerivedExpressionOp::PreviousMutationSameKeyResidual
+                | DerivedExpressionOp::PreviousOutputByKeyResidual
+        ) && (fields[usize::from(expression.output_slot)].scope != FieldScope::Repeated
+            || expression.input_slots.len() < 2
+            || fields[usize::from(expression.input_slots[0])].scope != FieldScope::Event
+            || expression.input_slots[1..].iter().any(|input_slot| {
+                fields[usize::from(*input_slot)].scope != FieldScope::Repeated
+                    || *input_slot == expression.output_slot
+            })
+            || expression
+                .input_slots
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != expression.input_slots.len())
+        {
+            return Err(AuraError::InvalidValue(
+                "previous mutation same-key expression",
+            ));
+        }
     }
 
     if let Some(compact_schema_map) = compact_schema_map {
@@ -1553,6 +1612,14 @@ fn validate_expression_shape(expression: &DerivedExpression) -> Result<()> {
                 return Err(AuraError::InvalidValue("derived expression inputs"));
             }
         }
+        DerivedExpressionOp::MulDiv => {
+            if expression.input_slots.is_empty()
+                || expression.literals.len() != 1
+                || expression.literals[0] == 0
+            {
+                return Err(AuraError::InvalidValue("derived expression inputs"));
+            }
+        }
         DerivedExpressionOp::AddResidual
         | DerivedExpressionOp::SubtractResidual
         | DerivedExpressionOp::FirstOffsetThenDelta => {
@@ -1562,6 +1629,17 @@ fn validate_expression_shape(expression: &DerivedExpression) -> Result<()> {
         }
         DerivedExpressionOp::MaxPlusResidual | DerivedExpressionOp::MinMinusResidual => {
             if expression.input_slots.is_empty() || !expression.literals.is_empty() {
+                return Err(AuraError::InvalidValue("derived expression inputs"));
+            }
+        }
+        DerivedExpressionOp::PreviousSnapshotSameKeyResidual => {
+            if expression.input_slots.is_empty() || !expression.literals.is_empty() {
+                return Err(AuraError::InvalidValue("derived expression inputs"));
+            }
+        }
+        DerivedExpressionOp::PreviousMutationSameKeyResidual
+        | DerivedExpressionOp::PreviousOutputByKeyResidual => {
+            if expression.input_slots.len() < 2 || !expression.literals.is_empty() {
                 return Err(AuraError::InvalidValue("derived expression inputs"));
             }
         }

@@ -22,7 +22,9 @@ pub fn unsigned_bitpack_width(value: u64) -> u8 {
 }
 
 pub fn bitpacked_byte_len(value_count: u64, bit_width: u8) -> u64 {
-    (value_count * u64::from(bit_width)).div_ceil(8)
+    value_count
+        .checked_mul(u64::from(bit_width))
+        .map_or(u64::MAX, |bits| bits.div_ceil(8))
 }
 
 pub fn pack_signed_values(values: &[i64], bit_width: u8) -> Result<Vec<u8>> {

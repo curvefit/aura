@@ -1,10 +1,13 @@
 use aura_codec::reader;
 use aura_codec::records::{
-    self, Aura0ByteLaneCodec, Aura0ByteLaneUse, Aura0FileProfile, I64FileInput,
+    self, Aura0ByteLaneCodec, Aura0ByteLaneUse, Aura0DecodePath, Aura0EncoderPath,
+    Aura0FileProfile, I64FileInput, OutputGuardMode, TranscodePath,
 };
 use aura_codec::schema::{generic_i64_parent_schema, ohlcv_schema};
 use aura_codec::writer;
-use aura_codec::{AuraHeader, AuraI64Reader, AuraI64Writer, Profile};
+use aura_codec::{
+    AuraHeader, AuraI64Reader, AuraI64Writer, DerivedExpression, DerivedExpressionOp, Profile,
+};
 use std::ffi::OsString;
 use std::sync::Mutex;
 
@@ -155,6 +158,68 @@ fn aura0_to_aura1_default_fast_path_matches_column_fallback() {
     let decoded = reader::decode_i64(&direct).unwrap();
     assert_eq!(Profile::Aura1, decoded.header.profile);
     assert_eq!(rows, decoded.rows);
+}
+
+#[test]
+fn aura0_to_aura1_compiled_path_reconstructs_temporal_derived_rows_directly() {
+    let _guard = AURA_ENV_LOCK.lock().unwrap();
+    let _restore = EnvRestore::capture();
+    std::env::remove_var("AURA_FORCE_COLUMNS_AURA1");
+    std::env::remove_var("AURA_STREAM_AURA1");
+
+    let expressions = vec![
+        DerivedExpression::new(1, 1, DerivedExpressionOp::FirstOffsetThenDelta, vec![4]).unwrap(),
+        DerivedExpression::new(2, 2, DerivedExpressionOp::MaxPlusResidual, vec![1, 4]).unwrap(),
+        DerivedExpression::new(3, 3, DerivedExpressionOp::MinMinusResidual, vec![1, 4]).unwrap(),
+    ];
+    let schema = generic_i64_parent_schema("derived_ohlcv", &[100, 101, 102, 103, 2, 0])
+        .unwrap()
+        .with_derived_expressions(expressions)
+        .unwrap();
+    let rows = (0..1_024i64)
+        .scan(100_000i64, |previous_close, index| {
+            let open = *previous_close + index.rem_euclid(3) - 1;
+            let close = open + index.rem_euclid(7) - 3;
+            let high = open.max(close) + index.rem_euclid(2);
+            let low = open.min(close) - index.rem_euclid(3);
+            *previous_close = close;
+            Some(vec![1_000 + index * 1_000, open, high, low, close, 10_000])
+        })
+        .collect::<Vec<_>>();
+    let ingest = writer::encode_i64(I64FileInput {
+        schema,
+        rows,
+        stream_id: 7,
+        dictionary_id: 11,
+        header_comment: None,
+    })
+    .unwrap();
+    let aura0 = writer::compile_i64(&ingest, Profile::Aura0).unwrap();
+
+    std::env::set_var("AURA_FORCE_COLUMNS_AURA1", "1");
+    let expected = writer::compile_i64(&aura0, Profile::Aura1).unwrap();
+    std::env::remove_var("AURA_FORCE_COLUMNS_AURA1");
+    let compiled = records::try_compile_i64_file_profiled(
+        &aura0,
+        Profile::Aura1,
+        OutputGuardMode::NoGuard,
+        TranscodePath::Auto,
+        Aura0EncoderPath::Materialized,
+        Aura0DecodePath::Materialized,
+    )
+    .unwrap()
+    .expect("compiled derived Aura0 -> Aura1 path");
+
+    assert_eq!(expected, compiled.bytes);
+    assert!(compiled.conversion_plan_hash.is_some());
+    let stats = compiled.stats.aura0_to_aura1.unwrap();
+    assert!(stats.writer.temporary_buffer_bytes < 1_024 * 6 * size_of::<i64>());
+
+    let guarded = records::try_compile_i64_file_with_fused_output_guard(&aura0, Profile::Aura1)
+        .unwrap()
+        .expect("compiled derived path with fused guard");
+    assert_eq!(expected, guarded.bytes);
+    assert_eq!(bytes_guard(&expected), guarded.guard);
 }
 
 #[test]

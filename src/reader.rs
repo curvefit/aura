@@ -1365,6 +1365,10 @@ impl AuraReader {
         let footer = parsed
             .compiled_footer
             .ok_or(AuraError::InvalidValue("compiled footer"))?;
+        if records::compiled_footer_has_explicit_events(&footer) {
+            let bytes = read_file_exact_at(&mut file, 0, parsed.file_len)?;
+            return Self::open_memory(bytes, options);
+        }
         match options.use_byte_lane {
             crate::Aura0ByteLaneUse::Always => {
                 return Err(AuraError::InvalidValue("aura0 byte lane"));
@@ -1438,6 +1442,16 @@ impl AuraReader {
 
     fn open_memory(bytes: Vec<u8>, options: ReaderOptions) -> Result<Self> {
         let metadata = records::decode_i64_file_metadata(&bytes)?;
+        let explicit_aura1 = metadata.header.profile == Profile::Aura1
+            && metadata
+                .compiled_footer
+                .as_ref()
+                .is_some_and(records::compiled_footer_has_explicit_events);
+        if explicit_aura1 {
+            // Validate counts, zero-child headers, and the complete sidecar at
+            // open. Fixed-row APIs subsequently read only the hot prefix.
+            records::decode_i64_events_file(&bytes)?;
+        }
         if metadata.header.profile == Profile::Aura0 {
             match options.use_byte_lane {
                 crate::Aura0ByteLaneUse::Always => {
@@ -1461,7 +1475,23 @@ impl AuraReader {
             Profile::Aura0 => AuraReaderState::Aura0Columns { columns: None },
             Profile::Ingest => AuraReaderState::LazyRows { rows: None },
         };
-        let body_bytes = metadata.footer_start.saturating_sub(metadata.header_len);
+        let physical_body_bytes = metadata.footer_start.saturating_sub(metadata.header_len);
+        if metadata.header.profile == Profile::Aura1
+            && !explicit_aura1
+            && compiled_plan
+                .as_ref()
+                .is_some_and(|plan| plan.aura1_body_size != physical_body_bytes)
+        {
+            return Err(AuraError::InvalidValue("aura1 body length"));
+        }
+        let body_bytes = if explicit_aura1 {
+            compiled_plan
+                .as_ref()
+                .map_or(physical_body_bytes, |plan| plan.aura1_body_size)
+        } else {
+            physical_body_bytes
+        };
+        let replay_body_end = metadata.header_len.saturating_add(body_bytes);
         let replay_backend = AuraReplayBackend::Memory;
         let row_width_from_plan = compiled_plan
             .as_ref()
@@ -1487,7 +1517,7 @@ impl AuraReader {
                 full_file_bytes_copied: bytes.len(),
                 row_width_from_plan,
                 body_offset_from_header: metadata.header_len,
-                footer_offset_from_trailer: metadata.footer_start,
+                footer_offset_from_trailer: replay_body_end,
                 record_count_from_footer: metadata.record_count,
                 rows_scanned: 0,
                 temp_row_buffers_allocated: 0,
@@ -3153,6 +3183,12 @@ pub struct AuraI64Reader {
     decoded: DecodedI64File,
 }
 
+/// In-memory reader retaining authoritative source-event boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuraI64EventReader {
+    decoded: crate::records::DecodedI64EventFile,
+}
+
 /// In-memory reader for sealed Aura typed files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuraTypedReader {
@@ -3199,6 +3235,30 @@ impl AuraI64Reader {
     }
 }
 
+impl AuraI64EventReader {
+    pub fn open(bytes: &[u8]) -> Result<Self> {
+        Ok(Self {
+            decoded: crate::records::decode_i64_events_file(bytes)?,
+        })
+    }
+
+    pub fn header(&self) -> &AuraHeader {
+        &self.decoded.header
+    }
+
+    pub fn schema(&self) -> &SchemaDescriptor {
+        &self.decoded.schema
+    }
+
+    pub fn events(&self) -> &[crate::records::I64Event] {
+        &self.decoded.events
+    }
+
+    pub fn into_events(self) -> Vec<crate::records::I64Event> {
+        self.decoded.events
+    }
+}
+
 impl AuraTypedReader {
     pub fn open(bytes: &[u8]) -> Result<Self> {
         Ok(Self {
@@ -3241,6 +3301,10 @@ impl AuraTypedReader {
 
 pub fn decode_i64(bytes: &[u8]) -> Result<DecodedI64File> {
     records::decode_i64_file_inner(bytes)
+}
+
+pub fn decode_i64_events(bytes: &[u8]) -> Result<crate::records::DecodedI64EventFile> {
+    records::decode_i64_events_file(bytes)
 }
 
 pub fn decode_typed(bytes: &[u8]) -> Result<DecodedTypedFile> {

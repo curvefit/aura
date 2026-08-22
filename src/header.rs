@@ -27,6 +27,23 @@ pub enum DerivedExpressionOp {
     MaxPlusResidual = 8,
     MinMinusResidual = 9,
     FirstOffsetThenDelta = 10,
+    /// Multiply the input slots using a checked i128 intermediate, then divide
+    /// by the single literal scale before converting the prediction to i64.
+    MulDiv = 11,
+    /// For a full-replacement repeated snapshot, subtract the value associated
+    /// with the same composite key in the previous snapshot. Missing keys use
+    /// zero; the input slots are the key components.
+    PreviousSnapshotSameKeyResidual = 12,
+    /// For a bootstrap-plus-mutation repeated stream, subtract the value
+    /// associated with the same composite key in the current live state. The
+    /// first input is an event-scoped reset flag and the remaining inputs are
+    /// repeated key components. A reconstructed zero removes the key.
+    PreviousMutationSameKeyResidual = 13,
+    /// Subtract the most recently decoded output associated with a composite
+    /// key. The first input is an event-scoped reset flag and the remaining
+    /// inputs are repeated key components. Unlike live mutation state, zero is
+    /// an ordinary remembered value and never deletes the key.
+    PreviousOutputByKeyResidual = 14,
 }
 
 impl DerivedExpressionOp {
@@ -43,6 +60,10 @@ impl DerivedExpressionOp {
             8 => Ok(Self::MaxPlusResidual),
             9 => Ok(Self::MinMinusResidual),
             10 => Ok(Self::FirstOffsetThenDelta),
+            11 => Ok(Self::MulDiv),
+            12 => Ok(Self::PreviousSnapshotSameKeyResidual),
+            13 => Ok(Self::PreviousMutationSameKeyResidual),
+            14 => Ok(Self::PreviousOutputByKeyResidual),
             _ => Err(AuraError::InvalidValue("derived expression op")),
         }
     }

@@ -151,6 +151,30 @@ fn generic_i64_parent_schema_maps_repeated_child_scope() {
 }
 
 #[test]
+fn generic_i64_parent_schema_treats_dual_domain_marker_as_structural() {
+    let parent_slots = [100, 0, 200, 203, 0, 4];
+    let entries = decode_schema_map(&parent_slots).unwrap();
+
+    assert_eq!(5, entries.len());
+    assert_eq!(SchemaMapHint::DualDomainGroup { width: 3 }, entries[2].hint);
+    assert_eq!(2, entries[2].field_index);
+    assert_eq!(FieldScope::Repeated, entries[2].scope);
+    assert_eq!(FieldScope::Repeated, entries[4].scope);
+    assert_eq!(FieldRelation::DeltaFromField(3), entries[4].relation);
+
+    let schema = generic_i64_parent_schema("dual_domain_book_v1", &parent_slots).unwrap();
+    assert_eq!(5, schema.fields.len());
+    assert_eq!(
+        parent_slots,
+        schema_parent_mapping(&schema).unwrap().as_slice()
+    );
+
+    assert!(decode_schema_map(&[100, 200]).is_err());
+    assert!(decode_schema_map(&[100, 200, 0]).is_err());
+    assert!(decode_schema_map(&[100, 203, 200, 0, 0]).is_err());
+}
+
+#[test]
 fn generic_i64_parent_schema_maps_extended_header_bytes() {
     let parent_slots = [100, 101, 2, 204, 4, 241, 242, 243, 255];
     let entries = decode_schema_map(&parent_slots).unwrap();
@@ -220,6 +244,134 @@ fn schema_derived_expressions_validate_graph_and_map_refs() {
         Err(AuraError::InvalidValue("derived expression cycle")),
         cyclic
     );
+}
+
+#[test]
+fn previous_snapshot_same_key_expression_requires_repeated_keys_and_is_acyclic() {
+    let valid = generic_i64_parent_schema("snapshot_expr", &[100, 203, 0, 101])
+        .unwrap()
+        .with_derived_expressions(vec![DerivedExpression::new(
+            1,
+            3,
+            DerivedExpressionOp::PreviousSnapshotSameKeyResidual,
+            vec![1, 2],
+        )
+        .unwrap()])
+        .unwrap();
+    assert_eq!(
+        &[100, 203, 0, 101],
+        schema_parent_mapping(&valid).unwrap().as_slice()
+    );
+
+    let event_output = generic_i64_parent_schema("event_snapshot_expr", &[101, 202, 0])
+        .unwrap()
+        .with_derived_expressions(vec![DerivedExpression::new(
+            1,
+            0,
+            DerivedExpressionOp::PreviousSnapshotSameKeyResidual,
+            vec![1],
+        )
+        .unwrap()]);
+    assert!(event_output.is_err());
+
+    let cyclic = generic_i64_parent_schema("cyclic_snapshot_expr", &[100, 204, 0, 101, 102])
+        .unwrap()
+        .with_derived_expressions(vec![
+            DerivedExpression::new(
+                1,
+                3,
+                DerivedExpressionOp::PreviousSnapshotSameKeyResidual,
+                vec![1, 4],
+            )
+            .unwrap(),
+            DerivedExpression::new(
+                2,
+                4,
+                DerivedExpressionOp::PreviousSnapshotSameKeyResidual,
+                vec![1, 3],
+            )
+            .unwrap(),
+        ]);
+    assert_eq!(
+        Err(AuraError::InvalidValue("derived expression cycle")),
+        cyclic
+    );
+}
+
+#[test]
+fn previous_mutation_same_key_requires_event_reset_and_repeated_keys() {
+    let valid = generic_i64_parent_schema("mutation_expr", &[100, 0, 203, 0, 101])
+        .unwrap()
+        .with_derived_expressions(vec![DerivedExpression::new(
+            1,
+            4,
+            DerivedExpressionOp::PreviousMutationSameKeyResidual,
+            vec![1, 2, 3],
+        )
+        .unwrap()])
+        .unwrap();
+    assert_eq!(
+        &[100, 0, 203, 0, 101],
+        schema_parent_mapping(&valid).unwrap().as_slice()
+    );
+
+    for (output_slot, input_slots) in [
+        (4, vec![2, 3]),
+        (4, vec![1, 0]),
+        (1, vec![0, 2]),
+        (4, vec![1, 2, 2]),
+    ] {
+        assert!(
+            generic_i64_parent_schema("invalid_mutation_expr", &[100, 0, 203, 0, 101])
+                .unwrap()
+                .with_derived_expressions(vec![DerivedExpression::new(
+                    1,
+                    output_slot,
+                    DerivedExpressionOp::PreviousMutationSameKeyResidual,
+                    input_slots,
+                )
+                .unwrap()])
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn previous_output_by_key_requires_event_reset_and_repeated_keys() {
+    let valid = generic_i64_parent_schema("previous_output_expr", &[100, 0, 202, 101])
+        .unwrap()
+        .with_derived_expressions(vec![DerivedExpression::new(
+            1,
+            3,
+            DerivedExpressionOp::PreviousOutputByKeyResidual,
+            vec![1, 2],
+        )
+        .unwrap()])
+        .unwrap();
+    assert_eq!(
+        &[100, 0, 202, 101],
+        schema_parent_mapping(&valid).unwrap().as_slice()
+    );
+
+    for (output_slot, input_slots) in [
+        (3, vec![2]),
+        (3, vec![1, 0]),
+        (1, vec![0, 2]),
+        (3, vec![1, 2, 2]),
+    ] {
+        assert!(
+            generic_i64_parent_schema("invalid_previous_output_expr", &[100, 0, 202, 101])
+                .unwrap()
+                .with_derived_expressions(vec![DerivedExpression::new(
+                    1,
+                    output_slot,
+                    DerivedExpressionOp::PreviousOutputByKeyResidual,
+                    input_slots,
+                )
+                .unwrap()])
+                .is_err()
+        );
+    }
 }
 
 #[test]

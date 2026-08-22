@@ -63,13 +63,14 @@ pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 pub use program::{CompiledAuraField, CompiledAuraPlan};
 pub use reader::{
     Aura1FieldI64Iter, Aura1FixedBatchView, Aura1RowView, Aura1SelectedRowView, AuraBatchIter,
-    AuraEventGroup, AuraGroupKey, AuraGroupStats, AuraI64Reader, AuraReader, AuraReaderSourceKind,
-    AuraReaderStats, AuraReplayBackend, AuraTypedReader, FusedOrderBookReplayStats, GroupBy,
-    OrderBookDeltaBatch, OrderBookDeltaSpec, OrderBookDeltaSpecBuilder,
+    AuraEventGroup, AuraGroupKey, AuraGroupStats, AuraI64EventReader, AuraI64Reader, AuraReader,
+    AuraReaderSourceKind, AuraReaderStats, AuraReplayBackend, AuraTypedReader,
+    FusedOrderBookReplayStats, GroupBy, OrderBookDeltaBatch, OrderBookDeltaSpec,
+    OrderBookDeltaSpecBuilder,
 };
 pub use records::{
-    Aura0ByteLaneCodec, Aura0ByteLaneUse, DecodedI64ColumnsFile, DecodedI64File, DecodedTypedFile,
-    I64FileInput, TypedFileInput,
+    Aura0ByteLaneCodec, Aura0ByteLaneUse, DecodedI64ColumnsFile, DecodedI64EventFile,
+    DecodedI64File, DecodedTypedFile, I64Event, I64EventFileInput, I64FileInput, TypedFileInput,
 };
 pub use schema::{
     decode_schema_map, generic_i64_parent_schema, schema_parent_mapping, AuraField, AuraSchema,
@@ -86,4 +87,6 @@ pub use types::{
     AuraBatch, AuraColumn, AuraColumnBatch, AuraColumnBatchBuilder, AuraRecordBatch,
     AuraTypedValue, AuraValue, Profile,
 };
-pub use writer::{AuraI64Writer, AuraTypedWriter, AuraWriteSummary, AuraWriter};
+pub use writer::{
+    AuraI64EventWriter, AuraI64Writer, AuraTypedWriter, AuraWriteSummary, AuraWriter,
+};
