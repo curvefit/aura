@@ -10,6 +10,13 @@ FooterLen
 Seal
 ```
 
+The established SDK writer and generic reader use container V2 by default.
+Container V3 is explicitly dispatched and currently has one complete profile:
+flat event-scoped Aura0 with exact-value blocks. The V3 profile is exposed by
+the seekable `V3FlatAura0Writer`/`V3FlatAura0Reader` API and by the `aura v3
+aura0 seal` and `aura v3 aura0 verify` developer commands. It is not selected
+implicitly by the V2 SDK writer.
+
 ## V2 header
 
 The V2 front header starts at byte zero. Its fixed prefix is 25 bytes; `header_len`
@@ -156,8 +163,17 @@ and expression cycles reject.
 
 The front V3 header authorizes relationships and groups. The full schema
 encoding tag 4 is authoritative for field names, exact types, roles, scales,
-nullability, and schema identity. Complete V3 footers/files are not yet enabled;
-production writers remain V2 and reject tag-4 schemas.
+nullability, and schema identity. For the complete flat Aura0 V3 profile, the
+canonical external schema JSON is the input declaration and the same validated
+schema is embedded in the footer. The V3 flat writer rejects groups, repeated
+fields, derived expressions, and byte `200`; those declarations remain
+available for a future profile whose event-to-child and inverse-transform
+contract is proven. Thus the presence of a V3 group header is not evidence that
+order-book body execution is supported.
+
+The V2 SDK writer remains the production compatibility path. It rejects V3
+schemas and emits V2 containers; callers that need V3 must select the explicit
+V3 API or CLI.
 
 ## Body
 
@@ -165,22 +181,27 @@ The body is profile-specific:
 
 ```text
 .aura   normalized generous ingest records
-.aura0  compact compiled records
-.aura1  replay compiled blocks
+.aura0  V2 compact compiled records, or V3 exact-value blocks
+.aura1  V2 replay compiled blocks
 ```
 
-The body should not need per-record schema mutation. Schema and layout decisions
-are file-level facts recorded in the footer.
+V2 body/schema and layout decisions are file-level facts recorded in the V2
+footer. A V3 flat body is a concatenation of positive-row `AURAV3VB` version-1
+exact-value blocks; each block carries its own schema fingerprint and exact
+column/value planes. A zero-row V3 file has no body blocks. V3 does not perform
+compression or physical relationship planning in this profile.
 
-The current writer body path is lossless for declared i64-compatible rows.
-Declared `i128` and `opaque16` values are validated at the typed writer boundary
-but are rejected before sealing until the body codecs can preserve those fields
-losslessly.
+The V2 SDK writer body path is lossless for its declared i64-compatible rows.
+Its typed boundary validates `i128` and `opaque16` but rejects them before V2
+sealing until the V2 body codecs can preserve those fields losslessly. The
+separate V3 exact-value block supports the V3 field types listed in
+[`SCHEMA.md`](SCHEMA.md), including exact `i128` and `opaque16` values, subject
+to the flat-profile limits.
 
 ## Footer
 
 The footer stores the facts readers and converters need before replaying the
-body. Ingest and compiled files intentionally use different footer payloads.
+body. Ingest and compiled V2 files intentionally use different footer payloads.
 
 An `.aura` ingest footer keeps the calculation evidence used while sealing:
 
@@ -249,6 +270,25 @@ The footer is what makes conversion deterministic. A converter can read the
 trailer to locate the footer, run the field program, and then process chunks
 without re-reading source payloads to discover ranges or group shapes.
 
+### V3 flat Aura0 footer
+
+The V3 flat footer also uses `AURP`, but its version is `3` and its layout
+version is `1`. It records the exact-block body encoding, record and body
+lengths, column/chunk counts, schema ID and fingerprint, primary timestamp and
+sequence slots, header/body/global logical SHA-256 values, a per-column stats
+table, a per-chunk descriptor table, and a footer self-hash. The embedded tag-4
+schema is length-prefixed and is checked against the schema ID, fingerprint,
+header map, and every exact-value block. Each chunk descriptor records its row
+range, body offset/length, stored-byte hash, logical-byte hash, and timestamp or
+sequence bounds when present.
+
+The V3 writer emits body blocks first, then performs a second pass over the
+sealed body to recompute hashes, statistics, and exact logical values before it
+writes the footer, footer length, and final seal. A reader opens the envelope
+and footer before trusting body-dependent claims; `verify_all` rechecks every
+block and global hash. The CLI publishes only a newly created, synced,
+atomically renamed destination and never replaces an existing path.
+
 ## Footer length and seal
 
 The last twelve bytes of a complete file store the footer length followed by the
@@ -271,3 +311,13 @@ footer_start      = footer_len_offset - footer_len
 body_start        = header_len
 body_end          = footer_start
 ```
+
+An incomplete or partially written file has no valid final seal and is rejected
+as incomplete. A truncated footer, invalid footer length, mismatched header or
+body hash, corrupted block, malformed value plane, unsupported version, or
+trailing bytes is rejected as an invalid file. Readers use checked lengths and
+bounded allocations; the V3 format ceilings are a 16 MiB front header, 64 MiB
+footer, 1 TiB body, 65,536 chunks, 16,777,216 rows, and 1 GiB per exact-value
+block. The default V3 API limits are lower; see [FORMAT.md](FORMAT.md) for the
+complete ceiling table and [COMPATIBILITY.md](COMPATIBILITY.md) for the
+promised compatibility boundary.

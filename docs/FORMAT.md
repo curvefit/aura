@@ -10,13 +10,14 @@ cannot be embedded in a V2 container.
 
 ## Standalone V3 exact-value reference block
 
-Aura defines a versioned, uncompressed exact-value block as a reference for V3
-value and null semantics. It is not a complete `.aura`, `.aura0`, or `.aura1`
-file, has no footer, planner, codec, or compression, and does not enable V3 file
-writing or conversion. Version 1 covers only flat event-scoped schemas (the
-trade/OI-like subset). It rejects repeated fields and groups because its single
-row count cannot represent event-to-child boundaries. Its magic is `AURAV3VB`;
-every integer is little-endian.
+Aura defines a versioned, uncompressed exact-value block as the V3 value and
+null-semantics primitive. The block itself is not a complete `.aura`, `.aura0`,
+or `.aura1` file: it has no footer, planner, codec, or compression. The
+complete V3 flat Aura0 writer wraps one or more of these blocks with the V3
+header, footer, hashes, chunk table, and seal. Version 1 covers only flat
+event-scoped schemas (the trade/OI-like subset). It rejects repeated fields and
+groups because its single row count cannot represent event-to-child boundaries.
+Its magic is `AURAV3VB`; every integer is little-endian.
 
 The fixed 64-byte header is:
 
@@ -105,9 +106,9 @@ most one U64 field with role `sequence` is the primary sequence slot.
 
 The hard supported-subset ceilings are 64 MiB footer bytes, 1 TiB body bytes,
 65,536 chunks, 16,777,216 total rows, and 16 MiB for the encoded schema
-descriptor. The current complete-file API is in-memory and checks all lengths
-and counts before count-controlled allocation. Its safe defaults are 256 MiB
-for the body and each exact-value block, 4,194,304 total rows, and 4,096 chunks;
+descriptor. The seekable writer and reader check all lengths and counts before
+count-controlled allocation. Their safe defaults are 256 MiB for the body and
+each exact-value block, 4,194,304 total rows, and 4,096 chunks;
 `V3FlatLimits::HARD` explicitly opts into the absolute 1 TiB body, 1 GiB block,
 and 16,777,216-row format ceilings.
 
@@ -115,8 +116,9 @@ and 16,777,216-row format ceilings.
 
 - `.aura`: ingest/preservation file. It stores logical i64 or typed rows plus
   the ingest footer (`AURF`).
-- `.aura0`: compiled cold file. It stores stream/delta/codec bodies plus the
-  compiled footer (`AURP`).
+- `.aura0`: V2 compiled cold file with stream/delta/codec bodies plus the
+  compiled footer (`AURP`), or the explicit V3 flat file with exact-value
+  blocks and the V3 flat footer (`AURP`, version 3).
 - `.aura1`: compiled fixed-width replay file. It stores fixed-width i64 rows
   plus the compiled footer (`AURP`).
 
@@ -144,7 +146,8 @@ discriminator. See `docs/container.md` for exact layouts.
 The V3 front header is authoritative for relationship and group permissions.
 The versioned full schema descriptor is authoritative for names, types, roles,
 scales, and nullability. In the flat Aura0 V3 subset, header and full-schema
-maps, expressions, groups, and schema dialect agree exactly.
+maps agree exactly and expressions/groups are empty because the current writer
+rejects them.
 Relationship byte 100 uniquely marks the primary event timestamp at slot 0.
 Additional event-scoped timestamp-role fields use byte 255 in the front map;
 their nanosecond, millisecond, or scaled-i64 units and nullability remain in the

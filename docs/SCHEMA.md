@@ -11,11 +11,13 @@ let schema = aura_codec::AuraSchema::builder()
 # Ok::<(), aura_codec::AuraError>(())
 ```
 
-The current V2 writer supports fixed-width scalar values backed by the generic
-i64 physical engine: booleans, signed/unsigned integer widths, timestamp
-nanos/micros, scaled i64 values, enum u8, and flags u32.
+The current V2 SDK writer supports fixed-width scalar values backed by the
+generic i64 physical engine: booleans, signed/unsigned integer widths,
+timestamp nanos/micros, scaled i64 values, enum u8, and flags u32. This is the
+default production schema path and emits V2 containers.
 
-Unsupported v1 types reject during schema build:
+Unsupported V2 SDK types reject during schema build or the typed writer
+boundary:
 
 - nullable fields
 - `Utf8`
@@ -23,10 +25,12 @@ Unsupported v1 types reject during schema build:
 - `F32`
 - `F64`
 
-These restrictions remain frozen for current V2 file writers. The standalone
-V3 exact-value API additionally identifies `I128`, `Opaque16`,
-`TimestampMillis`, `Utf8`, and `DecimalText` without projecting them to a
-different `AuraType`; this does not make them writable by the V2 SDK path.
+These restrictions remain frozen for current V2 file writers. The explicit V3
+exact-value API additionally supports `I128`, `Opaque16`, `TimestampMillis`,
+`Utf8`, and `DecimalText` without projecting them to a different logical type.
+V3 exact-value files may use nullable fields; null is represented by a validity
+bitmap and is never replaced with a sentinel or placeholder. V3 nullability is
+not retrofitted into the V2 SDK writer.
 
 Schema field order is the canonical storage order. Schema name, schema hash, field names, logical roles, physical types, scale, and nullability flags are preserved through SDK Aura0/Aura1 writes and conversions.
 
@@ -85,9 +89,13 @@ not alter the V2 relationship-map dialect or bytes.
 
 Relationship flags authorize a bounded planner search; they do not select a
 codec or exact residual direction. The chosen complete inverse belongs in the
-compiled footer. Full V3 file writing remains disabled while the footer/plan
-contract is under construction; current V2 writers reject V3 schemas rather
-than emitting cross-wired files.
+compiled V2 footer when that planner path is used. The V3 flat Aura0 writer
+currently accepts only flat event schemas with no groups, repeated fields,
+derived expressions, or byte-200 discriminator. A schema author may declare
+those relationships for a future V3 profile, but the current complete writer
+rejects them rather than emitting a file whose child boundaries or inverse math
+would be ambiguous. V2 writers reject V3 schemas rather than emitting
+cross-wired files.
 
 ### V3 exact field types
 
@@ -100,9 +108,10 @@ Field type codes 1 through 11 are frozen. V3 appends, without renumbering:
 | 14 | `decimal_text` | exact UTF-8 decimal spelling; the same structural restrictions as `utf8` |
 
 `Opaque16` likewise has scale zero, no relation, `absolute` as its only
-candidate, and no derived-expression input/output participation. It remains a
-V2 type for existing typed preservation, but it is never exposed as a numeric
-transform candidate.
+candidate, and no derived-expression input/output participation. It is
+preserved exactly by the V3 value block but is never exposed as a numeric
+transform candidate. The V2 SDK typed writer has the narrower V2 body
+limitation described above.
 
 `Utf8` has no provider-specific role restriction: any otherwise appropriate
 logical role is allowed. `DecimalTextV1` validates semantics after Unicode
@@ -118,7 +127,9 @@ are valid and preserved. Exponents, internal whitespace, Unicode digits,
 The standalone exact-value block v1 is intentionally flat and event-scoped.
 Repeated fields and non-empty group declarations reject until a later block
 version defines event-to-child counts; child rows are never flattened under
-the event row count.
+the event row count. This block is also the body block used by the complete V3
+flat Aura0 container, which adds the V3 header, footer, chunk table, second-pass
+statistics, hashes, and atomic seal/publication around it.
 
 ## Canonical external schema JSON v1
 
@@ -187,5 +198,23 @@ aura schema canonicalize --input schema.json --output canonical-schema.json
 File output validates and serializes before promotion, rejects symlink and
 non-regular destinations, writes a destination-local exclusive temporary file,
 syncs its contents, and atomically renames it on the current Unix development
-platform. Schema CLI support does not imply that complete V3 Aura0 files are
-implemented or stable.
+platform. The complete flat V3 Aura0 CLI uses the same canonical JSON contract:
+
+```bash
+cargo run --release --bin aura -- v3 aura0 seal \
+  --protocol aura-logical-arrow-ipc-v1 \
+  --schema <canonical-schema.json> \
+  --output <new-file.aura0> --json < <arrow-ipc-stream.bin>
+cargo run --release --bin aura -- v3 aura0 verify \
+  --input <new-file.aura0> --json
+```
+
+The schema author supplies the logical field declarations and relationship
+permissions. Aura's pinned implementation validates them and chooses any
+supported physical representation; the decoder does not infer a dataset,
+venue, or symbol from the input. For the currently complete flat V3 profile,
+the schema must have only event-scoped fields, no groups or derived
+expressions, and no byte-200 discriminator. The resulting file embeds the
+validated schema and complete decode metadata, so verification needs no schema
+sidecar. Future group/Flag200 and exact related-domain execution remain
+unsupported until a versioned body contract and inverse tests are accepted.
