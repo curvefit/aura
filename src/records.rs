@@ -7,7 +7,7 @@ use crate::bitpack::{
 use crate::body::{decode_generic_stream_body, encode_generic_stream_body, GenericStreamBodyValue};
 use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, ByteGuard, ByteReader};
 use crate::footer::AuraFooter;
-use crate::format::SEAL_MAGIC;
+use crate::format::{AuraContainerVersion, SEAL_MAGIC};
 use crate::generic_planner::{
     decode_generic_i64_events_body, decode_generic_i64_rows, decode_generic_i64_rows_body,
     decode_generic_i64_stream_values_profiled, encode_generic_i64_columns_with_plan,
@@ -28,9 +28,11 @@ use crate::plan::{
     unpack_ref_divisor, unpack_two_refs, Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan,
 };
 use crate::program::{
-    Aura1ByteLaneDescriptor, CompiledAuraPlan, CompiledFooter, DecodeProgram,
-    AURA1_BYTE_LANE_MAGIC, AURA1_BYTE_LANE_VERSION, BYTE_LANE_CHECKSUM_BYTE_GUARD,
-    BYTE_LANE_CHECKSUM_NONE, BYTE_LANE_CODEC_LZ4, BYTE_LANE_CODEC_RAW, BYTE_LANE_CODEC_ZSTD,
+    validate_aura1_byte_lane_limits, Aura1ByteLaneDescriptor, CompiledAuraPlan, CompiledFooter,
+    DecodeProgram, AURA1_BYTE_LANE_VERSION, BYTE_LANE_CHECKSUM_BYTE_GUARD, BYTE_LANE_CHECKSUM_NONE,
+    BYTE_LANE_CODEC_LZ4, BYTE_LANE_CODEC_RAW, BYTE_LANE_CODEC_ZSTD, COMPILED_FOOTER_MAGIC,
+    MAX_AURA1_BYTE_LANES_TOTAL_OUTPUT_BYTES, MAX_AURA1_BYTE_LANE_COMPRESSED_BYTES,
+    MAX_AURA1_BYTE_LANE_OUTPUT_BYTES,
 };
 use crate::schema::{schema_parent_mapping, FieldRole, FieldScope, FieldType, SchemaDescriptor};
 use crate::stats::IngestStats;
@@ -685,9 +687,12 @@ pub fn compile_aura0_to_aura1_bytes_with_lane(
     let footer_bytes = &bytes[offsets.footer_start..offsets.footer_len_offset];
     match use_byte_lane {
         Aura0ByteLaneUse::Auto | Aura0ByteLaneUse::Always => {
-            if let Some(output) =
-                try_decode_aura1_byte_lane_from_footer_tail(body, footer_bytes, verify_byte_lane)?
-            {
+            if let Some(output) = try_decode_aura1_byte_lane_from_footer_tail(
+                body,
+                footer_bytes,
+                offsets.header.container_version,
+                verify_byte_lane,
+            )? {
                 return Ok(output);
             }
             if use_byte_lane == Aura0ByteLaneUse::Always {
@@ -1080,7 +1085,12 @@ fn compile_typed_file_inner(bytes: &[u8], target_profile: Profile) -> Result<Vec
         }
         Profile::Ingest => unreachable!(),
     };
-    let footer = compiled_typed_footer(&decoded.schema, decoded.rows.len(), generic_aura0_plan)?;
+    let footer = compiled_typed_footer(
+        decoded.header.container_version,
+        &decoded.schema,
+        decoded.rows.len(),
+        generic_aura0_plan,
+    )?;
     encode_compiled_file(
         target_profile,
         decoded.header.stream_id,
@@ -1143,10 +1153,12 @@ fn encode_typed_aura0_body(
 }
 
 fn compiled_typed_footer(
+    container_version: AuraContainerVersion,
     schema: &SchemaDescriptor,
     record_count: usize,
     generic_aura0_plan: Option<GenericInstructionPlan>,
 ) -> Result<CompiledFooter> {
+    let container_version = conversion_output_container_version(container_version)?;
     let field_plans = absolute_typed_field_plans(schema, record_count)?;
     let aura0_plan = Aura0Plan {
         fields: field_plans.clone(),
@@ -1161,7 +1173,8 @@ fn compiled_typed_footer(
         1,
         DecodeProgram::from_aura0_plan(&aura0_plan, schema.fields.len())?,
         DecodeProgram::from_aura1_plan(&aura1_plan, schema.fields.len())?,
-    )?;
+    )?
+    .with_container_version(container_version);
     if let Some(plan) = generic_aura0_plan {
         footer = footer.with_generic_aura0_plan(plan);
     }
@@ -1205,7 +1218,7 @@ fn try_compile_i64_fast(bytes: &[u8], target_profile: Profile) -> Result<Option<
         return Ok(None);
     }
     let footer = AuraFooter::decode(&bytes[footer_start..footer_len_offset])?;
-    validate_header_schema_agreement(&header, &footer.schema)?;
+    validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
@@ -1243,6 +1256,7 @@ fn try_compile_aura0_to_aura1_fast(
     if let Some(out) = try_decode_aura1_byte_lane_from_footer_tail(
         &bytes[header_len..footer_start],
         &bytes[footer_start..footer_len_offset],
+        header.container_version,
         false,
     )? {
         if profile {
@@ -1255,7 +1269,7 @@ fn try_compile_aura0_to_aura1_fast(
         return Ok(Some(out));
     }
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-    validate_header_schema_agreement(&header, &footer.schema)?;
+    validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
     if compiled_footer_has_explicit_events(&footer) {
         return Ok(None);
     }
@@ -1448,6 +1462,7 @@ fn try_compile_aura0_to_aura1_fast_guarded(
     if let Some(out) = try_decode_aura1_byte_lane_from_footer_tail(
         &bytes[header_len..footer_start],
         &bytes[footer_start..footer_len_offset],
+        header.container_version,
         true,
     )? {
         return Ok(Some(GuardedCompileOutput {
@@ -1457,7 +1472,7 @@ fn try_compile_aura0_to_aura1_fast_guarded(
     }
 
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-    validate_header_schema_agreement(&header, &footer.schema)?;
+    validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
     if compiled_footer_has_explicit_events(&footer) {
         return Ok(None);
     }
@@ -1527,6 +1542,7 @@ fn try_compile_aura0_to_aura1_fast_profiled(
     if let Some(out) = try_decode_aura1_byte_lane_from_footer_tail(
         &bytes[header_len..footer_start],
         &bytes[footer_start..footer_len_offset],
+        header.container_version,
         guard_mode != OutputGuardMode::NoGuard,
     )? {
         let byte_lane_ns = byte_lane_start.elapsed().as_nanos();
@@ -1577,7 +1593,7 @@ fn try_compile_aura0_to_aura1_fast_profiled(
         }));
     }
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-    validate_header_schema_agreement(&header, &footer.schema)?;
+    validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
     if compiled_footer_has_explicit_events(&footer) {
         return Ok(None);
     }
@@ -1596,6 +1612,9 @@ fn try_compile_aura0_to_aura1_fast_profiled(
     let footer_len =
         u32::try_from(footer_bytes.len()).map_err(|_| AuraError::InvalidValue("footer length"))?;
     let header_out = AuraHeader::new(Profile::Aura1)
+        .with_container_version(conversion_output_container_version(
+            footer.container_version,
+        )?)
         .with_stream(header.stream_id, header.dictionary_id, header.base_time_ns)
         .with_schema_mapping(schema_parent_mapping(&footer.schema)?)?
         .with_derived_expressions(footer.schema.derived_expressions.clone())?
@@ -1855,7 +1874,7 @@ fn try_compile_aura1_to_aura0_direct_profiled(
 
     let metadata_start = Instant::now();
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-    validate_header_schema_agreement(&header, &footer.schema)?;
+    validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
     if compiled_footer_has_explicit_events(&footer) {
         return Ok(None);
     }
@@ -2135,7 +2154,7 @@ pub fn decode_i64_file_metadata(bytes: &[u8]) -> Result<DecodedI64FileMetadata> 
     match header.profile {
         Profile::Ingest => {
             let footer = AuraFooter::decode(&bytes[footer_start..footer_len_offset])?;
-            validate_header_schema_agreement(&header, &footer.schema)?;
+            validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
             if schema_has_wide_fields(&footer.schema) {
                 return Err(AuraError::InvalidValue("i64 schema"));
             }
@@ -2154,7 +2173,7 @@ pub fn decode_i64_file_metadata(bytes: &[u8]) -> Result<DecodedI64FileMetadata> 
         }
         Profile::Aura0 | Profile::Aura1 => {
             let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-            validate_header_schema_agreement(&header, &footer.schema)?;
+            validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
             if schema_has_wide_fields(&footer.schema) {
                 return Err(AuraError::InvalidValue("i64 schema"));
             }
@@ -2202,7 +2221,7 @@ pub fn decode_i64_columns_file(bytes: &[u8]) -> Result<Option<DecodedI64ColumnsF
     }
 
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-    validate_header_schema_agreement(&header, &footer.schema)?;
+    validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
@@ -2264,7 +2283,7 @@ pub fn aura1_fixed_layout_info(bytes: &[u8]) -> Result<Aura1FixedLayoutInfo> {
     }
 
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-    validate_header_schema_agreement(&header, &footer.schema)?;
+    validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
@@ -2318,7 +2337,7 @@ where
     }
 
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-    validate_header_schema_agreement(&header, &footer.schema)?;
+    validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
@@ -2377,7 +2396,7 @@ where
     }
 
     let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-    validate_header_schema_agreement(&header, &footer.schema)?;
+    validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
@@ -2445,7 +2464,7 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
     match header.profile {
         Profile::Ingest => {
             let footer = AuraFooter::decode(&bytes[footer_start..footer_len_offset])?;
-            validate_header_schema_agreement(&header, &footer.schema)?;
+            validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
             if schema_has_wide_fields(&footer.schema) {
                 return Err(AuraError::InvalidValue("i64 schema"));
             }
@@ -2474,7 +2493,7 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
         }
         Profile::Aura0 => {
             let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-            validate_header_schema_agreement(&header, &footer.schema)?;
+            validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
             if schema_has_wide_fields(&footer.schema) {
                 return Err(AuraError::InvalidValue("i64 schema"));
             }
@@ -2509,7 +2528,7 @@ pub(crate) fn decode_i64_file_inner(bytes: &[u8]) -> Result<DecodedI64File> {
         }
         Profile::Aura1 => {
             let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-            validate_header_schema_agreement(&header, &footer.schema)?;
+            validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
             if schema_has_wide_fields(&footer.schema) {
                 return Err(AuraError::InvalidValue("i64 schema"));
             }
@@ -2573,7 +2592,7 @@ pub(crate) fn decode_typed_file_inner(bytes: &[u8]) -> Result<DecodedTypedFile> 
     match header.profile {
         Profile::Ingest => {
             let footer = AuraFooter::decode(&bytes[footer_start..footer_len_offset])?;
-            validate_header_schema_agreement(&header, &footer.schema)?;
+            validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
             let rows = if schema_has_wide_fields(&footer.schema) {
                 decode_typed_body(&footer.schema, body)?
             } else {
@@ -2594,7 +2613,7 @@ pub(crate) fn decode_typed_file_inner(bytes: &[u8]) -> Result<DecodedTypedFile> 
             )? =>
         {
             let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-            validate_header_schema_agreement(&header, &footer.schema)?;
+            validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
             validate_flat_opaque16_schema(&footer.schema)?;
             let semantic_len = aura0_semantic_body_len(&footer, body.len())?;
             if semantic_len == 0 {
@@ -2627,7 +2646,7 @@ pub(crate) fn decode_typed_file_inner(bytes: &[u8]) -> Result<DecodedTypedFile> 
             )? =>
         {
             let footer = CompiledFooter::decode(&bytes[footer_start..footer_len_offset])?;
-            validate_header_schema_agreement(&header, &footer.schema)?;
+            validate_header_footer_agreement(&header, footer.container_version, &footer.schema)?;
             validate_flat_opaque16_schema(&footer.schema)?;
             let plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
             let rows = decode_typed_aura1_body(
@@ -3020,7 +3039,7 @@ fn parse_compiled_file_parts(
 ) -> Result<CompiledFileParts<'_>> {
     let offsets = parse_sealed_file_offsets(bytes, expected_profile)?;
     let footer = CompiledFooter::decode(&bytes[offsets.footer_start..offsets.footer_len_offset])?;
-    validate_header_schema_agreement(&offsets.header, &footer.schema)?;
+    validate_header_footer_agreement(&offsets.header, footer.container_version, &footer.schema)?;
     Ok(CompiledFileParts {
         header: offsets.header,
         body: &bytes[offsets.header_len..offsets.footer_start],
@@ -3068,6 +3087,7 @@ fn encode_aura1_byte_lane_file(
     compressed_offset: u64,
     record_count: u64,
 ) -> Result<(Vec<u8>, Aura1ByteLaneDescriptor)> {
+    let source_len = validate_aura1_byte_lane_source_len(aura1_bytes.len())?;
     let bytes = match codec {
         Aura0ByteLaneCodec::Raw => aura1_bytes.to_vec(),
         Aura0ByteLaneCodec::Lz4 => lz4_flex::compress_prepend_size(aura1_bytes),
@@ -3079,6 +3099,14 @@ fn encode_aura1_byte_lane_file(
             .map_err(|_| AuraError::InvalidValue("byte lane zstd"))?
         }
     };
+    let compressed_len = u64::try_from(bytes.len())
+        .map_err(|_| AuraError::InvalidValue("byte lane compressed length"))?;
+    if compressed_len > MAX_AURA1_BYTE_LANE_COMPRESSED_BYTES {
+        return Err(AuraError::InvalidValue("byte lane compressed length"));
+    }
+    let _compressed_end = compressed_offset
+        .checked_add(compressed_len)
+        .ok_or(AuraError::InvalidValue("byte lane compressed range"))?;
     let checksum = bytes_guard_value(aura1_bytes);
     let row_count =
         u32::try_from(record_count).map_err(|_| AuraError::InvalidValue("record count"))?;
@@ -3090,16 +3118,26 @@ fn encode_aura1_byte_lane_file(
         row_start: 0,
         row_count,
         aura1_output_offset: 0,
-        uncompressed_len: u64::try_from(aura1_bytes.len())
-            .map_err(|_| AuraError::InvalidValue("byte lane length"))?,
+        uncompressed_len: source_len,
         compressed_offset,
-        compressed_len: u64::try_from(bytes.len())
-            .map_err(|_| AuraError::InvalidValue("byte lane length"))?,
+        compressed_len,
         checksum_kind: BYTE_LANE_CHECKSUM_BYTE_GUARD,
         checksum,
         flags: 0,
     };
+    let _output_len = validate_aura1_byte_lane_limits(std::slice::from_ref(&descriptor))?;
     Ok((bytes, descriptor))
+}
+
+fn validate_aura1_byte_lane_source_len(source_len: usize) -> Result<u64> {
+    let source_len = u64::try_from(source_len)
+        .map_err(|_| AuraError::InvalidValue("byte lane output length"))?;
+    if source_len > MAX_AURA1_BYTE_LANE_OUTPUT_BYTES
+        || source_len > MAX_AURA1_BYTE_LANES_TOTAL_OUTPUT_BYTES
+    {
+        return Err(AuraError::InvalidValue("byte lane output length"));
+    }
+    Ok(source_len)
 }
 
 fn decode_aura1_byte_lanes_from_body(
@@ -3107,7 +3145,13 @@ fn decode_aura1_byte_lanes_from_body(
     footer: &CompiledFooter,
     validate_checksum: bool,
 ) -> Result<Vec<u8>> {
-    decode_aura1_byte_lanes_from_descriptors(body, &footer.aura1_byte_lanes, validate_checksum)
+    let decoded = decode_aura1_byte_lanes_from_descriptors(
+        body,
+        &footer.aura1_byte_lanes,
+        validate_checksum,
+    )?;
+    validate_embedded_aura1_container_version(&decoded, footer.container_version)?;
+    Ok(decoded)
 }
 
 fn decode_aura1_byte_lanes_from_descriptors(
@@ -3118,18 +3162,13 @@ fn decode_aura1_byte_lanes_from_descriptors(
     if lanes.is_empty() {
         return Err(AuraError::InvalidValue("aura0 byte lane"));
     }
+    let bounded_output_len = validate_aura1_byte_lane_limits(lanes)?;
 
     if lanes.len() == 1 {
         let lane = &lanes[0];
         validate_aura1_byte_lane_descriptor(lane)?;
         if lane.aura1_output_offset == 0 {
-            let compressed_start = usize::try_from(lane.compressed_offset)
-                .map_err(|_| AuraError::InvalidValue("byte lane offset"))?;
-            let compressed_len = usize::try_from(lane.compressed_len)
-                .map_err(|_| AuraError::InvalidValue("byte lane length"))?;
-            let compressed_end = compressed_start
-                .checked_add(compressed_len)
-                .ok_or(AuraError::UnexpectedEof)?;
+            let (compressed_start, compressed_end) = byte_lane_body_range(lane, body.len())?;
             let compressed = body
                 .get(compressed_start..compressed_end)
                 .ok_or(AuraError::UnexpectedEof)?;
@@ -3146,25 +3185,14 @@ fn decode_aura1_byte_lanes_from_descriptors(
         }
     }
 
-    let mut output_len = 0usize;
     for lane in lanes {
         validate_aura1_byte_lane_descriptor(lane)?;
-        let start = usize::try_from(lane.aura1_output_offset)
-            .map_err(|_| AuraError::InvalidValue("byte lane offset"))?;
-        let len = usize::try_from(lane.uncompressed_len)
-            .map_err(|_| AuraError::InvalidValue("byte lane length"))?;
-        output_len = output_len.max(start.checked_add(len).ok_or(AuraError::UnexpectedEof)?);
+        let _compressed_range = byte_lane_body_range(lane, body.len())?;
     }
-    let mut output = vec![0u8; output_len];
+    let mut output = allocate_zeroed_byte_lane_output(bounded_output_len)?;
 
     for lane in lanes {
-        let compressed_start = usize::try_from(lane.compressed_offset)
-            .map_err(|_| AuraError::InvalidValue("byte lane offset"))?;
-        let compressed_len = usize::try_from(lane.compressed_len)
-            .map_err(|_| AuraError::InvalidValue("byte lane length"))?;
-        let compressed_end = compressed_start
-            .checked_add(compressed_len)
-            .ok_or(AuraError::UnexpectedEof)?;
+        let (compressed_start, compressed_end) = byte_lane_body_range(lane, body.len())?;
         let compressed = body
             .get(compressed_start..compressed_end)
             .ok_or(AuraError::UnexpectedEof)?;
@@ -3192,9 +3220,32 @@ fn decode_aura1_byte_lane_payload(
 ) -> Result<Vec<u8>> {
     let expected_len = usize::try_from(lane.uncompressed_len)
         .map_err(|_| AuraError::InvalidValue("byte lane length"))?;
-    let mut decoded = vec![0u8; expected_len];
+    let mut decoded = allocate_zeroed_byte_lane_output(expected_len)?;
     decode_aura1_byte_lane_payload_into(lane, compressed, &mut decoded)?;
     Ok(decoded)
+}
+
+fn allocate_zeroed_byte_lane_output(len: usize) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(len)
+        .map_err(|_| AuraError::InvalidValue("byte lane output allocation"))?;
+    output.resize(len, 0);
+    Ok(output)
+}
+
+fn byte_lane_body_range(lane: &Aura1ByteLaneDescriptor, body_len: usize) -> Result<(usize, usize)> {
+    let end = lane
+        .compressed_offset
+        .checked_add(lane.compressed_len)
+        .ok_or(AuraError::InvalidValue("byte lane compressed range"))?;
+    let start = usize::try_from(lane.compressed_offset)
+        .map_err(|_| AuraError::InvalidValue("byte lane offset"))?;
+    let end = usize::try_from(end).map_err(|_| AuraError::InvalidValue("byte lane length"))?;
+    if end > body_len {
+        return Err(AuraError::UnexpectedEof);
+    }
+    Ok((start, end))
 }
 
 fn decode_aura1_byte_lane_payload_into(
@@ -3237,53 +3288,55 @@ fn decode_aura1_byte_lane_payload_into(
     Ok(())
 }
 
+fn validate_compiled_footer_version_prefix(
+    footer_bytes: &[u8],
+    expected_version: AuraContainerVersion,
+) -> Result<AuraContainerVersion> {
+    let mut reader = ByteReader::new(footer_bytes);
+    if reader.read_exact(COMPILED_FOOTER_MAGIC.len())? != COMPILED_FOOTER_MAGIC {
+        return Err(AuraError::InvalidMagic { expected: "AURP" });
+    }
+    let footer_version = AuraContainerVersion::from_wire(reader.read_u16_le()?)?;
+    footer_version.require_supported_container_layout()?;
+    validate_container_version_agreement(expected_version, footer_version)?;
+    Ok(footer_version)
+}
+
+fn validate_embedded_aura1_container_version(
+    bytes: &[u8],
+    expected_version: AuraContainerVersion,
+) -> Result<()> {
+    let offsets = parse_sealed_file_offsets(bytes, Profile::Aura1)?;
+    validate_container_version_agreement(expected_version, offsets.header.container_version)?;
+    validate_compiled_footer_version_prefix(
+        &bytes[offsets.footer_start..offsets.footer_len_offset],
+        expected_version,
+    )?;
+    Ok(())
+}
+
 fn try_decode_aura1_byte_lane_from_footer_tail(
     body: &[u8],
     footer_bytes: &[u8],
+    outer_header_version: AuraContainerVersion,
     validate_checksum: bool,
 ) -> Result<Option<Vec<u8>>> {
-    let Some(extension_offset) = footer_bytes
-        .windows(AURA1_BYTE_LANE_MAGIC.len())
-        .rposition(|window| window == AURA1_BYTE_LANE_MAGIC)
-    else {
+    let footer = CompiledFooter::decode(footer_bytes)?;
+    validate_container_version_agreement(outer_header_version, footer.container_version)?;
+    if footer.aura1_byte_lanes.is_empty() {
         return Ok(None);
-    };
-    let mut reader = ByteReader::new(&footer_bytes[extension_offset..]);
-    if reader.read_exact(AURA1_BYTE_LANE_MAGIC.len())? != AURA1_BYTE_LANE_MAGIC {
-        return Err(AuraError::InvalidMagic { expected: "AUBL" });
     }
-    let lane_count = reader.read_u32_le()? as usize;
-    let mut lanes = Vec::with_capacity(lane_count);
-    for _ in 0..lane_count {
-        let lane_version = reader.read_u8()?;
-        let codec_id = reader.read_u8()?;
-        let codec_level = reader.read_u8()?;
-        let checksum_kind = reader.read_u8()?;
-        lanes.push(Aura1ByteLaneDescriptor {
-            lane_version,
-            codec_id,
-            codec_level,
-            checksum_kind,
-            block_index: reader.read_u32_le()?,
-            row_start: reader.read_u64_le()?,
-            row_count: reader.read_u32_le()?,
-            aura1_output_offset: reader.read_u64_le()?,
-            uncompressed_len: reader.read_u64_le()?,
-            compressed_offset: reader.read_u64_le()?,
-            compressed_len: reader.read_u64_le()?,
-            checksum: reader.read_u64_le()?,
-            flags: reader.read_u32_le()?,
-        });
-    }
-    reader.finish()?;
-    Ok(Some(decode_aura1_byte_lanes_from_descriptors(
+    let decoded = decode_aura1_byte_lanes_from_descriptors(
         body,
-        &lanes,
+        &footer.aura1_byte_lanes,
         validate_checksum,
-    )?))
+    )?;
+    validate_embedded_aura1_container_version(&decoded, outer_header_version)?;
+    Ok(Some(decoded))
 }
 
 fn validate_aura1_byte_lane_descriptor(lane: &Aura1ByteLaneDescriptor) -> Result<()> {
+    let _output_len = validate_aura1_byte_lane_limits(std::slice::from_ref(lane))?;
     if lane.lane_version != AURA1_BYTE_LANE_VERSION {
         return Err(AuraError::UnsupportedVersion(u16::from(lane.lane_version)));
     }
@@ -3356,11 +3409,44 @@ pub(crate) fn validate_header_schema_agreement(
     Ok(())
 }
 
+pub(crate) fn validate_header_footer_agreement(
+    header: &AuraHeader,
+    footer_version: AuraContainerVersion,
+    schema: &SchemaDescriptor,
+) -> Result<()> {
+    validate_container_version_agreement(header.container_version, footer_version)?;
+    validate_header_schema_agreement(header, schema)
+}
+
+fn validate_container_version_agreement(
+    expected: AuraContainerVersion,
+    observed: AuraContainerVersion,
+) -> Result<()> {
+    if expected != observed {
+        return Err(AuraError::InvalidValue("header footer container version"));
+    }
+    Ok(())
+}
+
+fn conversion_output_container_version(
+    source_version: AuraContainerVersion,
+) -> Result<AuraContainerVersion> {
+    // TODO(aura-v3): before V3 decode is enabled, choose and test an explicit
+    // Preserve-vs-Upgrade conversion/restamp policy here. Keeping this match
+    // exhaustive prevents a newly supported version from defaulting to V2.
+    match source_version {
+        AuraContainerVersion::V2 => Ok(AuraContainerVersion::V2),
+        AuraContainerVersion::LegacyV1 | AuraContainerVersion::V3 => {
+            Err(AuraError::UnsupportedVersion(source_version.wire_value()))
+        }
+    }
+}
+
 pub(crate) fn validate_compiled_i64_metadata(
     header: &AuraHeader,
     footer: &CompiledFooter,
 ) -> Result<usize> {
-    validate_header_schema_agreement(header, &footer.schema)?;
+    validate_header_footer_agreement(header, footer.container_version, &footer.schema)?;
     if schema_has_wide_fields(&footer.schema) {
         return Err(AuraError::InvalidValue("i64 schema"));
     }
@@ -3413,13 +3499,15 @@ impl DecodedI64File {
         let aura1_plan = self.aura1_plan()?;
         let block_capacity = aura1_plan.block_capacity;
         let field_count = self.schema.fields.len();
+        let container_version = conversion_output_container_version(self.header.container_version)?;
         let mut footer = CompiledFooter::new(
             self.schema.clone(),
             self.rows.len() as u64,
             block_capacity,
             DecodeProgram::from_aura0_plan(&aura0_plan, field_count)?,
             DecodeProgram::from_aura1_plan(&aura1_plan, field_count)?,
-        )?;
+        )?
+        .with_container_version(container_version);
         if let Some(plan) = self.generic_aura0_plan() {
             footer = footer.with_generic_aura0_plan(plan);
         }
@@ -3446,13 +3534,15 @@ fn compiled_footer_from_ingest_footer(
         .ok_or(AuraError::InvalidValue("aura1 plan"))?;
     let block_capacity = aura1_plan.block_capacity;
     let field_count = footer.schema.fields.len();
+    let container_version = conversion_output_container_version(footer.container_version)?;
     let mut compiled = CompiledFooter::new(
         footer.schema.clone(),
         record_count,
         block_capacity,
         DecodeProgram::from_aura0_plan(&aura0_plan, field_count)?,
         DecodeProgram::from_aura1_plan(&aura1_plan, field_count)?,
-    )?;
+    )?
+    .with_container_version(container_version);
     if let Some(plan) = footer.generic_aura0_plan.clone() {
         compiled = compiled.with_generic_aura0_plan(plan);
     }
@@ -3471,7 +3561,9 @@ fn encode_file(
     let footer_bytes = footer.encode()?;
     let footer_len =
         u32::try_from(footer_bytes.len()).map_err(|_| AuraError::InvalidValue("footer length"))?;
+    let container_version = conversion_output_container_version(footer.container_version)?;
     let header = AuraHeader::new(profile)
+        .with_container_version(container_version)
         .with_stream(stream_id, dictionary_id, base_time_ns)
         .with_schema_mapping(schema_parent_mapping(&footer.schema)?)?
         .with_derived_expressions(footer.schema.derived_expressions.clone())?
@@ -3501,7 +3593,9 @@ fn encode_compiled_file(
     let footer_bytes = footer.encode()?;
     let footer_len =
         u32::try_from(footer_bytes.len()).map_err(|_| AuraError::InvalidValue("footer length"))?;
+    let container_version = conversion_output_container_version(footer.container_version)?;
     let header = AuraHeader::new(profile)
+        .with_container_version(container_version)
         .with_stream(stream_id, dictionary_id, base_time_ns)
         .with_schema_mapping(schema_parent_mapping(&footer.schema)?)?
         .with_derived_expressions(footer.schema.derived_expressions.clone())?
@@ -3598,7 +3692,9 @@ where
     let footer_bytes = footer.encode()?;
     let footer_len =
         u32::try_from(footer_bytes.len()).map_err(|_| AuraError::InvalidValue("footer length"))?;
+    let container_version = conversion_output_container_version(footer.container_version)?;
     let header = AuraHeader::new(profile)
+        .with_container_version(container_version)
         .with_stream(stream_id, dictionary_id, base_time_ns)
         .with_schema_mapping(schema_parent_mapping(&footer.schema)?)?
         .with_derived_expressions(footer.schema.derived_expressions.clone())?
@@ -5156,13 +5252,21 @@ fn schema_has_wide_fields_from_sealed_file(bytes: &[u8]) -> Result<bool> {
         Profile::Ingest => {
             let footer =
                 AuraFooter::decode(&bytes[offsets.footer_start..offsets.footer_len_offset])?;
-            validate_header_schema_agreement(&offsets.header, &footer.schema)?;
+            validate_header_footer_agreement(
+                &offsets.header,
+                footer.container_version,
+                &footer.schema,
+            )?;
             footer.schema
         }
         Profile::Aura0 | Profile::Aura1 => {
             let footer =
                 CompiledFooter::decode(&bytes[offsets.footer_start..offsets.footer_len_offset])?;
-            validate_header_schema_agreement(&offsets.header, &footer.schema)?;
+            validate_header_footer_agreement(
+                &offsets.header,
+                footer.container_version,
+                &footer.schema,
+            )?;
             footer.schema
         }
     };
@@ -5249,6 +5353,154 @@ fn put_u16_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> 
 #[cfg(test)]
 mod byte_lane_tests {
     use super::*;
+
+    fn bounded_raw_lane(
+        output_offset: u64,
+        output_len: u64,
+        compressed_offset: u64,
+        compressed_len: u64,
+    ) -> Aura1ByteLaneDescriptor {
+        Aura1ByteLaneDescriptor {
+            lane_version: AURA1_BYTE_LANE_VERSION,
+            codec_id: BYTE_LANE_CODEC_RAW,
+            codec_level: 0,
+            block_index: 0,
+            row_start: 0,
+            row_count: 1,
+            aura1_output_offset: output_offset,
+            uncompressed_len: output_len,
+            compressed_offset,
+            compressed_len,
+            checksum_kind: BYTE_LANE_CHECKSUM_NONE,
+            checksum: 0,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn header_footer_container_versions_must_agree() {
+        let schema =
+            crate::schema::generic_i64_parent_schema("version-agreement", &[100, 0]).unwrap();
+        let header = AuraHeader::new(Profile::Ingest)
+            .with_container_version(AuraContainerVersion::V3)
+            .with_schema_mapping(schema_parent_mapping(&schema).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            validate_header_footer_agreement(&header, AuraContainerVersion::V2, &schema),
+            Err(AuraError::InvalidValue("header footer container version"))
+        );
+        assert_eq!(
+            validate_header_footer_agreement(&header, AuraContainerVersion::V3, &schema),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn conversion_policy_cannot_silently_downgrade_future_versions() {
+        assert_eq!(
+            conversion_output_container_version(AuraContainerVersion::V2),
+            Ok(AuraContainerVersion::V2)
+        );
+        assert_eq!(
+            conversion_output_container_version(AuraContainerVersion::LegacyV1),
+            Err(AuraError::UnsupportedVersion(1))
+        );
+        assert_eq!(
+            conversion_output_container_version(AuraContainerVersion::V3),
+            Err(AuraError::UnsupportedVersion(3))
+        );
+    }
+
+    #[test]
+    fn byte_lane_footer_prefix_validation_is_bounded_and_versioned() {
+        assert_eq!(
+            validate_compiled_footer_version_prefix(b"AURP\x02", AuraContainerVersion::V2),
+            Err(AuraError::UnexpectedEof)
+        );
+        assert_eq!(
+            validate_compiled_footer_version_prefix(b"NOPE\x02\x00", AuraContainerVersion::V2),
+            Err(AuraError::InvalidMagic { expected: "AURP" })
+        );
+        assert_eq!(
+            validate_compiled_footer_version_prefix(b"AURP\x02\x00", AuraContainerVersion::V3),
+            Err(AuraError::InvalidValue("header footer container version"))
+        );
+        assert_eq!(
+            validate_compiled_footer_version_prefix(b"AURP\x03\x00", AuraContainerVersion::V2),
+            Err(AuraError::UnsupportedVersion(3))
+        );
+    }
+
+    #[test]
+    fn byte_lane_output_and_range_limits_reject_allocation_bombs() {
+        let u64_output_bomb = bounded_raw_lane(0, u64::MAX, 0, 0);
+        assert_eq!(
+            decode_aura1_byte_lanes_from_descriptors(&[], &[u64_output_bomb], false),
+            Err(AuraError::InvalidValue("byte lane output length"))
+        );
+
+        let per_lane_output_bomb = bounded_raw_lane(
+            0,
+            crate::program::MAX_AURA1_BYTE_LANE_OUTPUT_BYTES + 1,
+            0,
+            0,
+        );
+        assert_eq!(
+            decode_aura1_byte_lanes_from_descriptors(&[], &[per_lane_output_bomb], false),
+            Err(AuraError::InvalidValue("byte lane output length"))
+        );
+
+        let compressed_length_bomb = bounded_raw_lane(
+            0,
+            0,
+            0,
+            crate::program::MAX_AURA1_BYTE_LANE_COMPRESSED_BYTES + 1,
+        );
+        assert_eq!(
+            decode_aura1_byte_lanes_from_descriptors(&[], &[compressed_length_bomb], false),
+            Err(AuraError::InvalidValue("byte lane compressed length"))
+        );
+
+        let output_offset_overflow = bounded_raw_lane(u64::MAX, 1, 0, 0);
+        assert_eq!(
+            decode_aura1_byte_lanes_from_descriptors(&[], &[output_offset_overflow], false),
+            Err(AuraError::InvalidValue("byte lane output range"))
+        );
+
+        let compressed_offset_overflow = bounded_raw_lane(0, 0, u64::MAX, 1);
+        assert_eq!(
+            decode_aura1_byte_lanes_from_descriptors(&[], &[compressed_offset_overflow], false),
+            Err(AuraError::InvalidValue("byte lane compressed range"))
+        );
+
+        let half_plus_one = crate::program::MAX_AURA1_BYTE_LANES_TOTAL_OUTPUT_BYTES / 2 + 1;
+        let oversized_total = [
+            bounded_raw_lane(0, half_plus_one, 0, 0),
+            bounded_raw_lane(0, half_plus_one, 0, 0),
+        ];
+        assert_eq!(
+            decode_aura1_byte_lanes_from_descriptors(&[], &oversized_total, false),
+            Err(AuraError::InvalidValue("byte lane total output length"))
+        );
+    }
+
+    #[test]
+    fn byte_lane_encoder_preflights_source_length_before_codec_work() {
+        let supported = usize::try_from(MAX_AURA1_BYTE_LANE_OUTPUT_BYTES).unwrap();
+        assert_eq!(
+            validate_aura1_byte_lane_source_len(supported),
+            Ok(MAX_AURA1_BYTE_LANE_OUTPUT_BYTES)
+        );
+        assert_eq!(
+            validate_aura1_byte_lane_source_len(supported + 1),
+            Err(AuraError::InvalidValue("byte lane output length"))
+        );
+        assert_eq!(
+            encode_aura1_byte_lane_file(Aura0ByteLaneCodec::Raw, b"x", u64::MAX, 1),
+            Err(AuraError::InvalidValue("byte lane compressed range"))
+        );
+    }
 
     #[test]
     fn typed_uuid_decoder_rejects_uuid_stream_targeting_numeric_slot() {

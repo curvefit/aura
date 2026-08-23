@@ -1,6 +1,9 @@
 use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, put_u8, ByteReader};
 use crate::chunk::ChunkDescriptor;
-use crate::format::FORMAT_VERSION;
+use crate::format::{
+    AuraContainerVersion, AURA_CHUNK_DESCRIPTOR_SIZE, DEFAULT_CONTAINER_VERSION,
+    MAX_AURA_CHUNK_COUNT,
+};
 use crate::generic_planner::validate_generic_plan_schema_authorization;
 use crate::instructions::GenericInstructionPlan;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
@@ -55,6 +58,7 @@ impl CompressionDescriptor {
 /// Seal-time manifest appended to an Aura file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuraFooter {
+    pub container_version: AuraContainerVersion,
     pub schema: SchemaDescriptor,
     pub stats: IngestStats,
     pub compression: CompressionDescriptor,
@@ -67,6 +71,7 @@ pub struct AuraFooter {
 impl AuraFooter {
     pub fn new(schema: SchemaDescriptor, stats: IngestStats) -> Self {
         Self {
+            container_version: DEFAULT_CONTAINER_VERSION,
             schema,
             stats,
             compression: CompressionDescriptor::none(),
@@ -75,6 +80,15 @@ impl AuraFooter {
             generic_aura0_plan: None,
             chunks: Vec::new(),
         }
+    }
+
+    pub const fn with_container_version(mut self, container_version: AuraContainerVersion) -> Self {
+        self.container_version = container_version;
+        self
+    }
+
+    pub const fn container_version(&self) -> AuraContainerVersion {
+        self.container_version
     }
 
     pub fn with_compression(mut self, compression: CompressionDescriptor) -> Self {
@@ -103,9 +117,18 @@ impl AuraFooter {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
+        match self.container_version {
+            AuraContainerVersion::V2 => self.encode_v2(),
+            AuraContainerVersion::LegacyV1 | AuraContainerVersion::V3 => Err(
+                AuraError::UnsupportedVersion(self.container_version.wire_value()),
+            ),
+        }
+    }
+
+    fn encode_v2(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         out.extend_from_slice(FOOTER_MAGIC);
-        put_u16_le(&mut out, FORMAT_VERSION);
+        put_u16_le(&mut out, self.container_version.wire_value());
         put_u8(&mut out, self.compression.kind as u8);
         put_u8(&mut out, self.compression.level);
         encode_schema_block(&self.schema, &mut out)?;
@@ -120,10 +143,26 @@ impl AuraFooter {
         if reader.read_exact(4)? != FOOTER_MAGIC {
             return Err(AuraError::InvalidMagic { expected: "AURF" });
         }
-        let version = reader.read_u16_le()?;
-        if version != FORMAT_VERSION {
-            return Err(AuraError::UnsupportedVersion(version));
+        let container_version = AuraContainerVersion::from_wire(reader.read_u16_le()?)?;
+        match container_version {
+            AuraContainerVersion::V2 => Self::decode_v2(reader, container_version),
+            AuraContainerVersion::LegacyV1 => Err(AuraError::UnsupportedVersion(
+                container_version.wire_value(),
+            )),
+            AuraContainerVersion::V3 => Self::decode_v3(container_version),
         }
+    }
+
+    fn decode_v3(container_version: AuraContainerVersion) -> Result<Self> {
+        Err(AuraError::UnsupportedVersion(
+            container_version.wire_value(),
+        ))
+    }
+
+    fn decode_v2(
+        mut reader: ByteReader<'_>,
+        container_version: AuraContainerVersion,
+    ) -> Result<Self> {
         let compression = CompressionDescriptor {
             kind: CompressionKind::from_code(reader.read_u8()?)?,
             level: reader.read_u8()?,
@@ -138,6 +177,7 @@ impl AuraFooter {
         }
 
         Ok(Self {
+            container_version,
             schema,
             stats,
             compression,
@@ -365,6 +405,9 @@ fn decode_plan_fields(
 }
 
 fn encode_chunks(chunks: &[ChunkDescriptor], out: &mut Vec<u8>) -> Result<()> {
+    if chunks.len() > MAX_AURA_CHUNK_COUNT {
+        return Err(AuraError::InvalidValue("chunk count"));
+    }
     put_u32_len(out, chunks.len(), "chunk count")?;
     for chunk in chunks {
         put_u32_le(out, chunk.chunk_id);
@@ -384,7 +427,19 @@ fn encode_chunks(chunks: &[ChunkDescriptor], out: &mut Vec<u8>) -> Result<()> {
 
 fn decode_chunks(reader: &mut ByteReader<'_>) -> Result<Vec<ChunkDescriptor>> {
     let chunk_count = reader.read_u32_le()? as usize;
-    let mut chunks = Vec::with_capacity(chunk_count);
+    if chunk_count > MAX_AURA_CHUNK_COUNT {
+        return Err(AuraError::InvalidValue("chunk count"));
+    }
+    let descriptor_bytes = chunk_count
+        .checked_mul(AURA_CHUNK_DESCRIPTOR_SIZE)
+        .ok_or(AuraError::InvalidValue("chunk descriptor bytes"))?;
+    if descriptor_bytes > reader.remaining() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let mut chunks = Vec::new();
+    chunks
+        .try_reserve_exact(chunk_count)
+        .map_err(|_| AuraError::InvalidValue("chunk descriptor allocation"))?;
     for _ in 0..chunk_count {
         chunks.push(ChunkDescriptor {
             chunk_id: reader.read_u32_le()?,
@@ -464,11 +519,61 @@ mod tests {
         let decoded = AuraFooter::decode(&encoded).unwrap();
 
         assert_eq!(footer.schema.fields, decoded.schema.fields);
+        assert_eq!(AuraContainerVersion::V2, decoded.container_version);
         assert_eq!(footer.stats, decoded.stats);
         assert_eq!(footer.compression, decoded.compression);
         assert_eq!(footer.aura0_plan, decoded.aura0_plan);
         assert_eq!(footer.aura1_plan, decoded.aura1_plan);
         assert_eq!(footer.generic_aura0_plan, decoded.generic_aura0_plan);
         assert_eq!(footer.chunks, decoded.chunks);
+    }
+
+    #[test]
+    fn v3_footer_layout_is_an_explicit_unsupported_skeleton() {
+        let schema = book_delta_schema().unwrap();
+        let stats = IngestStats::new(schema.fields.len()).unwrap();
+        let v2 = AuraFooter::new(schema.clone(), stats.clone())
+            .encode()
+            .unwrap();
+        let mut advertised_v1 = v2.clone();
+        advertised_v1[4..6]
+            .copy_from_slice(&AuraContainerVersion::LegacyV1.wire_value().to_le_bytes());
+        assert_eq!(
+            AuraFooter::decode(&advertised_v1),
+            Err(AuraError::UnsupportedVersion(1)),
+            "legacy V1 support does not extend beyond the front header"
+        );
+
+        let mut advertised_v3 = v2;
+        advertised_v3[4..6].copy_from_slice(&AuraContainerVersion::V3.wire_value().to_le_bytes());
+
+        assert_eq!(
+            AuraFooter::decode(&advertised_v3),
+            Err(AuraError::UnsupportedVersion(3))
+        );
+        assert_eq!(
+            AuraFooter::new(schema, stats)
+                .with_container_version(AuraContainerVersion::V3)
+                .encode(),
+            Err(AuraError::UnsupportedVersion(3))
+        );
+    }
+
+    #[test]
+    fn ingest_chunk_table_is_bounded_before_allocation() {
+        assert_eq!(AURA_CHUNK_DESCRIPTOR_SIZE, 76);
+
+        let huge_count = u32::MAX.to_le_bytes();
+        assert_eq!(
+            decode_chunks(&mut ByteReader::new(&huge_count)),
+            Err(AuraError::InvalidValue("chunk count"))
+        );
+
+        let mut truncated = 1u32.to_le_bytes().to_vec();
+        truncated.resize(4 + AURA_CHUNK_DESCRIPTOR_SIZE - 1, 0);
+        assert_eq!(
+            decode_chunks(&mut ByteReader::new(&truncated)),
+            Err(AuraError::UnexpectedEof)
+        );
     }
 }

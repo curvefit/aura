@@ -1,7 +1,10 @@
 use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, put_u8, ByteReader};
 use crate::chunk::ChunkDescriptor;
 use crate::footer::{CompressionDescriptor, CompressionKind};
-use crate::format::FORMAT_VERSION;
+use crate::format::{
+    AuraContainerVersion, AURA_CHUNK_DESCRIPTOR_SIZE, DEFAULT_CONTAINER_VERSION,
+    MAX_AURA_CHUNK_COUNT,
+};
 use crate::generic_planner::validate_generic_plan_schema_authorization;
 use crate::instructions::GenericInstructionPlan;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
@@ -20,6 +23,21 @@ pub const BYTE_LANE_CODEC_ZSTD: u8 = 2;
 pub const BYTE_LANE_CHECKSUM_NONE: u8 = 0;
 pub const BYTE_LANE_CHECKSUM_BYTE_GUARD: u8 = 1;
 pub const FIELD_AUX_EXTENDED: u8 = 7;
+/// Fixed wire size of one descriptor in the `AUBL` footer extension.
+pub const AURA1_BYTE_LANE_DESCRIPTOR_SIZE: usize = 64;
+/// Normative V2+ supported-subset security ceiling for all-memory lane tables.
+/// Files above this limit are unsupported; there is no unsafe override.
+pub const MAX_AURA1_BYTE_LANE_COUNT: usize = 65_536;
+/// Normative V2+ supported-subset security ceiling for one lane's compressed
+/// bytes in current all-memory APIs. There is no unsafe override.
+pub const MAX_AURA1_BYTE_LANE_COMPRESSED_BYTES: u64 = 1 << 30;
+/// Normative V2+ supported-subset security ceiling for one lane's decoded bytes
+/// in current all-memory APIs. There is no unsafe override.
+pub const MAX_AURA1_BYTE_LANE_OUTPUT_BYTES: u64 = 1 << 30;
+/// Normative V2+ supported-subset security ceiling for both output span and
+/// cumulative decoded bytes across all lanes in current all-memory APIs. There
+/// is no unsafe override.
+pub const MAX_AURA1_BYTE_LANES_TOTAL_OUTPUT_BYTES: u64 = 1 << 30;
 
 const OP_MASK: u16 = 0b1_1111;
 const WIDTH_SHIFT: u16 = 5;
@@ -468,7 +486,10 @@ impl DecodeProgram {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledAuraPlan {
-    pub format_version: u16,
+    /// Explicit container metadata. This intentionally replaces the former
+    /// experimental `format_version: u16` field so compiled plans cannot lose
+    /// the distinction between recognized and implemented Aura versions.
+    pub container_version: AuraContainerVersion,
     pub schema_hash: u32,
     pub record_count: usize,
     pub field_count: usize,
@@ -491,6 +512,9 @@ pub struct CompiledAuraField {
 
 impl CompiledAuraPlan {
     pub fn from_footer(footer: &CompiledFooter) -> Result<Self> {
+        footer
+            .container_version
+            .require_supported_container_layout()?;
         let field_count = footer.schema.fields.len();
         let record_count = usize::try_from(footer.record_count)
             .map_err(|_| AuraError::InvalidValue("record count"))?;
@@ -514,7 +538,7 @@ impl CompiledAuraPlan {
             .collect::<Result<Vec<_>>>()?;
         let footer_bytes = footer.encode()?;
         Ok(Self {
-            format_version: FORMAT_VERSION,
+            container_version: footer.container_version,
             schema_hash: footer.schema.schema_id,
             record_count,
             field_count,
@@ -571,7 +595,7 @@ impl CompiledAuraPlan {
         let mut schema_bytes = Vec::new();
         encode_schema_block(descriptor, &mut schema_bytes)?;
         Ok(Self {
-            format_version: FORMAT_VERSION,
+            container_version: DEFAULT_CONTAINER_VERSION,
             schema_hash: descriptor.schema_id,
             record_count: 0,
             field_count,
@@ -608,6 +632,16 @@ impl CompiledAuraPlan {
         self.aura1_field_offsets()
             .into_iter()
             .find(|field| field.field_index == field_index)
+    }
+
+    pub const fn container_version(&self) -> AuraContainerVersion {
+        self.container_version
+    }
+
+    /// Numeric compatibility accessor for callers of the former experimental
+    /// `format_version` field.
+    pub const fn format_version(&self) -> u16 {
+        self.container_version.wire_value()
     }
 }
 
@@ -663,8 +697,48 @@ pub struct Aura1ByteLaneDescriptor {
     pub flags: u32,
 }
 
+pub(crate) fn validate_aura1_byte_lane_limits(lanes: &[Aura1ByteLaneDescriptor]) -> Result<usize> {
+    if lanes.len() > MAX_AURA1_BYTE_LANE_COUNT {
+        return Err(AuraError::InvalidValue("byte lane count"));
+    }
+    let mut output_span = 0u64;
+    let mut cumulative_output = 0u64;
+    for lane in lanes {
+        if lane.compressed_len > MAX_AURA1_BYTE_LANE_COMPRESSED_BYTES {
+            return Err(AuraError::InvalidValue("byte lane compressed length"));
+        }
+        if lane.uncompressed_len > MAX_AURA1_BYTE_LANE_OUTPUT_BYTES {
+            return Err(AuraError::InvalidValue("byte lane output length"));
+        }
+        let output_end = lane
+            .aura1_output_offset
+            .checked_add(lane.uncompressed_len)
+            .ok_or(AuraError::InvalidValue("byte lane output range"))?;
+        if output_end > MAX_AURA1_BYTE_LANES_TOTAL_OUTPUT_BYTES {
+            return Err(AuraError::InvalidValue("byte lane total output length"));
+        }
+        let _compressed_end = lane
+            .compressed_offset
+            .checked_add(lane.compressed_len)
+            .ok_or(AuraError::InvalidValue("byte lane compressed range"))?;
+        let _row_end = lane
+            .row_start
+            .checked_add(u64::from(lane.row_count))
+            .ok_or(AuraError::InvalidValue("byte lane row range"))?;
+        cumulative_output = cumulative_output
+            .checked_add(lane.uncompressed_len)
+            .ok_or(AuraError::InvalidValue("byte lane total output length"))?;
+        if cumulative_output > MAX_AURA1_BYTE_LANES_TOTAL_OUTPUT_BYTES {
+            return Err(AuraError::InvalidValue("byte lane total output length"));
+        }
+        output_span = output_span.max(output_end);
+    }
+    usize::try_from(output_span).map_err(|_| AuraError::InvalidValue("byte lane output length"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledFooter {
+    pub container_version: AuraContainerVersion,
     pub schema: SchemaDescriptor,
     pub compression: CompressionDescriptor,
     pub record_count: u64,
@@ -685,6 +759,7 @@ impl CompiledFooter {
         aura1_program: DecodeProgram,
     ) -> Result<Self> {
         Ok(Self {
+            container_version: DEFAULT_CONTAINER_VERSION,
             schema,
             compression: CompressionDescriptor::none(),
             record_count,
@@ -695,6 +770,15 @@ impl CompiledFooter {
             chunks: Vec::new(),
             aura1_byte_lanes: Vec::new(),
         })
+    }
+
+    pub const fn with_container_version(mut self, container_version: AuraContainerVersion) -> Self {
+        self.container_version = container_version;
+        self
+    }
+
+    pub const fn container_version(&self) -> AuraContainerVersion {
+        self.container_version
     }
 
     pub fn with_generic_aura0_plan(mut self, plan: GenericInstructionPlan) -> Self {
@@ -708,9 +792,18 @@ impl CompiledFooter {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
+        match self.container_version {
+            AuraContainerVersion::V2 => self.encode_v2(),
+            AuraContainerVersion::LegacyV1 | AuraContainerVersion::V3 => Err(
+                AuraError::UnsupportedVersion(self.container_version.wire_value()),
+            ),
+        }
+    }
+
+    fn encode_v2(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         out.extend_from_slice(COMPILED_FOOTER_MAGIC);
-        put_u16_le(&mut out, FORMAT_VERSION);
+        put_u16_le(&mut out, self.container_version.wire_value());
         put_u8(&mut out, self.compression.kind as u8);
         put_u8(&mut out, self.compression.level);
         put_u64_le(&mut out, self.record_count);
@@ -729,10 +822,26 @@ impl CompiledFooter {
         if reader.read_exact(4)? != COMPILED_FOOTER_MAGIC {
             return Err(AuraError::InvalidMagic { expected: "AURP" });
         }
-        let version = reader.read_u16_le()?;
-        if version != FORMAT_VERSION {
-            return Err(AuraError::UnsupportedVersion(version));
+        let container_version = AuraContainerVersion::from_wire(reader.read_u16_le()?)?;
+        match container_version {
+            AuraContainerVersion::V2 => Self::decode_v2(reader, container_version),
+            AuraContainerVersion::LegacyV1 => Err(AuraError::UnsupportedVersion(
+                container_version.wire_value(),
+            )),
+            AuraContainerVersion::V3 => Self::decode_v3(container_version),
         }
+    }
+
+    fn decode_v3(container_version: AuraContainerVersion) -> Result<Self> {
+        Err(AuraError::UnsupportedVersion(
+            container_version.wire_value(),
+        ))
+    }
+
+    fn decode_v2(
+        mut reader: ByteReader<'_>,
+        container_version: AuraContainerVersion,
+    ) -> Result<Self> {
         let compression = CompressionDescriptor {
             kind: CompressionKind::from_code(reader.read_u8()?)?,
             level: reader.read_u8()?,
@@ -750,6 +859,7 @@ impl CompiledFooter {
             validate_generic_plan_schema_authorization(&schema, plan)?;
         }
         Ok(Self {
+            container_version,
             schema,
             compression,
             record_count,
@@ -767,6 +877,7 @@ fn encode_aura1_byte_lanes(lanes: &[Aura1ByteLaneDescriptor], out: &mut Vec<u8>)
     if lanes.is_empty() {
         return Ok(());
     }
+    let _output_len = validate_aura1_byte_lane_limits(lanes)?;
     out.extend_from_slice(AURA1_BYTE_LANE_MAGIC);
     put_u32_len(out, lanes.len(), "byte lane count")?;
     for lane in lanes {
@@ -795,7 +906,19 @@ fn decode_aura1_byte_lanes(reader: &mut ByteReader<'_>) -> Result<Vec<Aura1ByteL
         return Err(AuraError::InvalidMagic { expected: "AUBL" });
     }
     let lane_count = reader.read_u32_le()? as usize;
-    let mut lanes = Vec::with_capacity(lane_count);
+    if lane_count > MAX_AURA1_BYTE_LANE_COUNT {
+        return Err(AuraError::InvalidValue("byte lane count"));
+    }
+    let descriptor_bytes = lane_count
+        .checked_mul(AURA1_BYTE_LANE_DESCRIPTOR_SIZE)
+        .ok_or(AuraError::InvalidValue("byte lane descriptor bytes"))?;
+    if descriptor_bytes > reader.remaining() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let mut lanes = Vec::new();
+    lanes
+        .try_reserve_exact(lane_count)
+        .map_err(|_| AuraError::InvalidValue("byte lane descriptor allocation"))?;
     for _ in 0..lane_count {
         let lane_version = reader.read_u8()?;
         if lane_version != AURA1_BYTE_LANE_VERSION {
@@ -820,6 +943,7 @@ fn decode_aura1_byte_lanes(reader: &mut ByteReader<'_>) -> Result<Vec<Aura1ByteL
             flags: reader.read_u32_le()?,
         });
     }
+    let _output_len = validate_aura1_byte_lane_limits(&lanes)?;
     Ok(lanes)
 }
 
@@ -909,6 +1033,9 @@ fn read_const(reader: &mut ByteReader<'_>, width: PhysicalWidth) -> Result<i64> 
 }
 
 fn encode_chunks(chunks: &[ChunkDescriptor], out: &mut Vec<u8>) -> Result<()> {
+    if chunks.len() > MAX_AURA_CHUNK_COUNT {
+        return Err(AuraError::InvalidValue("chunk count"));
+    }
     put_u32_len(out, chunks.len(), "chunk count")?;
     for chunk in chunks {
         put_u32_le(out, chunk.chunk_id);
@@ -928,7 +1055,19 @@ fn encode_chunks(chunks: &[ChunkDescriptor], out: &mut Vec<u8>) -> Result<()> {
 
 fn decode_chunks(reader: &mut ByteReader<'_>) -> Result<Vec<ChunkDescriptor>> {
     let chunk_count = reader.read_u32_le()? as usize;
-    let mut chunks = Vec::with_capacity(chunk_count);
+    if chunk_count > MAX_AURA_CHUNK_COUNT {
+        return Err(AuraError::InvalidValue("chunk count"));
+    }
+    let descriptor_bytes = chunk_count
+        .checked_mul(AURA_CHUNK_DESCRIPTOR_SIZE)
+        .ok_or(AuraError::InvalidValue("chunk descriptor bytes"))?;
+    if descriptor_bytes > reader.remaining() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let mut chunks = Vec::new();
+    chunks
+        .try_reserve_exact(chunk_count)
+        .map_err(|_| AuraError::InvalidValue("chunk descriptor allocation"))?;
     for _ in 0..chunk_count {
         chunks.push(ChunkDescriptor {
             chunk_id: reader.read_u32_le()?,
@@ -957,4 +1096,119 @@ fn put_u32_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> 
     let len = u32::try_from(len).map_err(|_| AuraError::InvalidValue(name))?;
     put_u32_le(out, len);
     Ok(())
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+    use crate::schema::book_delta_schema;
+
+    fn compiled_footer() -> CompiledFooter {
+        let schema = book_delta_schema().unwrap();
+        let fields = schema
+            .fields
+            .iter()
+            .map(|field| PhysicalFieldPlan {
+                field_index: field.index,
+                encoding: FieldEncoding::Absolute,
+                width: physical_width_for_field_type(field.field_type).unwrap(),
+                bit_width: 0,
+                reference_field_index: None,
+                base_value: 0,
+                step: 0,
+                estimated_bytes: 0,
+            })
+            .collect::<Vec<_>>();
+        let aura0_plan = Aura0Plan {
+            fields: fields.clone(),
+        };
+        let aura1_plan = Aura1Plan {
+            block_capacity: 1,
+            fields,
+        };
+        CompiledFooter::new(
+            schema,
+            0,
+            1,
+            DecodeProgram::from_aura0_plan(&aura0_plan, aura0_plan.fields.len()).unwrap(),
+            DecodeProgram::from_aura1_plan(&aura1_plan, aura1_plan.fields.len()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn compiled_footer_and_plan_carry_v2_container_version() {
+        let footer = CompiledFooter::decode(&compiled_footer().encode().unwrap()).unwrap();
+        let plan = CompiledAuraPlan::from_footer(&footer).unwrap();
+
+        assert_eq!(AuraContainerVersion::V2, footer.container_version);
+        assert_eq!(footer.container_version, plan.container_version);
+        assert_eq!(plan.format_version(), 2);
+    }
+
+    #[test]
+    fn v3_compiled_footer_layout_is_an_explicit_unsupported_skeleton() {
+        let footer = compiled_footer();
+        let v2 = footer.encode().unwrap();
+        let mut advertised_v1 = v2.clone();
+        advertised_v1[4..6]
+            .copy_from_slice(&AuraContainerVersion::LegacyV1.wire_value().to_le_bytes());
+        assert_eq!(
+            CompiledFooter::decode(&advertised_v1),
+            Err(AuraError::UnsupportedVersion(1)),
+            "legacy V1 support does not extend to compiled footers"
+        );
+
+        let mut advertised_v3 = v2;
+        advertised_v3[4..6].copy_from_slice(&AuraContainerVersion::V3.wire_value().to_le_bytes());
+
+        assert_eq!(
+            CompiledFooter::decode(&advertised_v3),
+            Err(AuraError::UnsupportedVersion(3))
+        );
+        assert_eq!(
+            footer
+                .with_container_version(AuraContainerVersion::V3)
+                .encode(),
+            Err(AuraError::UnsupportedVersion(3))
+        );
+    }
+
+    #[test]
+    fn aubl_descriptor_table_is_bounded_before_allocation() {
+        assert_eq!(AURA1_BYTE_LANE_DESCRIPTOR_SIZE, 64);
+
+        let mut huge_count = AURA1_BYTE_LANE_MAGIC.to_vec();
+        put_u32_le(&mut huge_count, u32::MAX);
+        assert_eq!(
+            decode_aura1_byte_lanes(&mut ByteReader::new(&huge_count)),
+            Err(AuraError::InvalidValue("byte lane count"))
+        );
+
+        let mut truncated = AURA1_BYTE_LANE_MAGIC.to_vec();
+        put_u32_le(&mut truncated, 1);
+        truncated.resize(truncated.len() + AURA1_BYTE_LANE_DESCRIPTOR_SIZE - 1, 0);
+        assert_eq!(
+            decode_aura1_byte_lanes(&mut ByteReader::new(&truncated)),
+            Err(AuraError::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn compiled_chunk_table_is_bounded_before_allocation() {
+        assert_eq!(AURA_CHUNK_DESCRIPTOR_SIZE, 76);
+
+        let huge_count = u32::MAX.to_le_bytes();
+        assert_eq!(
+            decode_chunks(&mut ByteReader::new(&huge_count)),
+            Err(AuraError::InvalidValue("chunk count"))
+        );
+
+        let mut truncated = 1u32.to_le_bytes().to_vec();
+        truncated.resize(4 + AURA_CHUNK_DESCRIPTOR_SIZE - 1, 0);
+        assert_eq!(
+            decode_chunks(&mut ByteReader::new(&truncated)),
+            Err(AuraError::UnexpectedEof)
+        );
+    }
 }

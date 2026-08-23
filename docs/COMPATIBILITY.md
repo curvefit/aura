@@ -136,3 +136,26 @@ Compatibility recommendation:
 Old readers may reject new fast/hybrid files because the `AURP` footer has an
 optional trailing `AUBL` extension. New readers read old compact files because
 the extension is omitted when no byte lanes are present.
+
+## Byte-lane safety limits
+
+Fast and hybrid byte lanes use all-memory expansion in the current reader, so
+the supported V2 byte-lane subset has fixed fail-closed limits:
+
+- at most 65,536 byte-lane descriptors;
+- at most 1 GiB (`1 << 30` bytes) of compressed payload per lane;
+- at most 1 GiB of uncompressed output per lane; and
+- at most 1 GiB of total expanded output across all lanes.
+
+Descriptor tables, offsets, lengths, row ranges, and cumulative output are
+checked before allocation or decompression. Output allocation is fallible, and
+raw, LZ4, and Zstd payloads must produce the exact declared bounded length.
+These are normative security ceilings for the current all-memory byte-lane
+implementation, not benchmark tuning parameters. Experimental V2 fast/hybrid
+artifacts above these ceilings are outside the promised compatibility subset
+and reject with a typed error. Compact semantic Aura0 files do not use this
+byte-lane output limit.
+
+Ingest and compiled V2 footers also support at most 65,536 chunk descriptors.
+Each chunk descriptor is a fixed 76-byte record; decoders validate the count,
+checked table size, and remaining footer bytes before fallible allocation.

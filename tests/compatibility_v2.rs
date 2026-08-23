@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use aura_codec::records::{self, Aura0ByteLaneCodec, Aura0FileProfile};
 use aura_codec::{
-    generic_i64_parent_schema, Aura0ByteLaneUse, AuraError, AuraI64EventReader, AuraI64EventWriter,
-    AuraI64Reader, AuraI64Writer, I64Event, Profile,
+    generic_i64_parent_schema, Aura0ByteLaneUse, AuraContainerVersion, AuraError, AuraHeader,
+    AuraI64EventReader, AuraI64EventWriter, AuraI64Reader, AuraI64Writer, AuraReader, I64Event,
+    Profile,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -152,6 +153,40 @@ fn artifact_json(facts: ArtifactFacts<'_>) -> Value {
 
 fn write_fixture(path: &Path, bytes: &[u8]) -> aura_codec::Result<()> {
     fs::write(path, bytes).map_err(|_| AuraError::InvalidValue("fixture write"))
+}
+
+fn regenerate_valid_fixtures_in_memory() -> aura_codec::Result<Vec<(&'static str, Vec<u8>)>> {
+    let rows = plain_rows();
+    let schema = plain_schema()?;
+    let mut writer = AuraI64Writer::new(schema)
+        .with_stream(17, 23)
+        .with_header_comment("compatibility-v2 plain rows");
+    writer.extend_rows(rows)?;
+    let ingest = writer.finish()?;
+    let compact = AuraI64Writer::compile_profile(&ingest, Profile::Aura0)?;
+    let replay = AuraI64Writer::compile_profile(&ingest, Profile::Aura1)?;
+    let hybrid = records::compile_i64_file_with_aura0_profile(
+        &ingest,
+        Aura0FileProfile::Hybrid,
+        Aura0ByteLaneCodec::Lz4,
+    )?;
+
+    let event_schema = explicit_schema()?;
+    let mut event_writer = AuraI64EventWriter::new(event_schema)
+        .with_stream(29, 31)
+        .with_header_comment("compatibility-v2 explicit events");
+    for event in explicit_events() {
+        event_writer.push_event(event)?;
+    }
+    let explicit_compact = event_writer.finish_profile(Profile::Aura0)?;
+
+    Ok(vec![
+        ("plain-ingest.aura", ingest),
+        ("plain-compact.aura0", compact),
+        ("plain-replay.aura1", replay),
+        ("plain-hybrid.aura0", hybrid),
+        ("explicit-events.aura0", explicit_compact),
+    ])
 }
 
 fn generate_fixtures() -> aura_codec::Result<()> {
@@ -315,6 +350,40 @@ fn check_container(bytes: &[u8], entry: &Value, expected_profile: Profile) {
     );
 }
 
+fn compiled_footer_start(bytes: &[u8]) -> usize {
+    let seal_offset = bytes.len() - 8;
+    assert_eq!(&bytes[seal_offset..], b"sealed:)");
+    let footer_len_offset = seal_offset - 4;
+    let footer_len =
+        u32::from_le_bytes(bytes[footer_len_offset..seal_offset].try_into().unwrap()) as usize;
+    footer_len_offset - footer_len
+}
+
+fn mutate_compiled_footer_version(bytes: &[u8], version: AuraContainerVersion) -> Vec<u8> {
+    let mut mutated = bytes.to_vec();
+    let footer_start = compiled_footer_start(&mutated);
+    assert_eq!(&mutated[footer_start..footer_start + 4], b"AURP");
+    mutated[footer_start + 4..footer_start + 6]
+        .copy_from_slice(&version.wire_value().to_le_bytes());
+    mutated
+}
+
+fn mutate_raw_embedded_footer_version(bytes: &[u8], version: AuraContainerVersion) -> Vec<u8> {
+    let mut mutated = bytes.to_vec();
+    let outer_header_len = AuraHeader::encoded_len(&mutated).unwrap();
+    let outer_footer_start = compiled_footer_start(&mutated);
+    let embedded = &mutated[outer_header_len..outer_footer_start];
+    let embedded_footer_start = compiled_footer_start(embedded);
+    assert_eq!(
+        &embedded[embedded_footer_start..embedded_footer_start + 4],
+        b"AURP"
+    );
+    let absolute_version_offset = outer_header_len + embedded_footer_start + 4;
+    mutated[absolute_version_offset..absolute_version_offset + 2]
+        .copy_from_slice(&version.wire_value().to_le_bytes());
+    mutated
+}
+
 #[test]
 #[ignore = "fixture generation is an explicit maintenance action"]
 fn generate_v2_fixtures() {
@@ -341,18 +410,35 @@ fn compatibility_v2_manifest_hashes_and_decode_contracts() {
     let event_schema = explicit_schema().unwrap();
     let fixtures = manifest["fixtures"].as_array().expect("fixture entries");
     assert_eq!(fixtures.len(), 5);
+    let regenerated = regenerate_valid_fixtures_in_memory().unwrap();
+    assert_eq!(regenerated.len(), fixtures.len());
 
     for entry in fixtures {
         let filename = entry["filename"].as_str().expect("fixture filename");
         let bytes = fs::read(Path::new(FIXTURE_DIR).join(filename)).expect("fixture bytes");
+        let regenerated_bytes = regenerated
+            .iter()
+            .find_map(|(generated_name, generated_bytes)| {
+                (*generated_name == filename).then_some(generated_bytes)
+            })
+            .expect("every committed valid fixture is regenerated in ordinary CI");
+        assert_eq!(
+            regenerated_bytes, &bytes,
+            "regenerated V2 bytes changed for {filename}"
+        );
         assert_eq!(entry["bytes"].as_u64(), Some(bytes.len() as u64));
         assert_eq!(entry["sha256"].as_str(), Some(sha256_hex(&bytes).as_str()));
+        assert_eq!(
+            entry["sha256"].as_str(),
+            Some(sha256_hex(regenerated_bytes).as_str())
+        );
 
         if entry["artifact_kind"] == "explicit-events" {
             let reader = AuraI64EventReader::open(&bytes).expect("explicit event fixture decodes");
             check_container(&bytes, entry, Profile::Aura0);
             check_schema_identity(entry, &event_schema);
             assert_eq!(reader.header().profile, Profile::Aura0);
+            assert_eq!(reader.header().container_version, AuraContainerVersion::V2);
             assert_eq!(reader.schema(), &event_schema);
             assert_eq!(reader.events(), events.as_slice());
             assert_eq!(entry["row_count"].as_u64(), Some(4));
@@ -362,10 +448,12 @@ fn compatibility_v2_manifest_hashes_and_decode_contracts() {
                 entry["canonical_hash"].as_str(),
                 Some(canonical_events_hash(&events).as_str())
             );
-            assert!(records::decode_i64_events_file(&bytes)
-                .unwrap()
-                .compiled_footer
-                .is_some());
+            let decoded = records::decode_i64_events_file(&bytes).unwrap();
+            assert_eq!(decoded.header.container_version, AuraContainerVersion::V2);
+            assert_eq!(
+                decoded.compiled_footer.unwrap().container_version,
+                AuraContainerVersion::V2
+            );
         } else {
             let reader = AuraI64Reader::open(&bytes).expect("row fixture decodes");
             let expected_profile = match entry["profile"].as_str().unwrap() {
@@ -377,6 +465,7 @@ fn compatibility_v2_manifest_hashes_and_decode_contracts() {
             check_container(&bytes, entry, expected_profile);
             check_schema_identity(entry, &plain_schema);
             assert_eq!(reader.profile(), expected_profile);
+            assert_eq!(reader.header().container_version, AuraContainerVersion::V2);
             assert_eq!(reader.schema(), &plain_schema);
             assert_eq!(reader.rows(), rows.as_slice());
             assert_eq!(entry["row_count"].as_u64(), Some(rows.len() as u64));
@@ -387,8 +476,27 @@ fn compatibility_v2_manifest_hashes_and_decode_contracts() {
                 Some(canonical_rows_hash(&rows).as_str())
             );
             match expected_profile {
-                Profile::Ingest => assert!(reader.ingest_footer().is_some()),
-                Profile::Aura0 | Profile::Aura1 => assert!(reader.compiled_footer().is_some()),
+                Profile::Ingest => {
+                    assert_eq!(
+                        reader.ingest_footer().unwrap().container_version,
+                        AuraContainerVersion::V2
+                    );
+                    let converted = AuraI64Writer::compile_profile(&bytes, Profile::Aura0)
+                        .expect("committed V2 ingest fixture converts");
+                    let decoded_converted = records::decode_i64_file(&converted).unwrap();
+                    assert_eq!(
+                        decoded_converted.header.container_version,
+                        AuraContainerVersion::V2
+                    );
+                    assert_eq!(
+                        decoded_converted.compiled_footer.unwrap().container_version,
+                        AuraContainerVersion::V2
+                    );
+                }
+                Profile::Aura0 | Profile::Aura1 => assert_eq!(
+                    reader.compiled_footer().unwrap().container_version,
+                    AuraContainerVersion::V2
+                ),
             }
             if filename == "plain-hybrid.aura0" {
                 assert_eq!(entry["aura0_storage_profile"].as_str(), Some("hybrid"));
@@ -432,4 +540,90 @@ fn compatibility_v2_manifest_hashes_and_decode_contracts() {
     );
     let error = records::decode_i64_file(&invalid).expect_err("truncated fixture must reject");
     assert_eq!(error_kind(&error), invalid_entry["expected_error_kind"]);
+}
+
+#[test]
+fn hybrid_byte_lane_shortcuts_reject_footer_only_v3_mismatch() {
+    let bytes = fs::read(Path::new(FIXTURE_DIR).join("plain-hybrid.aura0"))
+        .expect("committed hybrid fixture");
+    let mutated = mutate_compiled_footer_version(&bytes, AuraContainerVersion::V3);
+    let expected = AuraError::UnsupportedVersion(3);
+
+    assert_eq!(
+        records::compile_aura0_to_aura1_bytes_with_lane(&mutated, Aura0ByteLaneUse::Always, true,),
+        Err(expected.clone()),
+        "public byte-lane extraction must validate the outer AURP version"
+    );
+    assert_eq!(
+        records::compile_i64_file(&mutated, Profile::Aura1),
+        Err(expected.clone()),
+        "fast hybrid conversion must not bypass the outer footer version"
+    );
+    assert_eq!(
+        records::try_compile_i64_file_with_fused_output_guard(&mutated, Profile::Aura1),
+        Err(expected.clone()),
+        "guarded fast conversion must not bypass the outer footer version"
+    );
+    assert_eq!(
+        records::try_compile_i64_file_profiled(
+            &mutated,
+            Profile::Aura1,
+            records::OutputGuardMode::NoGuard,
+            records::TranscodePath::Auto,
+            records::Aura0EncoderPath::Materialized,
+            records::Aura0DecodePath::Materialized,
+        ),
+        Err(expected),
+        "profiled fast conversion must not bypass the outer footer version"
+    );
+}
+
+#[test]
+fn raw_byte_lane_shortcuts_validate_embedded_aura1_footer_version() {
+    let ingest = fs::read(Path::new(FIXTURE_DIR).join("plain-ingest.aura"))
+        .expect("committed ingest fixture");
+    let fast = records::compile_i64_file_with_aura0_profile(
+        &ingest,
+        Aura0FileProfile::Fast,
+        Aura0ByteLaneCodec::Raw,
+    )
+    .unwrap();
+    let mutated = mutate_raw_embedded_footer_version(&fast, AuraContainerVersion::V3);
+
+    assert_eq!(
+        records::compile_aura0_to_aura1_bytes_with_lane(&mutated, Aura0ByteLaneUse::Always, false,),
+        Err(AuraError::UnsupportedVersion(3))
+    );
+    assert_eq!(
+        records::compile_i64_file(&mutated, Profile::Aura1),
+        Err(AuraError::UnsupportedVersion(3))
+    );
+    assert_eq!(
+        records::try_compile_i64_file_profiled(
+            &mutated,
+            Profile::Aura1,
+            records::OutputGuardMode::NoGuard,
+            records::TranscodePath::Auto,
+            records::Aura0EncoderPath::Materialized,
+            records::Aura0DecodePath::Materialized,
+        ),
+        Err(AuraError::UnsupportedVersion(3))
+    );
+}
+
+#[test]
+fn file_backed_reader_rejects_footer_only_v3_mismatch() {
+    let bytes = fs::read(Path::new(FIXTURE_DIR).join("plain-hybrid.aura0"))
+        .expect("committed hybrid fixture");
+    let mutated = mutate_compiled_footer_version(&bytes, AuraContainerVersion::V3);
+    let path = std::env::temp_dir().join(format!(
+        "aura-v3-mismatch-{}-{}.aura0",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("compat")
+    ));
+    fs::write(&path, mutated).unwrap();
+    let result = AuraReader::open_path(&path);
+    let _removed = fs::remove_file(&path);
+
+    assert!(matches!(result, Err(AuraError::UnsupportedVersion(3))));
 }

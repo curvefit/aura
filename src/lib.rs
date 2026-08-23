@@ -38,6 +38,7 @@ pub use body::{decode_generic_stream_body, encode_generic_stream_body, GenericSt
 pub use convert::{convert_aura, ConversionSummary};
 pub use error::{AuraDiagnostic, AuraError, Result};
 pub use footer::{AuraFooter, CompressionDescriptor, CompressionKind};
+pub use format::{AuraContainerVersion, AURA_CHUNK_DESCRIPTOR_SIZE, MAX_AURA_CHUNK_COUNT};
 pub use generic_planner::{
     decode_generic_i64_rows, decode_generic_i64_rows_body, encode_generic_i64_rows,
     encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan, plan_generic_i64_rows,
@@ -60,7 +61,11 @@ pub use orderbook::{
     PreparedOrderBookApplyPlan, PreparedOrderBookEngine,
 };
 pub use plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
-pub use program::{CompiledAuraField, CompiledAuraPlan};
+pub use program::{
+    CompiledAuraField, CompiledAuraPlan, AURA1_BYTE_LANE_DESCRIPTOR_SIZE,
+    MAX_AURA1_BYTE_LANES_TOTAL_OUTPUT_BYTES, MAX_AURA1_BYTE_LANE_COMPRESSED_BYTES,
+    MAX_AURA1_BYTE_LANE_COUNT, MAX_AURA1_BYTE_LANE_OUTPUT_BYTES,
+};
 pub use reader::{
     Aura1FieldI64Iter, Aura1FixedBatchView, Aura1RowView, Aura1SelectedRowView, AuraBatchIter,
     AuraEventGroup, AuraGroupKey, AuraGroupStats, AuraI64EventReader, AuraI64Reader, AuraReader,

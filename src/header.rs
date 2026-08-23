@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::bytes::{put_i64_le, put_u16_le, put_u8, ByteReader};
-use crate::format::{AURA_MAGIC, FORMAT_VERSION};
+use crate::format::{AuraContainerVersion, AURA_MAGIC, DEFAULT_CONTAINER_VERSION};
 use crate::{AuraError, Profile, Result};
 
 pub const HEADER_PREFIX_SIZE: usize = 25;
@@ -160,6 +160,7 @@ impl DerivedExpression {
 /// Front Aura file header. The body starts at `header_len`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuraHeader {
+    pub container_version: AuraContainerVersion,
     pub profile: Profile,
     pub stream_id: u16,
     pub dictionary_id: u16,
@@ -172,6 +173,7 @@ pub struct AuraHeader {
 impl AuraHeader {
     pub fn new(profile: Profile) -> Self {
         Self {
+            container_version: DEFAULT_CONTAINER_VERSION,
             profile,
             stream_id: 0,
             dictionary_id: 0,
@@ -180,6 +182,15 @@ impl AuraHeader {
             derived_expressions: Vec::new(),
             comment: String::new(),
         }
+    }
+
+    pub const fn with_container_version(mut self, container_version: AuraContainerVersion) -> Self {
+        self.container_version = container_version;
+        self
+    }
+
+    pub const fn container_version(&self) -> AuraContainerVersion {
+        self.container_version
     }
 
     pub fn with_stream(mut self, stream_id: u16, dictionary_id: u16, base_time_ns: i64) -> Self {
@@ -232,6 +243,15 @@ impl AuraHeader {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
+        match self.container_version {
+            AuraContainerVersion::V2 => self.encode_v2(),
+            AuraContainerVersion::LegacyV1 | AuraContainerVersion::V3 => Err(
+                AuraError::UnsupportedVersion(self.container_version.wire_value()),
+            ),
+        }
+    }
+
+    fn encode_v2(&self) -> Result<Vec<u8>> {
         validate_derived_expressions(&self.derived_expressions)?;
         let derived_expression_table = encode_derived_expression_table(&self.derived_expressions)?;
         validate_header_lengths(
@@ -249,7 +269,7 @@ impl AuraHeader {
             .map_err(|_| AuraError::InvalidValue("derived expression length"))?;
         let mut out = Vec::with_capacity(usize::from(header_len));
         out.extend_from_slice(AURA_MAGIC);
-        put_u16_le(&mut out, FORMAT_VERSION);
+        put_u16_le(&mut out, self.container_version.wire_value());
         put_u8(&mut out, self.profile as u8);
         put_u16_le(&mut out, header_len);
         put_i64_le(&mut out, self.base_time_ns);
@@ -275,19 +295,19 @@ impl AuraHeader {
         if &bytes[..4] != AURA_MAGIC {
             return Err(AuraError::InvalidMagic { expected: "AURA" });
         }
-        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if version == 1 {
-            Ok(usize::from(bytes[HEADER_LEN_OFFSET]))
-        } else if version == FORMAT_VERSION {
-            if bytes.len() < HEADER_LEN_END {
-                return Err(AuraError::UnexpectedEof);
+        let version = AuraContainerVersion::from_wire(u16::from_le_bytes([bytes[4], bytes[5]]))?;
+        match version {
+            AuraContainerVersion::LegacyV1 => Ok(usize::from(bytes[HEADER_LEN_OFFSET])),
+            AuraContainerVersion::V2 => {
+                if bytes.len() < HEADER_LEN_END {
+                    return Err(AuraError::UnexpectedEof);
+                }
+                Ok(usize::from(u16::from_le_bytes([
+                    bytes[HEADER_LEN_OFFSET],
+                    bytes[HEADER_LEN_OFFSET + 1],
+                ])))
             }
-            Ok(usize::from(u16::from_le_bytes([
-                bytes[HEADER_LEN_OFFSET],
-                bytes[HEADER_LEN_OFFSET + 1],
-            ])))
-        } else {
-            Err(AuraError::UnsupportedVersion(version))
+            AuraContainerVersion::V3 => Self::encoded_len_v3(version),
         }
     }
 
@@ -297,22 +317,60 @@ impl AuraHeader {
         if magic != AURA_MAGIC {
             return Err(AuraError::InvalidMagic { expected: "AURA" });
         }
-        let version = reader.read_u16_le()?;
-        if version != 1 && version != FORMAT_VERSION {
-            return Err(AuraError::UnsupportedVersion(version));
+        let container_version = AuraContainerVersion::from_wire(reader.read_u16_le()?)?;
+        match container_version {
+            AuraContainerVersion::LegacyV1 => {
+                let profile = Profile::from_byte(reader.read_u8()?)?;
+                let header_len = usize::from(reader.read_u8()?);
+                Self::decode_supported_layout(
+                    reader,
+                    bytes,
+                    container_version,
+                    profile,
+                    header_len,
+                    LEGACY_HEADER_PREFIX_SIZE,
+                    false,
+                )
+            }
+            AuraContainerVersion::V2 => {
+                let profile = Profile::from_byte(reader.read_u8()?)?;
+                let header_len = usize::from(reader.read_u16_le()?);
+                Self::decode_supported_layout(
+                    reader,
+                    bytes,
+                    container_version,
+                    profile,
+                    header_len,
+                    HEADER_PREFIX_SIZE,
+                    true,
+                )
+            }
+            AuraContainerVersion::V3 => Self::decode_v3(container_version),
         }
-        let profile_byte = reader.read_u8()?;
-        let profile = Profile::from_byte(profile_byte)?;
-        let header_len = if version == 1 {
-            usize::from(reader.read_u8()?)
-        } else {
-            usize::from(reader.read_u16_le()?)
-        };
-        let prefix_size = if version == 1 {
-            LEGACY_HEADER_PREFIX_SIZE
-        } else {
-            HEADER_PREFIX_SIZE
-        };
+    }
+
+    fn encoded_len_v3(container_version: AuraContainerVersion) -> Result<usize> {
+        Err(AuraError::UnsupportedVersion(
+            container_version.wire_value(),
+        ))
+    }
+
+    fn decode_v3(container_version: AuraContainerVersion) -> Result<Self> {
+        Err(AuraError::UnsupportedVersion(
+            container_version.wire_value(),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_supported_layout(
+        mut reader: ByteReader<'_>,
+        bytes: &[u8],
+        container_version: AuraContainerVersion,
+        profile: Profile,
+        header_len: usize,
+        prefix_size: usize,
+        has_derived_expressions: bool,
+    ) -> Result<Self> {
         if header_len != bytes.len() || bytes.len() < prefix_size {
             return Err(AuraError::InvalidValue("header length"));
         }
@@ -321,10 +379,10 @@ impl AuraHeader {
         let dictionary_id = reader.read_u16_le()?;
         let schema_len = reader.read_u8()? as usize;
         let comment_len = reader.read_u8()? as usize;
-        let derived_expression_len = if version == 1 {
-            0
-        } else {
+        let derived_expression_len = if has_derived_expressions {
             reader.read_u16_le()? as usize
+        } else {
+            0
         };
         if prefix_size + schema_len + derived_expression_len + comment_len != header_len {
             return Err(AuraError::InvalidValue("header length"));
@@ -338,6 +396,7 @@ impl AuraHeader {
         reader.finish()?;
 
         Ok(Self {
+            container_version,
             profile,
             stream_id,
             dictionary_id,
@@ -483,6 +542,7 @@ mod tests {
         let encoded = open.encode().unwrap();
         let decoded_open = AuraHeader::decode(&encoded).unwrap();
         assert_eq!(open, decoded_open);
+        assert_eq!(AuraContainerVersion::V2, decoded_open.container_version);
         assert_eq!(7, decoded_open.stream_id);
         assert_eq!(3, decoded_open.dictionary_id);
         assert_eq!(1_725_000_000_000_000_000, decoded_open.base_time_ns);
@@ -597,8 +657,59 @@ mod tests {
         let encoded = AuraHeader::new(Profile::Aura0).encode().unwrap();
 
         assert_eq!(b"AURA", &encoded[..4]);
-        assert_eq!(FORMAT_VERSION.to_le_bytes(), encoded[4..6]);
+        assert_eq!(crate::format::FORMAT_VERSION.to_le_bytes(), encoded[4..6]);
         assert_eq!(Profile::Aura0 as u8, encoded[6]);
         assert_eq!(HEADER_PREFIX_SIZE as u16, read_u16_le(&encoded[7..9]));
+    }
+
+    #[test]
+    fn frozen_legacy_v1_header_still_decodes_as_header_only_layout() {
+        let frozen = [
+            b'A', b'U', b'R', b'A', 1, 0, 0, 27, 42, 0, 0, 0, 0, 0, 0, 0, 7, 0, 3, 0, 2, 3, 100, 0,
+            b'o', b'l', b'd',
+        ];
+
+        assert_eq!(AuraHeader::encoded_len(&frozen), Ok(frozen.len()));
+        let decoded = AuraHeader::decode(&frozen).unwrap();
+        assert_eq!(decoded.container_version, AuraContainerVersion::LegacyV1);
+        assert_eq!(decoded.profile, Profile::Ingest);
+        assert_eq!(decoded.base_time_ns, 42);
+        assert_eq!(decoded.stream_id, 7);
+        assert_eq!(decoded.dictionary_id, 3);
+        assert_eq!(decoded.schema_mapping, vec![100, 0]);
+        assert!(decoded.derived_expressions.is_empty());
+        assert_eq!(decoded.comment, "old");
+        assert_eq!(
+            decoded.encode(),
+            Err(AuraError::UnsupportedVersion(1)),
+            "legacy V1 support is intentionally header-decode-only"
+        );
+    }
+
+    #[test]
+    fn v3_header_layout_is_an_explicit_unsupported_skeleton() {
+        let mut encoded = AuraHeader::new(Profile::Aura0).encode().unwrap();
+        encoded[4..6].copy_from_slice(&AuraContainerVersion::V3.wire_value().to_le_bytes());
+
+        assert_eq!(
+            AuraHeader::encoded_len(&encoded),
+            Err(AuraError::UnsupportedVersion(3))
+        );
+        assert_eq!(
+            AuraHeader::decode(&encoded),
+            Err(AuraError::UnsupportedVersion(3))
+        );
+        encoded[6] = u8::MAX;
+        assert_eq!(
+            AuraHeader::decode(&encoded),
+            Err(AuraError::UnsupportedVersion(3)),
+            "V3 dispatch must occur before parsing V2 profile/layout bytes"
+        );
+        assert_eq!(
+            AuraHeader::new(Profile::Aura0)
+                .with_container_version(AuraContainerVersion::V3)
+                .encode(),
+            Err(AuraError::UnsupportedVersion(3))
+        );
     }
 }
