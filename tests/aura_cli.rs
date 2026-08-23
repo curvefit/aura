@@ -1,9 +1,19 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use aura_codec::canonicalize_schema_json;
+use arrow::array::{Int64Array, TimestampNanosecondArray};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
+use aura_codec::{
+    canonical_v3_batch_sha256, canonical_v3_schema_fingerprint, canonicalize_schema_json,
+    decode_v3_value_block, parse_schema_json, ShadowProtocolLimits, V3ValueLimits,
+};
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 const MINIMAL: &str = r#"{
   "schema_format": "aura-schema",
@@ -48,6 +58,11 @@ impl TestDir {
         let path =
             std::env::temp_dir().join(format!("aura-cli-test-{}-{suffix}", std::process::id()));
         fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         Self(path)
     }
 
@@ -69,6 +84,48 @@ fn aura(args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn aura_with_stdin(args: &[&str], stdin: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aura"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(stdin);
+    child.wait_with_output().unwrap()
+}
+
+fn minimal_ipc() -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let first = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(TimestampNanosecondArray::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![10, 20])),
+        ],
+    )
+    .unwrap();
+    let second = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(TimestampNanosecondArray::from(vec![3])),
+            Arc::new(Int64Array::from(vec![30])),
+        ],
+    )
+    .unwrap();
+    let mut bytes = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut bytes, &schema).unwrap();
+    writer.write(&first).unwrap();
+    writer.write(&second).unwrap();
+    writer.finish().unwrap();
+    drop(writer);
+    bytes
+}
+
 #[test]
 fn help_and_future_subcommands_are_clear() {
     let help = aura(&["--help"]);
@@ -76,6 +133,7 @@ fn help_and_future_subcommands_are_clear() {
     let stdout = String::from_utf8(help.stdout).unwrap();
     assert!(stdout.contains("aura schema validate"));
     assert!(stdout.contains("aura schema canonicalize"));
+    assert!(stdout.contains("aura shadow verify"));
 
     let nested_help = aura(&["schema", "validate", "--help"]);
     assert!(nested_help.status.success());
@@ -246,10 +304,576 @@ fn schema_input_must_be_a_regular_file() {
         .contains("regular file"));
 }
 
+#[test]
+fn shadow_handshake_is_stable_json_and_has_no_side_effects() {
+    let result = aura(&[
+        "shadow",
+        "handshake",
+        "--protocol",
+        "aura-logical-arrow-ipc-v1",
+        "--json",
+    ]);
+    assert!(result.status.success());
+    assert!(result.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_json_keys(
+        &value,
+        &[
+            "handshake_schema",
+            "package",
+            "package_version",
+            "git_commit",
+            "dirty",
+            "provenance_source",
+            "protocols",
+            "schema_formats",
+            "artifact_kinds",
+            "operations",
+            "complete_container_targets",
+            "hash_contracts",
+            "arrow",
+            "arrow_crate_version",
+            "cargo_lock_sha256",
+        ],
+    );
+    assert_eq!(value["handshake_schema"], "aura-shadow-handshake-v1");
+    assert_eq!(value["package"], "aura-codec");
+    assert_eq!(value["protocols"][0], "aura-logical-arrow-ipc-v1");
+    assert_eq!(value["operations"], serde_json::json!(["encode", "verify"]));
+    assert_eq!(
+        value["complete_container_targets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(value["package_version"].is_string());
+    assert!(value["arrow_crate_version"].is_string());
+    assert_eq!(value["cargo_lock_sha256"].as_str().unwrap().len(), 64);
+    assert_json_keys(
+        &value["hash_contracts"],
+        &["schema_fingerprint", "logical_values", "artifact"],
+    );
+    assert_json_keys(&value["arrow"], &["rust_version", "protocol"]);
+    assert_eq!(
+        value["schema_formats"],
+        serde_json::json!(["aura-schema-json-v1"])
+    );
+    assert_eq!(
+        value["artifact_kinds"],
+        serde_json::json!(["standalone-aura-v3-value-block-v1"])
+    );
+    assert!(matches!(
+        value["provenance_source"].as_str(),
+        Some("git-informational" | "override-untrusted" | "unavailable")
+    ));
+    if let Some(commit) = value["git_commit"].as_str() {
+        assert_eq!(commit.len(), 40);
+        assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(value["dirty"].is_boolean());
+    } else {
+        assert!(value["dirty"].is_null());
+    }
+}
+
+#[test]
+fn shadow_encode_publishes_verified_create_once_block() {
+    let dir = TestDir::new();
+    let schema_path = dir.path("schema.json");
+    let output = dir.path("values.aurav3vb");
+    fs::write(&schema_path, MINIMAL).unwrap();
+    let result = aura_with_stdin(
+        &[
+            "shadow",
+            "encode",
+            "--protocol",
+            "aura-logical-arrow-ipc-v1",
+            "--schema",
+            schema_path.to_str().unwrap(),
+            "--artifact-kind",
+            "standalone-aura-v3-value-block-v1",
+            "--output",
+            output.to_str().unwrap(),
+            "--json",
+        ],
+        &minimal_ipc(),
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(result.stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_json_keys(
+        &json,
+        &[
+            "result_schema",
+            "protocol",
+            "artifact_kind",
+            "complete_aura_file",
+            "reference_block_version",
+            "package_version",
+            "schema_id",
+            "schema_fingerprint_sha256",
+            "row_count",
+            "logical_sha256",
+            "artifact_bytes",
+            "artifact_sha256",
+            "stale_temp_cleanup_required",
+            "build",
+        ],
+    );
+    assert_eq!(json["result_schema"], "aura-shadow-encode-result-v1");
+    assert_eq!(json["complete_aura_file"], false);
+    assert_eq!(json["reference_block_version"], 1);
+    assert_eq!(json["row_count"], 3);
+    assert_eq!(json["stale_temp_cleanup_required"], false);
+    assert!(json["build"]["arrow_crate_version"].is_string());
+    assert_json_keys(
+        &json["build"],
+        &[
+            "git_commit",
+            "dirty",
+            "provenance_source",
+            "arrow_crate_version",
+            "cargo_lock_sha256",
+        ],
+    );
+    assert_eq!(
+        json["build"]["cargo_lock_sha256"].as_str().unwrap().len(),
+        64
+    );
+    assert!(json.get("output").is_none());
+    let bytes = fs::read(&output).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(json["artifact_bytes"], bytes.len());
+    let schema = parse_schema_json(MINIMAL).unwrap();
+    let decoded = decode_v3_value_block(&schema, &bytes, V3ValueLimits::default()).unwrap();
+    assert_eq!(decoded.row_count, 3);
+    assert_no_temp_files(&dir);
+
+    let collision = aura_with_stdin(
+        &[
+            "shadow",
+            "encode",
+            "--protocol",
+            "aura-logical-arrow-ipc-v1",
+            "--schema",
+            schema_path.to_str().unwrap(),
+            "--artifact-kind",
+            "standalone-aura-v3-value-block-v1",
+            "--output",
+            output.to_str().unwrap(),
+            "--json",
+        ],
+        &minimal_ipc(),
+    );
+    assert!(!collision.status.success());
+    assert_eq!(fs::read(output).unwrap(), bytes);
+    assert_no_temp_files(&dir);
+}
+
+#[test]
+fn shadow_encode_supports_documented_bare_relative_paths() {
+    let dir = TestDir::new();
+    fs::write(dir.path("schema.json"), MINIMAL).unwrap();
+    let run = || {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_aura"))
+            .current_dir(&dir.0)
+            .args([
+                "shadow",
+                "encode",
+                "--protocol",
+                "aura-logical-arrow-ipc-v1",
+                "--schema",
+                "schema.json",
+                "--artifact-kind",
+                "standalone-aura-v3-value-block-v1",
+                "--output",
+                "values.aurav3vb",
+                "--json",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(&minimal_ipc());
+        child.wait_with_output().unwrap()
+    };
+
+    let first = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let schema = parse_schema_json(MINIMAL).unwrap();
+    let artifact = fs::read(dir.path("values.aurav3vb")).unwrap();
+    assert!(decode_v3_value_block(&schema, &artifact, Default::default()).is_ok());
+    assert_no_temp_files(&dir);
+
+    let collision = run();
+    assert!(!collision.status.success());
+    assert_eq!(fs::read(dir.path("values.aurav3vb")).unwrap(), artifact);
+    assert_no_temp_files(&dir);
+}
+
+#[test]
+fn shadow_encode_invalid_input_never_publishes_or_leaks_environment() {
+    let dir = TestDir::new();
+    let schema_path = dir.path("schema.json");
+    let output = dir.path("values.aurav3vb");
+    fs::write(&schema_path, MINIMAL).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aura"));
+    command
+        .args([
+            "shadow",
+            "encode",
+            "--protocol",
+            "aura-logical-arrow-ipc-v1",
+            "--schema",
+            schema_path.to_str().unwrap(),
+            "--artifact-kind",
+            "standalone-aura-v3-value-block-v1",
+            "--output",
+            output.to_str().unwrap(),
+            "--json",
+        ])
+        .env("AURA_TEST_SECRET", "do-not-emit-this-secret")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"not ipc").unwrap();
+    let failed = child.wait_with_output().unwrap();
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+    assert!(!output.exists());
+    assert!(!String::from_utf8_lossy(&failed.stderr).contains("do-not-emit-this-secret"));
+    let error: serde_json::Value = serde_json::from_slice(&failed.stderr).unwrap();
+    assert_eq!(error["error_schema"], "aura-shadow-error-v1");
+    assert_no_temp_files(&dir);
+}
+
+#[test]
+fn shadow_encode_rejects_dash_path_spellings() {
+    let failed = aura_with_stdin(
+        &[
+            "shadow",
+            "encode",
+            "--protocol",
+            "aura-logical-arrow-ipc-v1",
+            "--schema",
+            "-",
+            "--artifact-kind",
+            "standalone-aura-v3-value-block-v1",
+            "--output",
+            "-.aurav3vb",
+            "--json",
+        ],
+        &minimal_ipc(),
+    );
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn shadow_stdout_failure_leaves_an_adopted_valid_artifact() {
+    let dir = TestDir::new();
+    let schema_path = dir.path("schema.json");
+    let output = dir.path("values.aurav3vb");
+    fs::write(&schema_path, MINIMAL).unwrap();
+    let stdout = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aura"))
+        .args([
+            "shadow",
+            "encode",
+            "--protocol",
+            "aura-logical-arrow-ipc-v1",
+            "--schema",
+            schema_path.to_str().unwrap(),
+            "--artifact-kind",
+            "standalone-aura-v3-value-block-v1",
+            "--output",
+            output.to_str().unwrap(),
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&minimal_ipc())
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(!result.status.success());
+    let committed_error: serde_json::Value = serde_json::from_slice(&result.stderr).unwrap();
+    assert_eq!(
+        committed_error["code"],
+        "publication_committed_result_unavailable"
+    );
+    let schema = parse_schema_json(MINIMAL).unwrap();
+    let bytes = fs::read(&output).unwrap();
+    let decoded = decode_v3_value_block(&schema, &bytes, Default::default()).unwrap();
+    let verify = aura(&[
+        "shadow",
+        "verify",
+        "--protocol",
+        "aura-logical-arrow-ipc-v1",
+        "--schema",
+        schema_path.to_str().unwrap(),
+        "--input",
+        output.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(verify.status.success());
+    assert!(verify.stderr.is_empty());
+    let verified: serde_json::Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_json_keys(
+        &verified,
+        &[
+            "result_schema",
+            "protocol",
+            "artifact_kind",
+            "complete_aura_file",
+            "reference_block_version",
+            "package_version",
+            "schema_id",
+            "schema_fingerprint_sha256",
+            "row_count",
+            "logical_sha256",
+            "artifact_bytes",
+            "artifact_sha256",
+            "build",
+        ],
+    );
+    assert_eq!(verified["result_schema"], "aura-shadow-verify-result-v1");
+    assert_eq!(verified["protocol"], "aura-logical-arrow-ipc-v1");
+    assert_eq!(
+        verified["artifact_kind"],
+        "standalone-aura-v3-value-block-v1"
+    );
+    assert_eq!(verified["complete_aura_file"], false);
+    assert_eq!(verified["reference_block_version"], 1);
+    assert!(verified["package_version"].is_string());
+    assert!(verified["schema_id"].is_number());
+    assert!(verified["artifact_bytes"].is_number());
+    assert_json_keys(
+        &verified["build"],
+        &[
+            "git_commit",
+            "dirty",
+            "provenance_source",
+            "arrow_crate_version",
+            "cargo_lock_sha256",
+        ],
+    );
+    assert_eq!(verified["row_count"], decoded.row_count);
+    assert_eq!(
+        verified["schema_fingerprint_sha256"],
+        test_hex(&canonical_v3_schema_fingerprint(&schema).unwrap())
+    );
+    assert_eq!(
+        verified["logical_sha256"],
+        test_hex(&canonical_v3_batch_sha256(&schema, &decoded, V3ValueLimits::default()).unwrap())
+    );
+    assert_eq!(
+        verified["artifact_sha256"],
+        test_hex(Sha256::digest(&bytes).as_ref())
+    );
+    assert_no_temp_files(&dir);
+}
+
+#[test]
+fn shadow_verify_rejects_malformed_and_oversize_inputs_without_writes() {
+    let dir = TestDir::new();
+    let schema = dir.path("schema.json");
+    let malformed = dir.path("malformed.aurav3vb");
+    let oversize = dir.path("oversize.aurav3vb");
+    fs::write(&schema, MINIMAL).unwrap();
+    fs::write(&malformed, b"not a value block").unwrap();
+    fs::File::create(&oversize)
+        .unwrap()
+        .set_len((ShadowProtocolLimits::default().values.max_block_bytes as u64) + 1)
+        .unwrap();
+    for input in [&malformed, &oversize] {
+        let result = aura(&[
+            "shadow",
+            "verify",
+            "--protocol",
+            "aura-logical-arrow-ipc-v1",
+            "--schema",
+            schema.to_str().unwrap(),
+            "--input",
+            input.to_str().unwrap(),
+            "--json",
+        ]);
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+    }
+    assert_no_temp_files(&dir);
+}
+
+#[test]
+fn shadow_verify_rejects_wrong_schema_dash_and_extension() {
+    let dir = TestDir::new();
+    let schema = dir.path("schema.json");
+    let wrong_schema = dir.path("wrong-schema.json");
+    let artifact = dir.path("values.aurav3vb");
+    fs::write(&schema, MINIMAL).unwrap();
+    fs::write(
+        &wrong_schema,
+        MINIMAL.replace("\"name\": \"value\"", "\"name\": \"different\""),
+    )
+    .unwrap();
+    let encoded = aura_with_stdin(
+        &[
+            "shadow",
+            "encode",
+            "--protocol",
+            "aura-logical-arrow-ipc-v1",
+            "--schema",
+            schema.to_str().unwrap(),
+            "--artifact-kind",
+            "standalone-aura-v3-value-block-v1",
+            "--output",
+            artifact.to_str().unwrap(),
+            "--json",
+        ],
+        &minimal_ipc(),
+    );
+    assert!(encoded.status.success());
+
+    let wrong = aura(&[
+        "shadow",
+        "verify",
+        "--protocol",
+        "aura-logical-arrow-ipc-v1",
+        "--schema",
+        wrong_schema.to_str().unwrap(),
+        "--input",
+        artifact.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(!wrong.status.success());
+    assert!(wrong.stdout.is_empty());
+
+    for input in ["-", "values.bin"] {
+        let failed = aura(&[
+            "shadow",
+            "verify",
+            "--protocol",
+            "aura-logical-arrow-ipc-v1",
+            "--schema",
+            schema.to_str().unwrap(),
+            "--input",
+            input,
+            "--json",
+        ]);
+        assert!(!failed.status.success());
+        assert!(failed.stdout.is_empty());
+    }
+    assert_no_temp_files(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn shadow_verify_rejects_symlink_input() {
+    use std::os::unix::fs::symlink;
+    let dir = TestDir::new();
+    let schema = dir.path("schema.json");
+    let target = dir.path("target.aurav3vb");
+    let input = dir.path("linked.aurav3vb");
+    fs::write(&schema, MINIMAL).unwrap();
+    fs::write(&target, b"target stays").unwrap();
+    symlink(&target, &input).unwrap();
+    let result = aura(&[
+        "shadow",
+        "verify",
+        "--protocol",
+        "aura-logical-arrow-ipc-v1",
+        "--schema",
+        schema.to_str().unwrap(),
+        "--input",
+        input.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(!result.status.success());
+    assert_eq!(fs::read(target).unwrap(), b"target stays");
+    assert_no_temp_files(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn shadow_encode_rejects_symlink_output() {
+    use std::os::unix::fs::symlink;
+    let dir = TestDir::new();
+    let schema_path = dir.path("schema.json");
+    let target = dir.path("target.aurav3vb");
+    let output = dir.path("values.aurav3vb");
+    fs::write(&schema_path, MINIMAL).unwrap();
+    fs::write(&target, b"preserve").unwrap();
+    symlink(&target, &output).unwrap();
+    let result = aura_with_stdin(
+        &[
+            "shadow",
+            "encode",
+            "--protocol",
+            "aura-logical-arrow-ipc-v1",
+            "--schema",
+            schema_path.to_str().unwrap(),
+            "--artifact-kind",
+            "standalone-aura-v3-value-block-v1",
+            "--output",
+            output.to_str().unwrap(),
+            "--json",
+        ],
+        &minimal_ipc(),
+    );
+    assert!(!result.status.success());
+    assert_eq!(fs::read(target).unwrap(), b"preserve");
+    assert_no_temp_files(&dir);
+}
+
 fn assert_no_temp_files(dir: &TestDir) {
     let names = fs::read_dir(&dir.0)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     assert!(names.iter().all(|name| !name.contains(".aura-tmp-")));
+}
+
+fn assert_json_keys(value: &serde_json::Value, expected: &[&str]) {
+    let actual = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = expected
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actual, expected);
+}
+
+fn test_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

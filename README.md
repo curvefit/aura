@@ -51,6 +51,7 @@ payload samples, or production capture logic.
 - [Aura container](docs/container.md) explains the header/body/footer shape.
 - [Field programs](docs/field-programs.md) explains compact decode instructions.
 - [Schemas](docs/schemas.md) explains logical schema construction.
+- [Shadow Arrow protocol](docs/SHADOW_PROTOCOL.md) specifies the offline external-compiler boundary and safe reference-block publication.
 - [Chunked storage](docs/chunking.md) explains independent compression chunks.
 - [Compression policy](docs/compression.md) explains why chunks beat whole-file streams.
 - [Aura1 block padding](docs/hot-padding.md) explains fixed-width replay blocks.
@@ -63,12 +64,12 @@ payload samples, or production capture logic.
 cargo test
 cargo run --bin aura -- schema validate --input schema.json
 cargo run --bin aura -- schema canonicalize --input schema.json --output canonical-schema.json
+cargo run --bin aura -- shadow handshake --protocol aura-logical-arrow-ipc-v1 --json
 cargo run --bin aura-size -- 10000 1 8
 cargo run --example roundtrip
 ```
 
-The current code is experimental. Complete files still use the V2 container;
-the V3 schema/header and canonical external schema JSON are available for
-development and validation. The V3 value, footer, and complete-file contracts
-are being built and will be compatibility-tested. Aura0 is not yet ready to
-replace Parquet in Grimoire.
+The current code is experimental. Complete files still use the V2 container.
+The V3 schema/header, canonical external schema JSON, and standalone value block
+are offline shadow/reference contracts only. They do not enable complete V3 or
+Aura0 output. Aura0 is not yet ready to replace Parquet in Grimoire.

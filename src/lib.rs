@@ -29,6 +29,7 @@ pub mod records;
 pub mod schema;
 pub mod schema_json;
 pub mod scoped;
+pub mod shadow_protocol;
 pub mod source;
 pub mod stats;
 pub mod types;
@@ -92,6 +93,14 @@ pub use schema::{
     AURA_V3_GROUP_DESCRIPTOR_TABLE_VERSION, MAX_DUAL_DOMAIN_COUNT,
 };
 pub use schema_json::{canonicalize_schema_json, parse_schema_json, MAX_SCHEMA_JSON_BYTES};
+pub use shadow_protocol::{
+    arrow_rust_version, build_provenance, cargo_lock_sha256, encode_shadow_arrow_ipc,
+    BuildProvenance, ShadowEncodeResult, ShadowProtocolLimits, DEFAULT_SHADOW_ARROW_IPC_BYTES,
+    DEFAULT_SHADOW_RECORD_BATCHES, DEFAULT_SHADOW_VALUE_BLOCK_BYTES, DEFAULT_SHADOW_VALUE_ROWS,
+    MAX_SHADOW_ARROW_IPC_BYTES, MAX_SHADOW_RECORD_BATCHES, SHADOW_ARROW_PROTOCOL,
+    SHADOW_ARTIFACT_KIND, SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL, SHADOW_RESULT_SCHEMA,
+    SHADOW_SCHEMA_FORMAT, SHADOW_VERIFY_RESULT_SCHEMA,
+};
 pub use source::{
     AuraEventBatch, AuraEventSource, AuraEventSourceStats, AuraFileSource, AuraLiveFrameSource,
     AuraLiveSource, AuraMemorySource,
