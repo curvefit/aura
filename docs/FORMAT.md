@@ -115,6 +115,11 @@ The V3 front header is authoritative for relationship and group permissions.
 The versioned full schema descriptor is authoritative for names, types, roles,
 scales, and nullability. When complete V3 containers are enabled, header and
 full-schema maps, expressions, groups, and schema dialect must agree exactly.
+Relationship byte 100 uniquely marks the primary event timestamp at slot 0.
+Additional event-scoped timestamp-role fields use byte 255 in the front map;
+their nanosecond, millisecond, or scaled-i64 units and nullability remain in the
+authoritative tag-4 schema. Byte 100 at any later slot is invalid. V2 mapping
+semantics and bytes are unchanged.
 
 ## Metadata
 

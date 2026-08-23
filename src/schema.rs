@@ -1824,9 +1824,31 @@ fn validate_v3_schema_parts(
         if entry.relation != field.relation {
             return Err(AuraError::InvalidValue("schema parent mapping"));
         }
-        if entry.is_timestamp != (field.role == FieldRole::Timestamp) {
+        validate_v3_timestamp_field(field)?;
+        let is_primary_timestamp = field.index == 0 && field.role == FieldRole::Timestamp;
+        if entry.is_timestamp != is_primary_timestamp {
             return Err(AuraError::InvalidValue("time slot"));
         }
+    }
+    Ok(())
+}
+
+fn validate_v3_timestamp_field(field: &FieldDescriptor) -> Result<()> {
+    if field.role != FieldRole::Timestamp {
+        return Ok(());
+    }
+    if field.scope != FieldScope::Event {
+        return Err(AuraError::InvalidValue("timestamp scope"));
+    }
+    let valid_type_and_scale = match field.field_type {
+        FieldType::TimestampNs | FieldType::TimestampMs => field.scale == 0,
+        // Scale zero retains the existing generic i64 primary timestamp form;
+        // scale -6 is the public TimestampMicros representation.
+        FieldType::I64 => matches!(field.scale, 0 | -6),
+        _ => false,
+    };
+    if !valid_type_and_scale {
+        return Err(AuraError::InvalidValue("v3 timestamp field"));
     }
     Ok(())
 }

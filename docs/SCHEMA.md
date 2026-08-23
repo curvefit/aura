@@ -68,6 +68,21 @@ the discriminator field itself. Group membership comes from the descriptor
 table. V2's zero-width `200` followed by `201..239` remains a separate legacy
 dialect and is never reinterpreted as V3.
 
+Byte `100` remains the unique primary timestamp relationship marker and is
+valid only for event-scoped slot 0. V3 may declare additional event-scoped
+timestamp-role fields at later slots; their front-map byte is `255`
+(`do-not-attempt`). The tag-4 full schema and canonical schema JSON remain
+authoritative for every field's logical type, role, scale, name, and
+nullability, so the auxiliary timestamps are not erased or coerced by the
+compact relationship map.
+
+V3 timestamp roles accept `timestamp_ns` at scale 0, `timestamp_ms` at scale 0,
+and `i64` in the existing scale-0 generic form or scale -6
+`TimestampMicros` form. Units remain encoded by `FieldType` and scale rather
+than the relationship byte. Every timestamp-role field must be event-scoped;
+text, opaque, boolean, and other non-timestamp physical types reject. This does
+not alter the V2 relationship-map dialect or bytes.
+
 Relationship flags authorize a bounded planner search; they do not select a
 codec or exact residual direction. The chosen complete inverse belongs in the
 compiled footer. Full V3 file writing remains disabled while the footer/plan

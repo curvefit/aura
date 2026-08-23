@@ -44,6 +44,140 @@ fn v3_schema(groups_reversed: bool) -> aura_codec::Result<aura_codec::SchemaDesc
 }
 
 #[test]
+fn v3_multiple_timestamp_roles_keep_one_primary_front_marker() {
+    let schema = SchemaBuilder::new("multi_timestamp")
+        .v3()
+        .field("source_ts_ms", FieldType::TimestampMs, FieldRole::Timestamp)
+        .nullable_field(
+            "source_time_aux_ms",
+            FieldType::TimestampMs,
+            FieldRole::Timestamp,
+        )
+        .field("sequence", FieldType::U64, FieldRole::Sequence)
+        .finish()
+        .unwrap();
+    assert_eq!(
+        schema.compact_schema_map.as_deref(),
+        Some(&[100, 255, 0][..])
+    );
+
+    let descriptor = encode_schema_descriptor(&schema).unwrap();
+    assert_eq!(descriptor[4], 4);
+    assert_eq!(decode_schema_descriptor(&descriptor).unwrap(), schema);
+    let canonical = schema.to_canonical_json().unwrap();
+    assert_eq!(parse_schema_json(&canonical).unwrap(), schema);
+
+    let header = AuraHeader::new(Profile::Ingest)
+        .with_container_version(AuraContainerVersion::V3)
+        .with_schema_mapping(schema.compact_schema_map.clone().unwrap())
+        .unwrap();
+    assert_eq!(
+        AuraHeader::decode(&header.encode().unwrap()).unwrap(),
+        header
+    );
+
+    let rebuilt = SchemaBuilder::new("multi_timestamp")
+        .v3()
+        .field("source_ts_ms", FieldType::TimestampMs, FieldRole::Timestamp)
+        .nullable_field(
+            "source_time_aux_ms",
+            FieldType::TimestampMs,
+            FieldRole::Timestamp,
+        )
+        .field("sequence", FieldType::U64, FieldRole::Sequence)
+        .finish()
+        .unwrap();
+    assert_eq!(rebuilt.schema_id, schema.schema_id);
+    let reordered = SchemaBuilder::new("multi_timestamp")
+        .v3()
+        .nullable_field(
+            "source_time_aux_ms",
+            FieldType::TimestampMs,
+            FieldRole::Timestamp,
+        )
+        .field("source_ts_ms", FieldType::TimestampMs, FieldRole::Timestamp)
+        .field("sequence", FieldType::U64, FieldRole::Sequence)
+        .finish()
+        .unwrap();
+    assert_ne!(reordered.schema_id, schema.schema_id);
+}
+
+#[test]
+fn v3_timestamp_roles_reject_forged_scope_type_and_scale() {
+    assert_eq!(
+        SchemaBuilder::new("forged_second_primary")
+            .v3()
+            .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
+            .field("aux", FieldType::TimestampMs, FieldRole::Timestamp)
+            .v3_schema_mapping(vec![100, 100])
+            .finish(),
+        Err(AuraError::InvalidValue("time slot"))
+    );
+    assert_eq!(
+        SchemaBuilder::new("repeated_timestamp")
+            .v3()
+            .field("ts", FieldType::TimestampNs, FieldRole::Timestamp)
+            .repeated_field("aux", FieldType::TimestampMs, FieldRole::Timestamp)
+            .repeated_group(1, vec![1], RelationshipPermissions::none())
+            .finish(),
+        Err(AuraError::InvalidValue("timestamp scope"))
+    );
+    for field_type in [
+        FieldType::Utf8,
+        FieldType::DecimalText,
+        FieldType::Opaque16,
+        FieldType::U8,
+    ] {
+        assert!(matches!(
+            SchemaBuilder::new("invalid_timestamp_type")
+                .v3()
+                .field("ts", field_type, FieldRole::Timestamp)
+                .finish(),
+            Err(AuraError::InvalidValue("v3 timestamp field"))
+        ));
+    }
+
+    let mut bad_ns_scale = SchemaBuilder::new("bad_ns_scale")
+        .v3()
+        .field("ts", FieldType::TimestampNs, FieldRole::Timestamp)
+        .finish()
+        .unwrap();
+    bad_ns_scale.fields[0].scale = -9;
+    assert_eq!(
+        bad_ns_scale.validate(),
+        Err(AuraError::InvalidValue("v3 timestamp field"))
+    );
+    let mut bad_i64_scale = SchemaBuilder::new("bad_i64_scale")
+        .v3()
+        .field("ts", FieldType::I64, FieldRole::Timestamp)
+        .finish()
+        .unwrap();
+    bad_i64_scale.fields[0].scale = -3;
+    assert_eq!(
+        bad_i64_scale.validate(),
+        Err(AuraError::InvalidValue("v3 timestamp field"))
+    );
+    let mut bad_ms_scale = SchemaBuilder::new("bad_ms_scale")
+        .v3()
+        .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
+        .finish()
+        .unwrap();
+    bad_ms_scale.fields[0].scale = -3;
+    assert_eq!(
+        bad_ms_scale.validate(),
+        Err(AuraError::InvalidValue("timestamp_ms field"))
+    );
+
+    let mut micros = SchemaBuilder::new("valid_i64_micros")
+        .v3()
+        .field("ts", FieldType::I64, FieldRole::Timestamp)
+        .finish()
+        .unwrap();
+    micros.fields[0].scale = -6;
+    assert!(micros.validate().is_ok());
+}
+
+#[test]
 fn v3_header_round_trips_authoritative_sections() {
     let schema = v3_schema(false).unwrap();
     let header = AuraHeader::new(Profile::Ingest)

@@ -20,7 +20,7 @@ use aura_codec::{
 fn aura_schema() -> SchemaDescriptor {
     SchemaBuilder::new("shadow_test")
         .v3()
-        .nullable_field("i8", FieldType::I8, FieldRole::Timestamp)
+        .nullable_field("i8", FieldType::I8, FieldRole::Value)
         .nullable_field("u8_bool", FieldType::U8, FieldRole::Boolean)
         .nullable_field("i16", FieldType::I16, FieldRole::Value)
         .nullable_field("u16", FieldType::U16, FieldRole::Value)
@@ -537,6 +537,53 @@ fn timestamp_millisecond_mapping_is_exact() {
     let decoded = decode_v3_value_block(&schema, &result.block, Default::default()).unwrap();
     assert_eq!(
         decoded.columns[0].value_ref(1).unwrap(),
+        Some(AuraV3ValueRef::TimestampMs(i64::MAX))
+    );
+}
+
+#[test]
+fn multiple_timestamp_millisecond_roles_use_one_primary_marker() {
+    let schema = SchemaBuilder::new("multiple_millis")
+        .v3()
+        .field("source_ts_ms", FieldType::TimestampMs, FieldRole::Timestamp)
+        .nullable_field(
+            "source_time_aux_ms",
+            FieldType::TimestampMs,
+            FieldRole::Timestamp,
+        )
+        .finish()
+        .unwrap();
+    assert_eq!(schema.compact_schema_map.as_deref(), Some(&[100, 255][..]));
+    let arrows = Arc::new(Schema::new(vec![
+        Field::new(
+            "source_ts_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new(
+            "source_time_aux_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrows.clone(),
+        vec![
+            Arc::new(TimestampMillisecondArray::from(vec![1, 2])),
+            Arc::new(TimestampMillisecondArray::from(vec![None, Some(i64::MAX)])),
+        ],
+    )
+    .unwrap();
+    let result = encode_shadow_arrow_ipc(
+        &schema,
+        Cursor::new(stream(arrows, &[batch])),
+        Default::default(),
+    )
+    .unwrap();
+    let decoded = decode_v3_value_block(&schema, &result.block, Default::default()).unwrap();
+    assert_eq!(decoded.columns[1].value_ref(0).unwrap(), None);
+    assert_eq!(
+        decoded.columns[1].value_ref(1).unwrap(),
         Some(AuraV3ValueRef::TimestampMs(i64::MAX))
     );
 }
