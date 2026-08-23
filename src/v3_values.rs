@@ -15,7 +15,7 @@ use crate::{AuraError, Result};
 const MAGIC: &[u8; 8] = b"AURAV3VB";
 const VERSION: u16 = 1;
 const HEADER_BYTES: usize = 64;
-const COLUMN_HEADER_BYTES: usize = 20;
+pub(crate) const COLUMN_HEADER_BYTES: usize = 20;
 const FLAG_VALIDITY: u8 = 1;
 const FLAG_VARIABLE: u8 = 2;
 const KNOWN_FLAGS: u8 = FLAG_VALIDITY | FLAG_VARIABLE;
@@ -43,7 +43,7 @@ impl V3ValueLimits {
         max_rows: MAX_V3_VALUE_ROWS,
     };
 
-    const fn effective(self) -> Self {
+    pub(crate) const fn effective(self) -> Self {
         Self {
             max_block_bytes: min_usize(self.max_block_bytes, MAX_V3_VALUE_BLOCK_BYTES),
             max_variable_value_bytes: min_usize(
@@ -115,7 +115,7 @@ impl AuraV3ColumnValues {
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::I8(values) => values.len(),
             Self::U8(values) => values.len(),
@@ -135,7 +135,7 @@ impl AuraV3ColumnValues {
         }
     }
 
-    const fn is_variable(&self) -> bool {
+    pub(crate) const fn is_variable(&self) -> bool {
         matches!(self, Self::Utf8(_) | Self::DecimalText(_))
     }
 }
@@ -315,33 +315,42 @@ pub fn validate_v3_batch(
     if batch.columns.len() != schema.fields.len() {
         return Err(AuraError::InvalidValue("v3 value column count"));
     }
-    let validity_len = bitmap_len(rows)?;
     for (slot, (field, column)) in schema.fields.iter().zip(&batch.columns).enumerate() {
         if usize::from(column.slot) != slot || field.index != column.slot {
             return Err(AuraError::InvalidValue("v3 value column slot"));
         }
-        if column.values.field_type() != field.field_type {
-            return Err(AuraError::InvalidValue("v3 value column type"));
-        }
-        if column.values.len() != rows {
-            return Err(AuraError::InvalidValue("v3 value column length"));
-        }
-        match (&column.validity, field.nullable) {
-            (None, false) => {}
-            (Some(bitmap), true) if bitmap.len() == validity_len => {
-                validate_bitmap_padding(bitmap, rows)?;
-            }
-            (Some(_), false) => return Err(AuraError::InvalidValue("v3 value validity")),
-            (None, true) => return Err(AuraError::InvalidValue("v3 value validity")),
-            (Some(_), true) => return Err(AuraError::InvalidValue("v3 value validity length")),
-        }
-        validate_column_values(column, rows, limits.max_variable_value_bytes)?;
+        validate_v3_column_exact(field, column, rows, limits.max_variable_value_bytes)?;
     }
     let length = encoded_len_value(batch, rows)?;
     if length > limits.max_block_bytes {
         return Err(AuraError::InvalidValue("v3 value block length"));
     }
     Ok(())
+}
+
+pub(crate) fn validate_v3_column_exact(
+    field: &crate::schema::FieldDescriptor,
+    column: &AuraV3Column,
+    rows: usize,
+    max_variable_value_bytes: usize,
+) -> Result<()> {
+    if column.values.field_type() != field.field_type {
+        return Err(AuraError::InvalidValue("v3 value column type"));
+    }
+    if column.values.len() != rows {
+        return Err(AuraError::InvalidValue("v3 value column length"));
+    }
+    let validity_len = bitmap_len(rows)?;
+    match (&column.validity, field.nullable) {
+        (None, false) => {}
+        (Some(bitmap), true) if bitmap.len() == validity_len => {
+            validate_bitmap_padding(bitmap, rows)?;
+        }
+        (Some(_), false) => return Err(AuraError::InvalidValue("v3 value validity")),
+        (None, true) => return Err(AuraError::InvalidValue("v3 value validity")),
+        (Some(_), true) => return Err(AuraError::InvalidValue("v3 value validity length")),
+    }
+    validate_column_values(column, rows, max_variable_value_bytes)
 }
 
 /// Encode the canonical standalone v3 exact-value block.
@@ -596,7 +605,11 @@ fn validate_flat_v3_schema(schema: &SchemaDescriptor) -> Result<()> {
     Ok(())
 }
 
-fn validate_column_values(column: &AuraV3Column, rows: usize, value_limit: usize) -> Result<()> {
+pub(crate) fn validate_column_values(
+    column: &AuraV3Column,
+    rows: usize,
+    value_limit: usize,
+) -> Result<()> {
     macro_rules! validate_fixed {
         ($values:expr, $zero:expr) => {{
             for (row, value) in $values.iter().enumerate() {
@@ -683,13 +696,13 @@ fn validate_variable(
     Ok(())
 }
 
-fn bitmap_len(rows: usize) -> Result<usize> {
+pub(crate) fn bitmap_len(rows: usize) -> Result<usize> {
     rows.checked_add(7)
         .map(|value| value / 8)
         .ok_or(AuraError::InvalidValue("v3 value validity length"))
 }
 
-fn validate_bitmap_padding(bitmap: &[u8], rows: usize) -> Result<()> {
+pub(crate) fn validate_bitmap_padding(bitmap: &[u8], rows: usize) -> Result<()> {
     let used = rows % 8;
     if used != 0 {
         let mask = !((1u8 << used) - 1);
@@ -700,7 +713,7 @@ fn validate_bitmap_padding(bitmap: &[u8], rows: usize) -> Result<()> {
     Ok(())
 }
 
-fn is_present(validity: Option<&[u8]>, row: usize) -> bool {
+pub(crate) fn is_present(validity: Option<&[u8]>, row: usize) -> bool {
     validity.is_none_or(|bitmap| bitmap[row / 8] & (1 << (row % 8)) != 0)
 }
 
@@ -737,32 +750,38 @@ fn encoded_len_value(batch: &AuraV3Batch, rows: usize) -> Result<usize> {
     let mut total = HEADER_BYTES;
     for column in &batch.columns {
         total = total
-            .checked_add(COLUMN_HEADER_BYTES)
-            .and_then(|value| value.checked_add(column.validity.as_ref().map_or(0, Vec::len)))
+            .checked_add(encoded_v3_column_len(column, rows)?)
             .ok_or(AuraError::InvalidValue("v3 value block length"))?;
-        if column.values.is_variable() {
-            let variable = match &column.values {
-                AuraV3ColumnValues::Utf8(value) | AuraV3ColumnValues::DecimalText(value) => value,
-                _ => unreachable!(),
-            };
-            total = total
-                .checked_add(
-                    rows.checked_add(1)
-                        .and_then(|value| value.checked_mul(4))
-                        .ok_or(AuraError::InvalidValue("v3 value block length"))?,
-                )
-                .and_then(|value| value.checked_add(variable.data.len()))
-                .ok_or(AuraError::InvalidValue("v3 value block length"))?;
-        } else {
-            let width = fixed_width(column.values.field_type())
-                .ok_or(AuraError::InvalidValue("v3 value column type"))?;
-            total = total
-                .checked_add(
-                    rows.checked_mul(width)
-                        .ok_or(AuraError::InvalidValue("v3 value block length"))?,
-                )
-                .ok_or(AuraError::InvalidValue("v3 value block length"))?;
-        }
+    }
+    Ok(total)
+}
+
+pub(crate) fn encoded_v3_column_len(column: &AuraV3Column, rows: usize) -> Result<usize> {
+    let mut total = COLUMN_HEADER_BYTES
+        .checked_add(column.validity.as_ref().map_or(0, Vec::len))
+        .ok_or(AuraError::InvalidValue("v3 value block length"))?;
+    if column.values.is_variable() {
+        let variable = match &column.values {
+            AuraV3ColumnValues::Utf8(value) | AuraV3ColumnValues::DecimalText(value) => value,
+            _ => unreachable!(),
+        };
+        total = total
+            .checked_add(
+                rows.checked_add(1)
+                    .and_then(|value| value.checked_mul(4))
+                    .ok_or(AuraError::InvalidValue("v3 value block length"))?,
+            )
+            .and_then(|value| value.checked_add(variable.data.len()))
+            .ok_or(AuraError::InvalidValue("v3 value block length"))?;
+    } else {
+        let width = fixed_width(column.values.field_type())
+            .ok_or(AuraError::InvalidValue("v3 value column type"))?;
+        total = total
+            .checked_add(
+                rows.checked_mul(width)
+                    .ok_or(AuraError::InvalidValue("v3 value block length"))?,
+            )
+            .ok_or(AuraError::InvalidValue("v3 value block length"))?;
     }
     Ok(total)
 }
@@ -780,7 +799,7 @@ fn fixed_width(field_type: FieldType) -> Option<usize> {
     }
 }
 
-fn encode_column(column: &AuraV3Column, rows: usize, out: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn encode_column(column: &AuraV3Column, rows: usize, out: &mut Vec<u8>) -> Result<()> {
     let variable = column.values.is_variable();
     let validity_len = column.validity.as_ref().map_or(0, Vec::len);
     let (fixed_len, offsets_len, data_len) = if variable {
@@ -860,7 +879,7 @@ fn encode_column_payload(values: &AuraV3ColumnValues, out: &mut Vec<u8>) {
     }
 }
 
-fn decode_column(
+pub(crate) fn decode_column(
     expected_slot: u16,
     expected_type: FieldType,
     nullable: bool,
@@ -1051,7 +1070,11 @@ fn decode_variable(
     })
 }
 
-fn hash_present_value(hasher: &mut Sha256, values: &AuraV3ColumnValues, row: usize) -> Result<()> {
+pub(crate) fn hash_present_value(
+    hasher: &mut Sha256,
+    values: &AuraV3ColumnValues,
+    row: usize,
+) -> Result<()> {
     macro_rules! hash_numeric {
         ($values:expr) => {
             hasher.update($values[row].to_le_bytes())

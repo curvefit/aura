@@ -35,6 +35,7 @@ pub mod source;
 pub mod stats;
 pub mod types;
 pub mod v3_container;
+pub mod v3_events;
 pub mod v3_reader;
 pub mod v3_values;
 pub mod v3_writer;
@@ -133,6 +134,13 @@ pub use v3_container::{
     MAX_V3_FLAT_CHUNKS, MAX_V3_FLAT_FOOTER_BYTES, MAX_V3_FLAT_ROWS, MAX_V3_FLAT_SCHEMA_BYTES,
     V3_FLAT_BODY_ENCODING_EXACT_BLOCKS, V3_FLAT_CHUNK_DESCRIPTOR_BYTES,
     V3_FLAT_FOOTER_LAYOUT_VERSION, V3_FLAT_FOOTER_PREFIX_BYTES, V3_FLAT_STATS_DESCRIPTOR_BYTES,
+};
+pub use v3_events::{
+    canonical_v3_event_batch_sha256, decode_v3_event_block, encode_v3_event_block,
+    validate_v3_event_batch, validate_v3_grouped_exact_subset, AuraV3EventBatch, V3EventLimits,
+    DEFAULT_V3_EVENT_BLOCK_BYTES, DEFAULT_V3_EVENT_CHILDREN, DEFAULT_V3_EVENT_EVENTS,
+    DEFAULT_V3_EVENT_VALUES, MAX_V3_EVENT_BLOCK_BYTES, MAX_V3_EVENT_CHILDREN, MAX_V3_EVENT_EVENTS,
+    MAX_V3_EVENT_OFFSETS_BYTES, MAX_V3_EVENT_VALUES,
 };
 pub use v3_reader::{
     AuraV3FlatReader, V3FlatAura0Reader, V3FlatReadAll, V3FlatReaderState, V3FlatVerifySummary,
