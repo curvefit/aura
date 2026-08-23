@@ -2644,10 +2644,9 @@ fn orderbook_benchmark_spec(operation: &str) -> Option<OrderBookBenchmarkSpec> {
     let (include_extract, rest) =
         if let Some(rest) = operation.strip_prefix("aura1-orderbook-extract-plus-apply-") {
             (true, rest)
-        } else if let Some(rest) = operation.strip_prefix("orderbook-apply-only-") {
-            (false, rest)
         } else {
-            return None;
+            let rest = operation.strip_prefix("orderbook-apply-only-")?;
+            (false, rest)
         };
 
     let (engine, mode, lifecycle) = rest

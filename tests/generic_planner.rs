@@ -1972,7 +1972,7 @@ fn generic_planner_composes_delta_of_delta_with_residual_codec() {
             let pseudo = (index as u64)
                 .wrapping_mul(2_862_933_555_777_941_757)
                 .wrapping_add(3_037_000_493);
-            if pseudo % 20 == 0 {
+            if pseudo.is_multiple_of(20) {
                 delta += 1 + i64::try_from((pseudo >> 21) % 257).unwrap() * 10_003;
             }
             value += delta;
