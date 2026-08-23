@@ -27,6 +27,7 @@ pub mod random_verify;
 pub mod reader;
 pub mod records;
 pub mod schema;
+pub mod schema_json;
 pub mod scoped;
 pub mod source;
 pub mod stats;
@@ -89,6 +90,7 @@ pub use schema::{
     SchemaDescriptor, SchemaEncodingVersion, SchemaMapEntry, SchemaMapHint, TransformCandidates,
     AURA_V3_GROUP_DESCRIPTOR_TABLE_VERSION, MAX_DUAL_DOMAIN_COUNT,
 };
+pub use schema_json::{canonicalize_schema_json, parse_schema_json, MAX_SCHEMA_JSON_BYTES};
 pub use source::{
     AuraEventBatch, AuraEventSource, AuraEventSourceStats, AuraFileSource, AuraLiveFrameSource,
     AuraLiveSource, AuraMemorySource,

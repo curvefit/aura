@@ -35,6 +35,7 @@ anyhow = "1"
 arrow = { version = "54", features = ["prettyprint"] }
 parquet = { version = "54", features = ["zstd"] }
 lz4_flex = "0.11.6"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 zstd = "0.13.3"
@@ -42,3 +43,7 @@ zstd = "0.13.3"
 [[bin]]
 name = "aura-json-i64"
 path = "src/bin/json_i64_rows.rs"
+
+[[bin]]
+name = "aura"
+path = "src/bin/aura.rs"

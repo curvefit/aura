@@ -5,9 +5,9 @@ use aura_codec::schema::{
     SchemaMapHint,
 };
 use aura_codec::{
-    records, AuraContainerVersion, AuraError, AuraFooter, AuraHeader, AuraI64Writer,
-    DerivedExpression, DerivedExpressionOp, IngestStats, Profile, MAX_V3_HEADER_BYTES,
-    V3_HEADER_PREFIX_SIZE,
+    parse_schema_json, records, AuraContainerVersion, AuraError, AuraFooter, AuraHeader,
+    AuraI64Writer, DerivedExpression, DerivedExpressionOp, IngestStats, Profile,
+    MAX_V3_HEADER_BYTES, V3_HEADER_PREFIX_SIZE,
 };
 
 fn permissions() -> RelationshipPermissions {
@@ -417,5 +417,72 @@ fn v2_ingest_and_compiled_emitters_reject_v3_schemas() {
     assert_eq!(
         compiled_footer.encode(),
         Err(AuraError::InvalidValue("schema container version"))
+    );
+}
+
+#[test]
+fn v3_derived_expression_order_is_canonical_across_all_public_encodings() {
+    let expression_1 =
+        DerivedExpression::new(1, 1, DerivedExpressionOp::AddResidual, vec![0]).unwrap();
+    let expression_2 =
+        DerivedExpression::new(2, 2, DerivedExpressionOp::AddResidual, vec![0]).unwrap();
+    let base_schema = || {
+        SchemaBuilder::new("expression_order")
+            .field("ts", FieldType::TimestampNs, FieldRole::Timestamp)
+            .field("a", FieldType::I64, FieldRole::Value)
+            .field("b", FieldType::I64, FieldRole::Value)
+            .finish()
+            .unwrap()
+    };
+    let forward = base_schema()
+        .with_derived_expressions(vec![expression_1.clone(), expression_2.clone()])
+        .unwrap()
+        .into_v3()
+        .unwrap();
+    let reverse = base_schema()
+        .with_derived_expressions(vec![expression_2.clone(), expression_1.clone()])
+        .unwrap()
+        .into_v3()
+        .unwrap();
+    assert_eq!(forward.schema_id, reverse.schema_id);
+    assert_eq!(forward.derived_expressions, reverse.derived_expressions);
+    assert_eq!(
+        encode_schema_descriptor(&forward).unwrap(),
+        encode_schema_descriptor(&reverse).unwrap()
+    );
+    let canonical_json = forward.to_canonical_json().unwrap();
+    assert_eq!(canonical_json, reverse.to_canonical_json().unwrap());
+    assert_eq!(
+        forward,
+        parse_schema_json(&canonical_json).unwrap(),
+        "canonical JSON reparsing retains the same binary schema identity"
+    );
+
+    let mapping = forward.compact_schema_map.clone().unwrap();
+    let forward_header = AuraHeader::new(Profile::Ingest)
+        .with_container_version(AuraContainerVersion::V3)
+        .with_schema_mapping(mapping.clone())
+        .unwrap()
+        .with_derived_expressions(vec![expression_1.clone(), expression_2.clone()])
+        .unwrap()
+        .encode()
+        .unwrap();
+    let reverse_header = AuraHeader::new(Profile::Ingest)
+        .with_schema_mapping(mapping)
+        .unwrap()
+        .with_derived_expressions(vec![expression_2, expression_1])
+        .unwrap()
+        .with_container_version(AuraContainerVersion::V3)
+        .encode()
+        .unwrap();
+    assert_eq!(forward_header, reverse_header);
+    let decoded_header = AuraHeader::decode(&reverse_header).unwrap();
+    assert_eq!(
+        vec![1, 2],
+        decoded_header
+            .derived_expressions
+            .iter()
+            .map(|expression| expression.expression_id)
+            .collect::<Vec<_>>()
     );
 }

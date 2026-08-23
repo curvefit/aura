@@ -855,8 +855,11 @@ impl SchemaDescriptor {
 
     pub fn with_derived_expressions(
         mut self,
-        derived_expressions: Vec<DerivedExpression>,
+        mut derived_expressions: Vec<DerivedExpression>,
     ) -> Result<Self> {
+        if self.encoding_version == SchemaEncodingVersion::V3 {
+            derived_expressions.sort_by_key(|expression| expression.expression_id);
+        }
         validate_schema_derived_expressions(
             &self.fields,
             self.compact_schema_map.as_deref(),
@@ -872,6 +875,8 @@ impl SchemaDescriptor {
     /// Promote this descriptor to Aura v3 and install its authoritative groups.
     pub fn with_v3_groups(mut self, groups: Vec<GroupDescriptor>) -> Result<Self> {
         self.encoding_version = SchemaEncodingVersion::V3;
+        self.derived_expressions
+            .sort_by_key(|expression| expression.expression_id);
         self.groups = groups;
         self.groups.sort_by_key(|group| group.group_id);
         if self.compact_schema_map.is_none() {
@@ -885,6 +890,8 @@ impl SchemaDescriptor {
     /// Promote a flat descriptor to Aura v3 without inferring identity from groups.
     pub fn into_v3(mut self) -> Result<Self> {
         self.encoding_version = SchemaEncodingVersion::V3;
+        self.derived_expressions
+            .sort_by_key(|expression| expression.expression_id);
         if self.compact_schema_map.is_none() {
             self.compact_schema_map = Some(derive_v3_schema_mapping(&self)?);
         }
@@ -2177,7 +2184,9 @@ fn encode_v3_full_field_schema(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> 
         .ok_or(AuraError::InvalidValue("v3 schema mapping"))?;
     put_u32_len(out, mapping.len(), "schema mapping length")?;
     out.extend_from_slice(mapping);
-    let expressions = encode_derived_expression_table(&schema.derived_expressions)?;
+    let mut derived_expressions = schema.derived_expressions.clone();
+    derived_expressions.sort_by_key(|expression| expression.expression_id);
+    let expressions = encode_derived_expression_table(&derived_expressions)?;
     put_u32_len(out, expressions.len(), "derived expression length")?;
     out.extend_from_slice(&expressions);
     let groups = encode_group_descriptor_table(&schema.groups)?;
@@ -2233,7 +2242,9 @@ fn decode_v3_named_full_field_schema(reader: &mut ByteReader<'_>) -> Result<Sche
     if expression_len > reader.remaining() {
         return Err(AuraError::UnexpectedEof);
     }
-    let derived_expressions = decode_derived_expression_table(reader.read_exact(expression_len)?)?;
+    let mut derived_expressions =
+        decode_derived_expression_table(reader.read_exact(expression_len)?)?;
+    derived_expressions.sort_by_key(|expression| expression.expression_id);
     let group_len = reader.read_u32_le()? as usize;
     if group_len > reader.remaining() {
         return Err(AuraError::UnexpectedEof);
@@ -2695,11 +2706,19 @@ fn schema_hash(
 }
 
 fn schema_hash_for_version(schema: &SchemaDescriptor) -> u32 {
+    let mut canonical_v3_expressions;
+    let derived_expressions = if schema.encoding_version == SchemaEncodingVersion::V3 {
+        canonical_v3_expressions = schema.derived_expressions.clone();
+        canonical_v3_expressions.sort_by_key(|expression| expression.expression_id);
+        canonical_v3_expressions.as_slice()
+    } else {
+        schema.derived_expressions.as_slice()
+    };
     let mut hash = schema_hash(
         &schema.name,
         &schema.fields,
         schema.compact_schema_map.as_deref(),
-        &schema.derived_expressions,
+        derived_expressions,
     );
     if schema.encoding_version == SchemaEncodingVersion::V3 {
         update_hash(&mut hash, b"AuraSchemaV3\0");

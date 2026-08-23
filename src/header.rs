@@ -227,8 +227,11 @@ impl AuraHeader {
 
     pub fn with_derived_expressions(
         mut self,
-        derived_expressions: Vec<DerivedExpression>,
+        mut derived_expressions: Vec<DerivedExpression>,
     ) -> Result<Self> {
+        if self.container_version == AuraContainerVersion::V3 {
+            derived_expressions.sort_by_key(|expression| expression.expression_id);
+        }
         validate_derived_expressions(&derived_expressions)?;
         self.validate_builder_lengths(
             self.schema_mapping.len(),
@@ -372,13 +375,11 @@ impl AuraHeader {
     }
 
     fn encode_v3(&self) -> Result<Vec<u8>> {
-        validate_derived_expressions(&self.derived_expressions)?;
-        validate_v3_header_schema(
-            &self.schema_mapping,
-            &self.groups,
-            &self.derived_expressions,
-        )?;
-        let expression_table = encode_derived_expression_table(&self.derived_expressions)?;
+        let mut derived_expressions = self.derived_expressions.clone();
+        derived_expressions.sort_by_key(|expression| expression.expression_id);
+        validate_derived_expressions(&derived_expressions)?;
+        validate_v3_header_schema(&self.schema_mapping, &self.groups, &derived_expressions)?;
+        let expression_table = encode_derived_expression_table(&derived_expressions)?;
         let group_table = encode_group_descriptor_table(&self.groups)?;
         let header_len = V3_HEADER_PREFIX_SIZE
             .checked_add(self.schema_mapping.len())
@@ -533,7 +534,8 @@ impl AuraHeader {
         let group_bytes = reader.read_exact(group_len)?;
         let comment_bytes = reader.read_exact(comment_len)?;
         reader.finish()?;
-        let derived_expressions = decode_derived_expression_table(expression_bytes)?;
+        let mut derived_expressions = decode_derived_expression_table(expression_bytes)?;
+        derived_expressions.sort_by_key(|expression| expression.expression_id);
         let groups = decode_group_descriptor_table(group_bytes)?;
         validate_v3_header_schema(schema_bytes, &groups, &derived_expressions)?;
         let comment = std::str::from_utf8(comment_bytes)

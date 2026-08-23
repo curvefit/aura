@@ -8,7 +8,7 @@ The public model is intentionally generic:
 
 - `.aura` stores normalized logical facts with generous integer fields and
   footer optimization stats when available,
-- a compact v1 schema header defines positional fields, direct parent refs,
+- a versioned schema header defines positional fields, direct parent refs,
   derived expression refs, repeated groups, booleans/enums, timestamps, and
   opaque streams,
 - `.aura0` is the compact compiled level with code-only decode instructions,
@@ -61,10 +61,14 @@ payload samples, or production capture logic.
 
 ```bash
 cargo test
+cargo run --bin aura -- schema validate --input schema.json
+cargo run --bin aura -- schema canonicalize --input schema.json --output canonical-schema.json
 cargo run --bin aura-size -- 10000 1 8
 cargo run --example roundtrip
 ```
 
-The current code is a prototype skeleton. It is meant to preserve the important
-format ideas and make future benchmarking straightforward, not to claim a stable
-wire format yet.
+The current code is experimental. Complete files still use the V2 container;
+the V3 schema/header and canonical external schema JSON are available for
+development and validation. The V3 value, footer, and complete-file contracts
+are being built and will be compatibility-tested. Aura0 is not yet ready to
+replace Parquet in Grimoire.
