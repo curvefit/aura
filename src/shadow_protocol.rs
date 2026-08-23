@@ -144,19 +144,11 @@ fn valid_embedded_commit(value: &str) -> bool {
 /// Read and convert one explicitly terminated Arrow IPC stream under bounded limits.
 pub fn encode_shadow_arrow_ipc<R: Read>(
     schema: &SchemaDescriptor,
-    mut input: R,
+    input: R,
     limits: ShadowProtocolLimits,
 ) -> Result<ShadowEncodeResult> {
     let limits = limits.effective();
-    let mut batch = empty_v3_batch(schema)?;
-    validate_v3_batch(schema, &batch, limits.values)?;
-    let ipc = read_bounded(&mut input, limits.max_input_bytes)?;
-    preflight_ipc_stream(schema, &ipc, limits)?;
-    batch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        decode_ipc_batches(schema, &ipc, batch, limits.values)
-    }))
-    .map_err(|_| AuraError::InvalidValue("shadow arrow ipc panic"))??;
-
+    let batch = decode_shadow_arrow_ipc_batch(schema, input, limits)?;
     let schema_fingerprint = canonical_v3_schema_fingerprint(schema)?;
     let logical_sha256 = canonical_v3_batch_sha256(schema, &batch, limits.values)?;
     let block = encode_v3_value_block(schema, &batch, limits.values)?;
@@ -168,6 +160,26 @@ pub fn encode_shadow_arrow_ipc<R: Read>(
         block,
         block_sha256,
     })
+}
+
+/// Decode one strict bounded Arrow stream into the exact logical batch used by
+/// both the reference-block encoder and the flat V3 container writer.
+pub fn decode_shadow_arrow_ipc_batch<R: Read>(
+    schema: &SchemaDescriptor,
+    mut input: R,
+    limits: ShadowProtocolLimits,
+) -> Result<AuraV3Batch> {
+    let limits = limits.effective();
+    let mut batch = empty_v3_batch(schema)?;
+    validate_v3_batch(schema, &batch, limits.values)?;
+    let ipc = read_bounded(&mut input, limits.max_input_bytes)?;
+    preflight_ipc_stream(schema, &ipc, limits)?;
+    batch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        decode_ipc_batches(schema, &ipc, batch, limits.values)
+    }))
+    .map_err(|_| AuraError::InvalidValue("shadow arrow ipc panic"))??;
+
+    Ok(batch)
 }
 
 fn decode_ipc_batches(

@@ -4,7 +4,9 @@
 testing an external Aura compiler. It accepts one explicitly terminated Arrow
 IPC **stream** and emits `standalone-aura-v3-value-block-v1`. The artifact is a
 schema-bound reference block, not a complete `.aura`, `.aura0`, or `.aura1`
-file. Complete V3/Aura0 targets remain disabled.
+file. The reference-block artifact remains unchanged; the same strict logical
+Arrow input can separately target the complete `flat-aura0-v3-v1` container
+through `aura v3 aura0 seal`.
 
 Discover the exact compiler capability without reading stdin or creating files:
 
@@ -15,7 +17,7 @@ aura shadow handshake --protocol aura-logical-arrow-ipc-v1 --json
 The stable `aura-shadow-handshake-v1` result identifies the package version,
 full local Git commit and dirty state when available, provenance evidence class, Cargo
 lockfile SHA-256, supported
-protocol/schema/artifact lists, an empty `complete_container_targets` list,
+protocol/schema/artifact lists, the single `flat-aura0-v3-v1` complete target,
 the hash-domain contracts, and the Rust Arrow version and IPC protocol.
 
 Encode a stream supplied on stdin:
@@ -28,6 +30,31 @@ aura shadow encode \
   --output values.aurav3vb \
   --json < logical.arrow-stream
 ```
+
+Seal the same strict logical stream as a complete flat V3 Aura0 file, then
+verify it using only its embedded canonical schema:
+
+```bash
+aura v3 aura0 seal \
+  --protocol aura-logical-arrow-ipc-v1 \
+  --schema canonical-schema.json \
+  --output events.aura0 \
+  --json < logical.arrow-stream
+
+aura v3 aura0 verify --input events.aura0 --json
+```
+
+Seal accepts canonical schema JSON only and publishes a new mode-0600 path via
+the same create-once, held-handle verification and directory-fsync state
+machine as the standalone shadow artifact. It never relabels an `AURAV3VB`
+reference block as a complete file.
+
+V3 seal and verify results identify container version 3, profile `aura0`, body
+encoding `flat_exact_blocks_v1`, footer layout version 1, all publication-size
+fields, schema and logical identities, and the exact artifact SHA-256. Both
+carry build provenance. V3 failures use `aura-v3-flat-error-v1`; committed
+result-delivery failure distinguishes whether stale temporary cleanup is also
+required.
 
 Verify and recover the path-free result for an already committed block without
 writing anything:

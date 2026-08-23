@@ -10,10 +10,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aura_codec::{
     arrow_rust_version, build_provenance, canonical_v3_batch_sha256, cargo_lock_sha256,
-    decode_v3_value_block, encode_shadow_arrow_ipc, parse_schema_json, ShadowEncodeResult,
-    ShadowProtocolLimits, V3ValueLimits, MAX_SCHEMA_JSON_BYTES, MAX_V3_VALUE_BLOCK_BYTES,
-    SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND, SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL,
-    SHADOW_RESULT_SCHEMA, SHADOW_SCHEMA_FORMAT, SHADOW_VERIFY_RESULT_SCHEMA,
+    decode_shadow_arrow_ipc_batch, decode_v3_value_block, encode_shadow_arrow_ipc,
+    parse_schema_json, ShadowEncodeResult, ShadowProtocolLimits, V3FlatAura0Reader,
+    V3FlatAura0Writer, V3FlatWriteSummary, V3FlatWriterOptions, V3ValueLimits,
+    MAX_SCHEMA_JSON_BYTES, MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND,
+    SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL, SHADOW_RESULT_SCHEMA, SHADOW_SCHEMA_FORMAT,
+    SHADOW_VERIFY_RESULT_SCHEMA,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -28,6 +30,9 @@ Usage:
     --artifact-kind standalone-aura-v3-value-block-v1 --output <path> --json
   aura shadow verify --protocol aura-logical-arrow-ipc-v1 --schema <path> \
     --input <existing.aurav3vb> --json
+  aura v3 aura0 seal --protocol aura-logical-arrow-ipc-v1 --schema <canonical.json> \
+    --output <new.aura0> --json
+  aura v3 aura0 verify --input <file.aura0> --json
   aura --help
 ";
 
@@ -42,8 +47,11 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             let shadow_error = args.first().is_some_and(|value| value == "shadow");
+            let v3_error = args.first().is_some_and(|value| value == "v3");
             let (error_code, error_text) = if shadow_error {
                 shadow_safe_error(&error.0)
+            } else if v3_error {
+                v3_safe_error(&error.0)
             } else {
                 ("schema_command_failed", bounded_error(&error.0))
             };
@@ -52,6 +60,8 @@ fn main() -> ExitCode {
                     .unwrap_or_else(|_| "\"schema command failed\"".to_owned());
                 if shadow_error {
                     eprintln!("{{\"error_schema\":\"aura-shadow-error-v1\",\"code\":\"{error_code}\",\"error\":{message}}}");
+                } else if v3_error {
+                    eprintln!("{{\"error_schema\":\"aura-v3-flat-error-v1\",\"code\":\"{error_code}\",\"error\":{message}}}");
                 } else {
                     eprintln!("{{\"valid\":false,\"error\":{message}}}");
                 }
@@ -67,6 +77,23 @@ fn run(args: &[String]) -> Result<(), CliError> {
     if matches!(args, [arg] if arg == "--help" || arg == "-h") {
         print!("{HELP}");
         return Ok(());
+    }
+    if matches!(args.first().map(String::as_str), Some("v3")) {
+        let [_, profile, command, options @ ..] = args else {
+            return Err(CliError(format!("invalid command\n\n{HELP}")));
+        };
+        if profile != "aura0" {
+            return Err(CliError(
+                "unsupported v3 profile; expected aura0".to_owned(),
+            ));
+        }
+        return match command.as_str() {
+            "seal" => v3_aura0_seal_command(options),
+            "verify" => v3_aura0_verify_command(options),
+            _ => Err(CliError(
+                "unsupported v3 aura0 command; expected seal or verify".to_owned(),
+            )),
+        };
     }
     if let Some(namespace) = args.first() {
         if namespace != "schema" && namespace != "shadow" {
@@ -128,8 +155,8 @@ fn shadow_handshake_command(args: &[String]) -> Result<(), CliError> {
         "protocols": [SHADOW_PROTOCOL],
         "schema_formats": [SHADOW_SCHEMA_FORMAT],
         "artifact_kinds": [SHADOW_ARTIFACT_KIND],
-        "operations": ["encode", "verify"],
-        "complete_container_targets": [],
+        "operations": ["encode", "verify", "v3-aura0-seal", "v3-aura0-verify"],
+        "complete_container_targets": ["flat-aura0-v3-v1"],
         "hash_contracts": {
             "schema_fingerprint": "sha256:aura-v3-schema-fingerprint-v1",
             "logical_values": "sha256:aura-v3-canonical-exact-values-v1",
@@ -281,6 +308,155 @@ fn shadow_verify_command(args: &[String]) -> Result<(), CliError> {
         "row_count": decoded.row_count,
         "logical_sha256": hex(&logical_sha256),
         "artifact_bytes": bytes.len(),
+        "artifact_sha256": hex(&artifact_sha256),
+        "build": {
+            "git_commit": provenance.git_commit,
+            "dirty": provenance.dirty,
+            "provenance_source": provenance.source,
+            "arrow_crate_version": arrow_rust_version(),
+            "cargo_lock_sha256": hex(&cargo_lock_sha256())
+        }
+    });
+    write_json_stdout(&value)
+}
+
+fn v3_aura0_seal_command(args: &[String]) -> Result<(), CliError> {
+    let mut protocol = None;
+    let mut schema_path = None;
+    let mut output = None;
+    let mut json_output = false;
+    parse_options(args, |name, value| match name {
+        "--protocol" => set_string(&mut protocol, value, "--protocol"),
+        "--schema" => set_path(&mut schema_path, value, "--schema"),
+        "--output" => set_path(&mut output, value, "--output"),
+        "--json" if value.is_none() => {
+            json_output = true;
+            Ok(())
+        }
+        _ => Err(CliError("unknown v3 aura0 seal option".to_owned())),
+    })?;
+    require_protocol(protocol)?;
+    if !json_output {
+        return Err(CliError("v3 aura0 seal requires --json".to_owned()));
+    }
+    let schema_path = schema_path.ok_or_else(|| CliError("missing --schema".to_owned()))?;
+    let output = output.ok_or_else(|| CliError("missing --output".to_owned()))?;
+    if schema_path == Path::new("-") || output == Path::new("-") {
+        return Err(CliError(
+            "v3 schema and output must be filesystem paths".to_owned(),
+        ));
+    }
+    if output.extension().and_then(|value| value.to_str()) != Some("aura0") {
+        return Err(CliError(
+            "v3 output must use the .aura0 extension".to_owned(),
+        ));
+    }
+    require_absent_output(&output)?;
+    let schema_text = read_bounded_schema(&schema_path)?;
+    let schema = parse_schema_json(&schema_text).map_err(|error| CliError(error.to_string()))?;
+    if schema
+        .to_canonical_json()
+        .map_err(|error| CliError(error.to_string()))?
+        != schema_text
+    {
+        return Err(CliError("v3 schema must be canonical JSON".to_owned()));
+    }
+    let batch =
+        decode_shadow_arrow_ipc_batch(&schema, io::stdin().lock(), ShadowProtocolLimits::default())
+            .map_err(|error| CliError(error.to_string()))?;
+    let (publication, summary, artifact_sha256) = publish_verified_v3(&output, &schema, &batch)?;
+    let provenance = build_provenance();
+    let value = json!({
+        "result_schema": "aura-v3-flat-aura0-seal-result-v1",
+        "protocol": SHADOW_PROTOCOL,
+        "complete_aura_file": true,
+        "container_target": "flat-aura0-v3-v1",
+        "container_version": 3,
+        "profile": "aura0",
+        "body_encoding": "flat_exact_blocks_v1",
+        "footer_layout_version": 1,
+        "schema_id": schema.schema_id,
+        "schema_fingerprint_sha256": hex(&summary.schema_fingerprint),
+        "row_count": summary.record_count,
+        "chunk_count": summary.chunk_count,
+        "body_bytes": summary.body_bytes,
+        "footer_bytes": summary.footer_bytes,
+        "file_bytes": summary.file_bytes,
+        "logical_sha256": hex(&summary.global_logical_sha256),
+        "artifact_sha256": hex(&artifact_sha256),
+        "stale_temp_cleanup_required": publication.stale_temp_cleanup_required,
+        "build": {
+            "git_commit": provenance.git_commit,
+            "dirty": provenance.dirty,
+            "provenance_source": provenance.source,
+            "arrow_crate_version": arrow_rust_version(),
+            "cargo_lock_sha256": hex(&cargo_lock_sha256())
+        }
+    });
+    write_json_stdout(&value).map_err(|_| {
+        if publication.stale_temp_cleanup_required {
+            CliError("publication_committed_result_unavailable_cleanup_required".to_owned())
+        } else {
+            CliError("publication committed result unavailable".to_owned())
+        }
+    })
+}
+
+fn v3_aura0_verify_command(args: &[String]) -> Result<(), CliError> {
+    let mut input = None;
+    let mut json_output = false;
+    parse_options(args, |name, value| match name {
+        "--input" => set_path(&mut input, value, "--input"),
+        "--json" if value.is_none() => {
+            json_output = true;
+            Ok(())
+        }
+        _ => Err(CliError("unknown v3 aura0 verify option".to_owned())),
+    })?;
+    if !json_output {
+        return Err(CliError("v3 aura0 verify requires --json".to_owned()));
+    }
+    let input = input.ok_or_else(|| CliError("missing --input".to_owned()))?;
+    if input == Path::new("-")
+        || input.extension().and_then(|value| value.to_str()) != Some("aura0")
+    {
+        return Err(CliError("v3 input path rejected".to_owned()));
+    }
+    let metadata =
+        fs::symlink_metadata(&input).map_err(|_| CliError("v3 input path rejected".to_owned()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CliError("v3 input path rejected".to_owned()));
+    }
+    let file = open_v3_input(&input, &metadata)?;
+    let mut reader =
+        V3FlatAura0Reader::open(file).map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    let schema_id = reader.embedded_footer().schema.schema_id;
+    let schema_fingerprint = reader.embedded_footer().schema_fingerprint;
+    let summary = reader
+        .verify_all()
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    let mut file = reader.into_inner();
+    let artifact_sha256 = hash_file_exact(&mut file, summary.file_bytes)
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    let provenance = build_provenance();
+    let value = json!({
+        "result_schema": "aura-v3-flat-aura0-verify-result-v1",
+        "protocol": SHADOW_PROTOCOL,
+        "complete_aura_file": true,
+        "container_target": "flat-aura0-v3-v1",
+        "container_version": 3,
+        "profile": "aura0",
+        "body_encoding": "flat_exact_blocks_v1",
+        "footer_layout_version": 1,
+        "verified": true,
+        "schema_id": schema_id,
+        "schema_fingerprint_sha256": hex(&schema_fingerprint),
+        "row_count": summary.record_count,
+        "chunk_count": summary.chunk_count,
+        "body_bytes": summary.body_bytes,
+        "footer_bytes": summary.footer_bytes,
+        "file_bytes": summary.file_bytes,
+        "logical_sha256": hex(&summary.global_logical_sha256),
         "artifact_sha256": hex(&artifact_sha256),
         "build": {
             "git_commit": provenance.git_commit,
@@ -541,6 +717,337 @@ fn publish_verified_block(
     }
 }
 
+fn publish_verified_v3(
+    output: &Path,
+    schema: &aura_codec::SchemaDescriptor,
+    batch: &aura_codec::AuraV3Batch,
+) -> Result<(PublicationOutcome, V3FlatWriteSummary, [u8; 32]), CliError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (output, schema, batch);
+        Err(CliError(
+            "trusted v3 publication is unsupported on this platform".to_owned(),
+        ))
+    }
+    #[cfg(unix)]
+    {
+        publish_verified_v3_with_ops(output, schema, batch, &RealPublicationOps)
+    }
+}
+
+#[cfg(unix)]
+fn publish_verified_v3_with_ops(
+    output: &Path,
+    schema: &aura_codec::SchemaDescriptor,
+    batch: &aura_codec::AuraV3Batch,
+    ops: &impl PublicationOps,
+) -> Result<(PublicationOutcome, V3FlatWriteSummary, [u8; 32]), CliError> {
+    let parent = normalized_parent(output);
+    let directory = ops
+        .open_parent(parent)
+        .map_err(|_| CliError("could not open trusted v3 output directory".to_owned()))?;
+    validate_trusted_parent(parent, &directory, ops)?;
+    let file_name = output
+        .file_name()
+        .ok_or_else(|| CliError("v3 output has no file name".to_owned()))?;
+    for _ in 0..128 {
+        let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        let mut temp_name = OsString::from(".");
+        temp_name.push(file_name);
+        temp_name.push(format!(".aura-tmp-{}-{sequence}", std::process::id()));
+        let temp_path = parent.join(temp_name);
+        let temp = match ops.create_temp(&temp_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(CliError("could not create v3 temporary output".to_owned())),
+        };
+        let held_origin = file_identity(
+            &temp
+                .metadata()
+                .map_err(|_| CliError("could not inspect held v3 output".to_owned()))?,
+        );
+        let held_guard = match temp.try_clone() {
+            Ok(file) => file,
+            Err(_) => {
+                return Err(prelink_failure(
+                    &directory,
+                    &temp_path,
+                    Some(held_origin),
+                    ops,
+                    CliError("could not retain held v3 output".to_owned()),
+                ))
+            }
+        };
+        let mut writer = match V3FlatAura0Writer::try_new(
+            temp,
+            schema.clone(),
+            V3FlatWriterOptions::default(),
+        ) {
+            Ok(writer) => writer,
+            Err(_) => {
+                let identity = held_guard
+                    .metadata()
+                    .ok()
+                    .map(|value| file_identity(&value));
+                return Err(prelink_failure(
+                    &directory,
+                    &temp_path,
+                    identity,
+                    ops,
+                    CliError("could not initialize v3 temporary output".to_owned()),
+                ));
+            }
+        };
+        if batch.row_count != 0 && writer.write_batch(batch).is_err() {
+            let identity = held_guard
+                .metadata()
+                .ok()
+                .map(|value| file_identity(&value));
+            return Err(prelink_failure(
+                &directory,
+                &temp_path,
+                identity,
+                ops,
+                CliError("could not write v3 temporary output".to_owned()),
+            ));
+        }
+        let (mut temp, summary) = match writer.finish_and_sync() {
+            Ok(result) => result,
+            Err(_) => {
+                let identity = held_guard
+                    .metadata()
+                    .ok()
+                    .map(|value| file_identity(&value));
+                return Err(prelink_failure(
+                    &directory,
+                    &temp_path,
+                    identity,
+                    ops,
+                    CliError("could not seal v3 temporary output".to_owned()),
+                ));
+            }
+        };
+        let held_identity = file_identity(
+            &temp
+                .metadata()
+                .map_err(|_| CliError("could not inspect sealed v3 output".to_owned()))?,
+        );
+        if !same_file_object(held_origin, held_identity) {
+            return Err(prelink_failure(
+                &directory,
+                &temp_path,
+                Some(held_identity),
+                ops,
+                CliError("held v3 output identity changed during write".to_owned()),
+            ));
+        }
+        if let Err(error) = verify_temp_v3(&mut temp, held_identity, &summary) {
+            return Err(prelink_failure(
+                &directory,
+                &temp_path,
+                Some(held_identity),
+                ops,
+                error,
+            ));
+        }
+        if ops.before_link(&temp_path, output).is_err()
+            || !path_matches_identity(&temp_path, held_identity, ops)
+        {
+            return Err(prelink_failure(
+                &directory,
+                &temp_path,
+                Some(held_identity),
+                ops,
+                CliError("v3 temporary output identity changed before publication".to_owned()),
+            ));
+        }
+        if let Err(error) = validate_trusted_parent(parent, &directory, ops) {
+            return Err(prelink_failure(
+                &directory,
+                &temp_path,
+                Some(held_identity),
+                ops,
+                error,
+            ));
+        }
+        if ops.hard_link(&temp_path, output).is_err() {
+            return Err(prelink_failure(
+                &directory,
+                &temp_path,
+                Some(held_identity),
+                ops,
+                CliError("could not publish v3 output without overwrite".to_owned()),
+            ));
+        }
+        let identity_ok = ops.after_link(&temp_path, output).is_ok()
+            && path_matches_identity(&temp_path, held_identity, ops)
+            && path_matches_identity(output, held_identity, ops);
+        let final_verification = if identity_ok {
+            verify_temp_v3(&mut temp, held_identity, &summary)
+        } else {
+            Err(CliError("v3 publication identity changed".to_owned()))
+        };
+        let artifact_sha256 = match final_verification {
+            Ok(hash) => hash,
+            Err(_) => {
+                if rollback_uncommitted(&directory, &temp_path, output, held_identity, ops) {
+                    return Err(CliError(
+                        "v3 publication identity verification failed".to_owned(),
+                    ));
+                }
+                return Err(CliError("publication ambiguous".to_owned()));
+            }
+        };
+        if ops.sync_parent(&directory).is_err() {
+            if rollback_uncommitted(&directory, &temp_path, output, held_identity, ops) {
+                return Err(CliError("could not commit v3 output directory".to_owned()));
+            }
+            return Err(CliError("publication ambiguous".to_owned()));
+        }
+        let stale_temp_cleanup_required = if remove_if_owned(&temp_path, held_identity, ops) {
+            ops.sync_parent(&directory).is_err()
+        } else {
+            true
+        };
+        return Ok((
+            PublicationOutcome {
+                stale_temp_cleanup_required,
+            },
+            summary,
+            artifact_sha256,
+        ));
+    }
+    Err(CliError(
+        "could not create unique v3 temporary output".to_owned(),
+    ))
+}
+
+#[cfg(unix)]
+fn verify_temp_v3(
+    temp: &mut File,
+    expected_identity: FileIdentity,
+    expected: &V3FlatWriteSummary,
+) -> Result<[u8; 32], CliError> {
+    let metadata = temp
+        .metadata()
+        .map_err(|_| CliError("could not inspect v3 temporary output".to_owned()))?;
+    if !metadata.is_file()
+        || metadata.len() != expected.file_bytes
+        || file_identity(&metadata) != expected_identity
+    {
+        return Err(CliError("invalid v3 temporary output length".to_owned()));
+    }
+    temp.seek(SeekFrom::Start(0))
+        .map_err(|_| CliError("could not seek v3 temporary output".to_owned()))?;
+    let mut reader = V3FlatAura0Reader::open(&mut *temp)
+        .map_err(|_| CliError("v3 temporary output open failed".to_owned()))?;
+    let verified = reader
+        .verify_all()
+        .map_err(|_| CliError("v3 temporary output verification failed".to_owned()))?;
+    if verified.record_count != expected.record_count
+        || verified.chunk_count != expected.chunk_count
+        || verified.header_bytes != expected.header_bytes
+        || verified.body_bytes != expected.body_bytes
+        || verified.footer_bytes != expected.footer_bytes
+        || verified.file_bytes != expected.file_bytes
+        || verified.schema_fingerprint != expected.schema_fingerprint
+        || verified.global_logical_sha256 != expected.global_logical_sha256
+    {
+        return Err(CliError("v3 temporary output summary mismatch".to_owned()));
+    }
+    hash_held_file(temp, expected.file_bytes)
+}
+
+#[cfg(unix)]
+fn hash_held_file(file: &mut File, expected_len: u64) -> Result<[u8; 32], CliError> {
+    hash_file_exact(file, expected_len)
+}
+
+fn hash_file_exact(file: &mut File, expected_len: u64) -> Result<[u8; 32], CliError> {
+    hash_file_exact_with_hook(file, expected_len, || {})
+}
+
+fn hash_file_exact_with_hook(
+    file: &mut File,
+    expected_len: u64,
+    after_initial_metadata: impl FnOnce(),
+) -> Result<[u8; 32], CliError> {
+    let before = file
+        .metadata()
+        .map_err(|_| CliError("v3 file hash metadata failed".to_owned()))?;
+    if !before.is_file() || before.len() != expected_len {
+        return Err(CliError("v3 file hash length changed".to_owned()));
+    }
+    after_initial_metadata();
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| CliError("could not seek v3 temporary output".to_owned()))?;
+    let mut remaining = expected_len;
+    let mut hasher = Sha256::new();
+    let mut scratch = [0u8; 16 * 1024];
+    while remaining != 0 {
+        let request = usize::try_from(remaining.min(scratch.len() as u64)).unwrap();
+        let read = file
+            .read(&mut scratch[..request])
+            .map_err(|_| CliError("could not hash v3 temporary output".to_owned()))?;
+        if read == 0 {
+            return Err(CliError("v3 temporary output changed length".to_owned()));
+        }
+        hasher.update(&scratch[..read]);
+        remaining -= read as u64;
+    }
+    let mut probe = [0u8; 1];
+    if file
+        .read(&mut probe)
+        .map_err(|_| CliError("could not hash v3 temporary output".to_owned()))?
+        != 0
+    {
+        return Err(CliError("v3 file hash length changed".to_owned()));
+    }
+    let after = file
+        .metadata()
+        .map_err(|_| CliError("v3 file hash metadata failed".to_owned()))?;
+    #[cfg(unix)]
+    if file_identity(&before) != file_identity(&after) {
+        return Err(CliError("v3 file hash identity changed".to_owned()));
+    }
+    #[cfg(not(unix))]
+    if !after.is_file() || after.len() != before.len() {
+        return Err(CliError("v3 file hash identity changed".to_owned()));
+    }
+    Ok(hasher.finalize().into())
+}
+
+#[cfg(unix)]
+fn open_v3_input(path: &Path, before: &fs::Metadata) -> Result<File, CliError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NOFOLLOW: i32 = 0o400000;
+        options.custom_flags(O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| CliError("v3 input path rejected".to_owned()))?;
+    let after =
+        fs::symlink_metadata(path).map_err(|_| CliError("v3 input identity changed".to_owned()))?;
+    let held = file
+        .metadata()
+        .map_err(|_| CliError("v3 input identity changed".to_owned()))?;
+    if file_identity(before) != file_identity(&after)
+        || file_identity(before) != file_identity(&held)
+    {
+        return Err(CliError("v3 input identity changed".to_owned()));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_v3_input(_path: &Path, _before: &fs::Metadata) -> Result<File, CliError> {
+    Err(CliError("v3 verify unsupported platform".to_owned()))
+}
+
 #[cfg(unix)]
 fn publish_verified_block_with_ops(
     output: &Path,
@@ -701,6 +1208,11 @@ fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
         inode: metadata.ino(),
         length: metadata.len(),
     }
+}
+
+#[cfg(unix)]
+const fn same_file_object(left: FileIdentity, right: FileIdentity) -> bool {
+    left.device == right.device && left.inode == right.inode
 }
 
 #[cfg(unix)]
@@ -937,6 +1449,66 @@ fn shadow_safe_error(message: &str) -> (&'static str, String) {
         ("publication_failed", "shadow artifact publication failed")
     } else {
         ("shadow_command_failed", "shadow command failed")
+    };
+    (code, safe.to_owned())
+}
+
+fn v3_safe_error(message: &str) -> (&'static str, String) {
+    let (code, safe) = if message == "publication ambiguous" {
+        (
+            "publication_ambiguous",
+            "v3 publication state requires coordinator reconciliation",
+        )
+    } else if message == "publication cleanup required" {
+        (
+            "publication_cleanup_required",
+            "no final v3 artifact was committed; owned temporary cleanup is required",
+        )
+    } else if message == "publication committed result unavailable" {
+        (
+            "publication_committed_result_unavailable",
+            "the v3 artifact was committed; verify and adopt the final artifact",
+        )
+    } else if message == "publication_committed_result_unavailable_cleanup_required" {
+        (
+            "publication_committed_result_unavailable_cleanup_required",
+            "the v3 artifact was committed; verify the final artifact and reconcile stale temporary cleanup",
+        )
+    } else if message == "v3 invalid artifact" {
+        ("invalid_artifact", "v3 artifact is invalid or unavailable")
+    } else if matches!(
+        message,
+        "v3 input path rejected" | "v3 input identity changed"
+    ) {
+        (
+            "invalid_input_path",
+            "v3 input path or held identity is invalid",
+        )
+    } else if message == "v3 verify unsupported platform" {
+        (
+            "verification_unsupported",
+            "strong-identity v3 verification is unsupported on this platform",
+        )
+    } else if message.contains("unsupported on this platform") {
+        (
+            "publication_unsupported",
+            "trusted v3 publication is unsupported",
+        )
+    } else if message.contains("not trusted") {
+        (
+            "untrusted_output_directory",
+            "v3 output directory is not trusted",
+        )
+    } else if message.contains("already exists") {
+        ("output_exists", "v3 output is not a new regular path")
+    } else if message.contains("protocol") {
+        ("unsupported_contract", "v3 input protocol is unsupported")
+    } else if message.contains("schema") {
+        ("invalid_schema", "v3 schema is invalid or unavailable")
+    } else if message.contains("publish") || message.contains("temporary output") {
+        ("publication_failed", "v3 artifact publication failed")
+    } else {
+        ("v3_command_failed", "v3 command failed")
     };
     (code, safe.to_owned())
 }
@@ -1184,6 +1756,24 @@ mod publication_tests {
         )
     }
 
+    fn v3_reference() -> (aura_codec::SchemaDescriptor, AuraV3Batch) {
+        let schema = SchemaBuilder::new("v3-publication")
+            .v3()
+            .field("ts", FieldType::I64, FieldRole::Timestamp)
+            .finish()
+            .unwrap();
+        let batch = AuraV3Batch {
+            schema_id: schema.schema_id,
+            row_count: 1,
+            columns: vec![AuraV3Column {
+                slot: 0,
+                validity: None,
+                values: AuraV3ColumnValues::I64(vec![42]),
+            }],
+        };
+        (schema, batch)
+    }
+
     #[test]
     fn directory_open_failure_creates_nothing() {
         let dir = TestDirectory::new();
@@ -1246,6 +1836,56 @@ mod publication_tests {
         let temps = dir.temp_paths();
         assert_eq!(temps.len(), 1);
         assert_eq!(fs::read(&temps[0]).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn v3_replaced_temp_identity_is_not_removed_or_published() {
+        let dir = TestDirectory::new();
+        let (schema, batch) = v3_reference();
+        let ops = FaultOps {
+            replace_temp_before_link: true,
+            ..Default::default()
+        };
+        assert!(publish_verified_v3_with_ops(&dir.output(), &schema, &batch, &ops).is_err());
+        assert!(!dir.output().exists());
+        let temps = dir.temp_paths();
+        assert_eq!(temps.len(), 1);
+        assert_eq!(fs::read(&temps[0]).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn exact_file_hash_rejects_append_before_and_during_hash() {
+        let dir = TestDirectory::new();
+        let path = dir.0.join("hash.aura0");
+        fs::write(&path, b"abc").unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut appender = OpenOptions::new().append(true).open(&path).unwrap();
+        appender.write_all(b"d").unwrap();
+        assert!(hash_file_exact(&mut file, 3).is_err());
+
+        file.set_len(3).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert!(hash_file_exact_with_hook(&mut file, 3, || {
+            appender.write_all(b"d").unwrap();
+            appender.flush().unwrap();
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn v3_stale_committed_result_code_is_distinct() {
+        assert_eq!(
+            v3_safe_error("publication_committed_result_unavailable_cleanup_required").0,
+            "publication_committed_result_unavailable_cleanup_required"
+        );
+        assert_eq!(
+            v3_safe_error("publication committed result unavailable").0,
+            "publication_committed_result_unavailable"
+        );
     }
 
     #[test]

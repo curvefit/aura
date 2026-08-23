@@ -3,10 +3,10 @@
 This document describes the current implementation.
 
 Current production writers still emit container V2. Aura also implements the
-first complete, decode-first V3 subset: flat, event-only, uncompressed Aura0
-files whose body is a concatenation of exact-value blocks. There is no public
-V3 streaming writer or CLI yet. A V3 schema cannot be embedded in a V2
-container.
+first complete V3 subset: flat, event-only, uncompressed Aura0 files whose body
+is a concatenation of exact-value blocks. A seekable writer, bounded streaming
+verifier, and explicit V3 CLI seal/verify commands are available. A V3 schema
+cannot be embedded in a V2 container.
 
 ## Standalone V3 exact-value reference block
 

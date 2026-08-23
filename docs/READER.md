@@ -145,3 +145,23 @@ Use `reader.stats()` in tests or diagnostics to inspect
 `body_bytes_read_at_open`, `full_file_bytes_copied`,
 `open_decoded_row_count`, `full_file_materialized`,
 `rows_decoded_in_last_batch`, and `max_rows_materialized_at_once`.
+
+## Flat Aura0 V3 reader
+
+`V3FlatAura0Reader<R: Read + Seek>::open` reads only the bounded EOF trailer,
+footer, and V3 header from one held stream. Open validates metadata and ranges,
+but its state is `Opened`, not a complete integrity claim. Call `verify_all`
+to stream through one chunk at a time and validate stored/chunk/global/body
+hashes, exact values, bounds, stats, and the final stream length. Only success
+changes the observable state to `Verified`.
+
+`verify_with` first completes verification without invoking user code, then
+performs a second checked callback pass. Callback effects are provisional until
+the method returns success: a final envelope check and full-body rehash follow
+the callbacks. `read_all` is the explicit collecting convenience.
+
+Generic `Read + Seek` cannot lock an arbitrary producer, so callers must supply
+an immutable snapshot for the full operation. The reader performs envelope
+checks around a second full-body hash to detect mutations observed during its
+passes, but does not claim categorical concurrent-mutation exclusion. Default
+and caller-lowered `V3FlatLimits` apply before count-controlled allocation.

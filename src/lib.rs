@@ -34,7 +34,9 @@ pub mod source;
 pub mod stats;
 pub mod types;
 pub mod v3_container;
+pub mod v3_reader;
 pub mod v3_values;
+pub mod v3_writer;
 pub mod varint;
 pub mod writer;
 
@@ -95,12 +97,13 @@ pub use schema::{
 };
 pub use schema_json::{canonicalize_schema_json, parse_schema_json, MAX_SCHEMA_JSON_BYTES};
 pub use shadow_protocol::{
-    arrow_rust_version, build_provenance, cargo_lock_sha256, encode_shadow_arrow_ipc,
-    BuildProvenance, ShadowEncodeResult, ShadowProtocolLimits, DEFAULT_SHADOW_ARROW_IPC_BYTES,
-    DEFAULT_SHADOW_RECORD_BATCHES, DEFAULT_SHADOW_VALUE_BLOCK_BYTES, DEFAULT_SHADOW_VALUE_ROWS,
-    MAX_SHADOW_ARROW_IPC_BYTES, MAX_SHADOW_RECORD_BATCHES, SHADOW_ARROW_PROTOCOL,
-    SHADOW_ARTIFACT_KIND, SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL, SHADOW_RESULT_SCHEMA,
-    SHADOW_SCHEMA_FORMAT, SHADOW_VERIFY_RESULT_SCHEMA,
+    arrow_rust_version, build_provenance, cargo_lock_sha256, decode_shadow_arrow_ipc_batch,
+    encode_shadow_arrow_ipc, BuildProvenance, ShadowEncodeResult, ShadowProtocolLimits,
+    DEFAULT_SHADOW_ARROW_IPC_BYTES, DEFAULT_SHADOW_RECORD_BATCHES,
+    DEFAULT_SHADOW_VALUE_BLOCK_BYTES, DEFAULT_SHADOW_VALUE_ROWS, MAX_SHADOW_ARROW_IPC_BYTES,
+    MAX_SHADOW_RECORD_BATCHES, SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND,
+    SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL, SHADOW_RESULT_SCHEMA, SHADOW_SCHEMA_FORMAT,
+    SHADOW_VERIFY_RESULT_SCHEMA,
 };
 pub use source::{
     AuraEventBatch, AuraEventSource, AuraEventSourceStats, AuraFileSource, AuraLiveFrameSource,
@@ -123,12 +126,18 @@ pub use v3_container::{
     V3_FLAT_BODY_ENCODING_EXACT_BLOCKS, V3_FLAT_CHUNK_DESCRIPTOR_BYTES,
     V3_FLAT_FOOTER_LAYOUT_VERSION, V3_FLAT_FOOTER_PREFIX_BYTES, V3_FLAT_STATS_DESCRIPTOR_BYTES,
 };
+pub use v3_reader::{
+    AuraV3FlatReader, V3FlatAura0Reader, V3FlatReadAll, V3FlatReaderState, V3FlatVerifySummary,
+};
 pub use v3_values::{
     canonical_v3_batch_sha256, canonical_v3_schema_fingerprint, decode_v3_value_block,
     encode_v3_value_block, validate_decimal_text_v1, validate_v3_batch, AuraV3Batch, AuraV3Column,
     AuraV3ColumnValues, AuraV3ValueRef, AuraV3VariableColumn, CanonicalV3RowHasher,
     V3CanonicalRowHasher, V3ValueLimits, MAX_V3_SCHEMA_DESCRIPTOR_BYTES, MAX_V3_VALUE_BLOCK_BYTES,
     MAX_V3_VALUE_ROWS, MAX_V3_VARIABLE_VALUE_BYTES,
+};
+pub use v3_writer::{
+    AuraV3FlatWriter, V3FlatAura0Writer, V3FlatWriteSummary, V3FlatWriterOptions, V3FlatWriterState,
 };
 pub use writer::{
     AuraI64EventWriter, AuraI64Writer, AuraTypedWriter, AuraWriteSummary, AuraWriter,

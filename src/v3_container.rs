@@ -79,7 +79,7 @@ impl V3FlatLimits {
         },
     };
 
-    const fn effective(self) -> Self {
+    pub(crate) const fn effective(self) -> Self {
         let max_value_rows = self.value_limits.max_rows as u64;
         Self {
             max_footer_bytes: min_usize(self.max_footer_bytes, MAX_V3_FLAT_FOOTER_BYTES),
@@ -218,6 +218,13 @@ pub fn v3_flat_header_sha256(header: &[u8]) -> Result<[u8; 32]> {
 
 pub fn v3_flat_body_sha256(body: &[u8]) -> Result<[u8; 32]> {
     domain_hash(BODY_HASH_DOMAIN, body, "v3 body length")
+}
+
+pub(crate) fn v3_flat_body_sha256_hasher(body_len: u64) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(BODY_HASH_DOMAIN);
+    hasher.update(body_len.to_le_bytes());
+    hasher
 }
 
 pub fn encode_v3_flat_footer(footer: &V3FlatFooter) -> Result<Vec<u8>> {
@@ -628,7 +635,7 @@ fn validate_footer_metadata(footer: &V3FlatFooter, limits: V3FlatLimits) -> Resu
     Ok(())
 }
 
-fn validate_flat_schema(schema: &SchemaDescriptor) -> Result<()> {
+pub(crate) fn validate_flat_schema(schema: &SchemaDescriptor) -> Result<()> {
     if schema.encoding_version != SchemaEncodingVersion::V3 {
         return Err(AuraError::InvalidValue("v3 flat schema"));
     }
@@ -656,7 +663,7 @@ fn validate_flat_schema(schema: &SchemaDescriptor) -> Result<()> {
     Ok(())
 }
 
-fn primary_sequence_slot(schema: &SchemaDescriptor) -> Result<Option<u16>> {
+pub(crate) fn primary_sequence_slot(schema: &SchemaDescriptor) -> Result<Option<u16>> {
     let mut slot = None;
     for field in &schema.fields {
         if field.role == FieldRole::Sequence
@@ -668,7 +675,7 @@ fn primary_sequence_slot(schema: &SchemaDescriptor) -> Result<Option<u16>> {
     Ok(slot)
 }
 
-fn primary_timestamp_slot(mapping: &[u8]) -> u16 {
+pub(crate) fn primary_timestamp_slot(mapping: &[u8]) -> u16 {
     if mapping.first() == Some(&100) {
         0
     } else {
@@ -790,7 +797,7 @@ fn validate_chunk_metadata(footer: &V3FlatFooter, limits: V3FlatLimits) -> Resul
     Ok(())
 }
 
-fn validate_header_footer(header: &AuraHeader, footer: &V3FlatFooter) -> Result<()> {
+pub(crate) fn validate_header_footer(header: &AuraHeader, footer: &V3FlatFooter) -> Result<()> {
     if header.container_version != AuraContainerVersion::V3
         || header.profile != Profile::Aura0
         || header.stream_id != 0
@@ -810,7 +817,7 @@ fn validate_header_footer(header: &AuraHeader, footer: &V3FlatFooter) -> Result<
     Ok(())
 }
 
-fn validate_chunk_bounds(
+pub(crate) fn validate_chunk_bounds(
     footer: &V3FlatFooter,
     chunk: &V3FlatChunkDescriptor,
     batch: &AuraV3Batch,
@@ -872,7 +879,7 @@ fn timestamp_i64(value: Option<crate::AuraV3ValueRef<'_>>) -> Result<i64> {
     }
 }
 
-fn zero_stats(schema: &SchemaDescriptor) -> Vec<V3FlatColumnStats> {
+pub(crate) fn zero_stats(schema: &SchemaDescriptor) -> Vec<V3FlatColumnStats> {
     schema
         .fields
         .iter()
@@ -888,7 +895,7 @@ fn zero_stats(schema: &SchemaDescriptor) -> Vec<V3FlatColumnStats> {
         .collect()
 }
 
-fn accumulate_stats(stats: &mut [V3FlatColumnStats], batch: &AuraV3Batch) -> Result<()> {
+pub(crate) fn accumulate_stats(stats: &mut [V3FlatColumnStats], batch: &AuraV3Batch) -> Result<()> {
     for (stat, column) in stats.iter_mut().zip(&batch.columns) {
         for row in 0..batch.row_count as usize {
             match column.value_ref(row)? {
@@ -980,7 +987,7 @@ fn footer_self_hash(bytes: &[u8]) -> Result<[u8; 32]> {
     domain_hash(FOOTER_HASH_DOMAIN, bytes, "v3 flat footer length")
 }
 
-fn plain_sha256(bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn plain_sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
