@@ -48,6 +48,9 @@ Important flags:
 ```text
 --guard-mode no_guard|fused_output_guard|old_post_output_guard|block_batched_output_guard
 --transcode-path auto|materialized|direct
+--aura1-body-path stable-auto|direct-file|streaming-cursor|direct-streams|columns
+--column-decode-path materialized|partitioned-sparse-cursor
+--unsupported-path error|fallback-to-stable
 --decode-path materialized|cursor
 --encoder-path materialized|direct-streams|column-free
 --canonical-hash-mode none|verify
@@ -60,6 +63,60 @@ Important flags:
 --reference-aura0 <path>
 --reference-aura1 <path>
 ```
+
+Execution paths are selected only through these typed command-line options.
+The library does not read process environment variables to choose a codec path.
+`stable-auto` is the production behavior. A non-auto path combined with
+`--unsupported-path error` fails instead of silently changing implementations;
+`fallback-to-stable` records the requested path, effective path, and fallback
+reason in JSON. These choices are execution-only and never alter the serialized
+schema, planner program, or V2 container format.
+
+The default unsupported-path policy is `error`. Omission never authorizes a
+guard or body-path downgrade; only the literal
+`--unsupported-path fallback-to-stable` does. `--use-byte-lane never` remains
+binding through fallback, so a pure fast file with no semantic body fails even
+when fallback was explicitly requested.
+This fail-closed rule also applies when no typed execution flags were supplied:
+a pure fast lane cannot satisfy fused/block guard semantics and therefore
+errors instead of falling through to the ordinary writer. Successful legacy
+Auto/Direct runs report `not-applicable` as the requested typed path but still
+report their actual effective implementation, including embedded byte lane,
+direct streams, streaming cursor, or materialized fallback.
+
+Typed execution flags are accepted only for Aura0-to-Aura1 operations and
+cannot be combined with legacy `--decode-path`, even when `stable-auto` is
+spelled explicitly. Other operations report `not-applicable`. When
+`stable-auto` expands an embedded AUBL byte lane, JSON reports the effective
+path as `embedded-byte-lane`; exact non-auto requests skip that lane and either
+use the requested semantic path or fail/fallback according to policy.
+For byte-lane benchmark operations, `--use-byte-lane auto|always|never` is
+passed through the same typed dispatcher. `always` conflicts with an exact
+semantic body path; `never` forces semantic dispatch. Byte-lane JSON fields are
+populated only when the effective path is actually `embedded-byte-lane`, not
+merely because the input contains a lane.
+
+Exact non-auto paths support `no_guard` and `old_post_output_guard`. Fused and
+block-batched guards require `--unsupported-path fallback-to-stable`, which
+uses the actual stable profiled guard implementation and records the fallback;
+with `error` they are rejected rather than mislabeled.
+Stable fused/block guard execution also bypasses embedded lanes. With
+`--unsupported-path error`, a pure fast lane with no semantic body is rejected.
+With explicit fallback policy it may use the embedded lane only by reporting
+`old_post_output_guard` as the effective guard and a fallback reason. A hybrid
+file uses its semantic body and reports the real effective path with zero
+post-output-guard time.
+
+`--decode-path` remains accepted for compatibility with older benchmark command
+lines. New experiments should use `--aura1-body-path` and
+`--column-decode-path`, which make the selected implementation unambiguous.
+`--transcode-path materialized` remains the explicit legacy reference writer
+when no typed execution flags are supplied. Combining it with typed execution
+flags is rejected as contradictory. This path calls the dedicated materialized
+compiler: it decodes bounded logical rows, rebuilds the Aura1 fixed-width body,
+and strips embedded-lane metadata. It does not call StableAuto. Compact,
+hybrid, and pure-fast inputs therefore share the same reference semantics;
+pure-fast inputs are decoded through their lane into rows before re-emission.
 
 Transcode benchmarks can preserve and verify output bytes. Verification decodes
 the source and produced output after timing and reports row equality,
@@ -110,7 +167,8 @@ Materialized paths are retained as reference/correctness fallbacks. Final
 candidate path decisions should use direct/profiled paths that emit
 `compiled_plan_used=true` and a non-null `conversion_plan_hash`.
 
-`--decode-path cursor` is a benchmarkable `.aura0 -> .aura1` experimental path
+`--aura1-body-path streaming-cursor` is a benchmarkable `.aura0 -> .aura1`
+experimental path
 for supported plans. It avoids materialized stream vectors, but current measured
 grimoire runs are slower than the materialized/profiled path, so it is not a
 default candidate.

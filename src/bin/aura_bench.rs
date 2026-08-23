@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use aura_codec::{records, writer, Profile};
+use aura_codec::{
+    records, writer, Aura0ColumnPath, Aura1BodyPath, Aura1EffectiveBodyPath, Aura1ExecutionOptions,
+    Profile, UnsupportedPathBehavior,
+};
 use records::{
     Aura0ByteLaneUse, Aura0DecodePath, Aura0EncoderPath, Aura0FileProfile, OutputGuardMode,
     ProfiledCompileStats, ProfiledCompileTimings, TranscodePath,
@@ -182,6 +185,17 @@ impl Operation {
         matches!(
             self,
             Self::Aura0ByteLaneToAura1Bytes | Self::Aura0ByteLaneToAura1BytesVerify
+        )
+    }
+
+    const fn supports_aura1_execution_options(self) -> bool {
+        matches!(
+            self,
+            Self::TranscodeAura0ToAura1
+                | Self::Aura0ToAura1Bytes
+                | Self::Aura0ToAura1BytesVerify
+                | Self::Aura0ByteLaneToAura1Bytes
+                | Self::Aura0ByteLaneToAura1BytesVerify
         )
     }
 }
@@ -360,6 +374,33 @@ fn parse_decode_path(value: &str) -> Result<Aura0DecodePath> {
     }
 }
 
+fn parse_aura1_body_path(value: &str) -> Result<Aura1BodyPath> {
+    match value {
+        "stable-auto" => Ok(Aura1BodyPath::StableAuto),
+        "direct-file" => Ok(Aura1BodyPath::DirectFile),
+        "streaming-cursor" => Ok(Aura1BodyPath::StreamingCursor),
+        "direct-streams" => Ok(Aura1BodyPath::DirectStreams),
+        "columns" => Ok(Aura1BodyPath::Columns),
+        other => bail!("unknown Aura1 body path: {other}"),
+    }
+}
+
+fn parse_column_decode_path(value: &str) -> Result<Aura0ColumnPath> {
+    match value {
+        "materialized" => Ok(Aura0ColumnPath::Materialized),
+        "partitioned-sparse-cursor" => Ok(Aura0ColumnPath::PartitionedSparseCursor),
+        other => bail!("unknown column decode path: {other}"),
+    }
+}
+
+fn parse_unsupported_path(value: &str) -> Result<UnsupportedPathBehavior> {
+    match value {
+        "error" => Ok(UnsupportedPathBehavior::Error),
+        "fallback-to-stable" => Ok(UnsupportedPathBehavior::FallbackToStable),
+        other => bail!("unknown unsupported-path behavior: {other}"),
+    }
+}
+
 #[derive(Debug)]
 struct Config {
     operation: Operation,
@@ -374,6 +415,8 @@ struct Config {
     transcode_path: TranscodePath,
     encoder_path: Aura0EncoderPath,
     decode_path: Aura0DecodePath,
+    aura1_execution: Aura1ExecutionOptions,
+    typed_execution_path_set: bool,
     preserve_output: Option<PathBuf>,
     verify_output_decodes: bool,
     canonical_hash_mode: Option<CanonicalHashMode>,
@@ -400,6 +443,11 @@ impl Config {
         let mut transcode_path = TranscodePath::Auto;
         let mut encoder_path = Aura0EncoderPath::Materialized;
         let mut decode_path = Aura0DecodePath::Materialized;
+        let mut aura1_execution = Aura1ExecutionOptions::default();
+        let mut legacy_decode_path_set = false;
+        let mut aura1_body_path_set = false;
+        let mut column_decode_path_set = false;
+        let mut unsupported_path_set = false;
         let mut preserve_output = None;
         let mut verify_output_decodes = false;
         let mut canonical_hash_mode = None;
@@ -407,6 +455,7 @@ impl Config {
         let mut byte_lane_codec = ByteLaneCodec::Zstd3;
         let mut aura0_profile = None;
         let mut use_byte_lane = Aura0ByteLaneUse::Auto;
+        let mut use_byte_lane_set = false;
         let mut reference_aura0 = None;
         let mut reference_aura1 = None;
 
@@ -463,8 +512,27 @@ impl Config {
                         parse_encoder_path(&args.next().context("missing --encoder-path value")?)?;
                 }
                 "--decode-path" => {
+                    legacy_decode_path_set = true;
                     decode_path =
                         parse_decode_path(&args.next().context("missing --decode-path value")?)?;
+                }
+                "--aura1-body-path" => {
+                    aura1_body_path_set = true;
+                    aura1_execution.body_path = parse_aura1_body_path(
+                        &args.next().context("missing --aura1-body-path value")?,
+                    )?;
+                }
+                "--column-decode-path" => {
+                    column_decode_path_set = true;
+                    aura1_execution.column_path = parse_column_decode_path(
+                        &args.next().context("missing --column-decode-path value")?,
+                    )?;
+                }
+                "--unsupported-path" => {
+                    unsupported_path_set = true;
+                    aura1_execution.unsupported_path = parse_unsupported_path(
+                        &args.next().context("missing --unsupported-path value")?,
+                    )?;
                 }
                 "--preserve-output" => {
                     preserve_output = Some(PathBuf::from(
@@ -497,6 +565,7 @@ impl Config {
                     )?);
                 }
                 "--use-byte-lane" => {
+                    use_byte_lane_set = true;
                     use_byte_lane = parse_use_byte_lane(
                         &args.next().context("missing --use-byte-lane value")?,
                     )?;
@@ -523,6 +592,23 @@ impl Config {
             bail!("--iterations must be greater than zero");
         }
         let operation = operation.context("missing --operation")?;
+        let typed_execution_path_set =
+            aura1_body_path_set || column_decode_path_set || unsupported_path_set;
+        if typed_execution_path_set && legacy_decode_path_set {
+            bail!("typed Aura1 execution flags conflict with legacy --decode-path");
+        }
+        if typed_execution_path_set && !operation.supports_aura1_execution_options() {
+            bail!("typed Aura1 execution flags require an Aura0-to-Aura1 operation");
+        }
+        if typed_execution_path_set && transcode_path == TranscodePath::Materialized {
+            bail!("typed Aura1 execution flags conflict with --transcode-path materialized");
+        }
+        if operation.is_fair_bytes_benchmark() && guard_mode != OutputGuardMode::NoGuard {
+            bail!("fair byte operations require --guard-mode no_guard");
+        }
+        if use_byte_lane_set && !operation.is_fair_byte_lane() {
+            bail!("--use-byte-lane requires a byte-lane Aura0-to-Aura1 operation");
+        }
         if (preserve_output.is_some() || verify_output_decodes) && !operation.is_transcode() {
             bail!("--preserve-output and --verify-output-decodes require a transcode operation");
         }
@@ -545,6 +631,8 @@ impl Config {
             transcode_path,
             encoder_path,
             decode_path,
+            aura1_execution,
+            typed_execution_path_set,
             preserve_output,
             verify_output_decodes,
             canonical_hash_mode,
@@ -569,6 +657,12 @@ struct RunOutcome {
     guard_mode: &'static str,
     transcode_path: &'static str,
     encoder_path: &'static str,
+    requested_aura1_body_path: &'static str,
+    effective_aura1_body_path: &'static str,
+    requested_aura0_column_path: &'static str,
+    effective_aura0_column_path: &'static str,
+    unsupported_path_behavior: &'static str,
+    fallback_reason: Option<&'static str>,
     conversion_plan_hash: Option<u64>,
     compiled_plan_used: bool,
     plan_setup_time: Duration,
@@ -729,6 +823,8 @@ fn run_benchmark(config: &Config) -> Result<String> {
                     config.transcode_path,
                     config.encoder_path,
                     config.decode_path,
+                    config.aura1_execution,
+                    config.typed_execution_path_set,
                     effective_canonical_hash_mode,
                     config.aura0_profile,
                     config.byte_lane_codec,
@@ -766,6 +862,8 @@ fn run_benchmark(config: &Config) -> Result<String> {
                     config.transcode_path,
                     config.encoder_path,
                     config.decode_path,
+                    config.aura1_execution,
+                    config.typed_execution_path_set,
                     effective_canonical_hash_mode,
                     config.aura0_profile,
                     config.byte_lane_codec,
@@ -788,6 +886,8 @@ fn run_benchmark(config: &Config) -> Result<String> {
                 config.transcode_path,
                 config.encoder_path,
                 config.decode_path,
+                config.aura1_execution,
+                config.typed_execution_path_set,
                 effective_canonical_hash_mode,
                 config.aura0_profile,
                 config.byte_lane_codec,
@@ -824,6 +924,8 @@ fn run_benchmark(config: &Config) -> Result<String> {
                     config.transcode_path,
                     config.encoder_path,
                     config.decode_path,
+                    config.aura1_execution,
+                    config.typed_execution_path_set,
                     effective_canonical_hash_mode,
                     config.aura0_profile,
                     config.byte_lane_codec,
@@ -971,6 +1073,12 @@ fn run_benchmark(config: &Config) -> Result<String> {
             "transcode_path": first.transcode_path,
             "decode_path_requested": config.decode_path.as_str(),
             "decode_path": config.decode_path.as_str(),
+                "aura1_body_path_requested": first.requested_aura1_body_path,
+                "aura1_body_path": first.effective_aura1_body_path,
+                "column_decode_path_requested": first.requested_aura0_column_path,
+                "column_decode_path": first.effective_aura0_column_path,
+                "unsupported_path": first.unsupported_path_behavior,
+                "execution_path_fallback_reason": first.fallback_reason,
                 "encoder_path_requested": config.encoder_path.as_str(),
                 "encoder_path": first.encoder_path,
                 "aura0_profile_requested": config.aura0_profile.as_str(),
@@ -1138,6 +1246,8 @@ fn measure_operation(
     transcode_path: TranscodePath,
     encoder_path: Aura0EncoderPath,
     decode_path: Aura0DecodePath,
+    aura1_execution: Aura1ExecutionOptions,
+    typed_execution_path_set: bool,
     canonical_hash_mode: CanonicalHashMode,
     aura0_profile: Aura0FileProfile,
     byte_lane_codec: ByteLaneCodec,
@@ -1153,6 +1263,8 @@ fn measure_operation(
         transcode_path,
         encoder_path,
         decode_path,
+        aura1_execution,
+        typed_execution_path_set,
         canonical_hash_mode,
         aura0_profile,
         byte_lane_codec,
@@ -1553,6 +1665,8 @@ fn run_operation(
     transcode_path: TranscodePath,
     encoder_path: Aura0EncoderPath,
     decode_path: Aura0DecodePath,
+    aura1_execution: Aura1ExecutionOptions,
+    typed_execution_path_set: bool,
     canonical_hash_mode: CanonicalHashMode,
     aura0_profile: Aura0FileProfile,
     byte_lane_codec: ByteLaneCodec,
@@ -1580,6 +1694,8 @@ fn run_operation(
             operation,
             bytes,
             decode_path,
+            aura1_execution,
+            typed_execution_path_set,
             fair_context.context("missing fair bytes context")?,
         ),
         Operation::TranscodeAura1ToAura0 => transcode(
@@ -1590,6 +1706,8 @@ fn run_operation(
             transcode_path,
             encoder_path,
             decode_path,
+            aura1_execution,
+            typed_execution_path_set,
             canonical_hash_mode,
             aura0_profile,
             byte_lane_codec,
@@ -1603,6 +1721,8 @@ fn run_operation(
             transcode_path,
             encoder_path,
             decode_path,
+            aura1_execution,
+            typed_execution_path_set,
             canonical_hash_mode,
             aura0_profile,
             byte_lane_codec,
@@ -1656,6 +1776,12 @@ fn parse_aura1(bytes: &[u8], canonical_hash_mode: CanonicalHashMode) -> Result<R
         guard_mode: "inline_parse",
         transcode_path: "none",
         encoder_path: "none",
+        requested_aura1_body_path: "not-applicable",
+        effective_aura1_body_path: "not-applicable",
+        requested_aura0_column_path: "not-applicable",
+        effective_aura0_column_path: "not-applicable",
+        unsupported_path_behavior: "not-applicable",
+        fallback_reason: None,
         conversion_plan_hash: Some(layout.conversion_plan_hash),
         compiled_plan_used: true,
         plan_setup_time,
@@ -1684,6 +1810,12 @@ fn decode_aura0(bytes: &[u8], canonical_hash_mode: CanonicalHashMode) -> Result<
         guard_mode: "inline_decode",
         transcode_path: "none",
         encoder_path: "none",
+        requested_aura1_body_path: "not-applicable",
+        effective_aura1_body_path: "not-applicable",
+        requested_aura0_column_path: "not-applicable",
+        effective_aura0_column_path: "not-applicable",
+        unsupported_path_behavior: "not-applicable",
+        fallback_reason: None,
         conversion_plan_hash: None,
         compiled_plan_used: false,
         plan_setup_time: Duration::ZERO,
@@ -1758,6 +1890,8 @@ fn transcode(
     transcode_path: TranscodePath,
     encoder_path: Aura0EncoderPath,
     decode_path: Aura0DecodePath,
+    aura1_execution: Aura1ExecutionOptions,
+    typed_execution_path_set: bool,
     canonical_hash_mode: CanonicalHashMode,
     aura0_profile: Aura0FileProfile,
     byte_lane_codec: ByteLaneCodec,
@@ -1795,6 +1929,12 @@ fn transcode(
             guard_mode: guard_mode.as_str(),
             transcode_path: "aura0-profile",
             encoder_path: Aura0EncoderPath::Materialized.as_str(),
+            requested_aura1_body_path: "not-applicable",
+            effective_aura1_body_path: "not-applicable",
+            requested_aura0_column_path: "not-applicable",
+            effective_aura0_column_path: "not-applicable",
+            unsupported_path_behavior: "not-applicable",
+            fallback_reason: None,
             conversion_plan_hash: None,
             compiled_plan_used: true,
             plan_setup_time: Duration::ZERO,
@@ -1809,14 +1949,47 @@ fn transcode(
         });
     }
 
-    if let Some(output) = records::try_compile_i64_file_profiled(
-        bytes,
-        target,
-        guard_mode,
-        transcode_path,
-        encoder_path,
-        decode_path,
-    )? {
+    let aura1_execution = if aura1_execution == Aura1ExecutionOptions::default()
+        && decode_path == Aura0DecodePath::Cursor
+    {
+        Aura1ExecutionOptions {
+            body_path: Aura1BodyPath::StreamingCursor,
+            ..aura1_execution
+        }
+    } else {
+        aura1_execution
+    };
+    let profiled = if target == Profile::Aura1 && typed_execution_path_set {
+        records::try_compile_i64_file_profiled_with_options(
+            bytes,
+            target,
+            guard_mode,
+            transcode_path,
+            aura1_execution,
+        )?
+        .map(|output| (output.profiled, Some(output.execution), None))
+    } else if target == Profile::Aura1 {
+        records::try_compile_i64_file_profiled_with_trace(
+            bytes,
+            target,
+            guard_mode,
+            transcode_path,
+            encoder_path,
+            decode_path,
+        )?
+        .map(|output| (output.profiled, None, output.effective_aura1_body_path))
+    } else {
+        records::try_compile_i64_file_profiled(
+            bytes,
+            target,
+            guard_mode,
+            transcode_path,
+            encoder_path,
+            decode_path,
+        )?
+        .map(|output| (output, None, None))
+    };
+    if let Some((output, execution, legacy_effective_body_path)) = profiled {
         let records::ProfiledCompileOutput {
             bytes: output_bytes_vec,
             output_byte_guard,
@@ -1827,6 +2000,25 @@ fn transcode(
             timings,
             stats,
         } = output;
+        let requested_aura1_body_path = execution
+            .as_ref()
+            .map_or("not-applicable", |trace| trace.requested_body_path.as_str());
+        let effective_aura1_body_path = execution
+            .as_ref()
+            .map(|trace| trace.effective_body_path.as_str())
+            .or_else(|| legacy_effective_body_path.map(Aura1EffectiveBodyPath::as_str))
+            .unwrap_or("not-applicable");
+        let requested_aura0_column_path = execution.as_ref().map_or("not-applicable", |trace| {
+            trace.requested_column_path.as_str()
+        });
+        let effective_aura0_column_path = execution
+            .as_ref()
+            .and_then(|trace| trace.effective_column_path)
+            .map_or("not-applicable", Aura0ColumnPath::as_str);
+        let unsupported_path_behavior = execution
+            .as_ref()
+            .map_or("not-applicable", |trace| trace.unsupported_path.as_str());
+        let fallback_reason = execution.as_ref().and_then(|trace| trace.fallback_reason);
         let output_bytes = output_bytes_vec.len();
         black_box(&output_bytes_vec);
         let guard = output_byte_guard.unwrap_or(output_bytes as u64);
@@ -1855,6 +2047,12 @@ fn transcode(
             guard_mode: guard_mode.as_str(),
             transcode_path: transcode_path.as_str(),
             encoder_path: encoder_path.as_str(),
+            requested_aura1_body_path,
+            effective_aura1_body_path,
+            requested_aura0_column_path,
+            effective_aura0_column_path,
+            unsupported_path_behavior,
+            fallback_reason,
             conversion_plan_hash,
             compiled_plan_used: conversion_plan_hash.is_some(),
             plan_setup_time: Duration::ZERO,
@@ -1868,12 +2066,35 @@ fn transcode(
             preserved_output,
         });
     }
+    if target == Profile::Aura1
+        && matches!(
+            guard_mode,
+            OutputGuardMode::FusedOutputGuard | OutputGuardMode::BlockBatchedOutputGuard
+        )
+    {
+        bail!("requested strict Aura1 guard path unsupported without explicit fallback");
+    }
     if transcode_path == TranscodePath::Direct {
         bail!("direct transcode path unsupported for this input/target pair");
     }
 
-    let output = writer::compile_i64(bytes, target)?;
+    let explicit_materialized = target == Profile::Aura1
+        && transcode_path == TranscodePath::Materialized
+        && !typed_execution_path_set;
+    let output = if explicit_materialized {
+        records::compile_aura0_to_aura1_materialized(bytes)?.bytes
+    } else {
+        writer::compile_i64(bytes, target)?
+    };
     black_box(&output);
+    let typed_aura1_execution = target == Profile::Aura1 && typed_execution_path_set;
+    let effective_materialized_path = if explicit_materialized {
+        Aura1EffectiveBodyPath::Materialized.as_str()
+    } else {
+        Aura1EffectiveBodyPath::MaterializedFallback.as_str()
+    };
+    let materialized_fallback_reason = (!explicit_materialized && target == Profile::Aura1)
+        .then_some("compiled execution path unavailable; materialized compiler used");
     if guard_mode == OutputGuardMode::NoGuard {
         let output_bytes = output.len();
         let (canonical_hash, canonical_hash_time, canonical_hash_equality) =
@@ -1900,6 +2121,28 @@ fn transcode(
             guard_mode: guard_mode.as_str(),
             transcode_path: "materialized",
             encoder_path: Aura0EncoderPath::Materialized.as_str(),
+            requested_aura1_body_path: if typed_aura1_execution {
+                aura1_execution.body_path.as_str()
+            } else {
+                "not-applicable"
+            },
+            effective_aura1_body_path: if target == Profile::Aura1 {
+                effective_materialized_path
+            } else {
+                "not-applicable"
+            },
+            requested_aura0_column_path: if typed_aura1_execution {
+                aura1_execution.column_path.as_str()
+            } else {
+                "not-applicable"
+            },
+            effective_aura0_column_path: "not-applicable",
+            unsupported_path_behavior: if typed_aura1_execution {
+                aura1_execution.unsupported_path.as_str()
+            } else {
+                "not-applicable"
+            },
+            fallback_reason: materialized_fallback_reason,
             conversion_plan_hash: None,
             compiled_plan_used: false,
             plan_setup_time: Duration::ZERO,
@@ -1938,9 +2181,31 @@ fn transcode(
         canonical_hash,
         canonical_hash_time,
         canonical_hash_equality,
-        guard_mode: "post_process_output",
+        guard_mode: guard_mode.as_str(),
         transcode_path: "materialized",
         encoder_path: Aura0EncoderPath::Materialized.as_str(),
+        requested_aura1_body_path: if typed_aura1_execution {
+            aura1_execution.body_path.as_str()
+        } else {
+            "not-applicable"
+        },
+        effective_aura1_body_path: if target == Profile::Aura1 {
+            effective_materialized_path
+        } else {
+            "not-applicable"
+        },
+        requested_aura0_column_path: if typed_aura1_execution {
+            aura1_execution.column_path.as_str()
+        } else {
+            "not-applicable"
+        },
+        effective_aura0_column_path: "not-applicable",
+        unsupported_path_behavior: if typed_aura1_execution {
+            aura1_execution.unsupported_path.as_str()
+        } else {
+            "not-applicable"
+        },
+        fallback_reason: materialized_fallback_reason,
         conversion_plan_hash: None,
         compiled_plan_used: false,
         plan_setup_time: Duration::ZERO,
@@ -1984,6 +2249,12 @@ fn aura1_scan_fixed(bytes: &[u8], canonical_hash_mode: CanonicalHashMode) -> Res
         guard_mode: "no_guard",
         transcode_path: "none",
         encoder_path: "none",
+        requested_aura1_body_path: "not-applicable",
+        effective_aura1_body_path: "not-applicable",
+        requested_aura0_column_path: "not-applicable",
+        effective_aura0_column_path: "not-applicable",
+        unsupported_path_behavior: "not-applicable",
+        fallback_reason: None,
         conversion_plan_hash: Some(layout.conversion_plan_hash),
         compiled_plan_used: true,
         plan_setup_time,
@@ -2044,6 +2315,12 @@ fn aura1_replay_callback(
         guard_mode: "no_guard",
         transcode_path: "none",
         encoder_path: "none",
+        requested_aura1_body_path: "not-applicable",
+        effective_aura1_body_path: "not-applicable",
+        requested_aura0_column_path: "not-applicable",
+        effective_aura0_column_path: "not-applicable",
+        unsupported_path_behavior: "not-applicable",
+        fallback_reason: None,
         conversion_plan_hash: Some(layout.conversion_plan_hash),
         compiled_plan_used: true,
         plan_setup_time,
@@ -2093,6 +2370,12 @@ fn aura1_parse_to_rows(bytes: &[u8], canonical_hash_mode: CanonicalHashMode) -> 
         guard_mode: "no_guard",
         transcode_path: "none",
         encoder_path: "none",
+        requested_aura1_body_path: "not-applicable",
+        effective_aura1_body_path: "not-applicable",
+        requested_aura0_column_path: "not-applicable",
+        effective_aura0_column_path: "not-applicable",
+        unsupported_path_behavior: "not-applicable",
+        fallback_reason: None,
         conversion_plan_hash: Some(layout.conversion_plan_hash),
         compiled_plan_used: true,
         plan_setup_time,
@@ -2119,8 +2402,19 @@ fn fair_aura1_bytes_operation(
     operation: Operation,
     bytes: &[u8],
     decode_path: Aura0DecodePath,
+    aura1_execution: Aura1ExecutionOptions,
+    typed_execution_path_set: bool,
     context: &FairBytesContext,
 ) -> Result<RunOutcome> {
+    let aura1_execution = if !typed_execution_path_set && decode_path == Aura0DecodePath::Cursor {
+        Aura1ExecutionOptions {
+            body_path: Aura1BodyPath::StreamingCursor,
+            unsupported_path: UnsupportedPathBehavior::FallbackToStable,
+            ..aura1_execution
+        }
+    } else {
+        aura1_execution
+    };
     let verify = operation.is_fair_verify();
     let is_zstd = operation.is_fair_zstd();
     let is_byte_lane = operation.is_fair_byte_lane();
@@ -2131,6 +2425,7 @@ fn fair_aura1_bytes_operation(
     let mut byte_lane_codec = None;
     let mut byte_lane_block_count = None;
     let mut byte_lane_output_guard = None;
+    let mut execution_trace = None;
 
     let output = if is_zstd {
         zstd::stream::decode_all(Cursor::new(bytes)).context("zstd-decompress Aura1 bytes")?
@@ -2139,45 +2434,46 @@ fn fair_aura1_bytes_operation(
             .byte_lane
             .as_ref()
             .context("missing Aura0 byte lane profile")?;
-        byte_lane_codec = Some(profile.codec);
-        byte_lane_block_count = Some(1);
-        if context.use_byte_lane == Aura0ByteLaneUse::Never {
-            records::compile_aura0_to_aura1_bytes_with_lane(bytes, context.use_byte_lane, verify)?
+        let guard_mode = if verify {
+            OutputGuardMode::OldPostOutputGuard
         } else {
-            let guard_mode = if verify {
-                OutputGuardMode::OldPostOutputGuard
-            } else {
-                OutputGuardMode::NoGuard
-            };
-            let profiled = records::try_compile_i64_file_profiled(
-                bytes,
-                Profile::Aura1,
-                guard_mode,
-                TranscodePath::Auto,
-                Aura0EncoderPath::Materialized,
-                decode_path,
-            )?
-            .context("Aura0 byte lane profile did not decode through production Aura0 reader")?;
-            conversion_plan_hash = profiled.conversion_plan_hash;
-            compiled_plan_used = profiled.conversion_plan_hash.is_some();
-            timings = Some(profiled.timings);
-            stats = Some(profiled.stats);
-            byte_lane_output_guard = profiled.output_byte_guard;
-            profiled.bytes
+            OutputGuardMode::NoGuard
+        };
+        let profiled = records::try_compile_i64_file_profiled_with_options_and_lane_use(
+            bytes,
+            Profile::Aura1,
+            guard_mode,
+            TranscodePath::Auto,
+            aura1_execution,
+            context.use_byte_lane,
+        )?
+        .context("Aura0 byte lane profile did not support the requested execution policy")?;
+        let lane_used =
+            profiled.execution.effective_body_path == Aura1EffectiveBodyPath::EmbeddedByteLane;
+        if lane_used {
+            byte_lane_codec = Some(profile.codec);
+            byte_lane_block_count = Some(1);
+            byte_lane_output_guard = profiled.profiled.output_byte_guard;
         }
-    } else if let Some(profiled) = records::try_compile_i64_file_profiled(
+        execution_trace = Some(profiled.execution);
+        conversion_plan_hash = profiled.profiled.conversion_plan_hash;
+        compiled_plan_used = profiled.profiled.conversion_plan_hash.is_some();
+        timings = Some(profiled.profiled.timings);
+        stats = Some(profiled.profiled.stats);
+        profiled.profiled.bytes
+    } else if let Some(profiled) = records::try_compile_i64_file_profiled_with_options(
         bytes,
         Profile::Aura1,
         OutputGuardMode::NoGuard,
         TranscodePath::Auto,
-        Aura0EncoderPath::Materialized,
-        decode_path,
+        aura1_execution,
     )? {
-        conversion_plan_hash = profiled.conversion_plan_hash;
+        execution_trace = Some(profiled.execution);
+        conversion_plan_hash = profiled.profiled.conversion_plan_hash;
         compiled_plan_used = conversion_plan_hash.is_some();
-        timings = Some(profiled.timings);
-        stats = Some(profiled.stats);
-        profiled.bytes
+        timings = Some(profiled.profiled.timings);
+        stats = Some(profiled.profiled.stats);
+        profiled.profiled.bytes
     } else {
         writer::compile_i64(bytes, Profile::Aura1)?
     };
@@ -2199,6 +2495,31 @@ fn fair_aura1_bytes_operation(
         context.aura0_bytes.len()
     };
     let output_len = output.len();
+    let execution_applicable = !is_zstd;
+    let byte_lane_used = execution_trace
+        .as_ref()
+        .is_some_and(|trace| trace.effective_body_path == Aura1EffectiveBodyPath::EmbeddedByteLane);
+    let effective_body_path = execution_trace
+        .as_ref()
+        .map(|trace| trace.effective_body_path.as_str())
+        .unwrap_or_else(|| {
+            if execution_applicable {
+                Aura1EffectiveBodyPath::MaterializedFallback.as_str()
+            } else {
+                "not-applicable"
+            }
+        });
+    let effective_column_path = execution_trace
+        .as_ref()
+        .and_then(|trace| trace.effective_column_path)
+        .map_or("not-applicable", Aura0ColumnPath::as_str);
+    let fallback_reason = execution_trace
+        .as_ref()
+        .and_then(|trace| trace.fallback_reason)
+        .or_else(|| {
+            (execution_applicable && execution_trace.is_none())
+                .then_some("compiled execution path unavailable; materialized compiler used")
+        });
 
     Ok(RunOutcome {
         record_count: context.record_count,
@@ -2214,6 +2535,24 @@ fn fair_aura1_bytes_operation(
             "auto"
         },
         encoder_path: "none",
+        requested_aura1_body_path: if execution_applicable && typed_execution_path_set {
+            aura1_execution.body_path.as_str()
+        } else {
+            "not-applicable"
+        },
+        effective_aura1_body_path: effective_body_path,
+        requested_aura0_column_path: if execution_applicable && typed_execution_path_set {
+            aura1_execution.column_path.as_str()
+        } else {
+            "not-applicable"
+        },
+        effective_aura0_column_path: effective_column_path,
+        unsupported_path_behavior: if execution_applicable && typed_execution_path_set {
+            aura1_execution.unsupported_path.as_str()
+        } else {
+            "not-applicable"
+        },
+        fallback_reason,
         conversion_plan_hash,
         compiled_plan_used,
         plan_setup_time: Duration::ZERO,
@@ -2252,16 +2591,16 @@ fn fair_aura1_bytes_operation(
             } else {
                 "aura0-compact-semantic"
             },
-            byte_lane_enabled: is_byte_lane,
+            byte_lane_enabled: byte_lane_used,
             byte_lane_codec: byte_lane_codec.map(ByteLaneCodec::as_str),
             byte_lane_level: byte_lane_codec
                 .map(ByteLaneCodec::zstd_level)
                 .filter(|level| *level > 0),
             byte_lane_block_count,
-            byte_lane_compressed_bytes: is_byte_lane.then_some(bytes.len()),
-            byte_lane_uncompressed_bytes: is_byte_lane.then_some(output_len),
+            byte_lane_compressed_bytes: byte_lane_used.then_some(bytes.len()),
+            byte_lane_uncompressed_bytes: byte_lane_used.then_some(output_len),
             byte_lane_output_guard,
-            byte_lane_guard_validated: is_byte_lane.then_some(verify),
+            byte_lane_guard_validated: byte_lane_used.then_some(verify),
         }),
         preserved_output: None,
     })
@@ -2345,6 +2684,12 @@ fn zstd_baseline(
         guard_mode: "no_guard",
         transcode_path: "none",
         encoder_path: "none",
+        requested_aura1_body_path: "not-applicable",
+        effective_aura1_body_path: "not-applicable",
+        requested_aura0_column_path: "not-applicable",
+        effective_aura0_column_path: "not-applicable",
+        unsupported_path_behavior: "not-applicable",
+        fallback_reason: None,
         conversion_plan_hash: None,
         compiled_plan_used: false,
         plan_setup_time: Duration::ZERO,
@@ -2570,6 +2915,6 @@ fn csv_escape(field: &str) -> String {
 
 fn print_usage() {
     eprintln!(
-        "usage: aura-bench --operation <parse-aura1|decode-aura0|transcode-aura1-to-aura0|transcode-aura0-to-aura1|aura1-scan-fixed|aura1-replay-callback|aura1-parse-to-rows|zstd-decompress-only|zstd-decompress-plus-parse|zstd-decompress-plus-replay|zstd-decompress-plus-aura1-output|aura0-to-aura1-bytes|aura0-to-aura1-bytes-verify|zstd-aura1-to-aura1-bytes|zstd-aura1-to-aura1-bytes-verify|aura0-byte-lane-to-aura1-bytes|aura0-byte-lane-to-aura1-bytes-verify> --dataset <name> --input <path> [--iterations N] [--warmups N] [--format json|csv] [--output path] [--cache-mode warm|cold] [--guard-mode no_guard|fused_output_guard|old_post_output_guard|block_batched_output_guard] [--transcode-path auto|materialized|direct] [--decode-path materialized|cursor] [--encoder-path materialized|direct-streams|column-free] [--canonical-hash-mode none|verify] [--zstd-level N] [--aura0-profile compact|fast|hybrid] [--byte-lane-codec raw|lz4|zstd1|zstd3|zstd9] [--use-byte-lane auto|always|never] [--reference-aura0 path] [--reference-aura1 path] [--preserve-output path] [--verify-output-decodes]"
+        "usage: aura-bench --operation <parse-aura1|decode-aura0|transcode-aura1-to-aura0|transcode-aura0-to-aura1|aura1-scan-fixed|aura1-replay-callback|aura1-parse-to-rows|zstd-decompress-only|zstd-decompress-plus-parse|zstd-decompress-plus-replay|zstd-decompress-plus-aura1-output|aura0-to-aura1-bytes|aura0-to-aura1-bytes-verify|zstd-aura1-to-aura1-bytes|zstd-aura1-to-aura1-bytes-verify|aura0-byte-lane-to-aura1-bytes|aura0-byte-lane-to-aura1-bytes-verify> --dataset <name> --input <path> [--iterations N] [--warmups N] [--format json|csv] [--output path] [--cache-mode warm|cold] [--guard-mode no_guard|fused_output_guard|old_post_output_guard|block_batched_output_guard] [--transcode-path auto|materialized|direct] [--aura1-body-path stable-auto|direct-file|streaming-cursor|direct-streams|columns] [--column-decode-path materialized|partitioned-sparse-cursor] [--unsupported-path error|fallback-to-stable] [--decode-path materialized|cursor] [--encoder-path materialized|direct-streams|column-free] [--canonical-hash-mode none|verify] [--zstd-level N] [--aura0-profile compact|fast|hybrid] [--byte-lane-codec raw|lz4|zstd1|zstd3|zstd9] [--use-byte-lane auto|always|never] [--reference-aura0 path] [--reference-aura1 path] [--preserve-output path] [--verify-output-decodes]"
     );
 }

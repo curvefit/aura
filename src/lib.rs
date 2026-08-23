@@ -10,6 +10,7 @@ pub mod bytes;
 pub mod chunk;
 pub mod convert;
 pub mod error;
+pub mod execution;
 mod fixed_width;
 pub mod footer;
 pub mod format;
@@ -43,6 +44,10 @@ pub mod writer;
 pub use body::{decode_generic_stream_body, encode_generic_stream_body, GenericStreamBodyValue};
 pub use convert::{convert_aura, ConversionSummary};
 pub use error::{AuraDiagnostic, AuraError, Result};
+pub use execution::{
+    Aura0ColumnPath, Aura1BodyPath, Aura1EffectiveBodyPath, Aura1ExecutionOptions,
+    Aura1ExecutionTrace, UnsupportedPathBehavior,
+};
 pub use footer::{AuraFooter, CompressionDescriptor, CompressionKind};
 pub use format::{
     AuraContainerVersion, AURA_CHUNK_DESCRIPTOR_SIZE, MAX_AURA_CHUNK_COUNT, MAX_V3_HEADER_BYTES,
@@ -82,8 +87,11 @@ pub use reader::{
     OrderBookDeltaSpecBuilder,
 };
 pub use records::{
-    Aura0ByteLaneCodec, Aura0ByteLaneUse, DecodedI64ColumnsFile, DecodedI64EventFile,
-    DecodedI64File, DecodedTypedFile, I64Event, I64EventFileInput, I64FileInput, TypedFileInput,
+    compile_aura0_to_aura1_materialized, Aura0ByteLaneCodec, Aura0ByteLaneUse,
+    DecodedI64ColumnsFile, DecodedI64EventFile, DecodedI64File, DecodedTypedFile, I64Event,
+    I64EventFileInput, I64FileInput, MaterializedAura1CompileOutput, TypedFileInput,
+    MAX_V2_I64_DECODE_BODY_BYTES, MAX_V2_I64_DECODE_FIELDS, MAX_V2_I64_DECODE_ROWS,
+    MAX_V2_I64_DECODE_VALUES,
 };
 pub use schema::{
     decode_group_descriptor_table, decode_schema_descriptor, decode_schema_map,

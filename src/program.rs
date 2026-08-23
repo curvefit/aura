@@ -471,7 +471,13 @@ impl DecodeProgram {
 
     pub fn decode_from(reader: &mut ByteReader<'_>) -> Result<Self> {
         let field_count = reader.read_u16_le()? as usize;
-        let mut fields = Vec::with_capacity(field_count);
+        if field_count > 256 {
+            return Err(AuraError::InvalidValue("program field count"));
+        }
+        let mut fields = Vec::new();
+        fields
+            .try_reserve_exact(field_count)
+            .map_err(|_| AuraError::InvalidValue("program field allocation"))?;
         for _ in 0..field_count {
             fields.push(FieldProgram::decode_from(reader)?);
         }

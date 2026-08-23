@@ -7,6 +7,8 @@ use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u64_le, put_u8, ByteR
 use crate::header::DerivedExpressionOp;
 use crate::{AuraError, Result};
 
+const MAX_GENERIC_DICTIONARY_ENTRIES: usize = 1024 * 1024;
+
 const MAGIC: &[u8; 4] = b"AURI";
 const VERSION: u8 = 1;
 const NO_SLOT: u16 = u16::MAX;
@@ -703,9 +705,20 @@ impl GenericStreamOp {
                 let unit = reader.read_i64_le()?;
                 let entry_count = reader.read_u32_le()?;
                 let entry_width = reader.read_u8()?;
-                let code_lengths = (0..entry_count)
-                    .map(|_| reader.read_u8())
-                    .collect::<Result<Vec<_>>>()?;
+                let entry_count_usize = usize::try_from(entry_count)
+                    .map_err(|_| AuraError::InvalidValue("dictionary entry count"))?;
+                if entry_count_usize > MAX_GENERIC_DICTIONARY_ENTRIES
+                    || entry_count_usize > reader.remaining()
+                {
+                    return Err(AuraError::InvalidValue("dictionary entry count"));
+                }
+                let mut code_lengths = Vec::new();
+                code_lengths
+                    .try_reserve_exact(entry_count_usize)
+                    .map_err(|_| AuraError::InvalidValue("dictionary entry allocation"))?;
+                for _ in 0..entry_count_usize {
+                    code_lengths.push(reader.read_u8()?);
+                }
                 Self::HuffmanDictionary {
                     base,
                     unit,
@@ -792,7 +805,10 @@ impl GenericStreamOp {
             } => {
                 validate_unit(unit)?;
                 validate_bit_width(code_width)?;
-                if entry_count == 0 {
+                if entry_count == 0
+                    || usize::try_from(entry_count)
+                        .map_or(true, |count| count > MAX_GENERIC_DICTIONARY_ENTRIES)
+                {
                     Err(AuraError::InvalidValue("dictionary entry count"))
                 } else {
                     Ok(())
@@ -808,7 +824,10 @@ impl GenericStreamOp {
                 validate_unit(unit)?;
                 validate_bit_width(entry_width)?;
                 validate_bit_width(code_width)?;
-                if entry_count == 0 {
+                if entry_count == 0
+                    || usize::try_from(entry_count)
+                        .map_or(true, |count| count > MAX_GENERIC_DICTIONARY_ENTRIES)
+                {
                     Err(AuraError::InvalidValue("dictionary entry count"))
                 } else {
                     Ok(())
@@ -823,6 +842,11 @@ impl GenericStreamOp {
             } => {
                 validate_unit(unit)?;
                 validate_bit_width(entry_width)?;
+                if usize::try_from(entry_count)
+                    .map_or(true, |count| count > MAX_GENERIC_DICTIONARY_ENTRIES)
+                {
+                    return Err(AuraError::InvalidValue("dictionary entry count"));
+                }
                 validate_huffman_code_lengths(entry_count, code_lengths)
             }
             Self::UuidConstMask {
@@ -1491,17 +1515,24 @@ fn read_packed_huffman_code_lengths(
     reader: &mut ByteReader<'_>,
     entry_count: u32,
 ) -> Result<Vec<u8>> {
+    let entry_count_usize = usize::try_from(entry_count)
+        .map_err(|_| AuraError::InvalidValue("dictionary entry count"))?;
+    if entry_count_usize > MAX_GENERIC_DICTIONARY_ENTRIES {
+        return Err(AuraError::InvalidValue("dictionary entry count"));
+    }
     let bit_width = reader.read_u8()?;
     validate_bit_width(bit_width)?;
-    let byte_len = bitpacked_byte_len(u64::from(entry_count), bit_width) as usize;
-    unpack_unsigned_values(
-        reader.read_exact(byte_len)?,
-        bit_width,
-        entry_count as usize,
-    )?
-    .into_iter()
-    .map(|value| u8::try_from(value).map_err(|_| AuraError::InvalidValue("huffman code lengths")))
-    .collect()
+    let byte_len = usize::try_from(bitpacked_byte_len(u64::from(entry_count), bit_width))
+        .map_err(|_| AuraError::InvalidValue("huffman code lengths"))?;
+    if byte_len > reader.remaining() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    unpack_unsigned_values(reader.read_exact(byte_len)?, bit_width, entry_count_usize)?
+        .into_iter()
+        .map(|value| {
+            u8::try_from(value).map_err(|_| AuraError::InvalidValue("huffman code lengths"))
+        })
+        .collect()
 }
 
 fn encode_optional_slot(slot: Option<u16>) -> Result<u16> {

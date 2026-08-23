@@ -70,12 +70,14 @@ pub fn pack_unsigned_values(values: &[u64], bit_width: u8) -> Result<Vec<u8>> {
 
 pub fn unpack_signed_values(bytes: &[u8], bit_width: u8, value_count: usize) -> Result<Vec<i64>> {
     validate_bit_width(bit_width)?;
-    let expected_len = bitpacked_byte_len(value_count as u64, bit_width) as usize;
+    let expected_len = validate_unpack_dimensions::<i64>(bytes, bit_width, value_count)?;
     if bytes.len() != expected_len {
         return Err(AuraError::InvalidValue("bitpacked length"));
     }
     if bit_width == 0 {
-        return Ok(vec![0; value_count]);
+        let mut values = unpack_vec_with_capacity(value_count)?;
+        values.resize(value_count, 0);
+        return Ok(values);
     }
 
     match bit_width {
@@ -104,12 +106,14 @@ pub fn unpack_signed_values(bytes: &[u8], bit_width: u8, value_count: usize) -> 
 
 pub fn unpack_unsigned_values(bytes: &[u8], bit_width: u8, value_count: usize) -> Result<Vec<u64>> {
     validate_bit_width(bit_width)?;
-    let expected_len = bitpacked_byte_len(value_count as u64, bit_width) as usize;
+    let expected_len = validate_unpack_dimensions::<u64>(bytes, bit_width, value_count)?;
     if bytes.len() != expected_len {
         return Err(AuraError::InvalidValue("bitpacked length"));
     }
     if bit_width == 0 {
-        return Ok(vec![0; value_count]);
+        let mut values = unpack_vec_with_capacity(value_count)?;
+        values.resize(value_count, 0);
+        return Ok(values);
     }
 
     match bit_width {
@@ -190,7 +194,7 @@ where
     F: FnMut(u64) -> Result<T>,
 {
     let mask = (1u128 << bit_width) - 1;
-    let mut values = Vec::with_capacity(value_count);
+    let mut values = unpack_vec_with_capacity(value_count)?;
     let mut byte_index = 0usize;
     let mut buffer = 0u128;
     let mut buffered_bits = 0u8;
@@ -207,6 +211,31 @@ where
         buffered_bits -= bit_width;
     }
 
+    Ok(values)
+}
+
+fn validate_unpack_dimensions<T>(bytes: &[u8], bit_width: u8, value_count: usize) -> Result<usize> {
+    if value_count > 64 * 1024 * 1024 || bytes.len() > 512 * 1024 * 1024 {
+        return Err(AuraError::InvalidValue("bitpacked value count"));
+    }
+    if value_count
+        .checked_mul(std::mem::size_of::<T>())
+        .is_none_or(|size| size > 512 * 1024 * 1024)
+    {
+        return Err(AuraError::InvalidValue("bitpacked allocation"));
+    }
+    usize::try_from(bitpacked_byte_len(
+        u64::try_from(value_count).map_err(|_| AuraError::InvalidValue("bitpacked value count"))?,
+        bit_width,
+    ))
+    .map_err(|_| AuraError::InvalidValue("bitpacked length"))
+}
+
+fn unpack_vec_with_capacity<T>(value_count: usize) -> Result<Vec<T>> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(value_count)
+        .map_err(|_| AuraError::InvalidValue("bitpacked allocation"))?;
     Ok(values)
 }
 

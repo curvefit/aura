@@ -6,39 +6,9 @@ use aura_codec::records::{
 use aura_codec::schema::{generic_i64_parent_schema, ohlcv_schema};
 use aura_codec::writer;
 use aura_codec::{
-    AuraHeader, AuraI64Reader, AuraI64Writer, DerivedExpression, DerivedExpressionOp, Profile,
+    Aura0ColumnPath, Aura1BodyPath, Aura1ExecutionOptions, AuraHeader, AuraI64Reader,
+    AuraI64Writer, DerivedExpression, DerivedExpressionOp, Profile, UnsupportedPathBehavior,
 };
-use std::ffi::OsString;
-use std::sync::Mutex;
-
-static AURA_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct EnvRestore {
-    force_columns: Option<OsString>,
-    stream_aura1: Option<OsString>,
-}
-
-impl EnvRestore {
-    fn capture() -> Self {
-        Self {
-            force_columns: std::env::var_os("AURA_FORCE_COLUMNS_AURA1"),
-            stream_aura1: std::env::var_os("AURA_STREAM_AURA1"),
-        }
-    }
-}
-
-impl Drop for EnvRestore {
-    fn drop(&mut self) {
-        match &self.force_columns {
-            Some(value) => std::env::set_var("AURA_FORCE_COLUMNS_AURA1", value),
-            None => std::env::remove_var("AURA_FORCE_COLUMNS_AURA1"),
-        }
-        match &self.stream_aura1 {
-            Some(value) => std::env::set_var("AURA_STREAM_AURA1", value),
-            None => std::env::remove_var("AURA_STREAM_AURA1"),
-        }
-    }
-}
 
 fn ohlcv_rows() -> Vec<Vec<i64>> {
     vec![
@@ -122,11 +92,6 @@ fn experimental_column_decode_matches_rows_without_row_materialization() {
 
 #[test]
 fn aura0_to_aura1_fused_output_guard_matches_full_scan() {
-    let _guard = AURA_ENV_LOCK.lock().unwrap();
-    let _restore = EnvRestore::capture();
-    std::env::remove_var("AURA_FORCE_COLUMNS_AURA1");
-    std::env::remove_var("AURA_STREAM_AURA1");
-
     let ingest = writer::encode_i64(sample_input()).unwrap();
     let aura0 = writer::compile_i64(&ingest, Profile::Aura0).unwrap();
     let expected = writer::compile_i64(&aura0, Profile::Aura1).unwrap();
@@ -140,19 +105,27 @@ fn aura0_to_aura1_fused_output_guard_matches_full_scan() {
 
 #[test]
 fn aura0_to_aura1_default_fast_path_matches_column_fallback() {
-    let _guard = AURA_ENV_LOCK.lock().unwrap();
-    let _restore = EnvRestore::capture();
-    std::env::remove_var("AURA_FORCE_COLUMNS_AURA1");
-    std::env::remove_var("AURA_STREAM_AURA1");
-
     let input = sample_input();
     let rows = input.rows.clone();
     let ingest = writer::encode_i64(input).unwrap();
     let aura0 = writer::compile_i64(&ingest, Profile::Aura0).unwrap();
     let direct = writer::compile_i64(&aura0, Profile::Aura1).unwrap();
 
-    std::env::set_var("AURA_FORCE_COLUMNS_AURA1", "1");
-    let columns = writer::compile_i64(&aura0, Profile::Aura1).unwrap();
+    let columns = records::try_compile_i64_file_profiled_with_options(
+        &aura0,
+        Profile::Aura1,
+        OutputGuardMode::NoGuard,
+        TranscodePath::Auto,
+        Aura1ExecutionOptions {
+            body_path: Aura1BodyPath::Columns,
+            column_path: Aura0ColumnPath::Materialized,
+            unsupported_path: UnsupportedPathBehavior::Error,
+        },
+    )
+    .unwrap()
+    .expect("column body path")
+    .profiled
+    .bytes;
 
     assert_eq!(direct, columns);
     let decoded = reader::decode_i64(&direct).unwrap();
@@ -162,11 +135,6 @@ fn aura0_to_aura1_default_fast_path_matches_column_fallback() {
 
 #[test]
 fn aura0_to_aura1_compiled_path_reconstructs_temporal_derived_rows_directly() {
-    let _guard = AURA_ENV_LOCK.lock().unwrap();
-    let _restore = EnvRestore::capture();
-    std::env::remove_var("AURA_FORCE_COLUMNS_AURA1");
-    std::env::remove_var("AURA_STREAM_AURA1");
-
     let expressions = vec![
         DerivedExpression::new(1, 1, DerivedExpressionOp::FirstOffsetThenDelta, vec![4]).unwrap(),
         DerivedExpression::new(2, 2, DerivedExpressionOp::MaxPlusResidual, vec![1, 4]).unwrap(),
@@ -196,9 +164,7 @@ fn aura0_to_aura1_compiled_path_reconstructs_temporal_derived_rows_directly() {
     .unwrap();
     let aura0 = writer::compile_i64(&ingest, Profile::Aura0).unwrap();
 
-    std::env::set_var("AURA_FORCE_COLUMNS_AURA1", "1");
     let expected = writer::compile_i64(&aura0, Profile::Aura1).unwrap();
-    std::env::remove_var("AURA_FORCE_COLUMNS_AURA1");
     let compiled = records::try_compile_i64_file_profiled(
         &aura0,
         Profile::Aura1,

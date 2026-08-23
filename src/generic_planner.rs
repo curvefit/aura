@@ -10,12 +10,17 @@ use crate::body::{
     GenericI64StreamCursor, GenericStreamBodyValue,
 };
 use crate::bytes::{put_u16_le, put_u32_le, put_u64_le, ByteGuard, ByteReader};
+use crate::execution::Aura0ColumnPath;
 use crate::header::{DerivedExpression, DerivedExpressionOp};
 use crate::instructions::{
     DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
     GenericStreamOp,
 };
 use crate::plan::Aura1Plan;
+use crate::records::{
+    try_reserve_exact, validate_i64_decode_dimensions_usize, zero_i64_rows,
+    MAX_V2_I64_DECODE_BODY_BYTES, MAX_V2_I64_DECODE_VALUES,
+};
 use crate::schema::{FieldRelation, FieldScope, SchemaDescriptor};
 use crate::varint;
 use crate::{AuraError, PhysicalWidth, Result};
@@ -1071,52 +1076,19 @@ pub fn encode_generic_i64_rows_with_plan(
     rows: &[Vec<i64>],
     plan: GenericInstructionPlan,
 ) -> Result<GenericEncodedI64Rows> {
-    let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
-    let total_start = Instant::now();
-    let stage_start = Instant::now();
     validate_rows(schema, rows)?;
     let _encoded_plan = plan.encode()?;
-    if profile {
-        eprintln!(
-            "generic encode_validate_plan_us={} rows={} fields={} streams={}",
-            stage_start.elapsed().as_micros(),
-            rows.len(),
-            schema.fields.len(),
-            plan.streams.len()
-        );
-    }
     let mut streams = Vec::with_capacity(plan.streams.len());
     for instruction in &plan.streams {
-        let stage_start = Instant::now();
         let values = stream_values_for_instruction(schema, rows, &plan, instruction)?;
-        let values_us = stage_start.elapsed().as_micros();
-        let stage_start = Instant::now();
         let body =
             encode_generic_stream_body(instruction, &GenericStreamBodyValue::I64(values.clone()))?;
-        if profile {
-            eprintln!(
-                "generic encode_stream id={} values={} op={} values_us={} body_us={} body_bytes={}",
-                instruction.stream_id,
-                values.len(),
-                generic_op_name(&instruction.op),
-                values_us,
-                stage_start.elapsed().as_micros(),
-                body.len()
-            );
-        }
         streams.push(GenericEncodedStream {
             stream_id: instruction.stream_id,
             value_count: values.len(),
             body,
         });
     }
-    if profile {
-        eprintln!(
-            "generic encode_total_us={}",
-            total_start.elapsed().as_micros()
-        );
-    }
-
     Ok(GenericEncodedI64Rows {
         plan,
         streams,
@@ -1248,15 +1220,33 @@ pub fn decode_generic_i64_rows_body(
     record_count: usize,
     field_count: usize,
 ) -> Result<Vec<Vec<i64>>> {
+    let _ = validate_i64_decode_dimensions_usize(record_count, field_count, bytes.len())?;
     let mut reader = ByteReader::new(bytes);
     let stream_count = reader.read_u16_le()? as usize;
-    let mut streams = Vec::with_capacity(stream_count);
+    let max_streams = field_count
+        .checked_mul(16)
+        .ok_or(AuraError::InvalidValue("generic stream count"))?;
+    if stream_count > max_streams || stream_count.saturating_mul(14) > reader.remaining() {
+        return Err(AuraError::InvalidValue("generic stream count"));
+    }
+    let mut streams = Vec::new();
+    try_reserve_exact(&mut streams, stream_count, "generic stream allocation")?;
+    let mut total_values = 0usize;
     for _ in 0..stream_count {
         let stream_id = reader.read_u16_le()?;
         let value_count = usize::try_from(reader.read_u64_le()?)
             .map_err(|_| AuraError::InvalidValue("stream value count"))?;
+        total_values = total_values
+            .checked_add(value_count)
+            .ok_or(AuraError::InvalidValue("generic stream value count"))?;
+        if value_count > MAX_V2_I64_DECODE_VALUES || total_values > MAX_V2_I64_DECODE_VALUES {
+            return Err(AuraError::InvalidValue("generic stream value limit"));
+        }
         let body_len = reader.read_u32_le()? as usize;
-        let body = reader.read_exact(body_len)?.to_vec();
+        let encoded_body = reader.read_exact(body_len)?;
+        let mut body = Vec::new();
+        try_reserve_exact(&mut body, body_len, "generic stream body allocation")?;
+        body.extend_from_slice(encoded_body);
         streams.push(GenericEncodedStream {
             stream_id,
             value_count,
@@ -1379,8 +1369,8 @@ pub(crate) fn try_decode_generic_i64_columns_body(
     bytes: &[u8],
     record_count: usize,
     field_count: usize,
+    column_path: Aura0ColumnPath,
 ) -> Result<Option<Vec<Vec<i64>>>> {
-    let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
     if plan.groups.iter().any(|group| {
         matches!(
             group,
@@ -1393,19 +1383,13 @@ pub(crate) fn try_decode_generic_i64_columns_body(
         return Ok(None);
     }
 
-    if std::env::var_os("AURA_CURSOR_COLUMNS").is_some() {
-        let stage_start = Instant::now();
-        if let Some(columns) =
-            try_decode_partitioned_sparse_i64_columns_body(&plan, bytes, record_count, field_count)?
-        {
-            if profile {
-                eprintln!(
-                    "generic cursor_columns_us={}",
-                    stage_start.elapsed().as_micros()
-                );
-            }
-            return Ok(Some(columns));
-        }
+    if column_path == Aura0ColumnPath::PartitionedSparseCursor {
+        return try_decode_partitioned_sparse_i64_columns_body(
+            &plan,
+            bytes,
+            record_count,
+            field_count,
+        );
     }
 
     let instructions = plan
@@ -1425,18 +1409,8 @@ pub(crate) fn try_decode_generic_i64_columns_body(
         let instruction = instructions
             .get(&stream_id)
             .ok_or(AuraError::InvalidValue("stream id"))?;
-        let stage_start = Instant::now();
         match decode_generic_stream_body(instruction, body, value_count)? {
             GenericStreamBodyValue::I64(values) => {
-                if profile {
-                    eprintln!(
-                        "generic stream id={} values={} op={} decode_us={}",
-                        stream_id,
-                        value_count,
-                        generic_op_name(&instruction.op),
-                        stage_start.elapsed().as_micros()
-                    );
-                }
                 stream_values.insert(stream_id, values);
             }
             GenericStreamBodyValue::U128(_) => return Err(AuraError::InvalidValue("body type")),
@@ -1445,15 +1419,8 @@ pub(crate) fn try_decode_generic_i64_columns_body(
     reader.finish()?;
     validate_explicit_event_counts(&plan, &stream_values, record_count)?;
 
-    let stage_start = Instant::now();
     let columns =
         materialize_generic_i64_columns(&plan, &stream_values, record_count, field_count)?;
-    if profile {
-        eprintln!(
-            "generic materialize_us={}",
-            stage_start.elapsed().as_micros()
-        );
-    }
     Ok(columns)
 }
 
@@ -3031,8 +2998,6 @@ fn try_write_generic_i64_aura1_body_inner(
     out: &mut Vec<u8>,
     mut output_guard: Option<&mut ByteGuard>,
 ) -> Result<bool> {
-    let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
-    let total_start = profile.then(Instant::now);
     if plan
         .groups
         .iter()
@@ -3041,18 +3006,9 @@ fn try_write_generic_i64_aura1_body_inner(
         return Ok(false);
     }
 
-    let stage_start = profile.then(Instant::now);
     let stream_values = decode_generic_i64_stream_values(&plan, bytes)?;
     validate_explicit_event_counts(&plan, &stream_values, record_count)?;
-    if let Some(stage_start) = stage_start {
-        eprintln!(
-            "direct_aura1 decode_streams_us={} streams={}",
-            stage_start.elapsed().as_micros(),
-            plan.streams.len()
-        );
-    }
 
-    let stage_start = profile.then(Instant::now);
     if try_write_partitioned_sparse_i64_aura1_body(
         &plan,
         &stream_values,
@@ -3062,15 +3018,6 @@ fn try_write_generic_i64_aura1_body_inner(
         out,
         output_guard.as_deref_mut(),
     )? {
-        if let Some(stage_start) = stage_start {
-            eprintln!(
-                "direct_aura1 partitioned_sparse_write_us={} total_us={}",
-                stage_start.elapsed().as_micros(),
-                total_start
-                    .map(|start| start.elapsed().as_micros())
-                    .unwrap_or(0)
-            );
-        }
         return Ok(true);
     }
 
@@ -3114,9 +3061,8 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
         return Ok(true);
     }
 
-    let profile = std::env::var_os("AURA_PROFILE_FAST").is_some();
     let total_start = Instant::now();
-    let measure_stages = profile || timings.is_some();
+    let measure_stages = timings.is_some();
 
     let stage_start = measure_stages.then(Instant::now);
     let partition_runs =
@@ -3130,13 +3076,6 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
             .sparse_partition_traversal_ns
             .saturating_add(partition_runs_ns);
     }
-    if profile {
-        let stage_start = stage_start.expect("profile stage timer");
-        eprintln!(
-            "direct_aura1 partition_runs_us={}",
-            stage_start.elapsed().as_micros()
-        );
-    }
 
     let stage_start = measure_stages.then(Instant::now);
     let presence_maps = presence_maps_by_group(plan, stream_values, record_count)?;
@@ -3148,13 +3087,6 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
         timings.branch_record_type_handling_ns = timings
             .branch_record_type_handling_ns
             .saturating_add(presence_maps_ns);
-    }
-    if profile {
-        let stage_start = stage_start.expect("profile stage timer");
-        eprintln!(
-            "direct_aura1 presence_maps_us={}",
-            stage_start.elapsed().as_micros()
-        );
     }
 
     let stage_start = measure_stages.then(Instant::now);
@@ -3174,13 +3106,6 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
         timings.buffer_slicing_view_creation_ns = timings
             .buffer_slicing_view_creation_ns
             .saturating_add(sources_ns);
-    }
-    if profile {
-        let stage_start = stage_start.expect("profile stage timer");
-        eprintln!(
-            "direct_aura1 sources_us={}",
-            stage_start.elapsed().as_micros()
-        );
     }
 
     let stage_start = measure_stages.then(Instant::now);
@@ -3231,15 +3156,6 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
             .field_reconstruction_packing_ns
             .saturating_add(field_specs_ns);
     }
-    if profile {
-        let stage_start = stage_start.expect("profile stage timer");
-        eprintln!(
-            "direct_aura1 field_specs_us={} row_width={} fields={}",
-            stage_start.elapsed().as_micros(),
-            row_width,
-            field_specs.len()
-        );
-    }
 
     let stage_start = measure_stages.then(Instant::now);
     let body_len = record_count
@@ -3270,14 +3186,6 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
         .unwrap_or(0);
     if let Some(timings) = timings.as_deref_mut() {
         timings.allocation_reuse_ns = timings.allocation_reuse_ns.saturating_add(allocation_ns);
-    }
-    if profile {
-        let stage_start = stage_start.expect("profile stage timer");
-        eprintln!(
-            "direct_aura1 reserve_us={} reserved_body_bytes={}",
-            stage_start.elapsed().as_micros(),
-            record_count.saturating_mul(row_width)
-        );
     }
 
     let stage_start = measure_stages.then(Instant::now);
@@ -3342,14 +3250,6 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
     if let Some(timings) = timings.as_deref_mut() {
         timings.output_byte_stores_ns = timings.output_byte_stores_ns.saturating_add(output_ns);
     }
-    if profile {
-        let stage_start = stage_start.expect("profile stage timer");
-        eprintln!(
-            "direct_aura1 emit_rows_us={} rows={}",
-            stage_start.elapsed().as_micros(),
-            record_count
-        );
-    }
 
     let stage_start = measure_stages.then(Instant::now);
     for source in &mut sources {
@@ -3402,14 +3302,6 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
                 .saturating_add(field_specs.len().saturating_mul(record_count));
             stats.guard_update_bytes = stats.guard_update_bytes.saturating_add(body_len);
         }
-    }
-    if profile {
-        let stage_start = stage_start.expect("profile stage timer");
-        eprintln!(
-            "direct_aura1 finish_us={} total_us={}",
-            stage_start.elapsed().as_micros(),
-            total_start.elapsed().as_micros()
-        );
     }
     Ok(true)
 }
@@ -4671,27 +4563,6 @@ fn lookup_segment_base(bases: &[(i64, i64)], count: usize, partition_value: i64)
         .ok_or(AuraError::InvalidValue("segmented base stream"))
 }
 
-fn generic_op_name(op: &GenericStreamOp) -> &'static str {
-    match op {
-        GenericStreamOp::FixedStep { .. } => "FixedStep",
-        GenericStreamOp::BaseBitpack { .. } => "BaseBitpack",
-        GenericStreamOp::PrevDelta { .. } => "PrevDelta",
-        GenericStreamOp::PrevVarint { .. } => "PrevVarint",
-        GenericStreamOp::BlockLocal { .. } => "BlockLocal",
-        GenericStreamOp::PatchedBitpack { .. } => "PatchedBitpack",
-        GenericStreamOp::Rle { .. } => "Rle",
-        GenericStreamOp::BitplaneRle { .. } => "BitplaneRle",
-        GenericStreamOp::Dictionary { .. } => "Dictionary",
-        GenericStreamOp::PackedDictionary { .. } => "PackedDictionary",
-        GenericStreamOp::HuffmanDictionary { .. } => "HuffmanDictionary",
-        GenericStreamOp::UuidConstMask { .. } => "UuidConstMask",
-        GenericStreamOp::FixedStrideDelta { .. } => "FixedStrideDelta",
-        GenericStreamOp::DeltaOfDelta { .. } => "DeltaOfDelta",
-        GenericStreamOp::PreviousValueDelta { .. } => "PreviousValueDelta",
-        GenericStreamOp::ZstdVarint { .. } => "ZstdVarint",
-    }
-}
-
 fn decode_generic_i64_stream_values(
     plan: &GenericInstructionPlan,
     bytes: &[u8],
@@ -5381,6 +5252,30 @@ fn write_direct_i64_width_guarded(
 }
 
 pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Vec<i64>>> {
+    let body_bytes = encoded.streams.iter().try_fold(0usize, |total, stream| {
+        total
+            .checked_add(stream.body.len())
+            .ok_or(AuraError::InvalidValue("generic body length"))
+    })?;
+    if body_bytes > MAX_V2_I64_DECODE_BODY_BYTES {
+        return Err(AuraError::InvalidValue("i64 decode body limit"));
+    }
+    let _ = validate_i64_decode_dimensions_usize(
+        encoded.record_count,
+        encoded.field_count,
+        body_bytes,
+    )?;
+    let mut total_stream_values = 0usize;
+    for stream in &encoded.streams {
+        total_stream_values = total_stream_values
+            .checked_add(stream.value_count)
+            .ok_or(AuraError::InvalidValue("generic stream value count"))?;
+        if stream.value_count > MAX_V2_I64_DECODE_VALUES
+            || total_stream_values > MAX_V2_I64_DECODE_VALUES
+        {
+            return Err(AuraError::InvalidValue("generic stream value limit"));
+        }
+    }
     validate_quotient_remainder_decode_plan(encoded)?;
     let instructions = encoded
         .plan
@@ -5402,8 +5297,23 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
     }
     validate_explicit_event_counts(&encoded.plan, &stream_values, encoded.record_count)?;
 
-    let mut rows = vec![vec![0i64; encoded.field_count]; encoded.record_count];
-    let mut filled = vec![vec![false; encoded.field_count]; encoded.record_count];
+    let mut rows = zero_i64_rows(encoded.record_count, encoded.field_count)?;
+    let mut filled = Vec::new();
+    try_reserve_exact(
+        &mut filled,
+        encoded.record_count,
+        "generic filled row allocation",
+    )?;
+    for _ in 0..encoded.record_count {
+        let mut row = Vec::new();
+        try_reserve_exact(
+            &mut row,
+            encoded.field_count,
+            "generic filled value allocation",
+        )?;
+        row.resize(encoded.field_count, false);
+        filled.push(row);
+    }
     for instruction in &encoded.plan.streams {
         let Some(slot) = instruction.target_slot else {
             continue;
@@ -11883,6 +11793,7 @@ mod tests {
             &body,
             rows.len(),
             schema.fields.len(),
+            Aura0ColumnPath::Materialized,
         )
         .unwrap()
         .expect("column fast path");

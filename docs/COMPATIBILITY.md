@@ -56,7 +56,7 @@ through `.aura`, but compiled i64 paths reject schemas with wide fields.
 
 | Role | Current default candidate | Reference/experimental alternatives |
 | --- | --- | --- |
-| `.aura0 -> .aura1` | `--transcode-path auto --decode-path materialized` | compiled generic fallback covers no-Huffman/`PartitionRuns`; `--decode-path cursor` is correct on huff/nohuff but slower; keep behind flag |
+| `.aura0 -> .aura1` | `--transcode-path auto --aura1-body-path stable-auto` | compiled generic fallback covers no-Huffman/`PartitionRuns`; `streaming-cursor` is correct where supported but slower; keep explicit |
 | `.aura1 -> .aura0` | `--transcode-path direct --encoder-path materialized` | materialized fallback is reference-only; `direct-streams` is mixed; `column-free` is a diagnostic rejection |
 | `.aura1` replay | `aura1-scan-fixed` / fixed replay visitor | `aura1-parse-to-rows` materializes rows for comparison only |
 | guard mode | `no_guard` | strict modes for verification only |
@@ -82,13 +82,57 @@ Do not compare guarded and unguarded runs as speedups.
 
 ## Experimental Paths
 
-`--transcode-path direct`, `--decode-path cursor`,
+Codec implementation strategy is explicit and process-local. Library callers
+may pass `Aura1ExecutionOptions`; ordinary writer/conversion APIs always use
+`StableAuto`. Environment variables are not part of Aura's execution contract
+and cannot switch production codec paths. Explicit strategies affect neither
+wire bytes nor compatibility promises: supported strategies must emit the same
+Aura1 bytes as `StableAuto`, and unsupported strategies either return an Aura
+error or report a deliberate fallback according to the caller's policy.
+The typed API defaults to `UnsupportedPathBehavior::Error`; callers must opt in
+to `FallbackToStable` explicitly.
+
+The established `ProfiledCompileOutput` remains unchanged. The explicit-options
+API returns it together with a separate `Aura1ExecutionTrace`, so requested and
+effective paths, embedded-byte-lane dispatch, column-path applicability, and
+fallback reasons remain auditable without expanding the compatibility surface
+of existing profiled callers.
+
+The strategy enums are not serialized. Adding, removing, or tuning an execution
+strategy therefore does not create a format version. V2 compatibility fixtures
+remain the byte-level authority for stable writer output.
+
+The materialized Aura0-to-Aura1 reference compiler is a separate API and
+execution path. Its counters prove row/field/value materialization, and its
+output must remain byte-identical to stable Aura1 output. Embedded AUBL bytes
+may be used only as an input decoder for pure-fast Aura0; they are never copied
+as the materialized output path.
+
+V2 row-materializing readers enforce non-configurable hard ceilings before
+allocating: 4,194,304 rows, 256 fields, 67,108,864 logical values, and 512 MiB
+of body bytes. Counts use checked `u64`/`usize` conversion and checked products;
+raw, fixed Aura0, and Aura1 bodies must prove their declared dimensions from
+actual bytes before row matrices are reserved. Generic streams additionally
+cap aggregate declared values and use fallible reservations. These ceilings
+apply to the public decoder and the materialized reference compiler; callers
+cannot raise them.
+
+The same admission gate applies to column readers, profiled/direct compilers,
+typed execution paths, byte-lane expansion, metadata-only readers, file-backed
+readers, batches, visitors, and replay. Attacker-controlled dictionary,
+Huffman, RLE, bitplane, UUID, schema, and program table counts are capped and
+checked against remaining bytes before fallible allocation. Lane-only wrapper
+footers may have no local fields, but their declared rows remain bounded and
+their AUBL descriptors must pass the existing lane limits; non-lane zero-width
+row claims are rejected.
+
+`--transcode-path direct`, `--aura1-body-path streaming-cursor`,
 `--encoder-path direct-streams`, and `--encoder-path column-free` are
 benchmarkable or diagnostic direct-path selectors. They are not all
 unconditional defaults because wider fixture coverage and remaining
 materialization decisions are still open.
 
-`--decode-path cursor` currently removes Aura0 stream-vector materialization for
+`--aura1-body-path streaming-cursor` currently removes Aura0 stream-vector materialization for
 supported `.aura0 -> .aura1` plans, but measured grimoire runs were slower than
 the materialized/profiled path. Treat it as experimental evidence, not the
 production default.

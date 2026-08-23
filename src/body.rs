@@ -13,6 +13,16 @@ use crate::{varint, AuraError, Result};
 
 const HUFFMAN_BOUNDED_ROOT_BITS: u8 = 12;
 const HUFFMAN_BOUNDED_MAX_SUBTABLE_BITS: u8 = 8;
+const MAX_GENERIC_DICTIONARY_ENTRIES: usize = 1024 * 1024;
+
+fn checked_dictionary_entry_count(entry_count: u32) -> Result<usize> {
+    let count = usize::try_from(entry_count)
+        .map_err(|_| AuraError::InvalidValue("dictionary entry count"))?;
+    if count == 0 || count > MAX_GENERIC_DICTIONARY_ENTRIES {
+        return Err(AuraError::InvalidValue("dictionary entry count"));
+    }
+    Ok(count)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenericStreamBodyValue {
@@ -164,6 +174,10 @@ pub fn decode_generic_stream_body(
     bytes: &[u8],
     value_count: usize,
 ) -> Result<GenericStreamBodyValue> {
+    validate_i64_decode_value_count(value_count)?;
+    if bytes.len() > 512 * 1024 * 1024 {
+        return Err(AuraError::InvalidValue("stream body limit"));
+    }
     match instruction.op {
         GenericStreamOp::UuidConstMask { .. } => {
             let values = decode_uuid_const_mask_body(&instruction.op, bytes, value_count)?;
@@ -183,6 +197,10 @@ pub(crate) fn try_generic_i64_stream_cursor<'a>(
     bytes: &'a [u8],
     value_count: usize,
 ) -> Result<Option<GenericI64StreamCursor<'a>>> {
+    validate_i64_decode_value_count(value_count)?;
+    if bytes.len() > 512 * 1024 * 1024 {
+        return Err(AuraError::InvalidValue("stream body limit"));
+    }
     match instruction.op {
         GenericStreamOp::UuidConstMask { .. }
         | GenericStreamOp::BitplaneRle { .. }
@@ -425,8 +443,11 @@ impl<'a> GenericI64StreamCursorKind<'a> {
                 entry_count,
                 code_width,
             } => {
-                let entry_count = entry_count as usize;
-                let mut entries = Vec::with_capacity(entry_count);
+                let entry_count = checked_dictionary_entry_count(entry_count)?;
+                if entry_count > reader.remaining() {
+                    return Err(AuraError::UnexpectedEof);
+                }
+                let mut entries = decode_vec_with_capacity(entry_count)?;
                 for _ in 0..entry_count {
                     entries.push(reconstruct_scaled_value(varint::decode_i64(reader)?, unit)?);
                 }
@@ -444,7 +465,8 @@ impl<'a> GenericI64StreamCursorKind<'a> {
                 entry_width,
                 code_width,
             } => {
-                let entries = read_bitpacked_unsigned(reader, entry_width, entry_count as usize)?;
+                let entry_count = checked_dictionary_entry_count(entry_count)?;
+                let entries = read_bitpacked_unsigned(reader, entry_width, entry_count)?;
                 let codes = read_bitpack_unsigned_cursor(reader, code_width, value_count)?;
                 Self::PackedDictionary {
                     base,
@@ -882,7 +904,7 @@ fn try_huffman_cursor<'a>(
     reader: &mut ByteReader<'a>,
     value_count: usize,
 ) -> Result<Option<GenericI64StreamCursorKind<'a>>> {
-    let entry_count = entry_count as usize;
+    let entry_count = checked_dictionary_entry_count(entry_count)?;
     if code_lengths.len() != entry_count {
         return Err(AuraError::InvalidValue("huffman code lengths"));
     }
@@ -1972,11 +1994,30 @@ fn decode_i64_op(
 }
 
 fn validate_i64_decode_value_count(value_count: usize) -> Result<()> {
+    const MAX_GENERIC_DECODE_VALUES: usize = 64 * 1024 * 1024;
+    if value_count > MAX_GENERIC_DECODE_VALUES {
+        return Err(AuraError::InvalidValue("stream value count"));
+    }
     value_count
         .checked_mul(std::mem::size_of::<i64>())
         .filter(|byte_len| *byte_len <= isize::MAX as usize)
         .map(|_| ())
         .ok_or(AuraError::InvalidValue("stream value count"))
+}
+
+fn decode_vec_with_capacity<T>(value_count: usize) -> Result<Vec<T>> {
+    validate_i64_decode_value_count(value_count)?;
+    if value_count
+        .checked_mul(std::mem::size_of::<T>())
+        .is_none_or(|bytes| bytes > 512 * 1024 * 1024)
+    {
+        return Err(AuraError::InvalidValue("stream value allocation"));
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(value_count)
+        .map_err(|_| AuraError::InvalidValue("stream value allocation"))?;
+    Ok(values)
 }
 
 fn fixed_stride_residuals(values: &[i64], stride: usize) -> Result<Vec<i64>> {
@@ -2160,7 +2201,7 @@ fn decode_prev_delta(
         return Ok(Vec::new());
     }
     let deltas = read_bitpacked_signed(reader, bit_width, value_count - 1)?;
-    let mut values = Vec::with_capacity(value_count);
+    let mut values = decode_vec_with_capacity(value_count)?;
     values.push(base);
     for delta in deltas {
         let previous = *values
@@ -2196,7 +2237,7 @@ fn decode_prev_varint(
     if value_count == 0 {
         return Ok(Vec::new());
     }
-    let mut values = Vec::with_capacity(value_count);
+    let mut values = decode_vec_with_capacity(value_count)?;
     values.push(base);
     for _ in 1..value_count {
         let delta = varint::decode_i64(reader)?;
@@ -2445,9 +2486,12 @@ fn decode_rle(
     reader: &mut ByteReader<'_>,
     value_count: usize,
 ) -> Result<Vec<i64>> {
-    let run_count = run_count as usize;
+    let run_count = usize::try_from(run_count).map_err(|_| AuraError::InvalidValue("run count"))?;
+    if run_count > value_count || run_count > reader.remaining() {
+        return Err(AuraError::InvalidValue("run count"));
+    }
     let run_values = read_bitpacked_unsigned(reader, bit_width, run_count)?;
-    let mut residuals = Vec::with_capacity(value_count);
+    let mut residuals = decode_vec_with_capacity(value_count)?;
     for value in run_values {
         let len = usize::try_from(varint::decode_u64(reader)?)
             .map_err(|_| AuraError::InvalidValue("run length"))?;
@@ -2502,7 +2546,8 @@ fn decode_bitplane_rle(
     reader: &mut ByteReader<'_>,
     value_count: usize,
 ) -> Result<Vec<i64>> {
-    let mut residuals = vec![0u64; value_count];
+    let mut residuals = decode_vec_with_capacity(value_count)?;
+    residuals.resize(value_count, 0u64);
     if value_count == 0 {
         return Ok(Vec::new());
     }
@@ -2513,6 +2558,9 @@ fn decode_bitplane_rle(
             _ => return Err(AuraError::InvalidValue("bitplane run bit")),
         };
         let run_count = reader.read_u32_le()? as usize;
+        if run_count > value_count || run_count > reader.remaining() {
+            return Err(AuraError::InvalidValue("run count"));
+        }
         let mut bit_value = start;
         let mut index = 0usize;
         for _ in 0..run_count {
@@ -2585,8 +2633,11 @@ fn decode_dictionary(
     reader: &mut ByteReader<'_>,
     value_count: usize,
 ) -> Result<Vec<i64>> {
-    let entry_count = entry_count as usize;
-    let mut entries = Vec::with_capacity(entry_count);
+    let entry_count = checked_dictionary_entry_count(entry_count)?;
+    if entry_count > reader.remaining() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let mut entries = decode_vec_with_capacity(entry_count)?;
     for _ in 0..entry_count {
         entries.push(varint::decode_i64(reader)?);
     }
@@ -2655,7 +2706,7 @@ fn decode_packed_dictionary(
     reader: &mut ByteReader<'_>,
     value_count: usize,
 ) -> Result<Vec<i64>> {
-    let entry_count = entry_count as usize;
+    let entry_count = checked_dictionary_entry_count(entry_count)?;
     let entries = read_bitpacked_unsigned(reader, entry_width, entry_count)?;
     let codes = read_bitpacked_unsigned(reader, code_width, value_count)?;
     codes
@@ -2726,7 +2777,7 @@ fn decode_huffman_dictionary(
     reader: &mut ByteReader<'_>,
     value_count: usize,
 ) -> Result<Vec<i64>> {
-    let entry_count = entry_count as usize;
+    let entry_count = checked_dictionary_entry_count(entry_count)?;
     if code_lengths.len() != entry_count {
         return Err(AuraError::InvalidValue("huffman code lengths"));
     }
@@ -2740,7 +2791,9 @@ fn decode_huffman_dictionary(
         if !code_bytes.is_empty() && code_lengths == [0] {
             return Err(AuraError::InvalidValue("huffman code"));
         }
-        return Ok(vec![value; value_count]);
+        let mut values = decode_vec_with_capacity(value_count)?;
+        values.resize(value_count, value);
+        return Ok(values);
     }
 
     let decoded_entries = entries
@@ -2765,7 +2818,7 @@ fn decode_huffman_dictionary(
     if max_len <= 20 {
         let decode_table = huffman_value_decode_table(&canonical_codes, &decoded_entries, max_len)?;
         let mut bit_reader = HuffmanTableBitReader::new(code_bytes);
-        let mut out = Vec::with_capacity(value_count);
+        let mut out = decode_vec_with_capacity(value_count)?;
         for _ in 0..value_count {
             let key = bit_reader.peek_bits(max_len)? as usize;
             let entry = decode_table
@@ -2784,7 +2837,7 @@ fn decode_huffman_dictionary(
         .filter_map(|(symbol, code)| code.map(|code| ((code.bit_len, code.bits), symbol)))
         .collect::<BTreeMap<_, _>>();
     let mut bit_reader = HuffmanBitReader::new(code_bytes);
-    let mut out = Vec::with_capacity(value_count);
+    let mut out = decode_vec_with_capacity(value_count)?;
     for _ in 0..value_count {
         let mut bits = 0u64;
         let mut symbol = None;
@@ -2837,7 +2890,7 @@ fn decode_block_local(
     if block_count != mode_count as usize {
         return Err(AuraError::InvalidValue("block count"));
     }
-    let mut out = Vec::with_capacity(value_count);
+    let mut out = decode_vec_with_capacity(value_count)?;
     for _ in 0..block_count {
         let remaining = value_count - out.len();
         let count = remaining.min(block_size);
@@ -2854,7 +2907,8 @@ fn decode_local_i64_op_into(
     out: &mut Vec<i64>,
 ) -> Result<()> {
     let start_len = out.len();
-    out.reserve(value_count);
+    out.try_reserve(value_count)
+        .map_err(|_| AuraError::InvalidValue("stream value allocation"))?;
     match *op {
         GenericStreamOp::FixedStep { base, step } => {
             for index in 0..value_count {
@@ -2937,7 +2991,8 @@ fn decode_patched_bitpack_into(
     let mut highs = read_bitpack_unsigned_cursor(reader, high_width, exception_count)?;
     let mut next_exception = read_next_patch_exception(&mut indexes, &mut highs)?;
     let mut exceptions_remaining = exception_count;
-    out.reserve(value_count);
+    out.try_reserve(value_count)
+        .map_err(|_| AuraError::InvalidValue("stream value allocation"))?;
     for index in 0..value_count {
         let mut residual = lows.next()?;
         if let Some((exception_index, high)) = next_exception {
@@ -2977,9 +3032,14 @@ fn decode_rle_into(
     value_count: usize,
     out: &mut Vec<i64>,
 ) -> Result<()> {
-    let mut run_values = read_bitpack_unsigned_cursor(reader, bit_width, run_count as usize)?;
+    let run_count = usize::try_from(run_count).map_err(|_| AuraError::InvalidValue("run count"))?;
+    if run_count > value_count || run_count > reader.remaining() {
+        return Err(AuraError::InvalidValue("run count"));
+    }
+    let mut run_values = read_bitpack_unsigned_cursor(reader, bit_width, run_count)?;
     let start_len = out.len();
-    out.reserve(value_count);
+    out.try_reserve(value_count)
+        .map_err(|_| AuraError::InvalidValue("stream value allocation"))?;
     for _ in 0..run_count {
         let value = reconstruct_unsigned_offset(base, unit, run_values.next()?)?;
         let len = usize::try_from(varint::decode_u64(reader)?)
@@ -3318,7 +3378,7 @@ fn decode_uuid_const_mask_body(
     let byte_len = bit_len.div_ceil(8);
     let variable_bytes = reader.read_exact(byte_len)?;
     let mut bit_reader = U128BitReader::new(variable_bytes);
-    let mut values = Vec::with_capacity(value_count);
+    let mut values = decode_vec_with_capacity(value_count)?;
     for _ in 0..value_count {
         let mut value = constant_value;
         for bit in 0..128 {
@@ -3734,7 +3794,7 @@ fn decode_huffman_values_with_bounded_table(
     value_count: usize,
 ) -> Result<Vec<i64>> {
     let mut bit_reader = HuffmanTableBitReader::new(code_bytes);
-    let mut out = Vec::with_capacity(value_count);
+    let mut out = decode_vec_with_capacity(value_count)?;
     for _ in 0..value_count {
         let key = bit_reader.peek_bits(table.root_bits)? as usize;
         let entry = match table
@@ -4276,6 +4336,34 @@ mod tests {
                 &mut Vec::new(),
             );
             assert_eq!(Err(AuraError::InvalidValue("run length")), result);
+        }
+    }
+
+    #[test]
+    fn dictionary_cursor_rejects_hostile_entry_count_before_allocation() {
+        for op in [
+            GenericStreamOp::Dictionary {
+                unit: 1,
+                entry_count: u32::MAX,
+                code_width: 1,
+            },
+            GenericStreamOp::PackedDictionary {
+                base: 0,
+                unit: 1,
+                entry_count: u32::MAX,
+                entry_width: 1,
+                code_width: 1,
+            },
+        ] {
+            let instruction = GenericStreamInstruction {
+                stream_id: 0,
+                target_slot: Some(0),
+                op,
+            };
+            assert_eq!(
+                Err(AuraError::InvalidValue("dictionary entry count")),
+                try_generic_i64_stream_cursor(&instruction, &[], 1).map(|_| ())
+            );
         }
     }
 }

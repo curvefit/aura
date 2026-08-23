@@ -1375,12 +1375,13 @@ impl AuraReader {
             }
             crate::Aura0ByteLaneUse::Auto | crate::Aura0ByteLaneUse::Never => {}
         }
-        let record_count = records::validate_compiled_i64_metadata(&parsed.header, &footer)?;
-        let compiled_plan = CompiledAuraPlan::from_footer(&footer)?;
         let body_bytes = parsed
             .footer_offset
             .checked_sub(parsed.header_len)
             .ok_or(AuraError::UnexpectedEof)?;
+        let record_count =
+            records::validate_compiled_i64_metadata(&parsed.header, &footer, body_bytes)?;
+        let compiled_plan = CompiledAuraPlan::from_footer(&footer)?;
         if body_bytes != compiled_plan.aura1_body_size {
             return Err(AuraError::InvalidValue("aura1 body length"));
         }
