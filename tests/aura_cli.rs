@@ -10,7 +10,8 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use aura_codec::{
     canonical_v3_batch_sha256, canonical_v3_schema_fingerprint, canonicalize_schema_json,
-    decode_v3_value_block, parse_schema_json, ShadowProtocolLimits, V3ValueLimits,
+    decode_v3_value_block, parse_schema_json, FieldRole, FieldType, RelationshipPermissions,
+    SchemaBuilder, ShadowProtocolLimits, V3ValueLimits, MAX_SCHEMA_JSON_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -132,6 +133,7 @@ fn help_and_future_subcommands_are_clear() {
     assert!(help.status.success());
     let stdout = String::from_utf8(help.stdout).unwrap();
     assert!(stdout.contains("aura schema validate"));
+    assert!(stdout.contains("aura schema inspect"));
     assert!(stdout.contains("aura schema canonicalize"));
     assert!(stdout.contains("aura shadow verify"));
 
@@ -143,6 +145,223 @@ fn help_and_future_subcommands_are_clear() {
     assert!(String::from_utf8(unsupported.stderr)
         .unwrap()
         .contains("unsupported"));
+}
+
+fn grouped_schema_json() -> String {
+    SchemaBuilder::new("cli_grouped_schema")
+        .field("source_ts_ms", FieldType::TimestampMs, FieldRole::Timestamp)
+        .field("sequence", FieldType::U64, FieldRole::Sequence)
+        .repeated_field("side", FieldType::U8, FieldRole::Side)
+        .repeated_field("price", FieldType::I64, FieldRole::Price)
+        .repeated_field("quantity", FieldType::I64, FieldRole::Quantity)
+        .dual_domain_repeated_group(
+            1,
+            vec![2, 3, 4],
+            2,
+            RelationshipPermissions::none()
+                .with_split()
+                .with_within_domain()
+                .with_across_domain_same_field()
+                .with_joint_same_field(),
+        )
+        .finish()
+        .unwrap()
+        .to_canonical_json()
+        .unwrap()
+}
+
+fn assert_schema_inspection(source: &str, value: &serde_json::Value) {
+    let schema = parse_schema_json(source).unwrap();
+    let canonical = canonicalize_schema_json(source).unwrap();
+    let canonical_hash: [u8; 32] = Sha256::digest(canonical.as_bytes()).into();
+    let fingerprint = canonical_v3_schema_fingerprint(&schema).unwrap();
+    let mapping = schema.compact_schema_map.as_ref().unwrap();
+    assert_json_keys(
+        value,
+        &[
+            "result_schema",
+            "valid",
+            "schema_format",
+            "schema_format_version",
+            "schema_encoding",
+            "schema_encoding_version",
+            "schema_id",
+            "name",
+            "schema_fingerprint_sha256",
+            "canonical_json_sha256",
+            "compact_schema_map",
+            "compact_schema_map_hex",
+            "field_count",
+            "group_count",
+            "dual_domain_discriminators",
+            "build",
+        ],
+    );
+    assert_eq!(value["result_schema"], "aura-schema-inspect-v1");
+    assert_eq!(value["valid"], true);
+    assert_eq!(value["schema_format"], "aura-schema");
+    assert_eq!(value["schema_format_version"], 1);
+    assert_eq!(value["schema_encoding"], "v3");
+    assert_eq!(value["schema_encoding_version"], 3);
+    assert_eq!(value["schema_id"], schema.schema_id);
+    assert_eq!(value["name"], schema.name);
+    assert_eq!(value["schema_fingerprint_sha256"], test_hex(&fingerprint));
+    assert_eq!(value["canonical_json_sha256"], test_hex(&canonical_hash));
+    assert_eq!(
+        value["compact_schema_map"],
+        serde_json::to_value(mapping).unwrap()
+    );
+    assert_eq!(value["compact_schema_map_hex"], test_hex(mapping));
+    assert_eq!(value["field_count"], schema.fields.len());
+    assert_eq!(value["group_count"], schema.groups.len());
+    assert_json_keys(
+        &value["build"],
+        &[
+            "package_version",
+            "git_commit",
+            "dirty",
+            "provenance_source",
+            "cargo_lock_sha256",
+        ],
+    );
+    assert_eq!(
+        value["build"]["cargo_lock_sha256"].as_str().unwrap().len(),
+        64
+    );
+}
+
+#[test]
+fn schema_inspect_flat_is_deterministic_hashed_and_read_only() {
+    let dir = TestDir::new();
+    let input = dir.path("flat.json");
+    fs::write(&input, format!("\n{MINIMAL}\n")).unwrap();
+    let before = fs::read_dir(&dir.0).unwrap().count();
+    let args = [
+        "schema",
+        "inspect",
+        "--input",
+        input.to_str().unwrap(),
+        "--json",
+    ];
+    let first = aura(&args);
+    let second = aura(&args);
+    assert!(first.status.success());
+    assert!(first.stderr.is_empty());
+    assert_eq!(first.stdout, second.stdout);
+    assert_eq!(before, fs::read_dir(&dir.0).unwrap().count());
+    assert_eq!(
+        fs::read_to_string(&input).unwrap(),
+        format!("\n{MINIMAL}\n")
+    );
+    let value: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_schema_inspection(MINIMAL, &value);
+    assert_eq!(
+        value["dual_domain_discriminators"],
+        serde_json::Value::Array(Vec::new())
+    );
+    assert_no_temp_files(&dir);
+}
+
+#[test]
+fn schema_inspect_grouped_exposes_actual_marker_200() {
+    let dir = TestDir::new();
+    let input = dir.path("grouped.json");
+    let source = grouped_schema_json();
+    fs::write(&input, &source).unwrap();
+    let result = aura(&[
+        "schema",
+        "inspect",
+        "--input",
+        input.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(result.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_schema_inspection(&source, &value);
+    assert_eq!(value["compact_schema_map"][2], 200);
+    let discriminators = value["dual_domain_discriminators"].as_array().unwrap();
+    assert_eq!(discriminators.len(), 1);
+    assert_json_keys(
+        &discriminators[0],
+        &[
+            "group_id",
+            "domain_count",
+            "discriminator_slot",
+            "schema_map_byte",
+        ],
+    );
+    assert_eq!(discriminators[0]["group_id"], 1);
+    assert_eq!(discriminators[0]["domain_count"], 2);
+    assert_eq!(discriminators[0]["discriminator_slot"], 2);
+    assert_eq!(discriminators[0]["schema_map_byte"], 200);
+    assert_no_temp_files(&dir);
+}
+
+#[test]
+fn schema_inspect_errors_are_stable_sanitized_and_side_effect_free() {
+    let dir = TestDir::new();
+    let malformed = dir.path("malformed.json");
+    let oversize = dir.path("oversize.json");
+    fs::write(&malformed, r#"{"secret":"DO_NOT_LEAK_INSPECT_CONTENT"}"#).unwrap();
+    fs::File::create(&oversize)
+        .unwrap()
+        .set_len((MAX_SCHEMA_JSON_BYTES + 1) as u64)
+        .unwrap();
+    for input in [&malformed, &oversize, &dir.0] {
+        let result = aura(&[
+            "schema",
+            "inspect",
+            "--input",
+            input.to_str().unwrap(),
+            "--json",
+        ]);
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&result.stderr).unwrap();
+        assert_json_keys(&error, &["error_schema", "valid", "code", "error"]);
+        assert_eq!(error["error_schema"], "aura-schema-inspect-error-v1");
+        assert_eq!(error["valid"], false);
+        assert_eq!(error["code"], "schema_inspect_failed");
+        assert_eq!(error["error"], "schema inspection failed");
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("DO_NOT_LEAK"));
+    }
+    let future = aura(&["schema", "inspect", "--future", "value", "--json"]);
+    assert!(!future.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&future.stderr).unwrap();
+    assert_eq!(error["error_schema"], "aura-schema-inspect-error-v1");
+    let missing_json = aura(&["schema", "inspect", "--input", malformed.to_str().unwrap()]);
+    assert!(!missing_json.status.success());
+    assert!(serde_json::from_slice::<serde_json::Value>(&missing_json.stderr).is_ok());
+    assert_no_temp_files(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn schema_inspect_rejects_symlink_input_without_writes() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TestDir::new();
+    let target = dir.path("target.json");
+    let input = dir.path("input.json");
+    fs::write(&target, MINIMAL).unwrap();
+    symlink(&target, &input).unwrap();
+    let result = aura(&[
+        "schema",
+        "inspect",
+        "--input",
+        input.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&result.stderr).unwrap();
+    assert_eq!(error["error_schema"], "aura-schema-inspect-error-v1");
+    assert!(fs::symlink_metadata(input)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_to_string(target).unwrap(), MINIMAL);
+    assert_no_temp_files(&dir);
 }
 
 #[test]

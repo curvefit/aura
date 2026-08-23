@@ -9,13 +9,13 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aura_codec::{
-    arrow_rust_version, build_provenance, canonical_v3_batch_sha256, cargo_lock_sha256,
-    decode_shadow_arrow_ipc_batch, decode_v3_value_block, encode_shadow_arrow_ipc,
-    parse_schema_json, ShadowEncodeResult, ShadowProtocolLimits, V3FlatAura0Reader,
-    V3FlatAura0Writer, V3FlatWriteSummary, V3FlatWriterOptions, V3ValueLimits,
-    MAX_SCHEMA_JSON_BYTES, MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND,
-    SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL, SHADOW_RESULT_SCHEMA, SHADOW_SCHEMA_FORMAT,
-    SHADOW_VERIFY_RESULT_SCHEMA,
+    arrow_rust_version, build_provenance, canonical_v3_batch_sha256,
+    canonical_v3_schema_fingerprint, cargo_lock_sha256, decode_shadow_arrow_ipc_batch,
+    decode_v3_value_block, encode_shadow_arrow_ipc, parse_schema_json, SchemaEncodingVersion,
+    ShadowEncodeResult, ShadowProtocolLimits, V3FlatAura0Reader, V3FlatAura0Writer,
+    V3FlatWriteSummary, V3FlatWriterOptions, V3ValueLimits, MAX_SCHEMA_JSON_BYTES,
+    MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND, SHADOW_HANDSHAKE_SCHEMA,
+    SHADOW_PROTOCOL, SHADOW_RESULT_SCHEMA, SHADOW_SCHEMA_FORMAT, SHADOW_VERIFY_RESULT_SCHEMA,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -24,6 +24,7 @@ const HELP: &str = "Aura developer CLI
 
 Usage:
   aura schema validate --input <path> [--json]
+  aura schema inspect --input <path> --json
   aura schema canonicalize --input <path> [--output <path>]
   aura shadow handshake --protocol aura-logical-arrow-ipc-v1 --json
   aura shadow encode --protocol aura-logical-arrow-ipc-v1 --schema <path> \
@@ -48,6 +49,10 @@ fn main() -> ExitCode {
         Err(error) => {
             let shadow_error = args.first().is_some_and(|value| value == "shadow");
             let v3_error = args.first().is_some_and(|value| value == "v3");
+            let schema_inspect_error = matches!(
+                args.as_slice(),
+                [namespace, command, ..] if namespace == "schema" && command == "inspect"
+            );
             let (error_code, error_text) = if shadow_error {
                 shadow_safe_error(&error.0)
             } else if v3_error {
@@ -55,7 +60,11 @@ fn main() -> ExitCode {
             } else {
                 ("schema_command_failed", bounded_error(&error.0))
             };
-            if args.iter().any(|arg| arg == "--json") {
+            if schema_inspect_error {
+                eprintln!(
+                    "{{\"error_schema\":\"aura-schema-inspect-error-v1\",\"valid\":false,\"code\":\"schema_inspect_failed\",\"error\":\"schema inspection failed\"}}"
+                );
+            } else if args.iter().any(|arg| arg == "--json") {
                 let message = serde_json::to_string(&error_text)
                     .unwrap_or_else(|_| "\"schema command failed\"".to_owned());
                 if shadow_error {
@@ -111,12 +120,13 @@ fn run(args: &[String]) -> Result<(), CliError> {
     }
     match (namespace.as_str(), command.as_str()) {
         ("schema", "validate") => validate_command(options),
+        ("schema", "inspect") => inspect_command(options),
         ("schema", "canonicalize") => canonicalize_command(options),
         ("shadow", "handshake") => shadow_handshake_command(options),
         ("shadow", "encode") => shadow_encode_command(options),
         ("shadow", "verify") => shadow_verify_command(options),
         ("schema", _) => Err(CliError(format!(
-            "unsupported schema command {command:?}; expected validate or canonicalize"
+            "unsupported schema command {command:?}; expected validate, inspect, or canonicalize"
         ))),
         ("shadow", _) => Err(CliError(format!(
             "unsupported shadow command {command:?}; expected handshake, encode, or verify"
@@ -520,6 +530,87 @@ fn validate_command(args: &[String]) -> Result<(), CliError> {
         println!("valid Aura schema {escaped_name} ({})", schema.schema_id);
     }
     Ok(())
+}
+
+fn inspect_command(args: &[String]) -> Result<(), CliError> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{HELP}");
+        return Ok(());
+    }
+    let mut input = None;
+    let mut json_output = false;
+    parse_options(args, |name, value| match name {
+        "--input" => set_path(&mut input, value, "--input"),
+        "--json" if value.is_none() => {
+            json_output = true;
+            Ok(())
+        }
+        _ => Err(CliError("unknown schema inspect option".to_owned())),
+    })?;
+    if !json_output {
+        return Err(CliError("schema inspect requires --json".to_owned()));
+    }
+    let input = input.ok_or_else(|| CliError("missing schema inspect input".to_owned()))?;
+    let text = read_bounded_schema(&input)?;
+    let schema = parse_schema_json(&text).map_err(|_| CliError("invalid schema".to_owned()))?;
+    let canonical = schema
+        .to_canonical_json()
+        .map_err(|_| CliError("invalid canonical schema".to_owned()))?;
+    let canonical_json_sha256: [u8; 32] = Sha256::digest(canonical.as_bytes()).into();
+    let schema_fingerprint = canonical_v3_schema_fingerprint(&schema)
+        .map_err(|_| CliError("invalid schema fingerprint".to_owned()))?;
+    let compact_schema_map = schema
+        .compact_schema_map
+        .as_deref()
+        .ok_or_else(|| CliError("schema mapping unavailable".to_owned()))?;
+    let mut dual_domain_discriminators = Vec::new();
+    dual_domain_discriminators
+        .try_reserve_exact(schema.groups.len())
+        .map_err(|_| CliError("could not allocate schema inspection result".to_owned()))?;
+    for group in &schema.groups {
+        let Some(dual) = group.dual_domain else {
+            continue;
+        };
+        let map_byte = compact_schema_map
+            .get(usize::from(dual.discriminator_slot))
+            .copied()
+            .ok_or_else(|| CliError("invalid discriminator mapping".to_owned()))?;
+        dual_domain_discriminators.push(json!({
+            "group_id": group.group_id,
+            "domain_count": dual.domain_count,
+            "discriminator_slot": dual.discriminator_slot,
+            "schema_map_byte": map_byte
+        }));
+    }
+    let (schema_encoding, schema_encoding_version) = match schema.encoding_version {
+        SchemaEncodingVersion::V2 => ("v2", 2),
+        SchemaEncodingVersion::V3 => ("v3", 3),
+    };
+    let provenance = build_provenance();
+    write_json_stdout(&json!({
+        "result_schema": "aura-schema-inspect-v1",
+        "valid": true,
+        "schema_format": "aura-schema",
+        "schema_format_version": 1,
+        "schema_encoding": schema_encoding,
+        "schema_encoding_version": schema_encoding_version,
+        "schema_id": schema.schema_id,
+        "name": schema.name,
+        "schema_fingerprint_sha256": hex(&schema_fingerprint),
+        "canonical_json_sha256": hex(&canonical_json_sha256),
+        "compact_schema_map": compact_schema_map,
+        "compact_schema_map_hex": hex(compact_schema_map),
+        "field_count": schema.fields.len(),
+        "group_count": schema.groups.len(),
+        "dual_domain_discriminators": dual_domain_discriminators,
+        "build": {
+            "package_version": env!("CARGO_PKG_VERSION"),
+            "git_commit": provenance.git_commit,
+            "dirty": provenance.dirty,
+            "provenance_source": provenance.source,
+            "cargo_lock_sha256": hex(&cargo_lock_sha256())
+        }
+    }))
 }
 
 fn canonicalize_command(args: &[String]) -> Result<(), CliError> {
@@ -1514,13 +1605,13 @@ fn v3_safe_error(message: &str) -> (&'static str, String) {
 }
 
 fn read_bounded_schema(path: &Path) -> Result<String, CliError> {
-    let metadata = fs::metadata(path).map_err(|error| {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
         CliError(format!(
             "could not inspect input {}: {error}",
             path.display()
         ))
     })?;
-    if !metadata.is_file() {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(CliError(format!(
             "schema input is not a regular file: {}",
             path.display()
@@ -1533,6 +1624,17 @@ fn read_bounded_schema(path: &Path) -> Result<String, CliError> {
     }
     let file = File::open(path)
         .map_err(|error| CliError(format!("could not open input {}: {error}", path.display())))?;
+    let held = file
+        .metadata()
+        .map_err(|_| CliError("could not inspect held schema input".to_owned()))?;
+    #[cfg(unix)]
+    if file_identity(&metadata) != file_identity(&held) {
+        return Err(CliError("schema input identity changed".to_owned()));
+    }
+    #[cfg(not(unix))]
+    if !held.is_file() || held.len() != metadata.len() {
+        return Err(CliError("schema input identity changed".to_owned()));
+    }
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(metadata.len() as usize)
