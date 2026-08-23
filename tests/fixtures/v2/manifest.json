@@ -1,0 +1,170 @@
+{
+  "fixtures": [
+    {
+      "artifact_kind": "rows",
+      "aura0_storage_profile": null,
+      "bytes": 891,
+      "canonical_hash": "fa4fcb486814e335fb93f792dd97ebabc914491776c3547c79c1e37f882d9bc4",
+      "child_count": null,
+      "container_magic": "AURA",
+      "event_count": null,
+      "filename": "plain-ingest.aura",
+      "format_version": 2,
+      "has_byte_lane": false,
+      "profile": "ingest",
+      "row_count": 4,
+      "schema": {
+        "compact_schema_map": [
+          100,
+          0,
+          2,
+          0
+        ],
+        "field_count": 4,
+        "name": "compat-v2-plain",
+        "schema_id": 590236859
+      },
+      "sha256": "aed5cf494a494ba4e57ade99fd3657dda245d3ffa44b4cf292997a0f14ca09cb"
+    },
+    {
+      "artifact_kind": "rows",
+      "aura0_storage_profile": null,
+      "bytes": 363,
+      "canonical_hash": "fa4fcb486814e335fb93f792dd97ebabc914491776c3547c79c1e37f882d9bc4",
+      "child_count": null,
+      "container_magic": "AURA",
+      "event_count": null,
+      "filename": "plain-compact.aura0",
+      "format_version": 2,
+      "has_byte_lane": false,
+      "profile": "aura0",
+      "row_count": 4,
+      "schema": {
+        "compact_schema_map": [
+          100,
+          0,
+          2,
+          0
+        ],
+        "field_count": 4,
+        "name": "compat-v2-plain",
+        "schema_id": 590236859
+      },
+      "sha256": "e3179f95af7b7ca0a68c8a106f7828bd7fd1712e37edd21ce5b2d3f6a666940b"
+    },
+    {
+      "artifact_kind": "rows",
+      "aura0_storage_profile": null,
+      "bytes": 328,
+      "canonical_hash": "fa4fcb486814e335fb93f792dd97ebabc914491776c3547c79c1e37f882d9bc4",
+      "child_count": null,
+      "container_magic": "AURA",
+      "event_count": null,
+      "filename": "plain-replay.aura1",
+      "format_version": 2,
+      "has_byte_lane": false,
+      "profile": "aura1",
+      "row_count": 4,
+      "schema": {
+        "compact_schema_map": [
+          100,
+          0,
+          2,
+          0
+        ],
+        "field_count": 4,
+        "name": "compat-v2-plain",
+        "schema_id": 590236859
+      },
+      "sha256": "e8d74c647369d6aa871169e1013f648fd9a592b1dace4f60b4d5c05f81215f5e"
+    },
+    {
+      "artifact_kind": "rows",
+      "aura0_storage_profile": "hybrid",
+      "bytes": 681,
+      "canonical_hash": "fa4fcb486814e335fb93f792dd97ebabc914491776c3547c79c1e37f882d9bc4",
+      "child_count": null,
+      "container_magic": "AURA",
+      "event_count": null,
+      "filename": "plain-hybrid.aura0",
+      "format_version": 2,
+      "has_byte_lane": true,
+      "profile": "aura0",
+      "row_count": 4,
+      "schema": {
+        "compact_schema_map": [
+          100,
+          0,
+          2,
+          0
+        ],
+        "field_count": 4,
+        "name": "compat-v2-plain",
+        "schema_id": 590236859
+      },
+      "sha256": "0e247d58eca2496ad38e81f866afb3e4051b312a3194cca4338d2e38284c9801"
+    },
+    {
+      "artifact_kind": "explicit-events",
+      "aura0_storage_profile": null,
+      "bytes": 606,
+      "canonical_hash": "4063518974dbd99f15823d6972cc6060448efe5b255c779ddbc5d1553227f85e",
+      "child_count": 4,
+      "container_magic": "AURA",
+      "event_count": 4,
+      "filename": "explicit-events.aura0",
+      "format_version": 2,
+      "has_byte_lane": false,
+      "profile": "aura0",
+      "row_count": 4,
+      "schema": {
+        "compact_schema_map": [
+          100,
+          0,
+          200,
+          205,
+          0,
+          0,
+          5,
+          0
+        ],
+        "field_count": 7,
+        "name": "compat-v2-explicit-events",
+        "schema_id": 728210909
+      },
+      "sha256": "a9cd34dc142bf5255cca24474843011174dc59c387d9bcfebdd707be6af097f8"
+    }
+  ],
+  "format": "Aura v2 compatibility fixtures",
+  "format_version": 2,
+  "generation_contract": "tiny deterministic artifacts generated through public Aura writer/compile APIs",
+  "invalid": [
+    {
+      "bytes": 362,
+      "canonical_hash": "fa4fcb486814e335fb93f792dd97ebabc914491776c3547c79c1e37f882d9bc4",
+      "child_count": null,
+      "container_magic": "AURA",
+      "event_count": null,
+      "expected_behavior": "reject with a typed AuraError before logical row decode",
+      "expected_error_kind": "InvalidMagic",
+      "filename": "invalid-truncated.aura0",
+      "format_version": 2,
+      "profile": "aura0",
+      "row_count": 4,
+      "schema": {
+        "compact_schema_map": [
+          100,
+          0,
+          2,
+          0
+        ],
+        "field_count": 4,
+        "name": "compat-v2-plain",
+        "schema_id": 590236859
+      },
+      "sha256": "c5330d0a0e9f55b29a9314868d075da17fc0cdfa785be6b731abbcc4e11ba8a7",
+      "source_fixture": "plain-compact.aura0"
+    }
+  ],
+  "manifest_version": 1
+}
