@@ -150,7 +150,8 @@ macro_rules! string_enum {
 string_enum!(FieldTypeDto {
     I8 => "i8", U8 => "u8", I16 => "i16", U16 => "u16", I32 => "i32",
     U32 => "u32", I64 => "i64", U64 => "u64", TimestampNs => "timestamp_ns",
-    I128 => "i128", Opaque16 => "opaque16"
+    I128 => "i128", Opaque16 => "opaque16", TimestampMs => "timestamp_ms",
+    Utf8 => "utf8", DecimalText => "decimal_text"
 });
 string_enum!(FieldRoleDto {
     Timestamp => "timestamp", Sequence => "sequence", Identifier => "identifier",
@@ -235,7 +236,10 @@ impl SchemaDescriptor {
     }
 }
 
-fn preflight_schema_json_complexity(schema: &SchemaDescriptor, limit: usize) -> Result<()> {
+pub(crate) fn preflight_schema_json_complexity(
+    schema: &SchemaDescriptor,
+    limit: usize,
+) -> Result<()> {
     // These charges conservatively cover pretty-print syntax, decimal integer
     // widths, binary descriptor bytes, and the owned DTO vectors/strings.
     const ROOT_BYTES: usize = 4_096;
@@ -652,7 +656,8 @@ macro_rules! bidirectional_enum {
 
 bidirectional_enum!(FieldTypeDto, FieldType {
     I8 => I8, U8 => U8, I16 => I16, U16 => U16, I32 => I32, U32 => U32,
-    I64 => I64, U64 => U64, TimestampNs => TimestampNs, I128 => I128, Opaque16 => Opaque16
+    I64 => I64, U64 => U64, TimestampNs => TimestampNs, I128 => I128, Opaque16 => Opaque16,
+    TimestampMs => TimestampMs, Utf8 => Utf8, DecimalText => DecimalText
 });
 bidirectional_enum!(FieldRoleDto, FieldRole {
     Timestamp => Timestamp, Sequence => Sequence, Identifier => Identifier, Side => Side,

@@ -1,0 +1,14 @@
+{
+  "fixture_version": 1,
+  "artifact_kind": "standalone-aura-v3-value-block-v1",
+  "complete_aura_file": false,
+  "schema": "flat-source-order.schema.json",
+  "block_hex": "flat-source-order.aurav3vb.hex",
+  "schema_json_sha256": "ad0b886524c2902d460e18bb8eb0f2bffc171d69bc561d61ac31e90e7aaa4674",
+  "block_hex_file_sha256": "3aec5b0e7c3257eca3a8294bb7492f5038102959d4753607f174552785dea9ba",
+  "schema_fingerprint_sha256": "16e8df0dfc0acabad1a781917b43af123c60e057d4c598d65a892158176d2991",
+  "block_sha256": "8079d2b27d145ec3158213f54637095d5d9f92616a7b53569305dc31b5a47d01",
+  "logical_sha256": "4fea7cf396241f7a7395f35db272c5a687d9769288e7db25e4aa5f7dbf6ab5ff",
+  "row_count": 4,
+  "block_bytes": 107
+}

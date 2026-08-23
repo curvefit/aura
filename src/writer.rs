@@ -736,10 +736,16 @@ pub fn encode_typed(input: TypedFileInput) -> Result<Vec<u8>> {
 }
 
 fn schema_is_i64_compatible(schema: &SchemaDescriptor) -> bool {
-    schema
-        .fields
-        .iter()
-        .all(|field| !matches!(field.field_type, FieldType::I128 | FieldType::Opaque16))
+    schema.fields.iter().all(|field| {
+        !matches!(
+            field.field_type,
+            FieldType::I128
+                | FieldType::Opaque16
+                | FieldType::TimestampMs
+                | FieldType::Utf8
+                | FieldType::DecimalText
+        )
+    })
 }
 
 fn typed_rows_to_i64(
@@ -895,6 +901,17 @@ fn validate_i64_input(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<()
                 "unsupported profile",
                 "wide field",
                 Some("use typed ingest for i128 or opaque16 fields"),
+            ));
+        }
+        if field.field_type.is_v3_only() {
+            return Err(layout_diagnostic(
+                None,
+                Some(field.index),
+                field.field_type.name(),
+                field.field_type.name(),
+                "unsupported profile",
+                "v3-only field",
+                Some("use the standalone v3 exact-value block for v3-only fields"),
             ));
         }
     }

@@ -653,6 +653,9 @@ fn physical_width_for_field_type(field_type: FieldType) -> Result<PhysicalWidth>
         FieldType::I32 | FieldType::U32 => Ok(PhysicalWidth::I32),
         FieldType::I64 | FieldType::U64 | FieldType::TimestampNs => Ok(PhysicalWidth::I64),
         FieldType::I128 | FieldType::Opaque16 => Ok(PhysicalWidth::I128),
+        FieldType::TimestampMs | FieldType::Utf8 | FieldType::DecimalText => {
+            Err(AuraError::InvalidValue("v3-only field type"))
+        }
     }
 }
 

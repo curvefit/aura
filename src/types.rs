@@ -62,9 +62,14 @@ impl AuraValue {
             | AuraType::TimestampMicros
             | AuraType::I64Scaled { .. }
             | AuraType::PriceI64Scaled { .. } => self.to_signed_range(i64::MIN, i64::MAX),
-            AuraType::F32 | AuraType::F64 | AuraType::Binary | AuraType::Utf8 => {
-                Err(AuraError::InvalidValue("unsupported aura type"))
-            }
+            AuraType::TimestampMillis
+            | AuraType::F32
+            | AuraType::F64
+            | AuraType::I128
+            | AuraType::Opaque16
+            | AuraType::Binary
+            | AuraType::Utf8
+            | AuraType::DecimalText => Err(AuraError::InvalidValue("unsupported aura type")),
         }
     }
 
@@ -312,9 +317,14 @@ impl AuraColumn {
             | AuraType::TimestampMicros
             | AuraType::I64Scaled { .. }
             | AuraType::PriceI64Scaled { .. } => Ok(Self::I64(values)),
-            AuraType::F32 | AuraType::F64 | AuraType::Binary | AuraType::Utf8 => {
-                Err(AuraError::InvalidValue("unsupported aura type"))
-            }
+            AuraType::TimestampMillis
+            | AuraType::F32
+            | AuraType::F64
+            | AuraType::I128
+            | AuraType::Opaque16
+            | AuraType::Binary
+            | AuraType::Utf8
+            | AuraType::DecimalText => Err(AuraError::InvalidValue("unsupported aura type")),
         }
     }
 }

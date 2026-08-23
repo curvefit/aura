@@ -1,0 +1,26 @@
+{
+  "schema_format": "aura-schema",
+  "schema_version": 1,
+  "schema_encoding": "v3",
+  "name": "source_order",
+  "schema_id": 2091479349,
+  "fields": [
+    {
+      "id": 0,
+      "name": "text",
+      "type": "utf8",
+      "role": "value",
+      "scale": 0,
+      "scope": "event",
+      "nullable": false,
+      "relation": {
+        "kind": "none"
+      },
+      "transform_candidates": [
+        "absolute"
+      ]
+    }
+  ],
+  "groups": [],
+  "derived_expressions": []
+}

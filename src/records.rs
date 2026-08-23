@@ -5205,6 +5205,7 @@ fn validate_i64_field_range(field_type: FieldType, value: i64) -> Result<()> {
         FieldType::U64 => value >= 0,
         FieldType::TimestampNs | FieldType::I64 => true,
         FieldType::I128 | FieldType::Opaque16 => false,
+        FieldType::TimestampMs | FieldType::Utf8 | FieldType::DecimalText => false,
     };
     if valid {
         Ok(())
@@ -5258,10 +5259,16 @@ fn observe_typed_timestamp_runs(
 }
 
 fn schema_has_wide_fields(schema: &SchemaDescriptor) -> bool {
-    schema
-        .fields
-        .iter()
-        .any(|field| matches!(field.field_type, FieldType::I128 | FieldType::Opaque16))
+    schema.fields.iter().any(|field| {
+        matches!(
+            field.field_type,
+            FieldType::I128
+                | FieldType::Opaque16
+                | FieldType::TimestampMs
+                | FieldType::Utf8
+                | FieldType::DecimalText
+        )
+    })
 }
 
 fn schema_has_wide_fields_from_sealed_file(bytes: &[u8]) -> Result<bool> {
@@ -5346,6 +5353,9 @@ fn absolute_typed_field_plans(
                 FieldType::U32 => PhysicalWidth::I64,
                 FieldType::I64 | FieldType::U64 | FieldType::TimestampNs => PhysicalWidth::I64,
                 FieldType::I128 | FieldType::Opaque16 => PhysicalWidth::I128,
+                FieldType::TimestampMs | FieldType::Utf8 | FieldType::DecimalText => {
+                    return Err(AuraError::InvalidValue("v3-only field type"));
+                }
             };
             Ok(PhysicalFieldPlan {
                 field_index: field.index,

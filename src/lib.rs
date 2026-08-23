@@ -32,6 +32,7 @@ pub mod scoped;
 pub mod source;
 pub mod stats;
 pub mod types;
+pub mod v3_values;
 pub mod varint;
 pub mod writer;
 
@@ -99,6 +100,13 @@ pub use stats::{FieldStats, IngestStats, PhysicalWidth, RunHistogramEntry, Shape
 pub use types::{
     AuraBatch, AuraColumn, AuraColumnBatch, AuraColumnBatchBuilder, AuraRecordBatch,
     AuraTypedValue, AuraValue, Profile,
+};
+pub use v3_values::{
+    canonical_v3_batch_sha256, canonical_v3_schema_fingerprint, decode_v3_value_block,
+    encode_v3_value_block, validate_decimal_text_v1, validate_v3_batch, AuraV3Batch, AuraV3Column,
+    AuraV3ColumnValues, AuraV3ValueRef, AuraV3VariableColumn, V3ValueLimits,
+    MAX_V3_SCHEMA_DESCRIPTOR_BYTES, MAX_V3_VALUE_BLOCK_BYTES, MAX_V3_VALUE_ROWS,
+    MAX_V3_VARIABLE_VALUE_BYTES,
 };
 pub use writer::{
     AuraI64EventWriter, AuraI64Writer, AuraTypedWriter, AuraWriteSummary, AuraWriter,

@@ -46,6 +46,14 @@ pub fn validate_schema_container_compatibility(
     schema: &SchemaDescriptor,
     container_version: AuraContainerVersion,
 ) -> Result<()> {
+    if container_version == AuraContainerVersion::V2
+        && schema
+            .fields
+            .iter()
+            .any(|field| field.field_type.is_v3_only())
+    {
+        return Err(AuraError::InvalidValue("v3-only field type"));
+    }
     let compatible = matches!(
         (container_version, schema.encoding_version),
         (AuraContainerVersion::V2, SchemaEncodingVersion::V2)
@@ -215,19 +223,33 @@ pub enum AuraType {
     I64,
     TimestampNanos,
     TimestampMicros,
+    TimestampMillis,
     I64Scaled { scale: i8 },
     PriceI64Scaled { scale: i8 },
     EnumU8,
     FlagsU32,
     F32,
     F64,
+    I128,
+    Opaque16,
     Binary,
     Utf8,
+    DecimalText,
 }
 
 impl AuraType {
     pub const fn is_supported(self) -> bool {
-        !matches!(self, Self::F32 | Self::F64 | Self::Binary | Self::Utf8)
+        !matches!(
+            self,
+            Self::F32
+                | Self::F64
+                | Self::I128
+                | Self::Opaque16
+                | Self::Binary
+                | Self::Utf8
+                | Self::TimestampMillis
+                | Self::DecimalText
+        )
     }
 
     pub const fn nullable_supported(self) -> bool {
@@ -244,10 +266,12 @@ impl AuraType {
             | Self::I64
             | Self::TimestampNanos
             | Self::TimestampMicros
+            | Self::TimestampMillis
             | Self::I64Scaled { .. }
             | Self::PriceI64Scaled { .. }
             | Self::F64 => Some(8),
-            Self::Binary | Self::Utf8 => None,
+            Self::I128 | Self::Opaque16 => Some(16),
+            Self::Binary | Self::Utf8 | Self::DecimalText => None,
         }
     }
 
@@ -265,13 +289,20 @@ impl AuraType {
             }
             Self::TimestampNanos => Some(FieldType::TimestampNs),
             Self::TimestampMicros => Some(FieldType::I64),
-            Self::F32 | Self::F64 | Self::Binary | Self::Utf8 => None,
+            Self::TimestampMillis => Some(FieldType::TimestampMs),
+            Self::I128 => Some(FieldType::I128),
+            Self::Opaque16 => Some(FieldType::Opaque16),
+            Self::Utf8 => Some(FieldType::Utf8),
+            Self::DecimalText => Some(FieldType::DecimalText),
+            Self::F32 | Self::F64 | Self::Binary => None,
         }
     }
 
     const fn role(self) -> FieldRole {
         match self {
-            Self::TimestampNanos | Self::TimestampMicros => FieldRole::Timestamp,
+            Self::TimestampNanos | Self::TimestampMicros | Self::TimestampMillis => {
+                FieldRole::Timestamp
+            }
             Self::PriceI64Scaled { .. } => FieldRole::Price,
             Self::Bool => FieldRole::Boolean,
             Self::EnumU8 => FieldRole::Enum,
@@ -301,14 +332,18 @@ impl AuraType {
             Self::I64 => "i64",
             Self::TimestampNanos => "timestamp_nanos",
             Self::TimestampMicros => "timestamp_micros",
+            Self::TimestampMillis => "timestamp_ms",
             Self::I64Scaled { .. } => "i64_scaled",
             Self::PriceI64Scaled { .. } => "price_i64_scaled",
             Self::EnumU8 => "enum_u8",
             Self::FlagsU32 => "flags_u32",
             Self::F32 => "f32",
             Self::F64 => "f64",
+            Self::I128 => "i128",
+            Self::Opaque16 => "opaque16",
             Self::Binary => "binary",
             Self::Utf8 => "utf8",
+            Self::DecimalText => "decimal_text",
         }
     }
 }
@@ -505,8 +540,11 @@ fn aura_type_from_descriptor(field: &FieldDescriptor) -> AuraType {
         (FieldType::U32, _, _) => AuraType::U32,
         (FieldType::I64, _, _) => AuraType::I64,
         (FieldType::U64, _, _) => AuraType::U64,
-        (FieldType::I128, _, _) => AuraType::I64,
-        (FieldType::Opaque16, _, _) => AuraType::Binary,
+        (FieldType::I128, _, _) => AuraType::I128,
+        (FieldType::Opaque16, _, _) => AuraType::Opaque16,
+        (FieldType::TimestampMs, _, _) => AuraType::TimestampMillis,
+        (FieldType::Utf8, _, _) => AuraType::Utf8,
+        (FieldType::DecimalText, _, _) => AuraType::DecimalText,
     }
 }
 
@@ -525,6 +563,9 @@ pub enum FieldType {
     TimestampNs = 9,
     I128 = 10,
     Opaque16 = 11,
+    TimestampMs = 12,
+    Utf8 = 13,
+    DecimalText = 14,
 }
 
 impl FieldType {
@@ -541,6 +582,9 @@ impl FieldType {
             9 => Ok(Self::TimestampNs),
             10 => Ok(Self::I128),
             11 => Ok(Self::Opaque16),
+            12 => Ok(Self::TimestampMs),
+            13 => Ok(Self::Utf8),
+            14 => Ok(Self::DecimalText),
             _ => Err(AuraError::InvalidValue("field type")),
         }
     }
@@ -558,7 +602,15 @@ impl FieldType {
             Self::TimestampNs => "timestamp_ns",
             Self::I128 => "i128",
             Self::Opaque16 => "opaque16",
+            Self::TimestampMs => "timestamp_ms",
+            Self::Utf8 => "utf8",
+            Self::DecimalText => "decimal_text",
         }
+    }
+
+    /// Whether this type belongs exclusively to the standalone Aura v3 value dialect.
+    pub const fn is_v3_only(self) -> bool {
+        matches!(self, Self::TimestampMs | Self::Utf8 | Self::DecimalText)
     }
 }
 
@@ -906,6 +958,13 @@ impl SchemaDescriptor {
         self.validate_derived_expressions()?;
         match self.encoding_version {
             SchemaEncodingVersion::V2 => {
+                if self
+                    .fields
+                    .iter()
+                    .any(|field| field.field_type.is_v3_only())
+                {
+                    return Err(AuraError::InvalidValue("v3-only field type"));
+                }
                 if !self.groups.is_empty() {
                     return Err(AuraError::InvalidValue("v2 schema groups"));
                 }
@@ -1175,7 +1234,10 @@ impl SchemaBuilder {
         nullable: bool,
         relation: FieldRelation,
     ) -> Self {
-        let mut candidates = if field_type == FieldType::Opaque16 {
+        let mut candidates = if matches!(
+            field_type,
+            FieldType::Opaque16 | FieldType::Utf8 | FieldType::DecimalText
+        ) {
             TransformCandidates::empty().with(FieldTransform::Absolute)
         } else {
             TransformCandidates::default_for_role(role)
@@ -1591,11 +1653,25 @@ fn validate_field_descriptors(fields: &[FieldDescriptor]) -> Result<()> {
         if field.role == FieldRole::Timestamp && field.scope != FieldScope::Event {
             return Err(AuraError::InvalidValue("timestamp scope"));
         }
-        if field.field_type == FieldType::Opaque16
-            && field.relation != FieldRelation::None
-            && field.candidates.contains(FieldTransform::DeltaRelated)
-        {
-            return Err(AuraError::InvalidValue("opaque field relation"));
+        match field.field_type {
+            FieldType::TimestampMs => {
+                if field.role != FieldRole::Timestamp || field.scale != 0 {
+                    return Err(AuraError::InvalidValue("timestamp_ms field"));
+                }
+            }
+            FieldType::Opaque16 | FieldType::Utf8 | FieldType::DecimalText => {
+                let absolute = TransformCandidates::empty().with(FieldTransform::Absolute);
+                if field.scale != 0
+                    || field.relation != FieldRelation::None
+                    || field.candidates != absolute
+                {
+                    return Err(AuraError::InvalidValue(match field.field_type {
+                        FieldType::Opaque16 => "opaque16 field",
+                        _ => "exact text field",
+                    }));
+                }
+            }
+            _ => {}
         }
         if let FieldRelation::DeltaFromField(related_index) = field.relation {
             if usize::from(related_index) >= fields.len() || related_index == field.index {
@@ -1922,7 +1998,10 @@ fn schema_field_map_byte(
             .checked_add(*expression_id)
             .ok_or(AuraError::InvalidValue("schema parent mapping"));
     }
-    if matches!(field.field_type, FieldType::Opaque16) {
+    if matches!(
+        field.field_type,
+        FieldType::Opaque16 | FieldType::Utf8 | FieldType::DecimalText
+    ) {
         return Ok(SCHEMA_MAP_DO_NOT_ATTEMPT);
     }
     match field.role {
@@ -2012,6 +2091,14 @@ fn validate_i64_schema_definition_header(schema_len: usize, comment_len: usize) 
 }
 
 pub(crate) fn encode_schema_block(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Result<()> {
+    if schema.encoding_version == SchemaEncodingVersion::V2
+        && schema
+            .fields
+            .iter()
+            .any(|field| field.field_type.is_v3_only())
+    {
+        return Err(AuraError::InvalidValue("v3-only field type"));
+    }
     if schema.encoding_version == SchemaEncodingVersion::V3 {
         schema.validate()?;
         if schema.schema_id != schema_hash_for_version(schema) {
@@ -2355,6 +2442,9 @@ fn schema_from_fields(
     compact_schema_map: Option<Vec<u8>>,
     derived_expressions: Vec<DerivedExpression>,
 ) -> Result<SchemaDescriptor> {
+    if fields.iter().any(|field| field.field_type.is_v3_only()) {
+        return Err(AuraError::InvalidValue("v3-only field type"));
+    }
     validate_schema_derived_expressions(
         &fields,
         compact_schema_map.as_deref(),
@@ -2399,9 +2489,21 @@ fn validate_schema_derived_expressions(
         if fields[usize::from(expression.output_slot)].relation != FieldRelation::None {
             return Err(AuraError::InvalidValue("derived expression output"));
         }
+        if matches!(
+            fields[usize::from(expression.output_slot)].field_type,
+            FieldType::Opaque16 | FieldType::Utf8 | FieldType::DecimalText
+        ) {
+            return Err(AuraError::InvalidValue("exact value derived expression"));
+        }
         for input_slot in &expression.input_slots {
             if usize::from(*input_slot) >= field_count {
                 return Err(AuraError::InvalidValue("derived expression input"));
+            }
+            if matches!(
+                fields[usize::from(*input_slot)].field_type,
+                FieldType::Opaque16 | FieldType::Utf8 | FieldType::DecimalText
+            ) {
+                return Err(AuraError::InvalidValue("exact value derived expression"));
             }
         }
         if expression.op == DerivedExpressionOp::PreviousSnapshotSameKeyResidual
@@ -2662,6 +2764,18 @@ fn schema_hash(
     compact_schema_map: Option<&[u8]>,
     derived_expressions: &[DerivedExpression],
 ) -> u32 {
+    let mut hash = schema_hash_prefix(name, fields, compact_schema_map);
+    for expression in derived_expressions {
+        update_expression_hash(&mut hash, expression);
+    }
+    hash
+}
+
+fn schema_hash_prefix(
+    name: &str,
+    fields: &[FieldDescriptor],
+    compact_schema_map: Option<&[u8]>,
+) -> u32 {
     let mut hash = 0x811c9dc5u32;
     update_hash(&mut hash, name.as_bytes());
     for field in fields {
@@ -2691,64 +2805,104 @@ fn schema_hash(
     if let Some(compact_schema_map) = compact_schema_map {
         update_hash(&mut hash, compact_schema_map);
     }
-    for expression in derived_expressions {
-        update_hash(&mut hash, &[expression.expression_id, expression.op as u8]);
-        update_hash(&mut hash, &expression.output_slot.to_le_bytes());
-        update_hash(&mut hash, &[expression.flags]);
-        for input_slot in &expression.input_slots {
-            update_hash(&mut hash, &input_slot.to_le_bytes());
-        }
-        for literal in &expression.literals {
-            update_hash(&mut hash, &literal.to_le_bytes());
-        }
-    }
     hash
 }
 
+fn update_expression_hash(hash: &mut u32, expression: &DerivedExpression) {
+    update_hash(hash, &[expression.expression_id, expression.op as u8]);
+    update_hash(hash, &expression.output_slot.to_le_bytes());
+    update_hash(hash, &[expression.flags]);
+    for input_slot in &expression.input_slots {
+        update_hash(hash, &input_slot.to_le_bytes());
+    }
+    for literal in &expression.literals {
+        update_hash(hash, &literal.to_le_bytes());
+    }
+}
+
+/// Validate the stored identity used by the standalone v3 exact-value block.
+///
+/// Sorting allocates only borrowed references and uses fallible reservation;
+/// nested schema vectors and strings are never cloned.
+pub(crate) fn validate_v3_schema_identity(schema: &SchemaDescriptor) -> Result<()> {
+    if schema.encoding_version != SchemaEncodingVersion::V3 {
+        return Err(AuraError::InvalidValue("v3 value schema"));
+    }
+    schema.validate()?;
+    let mut expressions = Vec::new();
+    expressions
+        .try_reserve_exact(schema.derived_expressions.len())
+        .map_err(|_| AuraError::InvalidValue("schema identity allocation"))?;
+    expressions.extend(schema.derived_expressions.iter());
+    expressions.sort_by_key(|expression| expression.expression_id);
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(schema.groups.len())
+        .map_err(|_| AuraError::InvalidValue("schema identity allocation"))?;
+    groups.extend(schema.groups.iter());
+    groups.sort_by_key(|group| group.group_id);
+    let hash = canonical_v3_schema_hash(schema, expressions.into_iter(), groups.into_iter());
+    if hash != schema.schema_id {
+        return Err(AuraError::InvalidValue("schema id"));
+    }
+    Ok(())
+}
+
 fn schema_hash_for_version(schema: &SchemaDescriptor) -> u32 {
-    let mut canonical_v3_expressions;
-    let derived_expressions = if schema.encoding_version == SchemaEncodingVersion::V3 {
-        canonical_v3_expressions = schema.derived_expressions.clone();
-        canonical_v3_expressions.sort_by_key(|expression| expression.expression_id);
-        canonical_v3_expressions.as_slice()
+    if schema.encoding_version == SchemaEncodingVersion::V3 {
+        let mut expressions = schema.derived_expressions.iter().collect::<Vec<_>>();
+        expressions.sort_by_key(|expression| expression.expression_id);
+        let mut groups = schema.groups.iter().collect::<Vec<_>>();
+        groups.sort_by_key(|group| group.group_id);
+        canonical_v3_schema_hash(schema, expressions.into_iter(), groups.into_iter())
     } else {
-        schema.derived_expressions.as_slice()
-    };
-    let mut hash = schema_hash(
+        schema_hash(
+            &schema.name,
+            &schema.fields,
+            schema.compact_schema_map.as_deref(),
+            &schema.derived_expressions,
+        )
+    }
+}
+
+fn canonical_v3_schema_hash<'a>(
+    schema: &SchemaDescriptor,
+    expressions: impl Iterator<Item = &'a DerivedExpression>,
+    groups: impl Iterator<Item = &'a GroupDescriptor>,
+) -> u32 {
+    let mut hash = schema_hash_prefix(
         &schema.name,
         &schema.fields,
         schema.compact_schema_map.as_deref(),
-        derived_expressions,
     );
-    if schema.encoding_version == SchemaEncodingVersion::V3 {
-        update_hash(&mut hash, b"AuraSchemaV3\0");
-        let mut groups = schema.groups.iter().collect::<Vec<_>>();
-        groups.sort_by_key(|group| group.group_id);
-        update_hash(&mut hash, &(groups.len() as u32).to_le_bytes());
-        for group in groups {
-            update_hash(&mut hash, &group.group_id.to_le_bytes());
-            update_hash(
-                &mut hash,
-                &[
-                    group.kind as u8,
-                    group.relationships.bits(),
-                    u8::from(group.dual_domain.is_some()),
-                ],
-            );
-            match group.dual_domain {
-                Some(dual) => {
-                    update_hash(&mut hash, &[dual.domain_count]);
-                    update_hash(&mut hash, &dual.discriminator_slot.to_le_bytes());
-                }
-                None => {
-                    update_hash(&mut hash, &[0]);
-                    update_hash(&mut hash, &u16::MAX.to_le_bytes());
-                }
+    for expression in expressions {
+        update_expression_hash(&mut hash, expression);
+    }
+    update_hash(&mut hash, b"AuraSchemaV3\0");
+    update_hash(&mut hash, &(schema.groups.len() as u32).to_le_bytes());
+    for group in groups {
+        update_hash(&mut hash, &group.group_id.to_le_bytes());
+        update_hash(
+            &mut hash,
+            &[
+                group.kind as u8,
+                group.relationships.bits(),
+                u8::from(group.dual_domain.is_some()),
+            ],
+        );
+        match group.dual_domain {
+            Some(dual) => {
+                update_hash(&mut hash, &[dual.domain_count]);
+                update_hash(&mut hash, &dual.discriminator_slot.to_le_bytes());
             }
-            update_hash(&mut hash, &(group.child_slots.len() as u32).to_le_bytes());
-            for child_slot in &group.child_slots {
-                update_hash(&mut hash, &child_slot.to_le_bytes());
+            None => {
+                update_hash(&mut hash, &[0]);
+                update_hash(&mut hash, &u16::MAX.to_le_bytes());
             }
+        }
+        update_hash(&mut hash, &(group.child_slots.len() as u32).to_le_bytes());
+        for child_slot in &group.child_slots {
+            update_hash(&mut hash, &child_slot.to_le_bytes());
         }
     }
     hash

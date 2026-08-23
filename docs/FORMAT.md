@@ -8,6 +8,79 @@ metadata, but complete V3 ingest/compiled footers and bodies are intentionally
 unsupported until Aura Plan V2 and the bounded writer path land. A V3 schema
 cannot be embedded in a V2 container.
 
+## Standalone V3 exact-value reference block
+
+Aura defines a versioned, uncompressed exact-value block as a reference for V3
+value and null semantics. It is not a complete `.aura`, `.aura0`, or `.aura1`
+file, has no footer, planner, codec, or compression, and does not enable V3 file
+writing or conversion. Version 1 covers only flat event-scoped schemas (the
+trade/OI-like subset). It rejects repeated fields and groups because its single
+row count cannot represent event-to-child boundaries. Its magic is `AURAV3VB`;
+every integer is little-endian.
+
+The fixed 64-byte header is:
+
+| Offset | Width | Meaning |
+| ---: | ---: | --- |
+| 0 | 8 | magic `AURAV3VB` |
+| 8 | 2 | reference-block version, exactly `1` |
+| 10 | 2 | block flags, exactly zero |
+| 12 | 4 | V3 `schema_id` routing hint |
+| 16 | 32 | canonical V3 schema SHA-256 fingerprint |
+| 48 | 4 | row count |
+| 52 | 4 | exact column count |
+| 56 | 8 | total block byte length, including header |
+
+The schema fingerprint is SHA-256 over
+`aura-v3-schema-fingerprint-v1\0`, the canonical tag-4 descriptor length as
+u64 LE, and the exact canonical descriptor bytes (including their outer u32
+length). Descriptor complexity is checked without cloning owned schema data
+before encoding, and the encoded descriptor is capped at the standalone
+16 MiB schema envelope. The decoder verifies this fingerprint before any value
+plane allocation. The 32-bit `schema_id` remains a routing hint and is not the
+strong identity boundary.
+
+Columns immediately follow in stable schema-slot order. Each has this 20-byte
+header, followed immediately by its planes:
+
+| Offset | Width | Meaning |
+| ---: | ---: | --- |
+| 0 | 2 | stable schema slot |
+| 2 | 1 | exact `FieldType` code |
+| 3 | 1 | flags: bit 0 validity, bit 1 variable-width; all others zero |
+| 4 | 4 | validity byte length |
+| 8 | 4 | fixed-value byte length |
+| 12 | 4 | offset-plane byte length |
+| 16 | 4 | variable-data byte length |
+
+Plane order is validity, then fixed values, or validity, u32 offsets, and
+variable data. Nullable columns carry exactly `ceil(row_count / 8)` validity
+bytes; nonnullable columns carry none. Validity is LSB-first: row `r` uses bit
+`r % 8` of byte `r / 8`, where one means present. Unused high bits in the final
+byte are zero.
+
+Fixed values use their exact signed/unsigned little-endian width. Null fixed
+slots contain all-zero bytes, including `Opaque16`. Variable columns have
+exactly `row_count + 1` u32 offsets: first zero, monotonic, and final equal to
+the data length. A null repeats its preceding offset. Present empty text and
+null therefore have the same adjacent offsets but different validity bits.
+Every slice is independently valid UTF-8.
+
+Decoding is canonical and fail-closed: magic, version, schema identity, slots,
+types, flags, plane lengths, bitmap padding, placeholders, offsets, UTF-8,
+decimal grammar, total length, and trailing bytes must all agree. Hard ceilings
+are 1 GiB per block, 16 MiB of raw stored UTF-8 bytes per value, and 16,777,216
+rows. `V3ValueLimits` may lower but never raise these ceilings.
+
+The exact-value SHA-256 domain is
+`aura-v3-canonical-exact-values-v1\0`. Framing includes the canonical encoded
+schema fingerprint and routing ID, row count and column count, then supplied
+row order. Within each row, fields occur in stable schema-slot order and
+contribute slot, exact type tag, presence tag, and—only when present—the exact
+fixed LE payload or a u32 length plus original variable bytes. Hashing never
+sorts rows, narrows U64, uses Rust `Hash`, or includes physical null
+placeholders.
+
 ## Roles
 
 - `.aura`: ingest/preservation file. It stores logical i64 or typed rows plus

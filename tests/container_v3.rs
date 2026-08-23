@@ -5,9 +5,9 @@ use aura_codec::schema::{
     SchemaMapHint,
 };
 use aura_codec::{
-    parse_schema_json, records, AuraContainerVersion, AuraError, AuraFooter, AuraHeader,
-    AuraI64Writer, DerivedExpression, DerivedExpressionOp, IngestStats, Profile,
-    MAX_V3_HEADER_BYTES, V3_HEADER_PREFIX_SIZE,
+    parse_schema_json, records, validate_schema_container_compatibility, AuraContainerVersion,
+    AuraError, AuraFooter, AuraHeader, AuraI64Writer, DerivedExpression, DerivedExpressionOp,
+    IngestStats, Profile, MAX_V3_HEADER_BYTES, V3_HEADER_PREFIX_SIZE,
 };
 
 fn permissions() -> RelationshipPermissions {
@@ -129,6 +129,53 @@ fn v3_flat_identity_is_explicit_and_v2_hash_stays_frozen() {
         encode_schema_descriptor(&v2).unwrap()[4],
         encode_schema_descriptor(&v3).unwrap()[4],
         "the byte after the outer u32 length is the explicit schema encoding tag"
+    );
+}
+
+#[test]
+fn field_type_codes_are_append_only_and_v2_rejects_every_v3_only_type() {
+    let old = [
+        FieldType::I8,
+        FieldType::U8,
+        FieldType::I16,
+        FieldType::U16,
+        FieldType::I32,
+        FieldType::U32,
+        FieldType::I64,
+        FieldType::U64,
+        FieldType::TimestampNs,
+        FieldType::I128,
+        FieldType::Opaque16,
+    ];
+    for (code, field_type) in (1u8..=11).zip(old) {
+        assert_eq!(field_type, FieldType::from_code(code).unwrap());
+    }
+    for (field_type, role) in [
+        (FieldType::TimestampMs, FieldRole::Timestamp),
+        (FieldType::Utf8, FieldRole::Identifier),
+        (FieldType::DecimalText, FieldRole::Price),
+    ] {
+        assert_eq!(
+            SchemaBuilder::new("v2_reject")
+                .field("value", field_type, role)
+                .finish(),
+            Err(AuraError::InvalidValue("v3-only field type"))
+        );
+    }
+
+    let mut forged_v2 = SchemaBuilder::new("forged")
+        .v3()
+        .field("text", FieldType::Utf8, FieldRole::Value)
+        .finish()
+        .unwrap();
+    forged_v2.encoding_version = SchemaEncodingVersion::V2;
+    assert_eq!(
+        validate_schema_container_compatibility(&forged_v2, AuraContainerVersion::V2),
+        Err(AuraError::InvalidValue("v3-only field type"))
+    );
+    assert_eq!(
+        encode_schema_descriptor(&forged_v2),
+        Err(AuraError::InvalidValue("v3-only field type"))
     );
 }
 

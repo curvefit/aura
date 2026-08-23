@@ -295,7 +295,7 @@ pub fn generate_orderbook_case(
                 Role::Sequence => AuraValue::I64(row_index_i64),
                 Role::OrderId => AuraValue::I64(10_000 + row_index_i64),
                 Role::Flags => AuraValue::U64(rng.next_u64() % 16),
-                Role::Extra => value_for_type(*aura_type, row_index, &mut rng, "orderbook-extra"),
+                Role::Extra => value_for_type(*aura_type, row_index, &mut rng, "orderbook-extra")?,
             };
             row.push(value);
         }
@@ -706,7 +706,7 @@ fn rows_for_schema(
             .fields()
             .iter()
             .map(|field| value_for_type(field.aura_type, row_index, &mut rng, dataset_kind))
-            .collect::<Vec<_>>();
+            .collect::<VerifyResult<Vec<_>>>()?;
         rows.push(row);
     }
     Ok(rows)
@@ -717,9 +717,9 @@ fn value_for_type(
     row_index: usize,
     rng: &mut Lcg,
     dataset_kind: &str,
-) -> AuraValue {
+) -> VerifyResult<AuraValue> {
     let row = row_index as i64;
-    match aura_type {
+    Ok(match aura_type {
         AuraType::Bool => AuraValue::Bool((row_index + rng.usize(3)).is_multiple_of(2)),
         AuraType::U8 => AuraValue::U64(boundary_unsigned(rng, u8::MAX as u64, row_index)),
         AuraType::U16 => {
@@ -772,8 +772,15 @@ fn value_for_type(
             AuraValue::I64(100_000_000 + row.saturating_mul(3) + (rng.usize(7) as i64))
         }
         AuraType::EnumU8 => AuraValue::U64((rng.next_u64() % 6) + (row_index % 3) as u64),
-        AuraType::F32 | AuraType::F64 | AuraType::Binary | AuraType::Utf8 => AuraValue::I64(0),
-    }
+        AuraType::TimestampMillis
+        | AuraType::F32
+        | AuraType::F64
+        | AuraType::I128
+        | AuraType::Opaque16
+        | AuraType::Binary
+        | AuraType::Utf8
+        | AuraType::DecimalText => return Err("unsupported AuraType in random verifier".to_owned()),
+    })
 }
 
 fn boundary_unsigned(rng: &mut Lcg, max: u64, row_index: usize) -> u64 {

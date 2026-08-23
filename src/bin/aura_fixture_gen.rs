@@ -331,7 +331,7 @@ fn write_fixture(
         "schema_hash": fixture.schema.schema_id,
         "field_names": fixture.schema.fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(),
         "field_physical_types": fixture.schema.fields.iter().map(|field| field.field_type.name()).collect::<Vec<_>>(),
-        "record_width": schema_record_width(&fixture.schema),
+        "record_width": schema_record_width(&fixture.schema)?,
         "paths": {
             "aura": aura_path,
             "aura0": aura0_path,
@@ -413,18 +413,23 @@ fn sdk_bench_smoke_matrix(
     }))
 }
 
-fn schema_record_width(schema: &SchemaDescriptor) -> usize {
+fn schema_record_width(schema: &SchemaDescriptor) -> Result<usize> {
     schema
         .fields
         .iter()
         .map(|field| match field.field_type {
-            aura_codec::FieldType::I8 | aura_codec::FieldType::U8 => 1,
-            aura_codec::FieldType::I16 | aura_codec::FieldType::U16 => 2,
-            aura_codec::FieldType::I32 | aura_codec::FieldType::U32 => 4,
+            aura_codec::FieldType::I8 | aura_codec::FieldType::U8 => Ok(1),
+            aura_codec::FieldType::I16 | aura_codec::FieldType::U16 => Ok(2),
+            aura_codec::FieldType::I32 | aura_codec::FieldType::U32 => Ok(4),
             aura_codec::FieldType::I64
             | aura_codec::FieldType::U64
-            | aura_codec::FieldType::TimestampNs => 8,
-            aura_codec::FieldType::I128 | aura_codec::FieldType::Opaque16 => 16,
+            | aura_codec::FieldType::TimestampNs => Ok(8),
+            aura_codec::FieldType::I128 | aura_codec::FieldType::Opaque16 => Ok(16),
+            aura_codec::FieldType::TimestampMs
+            | aura_codec::FieldType::Utf8
+            | aura_codec::FieldType::DecimalText => {
+                bail!("v3-only type reached v2 fixture generator")
+            }
         })
         .sum()
 }

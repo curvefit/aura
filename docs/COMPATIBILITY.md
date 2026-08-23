@@ -9,6 +9,22 @@ V3 footers/bodies remain unsupported. V2 footers reject V3 schema tag 4, and V3
 footers reject until their plan/body contract is implemented. The V3 front
 header has a normative 16 MiB ceiling enforced before file-backed allocation.
 
+The `AURAV3VB` exact-value reference block is a separate, explicitly V3 API.
+Its 32-bit schema ID is only a routing hint; a SHA-256 fingerprint of the
+canonical tag-4 schema is the strong binding. It is not a container or
+conversion target. Version 1 supports flat event-scoped schemas only and
+rejects repeated fields/groups rather than flattening child rows. V2 schema encode/decode and
+every current ingest/compiled writer path reject field codes 12
+(`TimestampMs`), 13 (`Utf8`), and 14 (`DecimalText`). Codes 1 through 11 and all
+checked-in V2 fixture bytes/hashes remain unchanged. Adding the reference block
+does not permit a V3 footer, body, writer, stamp, restamp, or profile conversion.
+
+The versioned fixture under `tests/fixtures/v3/` freezes a canonical schema,
+hex-encoded reference-block bytes, schema fingerprint, block SHA-256, logical
+SHA-256, and row count. It is explicitly a standalone block fixture, not a
+complete Aura-file compatibility fixture. Regeneration is an ignored,
+explicitly invoked maintenance test; normal tests only verify checked-in bytes.
+
 `CompiledAuraPlan` now exposes typed `container_version` and a numeric
 `format_version()` compatibility accessor. Direct field access through the old
 experimental `format_version` member is an intentional 0.1 API break ahead of

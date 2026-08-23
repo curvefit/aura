@@ -1,8 +1,8 @@
 use aura_codec::{
     canonicalize_schema_json, decode_schema_descriptor, encode_schema_descriptor,
-    parse_schema_json, AuraError, DerivedExpression, DerivedExpressionOp, FieldRole, FieldType,
-    GroupDescriptor, RelationshipPermissions, SchemaBuilder, SchemaDescriptor,
-    SchemaEncodingVersion, MAX_SCHEMA_JSON_BYTES,
+    parse_schema_json, AuraError, AuraSchema, AuraType, DerivedExpression, DerivedExpressionOp,
+    FieldRole, FieldType, GroupDescriptor, RelationshipPermissions, SchemaBuilder,
+    SchemaDescriptor, SchemaEncodingVersion, MAX_SCHEMA_JSON_BYTES,
 };
 use serde_json::{json, Value};
 
@@ -304,6 +304,43 @@ fn exact_i128_opaque16_and_nullable_descriptor_fields_are_not_lossy() {
             .to_canonical_json()
             .unwrap()
     );
+}
+
+#[test]
+fn v3_exact_types_have_strict_json_names_and_lossless_public_projection() {
+    let input = r#"{
+      "schema_format":"aura-schema",
+      "schema_version":1,
+      "schema_encoding":"v3",
+      "name":"exact_types",
+      "fields":[
+        {"id":0,"name":"ts","type":"timestamp_ms","role":"timestamp","scale":0,"scope":"event","nullable":false,"relation":{"kind":"none"},"transform_candidates":["absolute","delta_previous"]},
+        {"id":1,"name":"label","type":"utf8","role":"identifier","scale":0,"scope":"event","nullable":true,"relation":{"kind":"none"},"transform_candidates":["absolute"]},
+        {"id":2,"name":"price","type":"decimal_text","role":"price","scale":0,"scope":"event","nullable":false,"relation":{"kind":"none"},"transform_candidates":["absolute"]}
+      ],
+      "groups":[],
+      "derived_expressions":[]
+    }"#;
+    let schema = parse_schema_json(input).unwrap();
+    assert_eq!(12, FieldType::TimestampMs as u8);
+    assert_eq!(13, FieldType::Utf8 as u8);
+    assert_eq!(14, FieldType::DecimalText as u8);
+    let canonical = schema.to_canonical_json().unwrap();
+    assert!(canonical.contains("\"type\": \"timestamp_ms\""));
+    assert!(canonical.contains("\"type\": \"utf8\""));
+    assert!(canonical.contains("\"type\": \"decimal_text\""));
+    assert_eq!(
+        schema,
+        decode_schema_descriptor(&encode_schema_descriptor(&schema).unwrap()).unwrap()
+    );
+
+    let projected = AuraSchema::from(schema);
+    assert_eq!(AuraType::TimestampMillis, projected.fields()[0].aura_type);
+    assert_eq!(AuraType::Utf8, projected.fields()[1].aura_type);
+    assert_eq!(AuraType::DecimalText, projected.fields()[2].aura_type);
+    assert_eq!("timestamp_ms", AuraType::TimestampMillis.name());
+    assert_eq!(Some(16), AuraType::I128.byte_width());
+    assert_eq!(Some(16), AuraType::Opaque16.byte_width());
 }
 
 #[test]

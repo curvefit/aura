@@ -23,6 +23,11 @@ Unsupported v1 types reject during schema build:
 - `F32`
 - `F64`
 
+These restrictions remain frozen for current V2 file writers. The standalone
+V3 exact-value API additionally identifies `I128`, `Opaque16`,
+`TimestampMillis`, `Utf8`, and `DecimalText` without projecting them to a
+different `AuraType`; this does not make them writable by the V2 SDK path.
+
 Schema field order is the canonical storage order. Schema name, schema hash, field names, logical roles, physical types, scale, and nullability flags are preserved through SDK Aura0/Aura1 writes and conversions.
 
 ## Aura V3 group declarations
@@ -68,6 +73,37 @@ codec or exact residual direction. The chosen complete inverse belongs in the
 compiled footer. Full V3 file writing remains disabled while the footer/plan
 contract is under construction; current V2 writers reject V3 schemas rather
 than emitting cross-wired files.
+
+### V3 exact field types
+
+Field type codes 1 through 11 are frozen. V3 appends, without renumbering:
+
+| Code | JSON name | Contract |
+| ---: | --- | --- |
+| 12 | `timestamp_ms` | exact signed i64 milliseconds; role `timestamp`; scale zero; numeric timestamp candidates allowed |
+| 13 | `utf8` | exact UTF-8 bytes; scale zero; no relation or derived-expression participation; `absolute` only |
+| 14 | `decimal_text` | exact UTF-8 decimal spelling; the same structural restrictions as `utf8` |
+
+`Opaque16` likewise has scale zero, no relation, `absolute` as its only
+candidate, and no derived-expression input/output participation. It remains a
+V2 type for existing typed preservation, but it is never exposed as a numeric
+transform candidate.
+
+`Utf8` has no provider-specific role restriction: any otherwise appropriate
+logical role is allowed. `DecimalTextV1` validates semantics after Unicode
+outer trimming but retains every original byte. “Outer whitespace” is frozen
+to the Unicode 15.1 `White_Space` set: U+0009..U+000D, U+0020, U+0085, U+00A0,
+U+1680, U+2000..U+200A, U+2028, U+2029, U+202F, U+205F, and U+3000. U+180E,
+U+200B, and U+FEFF are not whitespace in this grammar. It accepts an optional
+sign, at most one decimal point, and requires at least one ASCII digit. Thus
+`+1.2`, `-0`, `.5`, `5.`, leading/trailing zeros, and Unicode outer whitespace
+are valid and preserved. Exponents, internal whitespace, Unicode digits,
+`NaN`/`Inf`, empty strings, and sign- or dot-only strings reject.
+
+The standalone exact-value block v1 is intentionally flat and event-scoped.
+Repeated fields and non-empty group declarations reject until a later block
+version defines event-to-child counts; child rows are never flattened under
+the event row count.
 
 ## Canonical external schema JSON v1
 
