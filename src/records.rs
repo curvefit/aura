@@ -34,7 +34,10 @@ use crate::program::{
     MAX_AURA1_BYTE_LANES_TOTAL_OUTPUT_BYTES, MAX_AURA1_BYTE_LANE_COMPRESSED_BYTES,
     MAX_AURA1_BYTE_LANE_OUTPUT_BYTES,
 };
-use crate::schema::{schema_parent_mapping, FieldRole, FieldScope, FieldType, SchemaDescriptor};
+use crate::schema::{
+    schema_parent_mapping, validate_schema_container_compatibility, FieldRole, FieldScope,
+    FieldType, SchemaDescriptor,
+};
 use crate::stats::IngestStats;
 use crate::varint::{decode_i64 as decode_varint_i64, decode_u64 as decode_varint_u64};
 use crate::varint::{encode_i64 as encode_varint_i64, encode_u64 as encode_varint_u64};
@@ -3399,6 +3402,22 @@ pub(crate) fn validate_header_schema_agreement(
     header: &AuraHeader,
     schema: &SchemaDescriptor,
 ) -> Result<()> {
+    validate_schema_container_compatibility(schema, header.container_version)?;
+    match header.container_version {
+        AuraContainerVersion::V2 => {
+            if !header.groups.is_empty() || !schema.groups.is_empty() {
+                return Err(AuraError::InvalidValue("header schema groups"));
+            }
+        }
+        AuraContainerVersion::V3 => {
+            if header.groups != schema.groups {
+                return Err(AuraError::InvalidValue("header schema groups"));
+            }
+        }
+        AuraContainerVersion::LegacyV1 => {
+            return Err(AuraError::InvalidValue("schema container version"));
+        }
+    }
     let expected_mapping = schema_parent_mapping(schema)?;
     if header.schema_mapping != expected_mapping {
         return Err(AuraError::InvalidValue("header schema mapping"));
@@ -5354,6 +5373,33 @@ fn put_u16_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> 
 mod byte_lane_tests {
     use super::*;
 
+    fn v3_agreement_schema() -> SchemaDescriptor {
+        crate::schema::SchemaBuilder::new("v3-header-schema-agreement")
+            .v3()
+            .field("ts", FieldType::TimestampNs, FieldRole::Timestamp)
+            .repeated_field("side", FieldType::U8, FieldRole::Side)
+            .repeated_field("value", FieldType::I64, FieldRole::Value)
+            .dual_domain_repeated_group(
+                7,
+                vec![1, 2],
+                1,
+                crate::schema::RelationshipPermissions::none()
+                    .with_split()
+                    .with_within_domain(),
+            )
+            .finish()
+            .unwrap()
+    }
+
+    fn v3_agreement_header(schema: &SchemaDescriptor) -> AuraHeader {
+        AuraHeader::new(Profile::Ingest)
+            .with_container_version(AuraContainerVersion::V3)
+            .with_schema_mapping(schema_parent_mapping(schema).unwrap())
+            .unwrap()
+            .with_groups(schema.groups.clone())
+            .unwrap()
+    }
+
     fn bounded_raw_lane(
         output_offset: u64,
         output_len: u64,
@@ -5379,20 +5425,99 @@ mod byte_lane_tests {
 
     #[test]
     fn header_footer_container_versions_must_agree() {
-        let schema =
+        let v2_schema =
             crate::schema::generic_i64_parent_schema("version-agreement", &[100, 0]).unwrap();
         let header = AuraHeader::new(Profile::Ingest)
             .with_container_version(AuraContainerVersion::V3)
-            .with_schema_mapping(schema_parent_mapping(&schema).unwrap())
+            .with_schema_mapping(schema_parent_mapping(&v2_schema).unwrap())
             .unwrap();
 
         assert_eq!(
-            validate_header_footer_agreement(&header, AuraContainerVersion::V2, &schema),
+            validate_header_footer_agreement(&header, AuraContainerVersion::V2, &v2_schema),
             Err(AuraError::InvalidValue("header footer container version"))
         );
         assert_eq!(
-            validate_header_footer_agreement(&header, AuraContainerVersion::V3, &schema),
+            validate_header_footer_agreement(&header, AuraContainerVersion::V3, &v2_schema),
+            Err(AuraError::InvalidValue("schema container version"))
+        );
+
+        let v3_schema = v3_agreement_schema();
+        let v3_header = v3_agreement_header(&v3_schema);
+        assert_eq!(
+            validate_header_footer_agreement(&v3_header, AuraContainerVersion::V3, &v3_schema),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn v3_header_schema_group_declarations_must_match_exactly() {
+        let schema = v3_agreement_schema();
+        let header = v3_agreement_header(&schema);
+
+        let mut changed_relationships = header.clone();
+        changed_relationships.groups[0].relationships =
+            crate::schema::RelationshipPermissions::none().with_split();
+        assert_eq!(
+            validate_header_schema_agreement(&changed_relationships, &schema),
+            Err(AuraError::InvalidValue("header schema groups"))
+        );
+
+        let mut changed_discriminator = header.clone();
+        changed_discriminator.groups[0]
+            .dual_domain
+            .as_mut()
+            .unwrap()
+            .discriminator_slot = 2;
+        assert_eq!(
+            validate_header_schema_agreement(&changed_discriminator, &schema),
+            Err(AuraError::InvalidValue("header schema groups"))
+        );
+
+        let mut changed_children = header.clone();
+        changed_children.groups[0].child_slots = vec![1];
+        assert_eq!(
+            validate_header_schema_agreement(&changed_children, &schema),
+            Err(AuraError::InvalidValue("header schema groups"))
+        );
+
+        let mut changed_order = header.clone();
+        changed_order.groups[0].child_slots.reverse();
+        assert_eq!(
+            validate_header_schema_agreement(&changed_order, &schema),
+            Err(AuraError::InvalidValue("header schema groups"))
+        );
+
+        let mut missing_group = header;
+        missing_group.groups.clear();
+        assert_eq!(
+            validate_header_schema_agreement(&missing_group, &schema),
+            Err(AuraError::InvalidValue("header schema groups"))
+        );
+    }
+
+    #[test]
+    fn header_schema_agreement_rejects_schema_dialect_mismatches_and_v2_groups() {
+        let v2_schema =
+            crate::schema::generic_i64_parent_schema("v2-schema-agreement", &[100, 0]).unwrap();
+        let v3_schema = v3_agreement_schema();
+        let v3_header = v3_agreement_header(&v3_schema);
+        assert_eq!(
+            validate_header_schema_agreement(&v3_header, &v2_schema),
+            Err(AuraError::InvalidValue("schema container version"))
+        );
+
+        let mut v2_header = AuraHeader::new(Profile::Ingest)
+            .with_schema_mapping(schema_parent_mapping(&v2_schema).unwrap())
+            .unwrap();
+        assert_eq!(
+            validate_header_schema_agreement(&v2_header, &v3_schema),
+            Err(AuraError::InvalidValue("schema container version"))
+        );
+
+        v2_header.groups = v3_schema.groups;
+        assert_eq!(
+            validate_header_schema_agreement(&v2_header, &v2_schema),
+            Err(AuraError::InvalidValue("header schema groups"))
         );
     }
 

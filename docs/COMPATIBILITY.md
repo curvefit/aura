@@ -3,6 +3,17 @@
 The current format version is checked during footer decode. Unsupported versions
 return an error instead of falling back silently.
 
+Current writers emit complete V2 containers. The V3 front-header and schema
+descriptor codecs are implemented for development and validation, but complete
+V3 footers/bodies remain unsupported. V2 footers reject V3 schema tag 4, and V3
+footers reject until their plan/body contract is implemented. The V3 front
+header has a normative 16 MiB ceiling enforced before file-backed allocation.
+
+`CompiledAuraPlan` now exposes typed `container_version` and a numeric
+`format_version()` compatibility accessor. Direct field access through the old
+experimental `format_version` member is an intentional 0.1 API break ahead of
+the V3 SDK freeze.
+
 ## Supported Current Paths
 
 - `.aura -> .aura0`

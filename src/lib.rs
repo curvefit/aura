@@ -38,7 +38,9 @@ pub use body::{decode_generic_stream_body, encode_generic_stream_body, GenericSt
 pub use convert::{convert_aura, ConversionSummary};
 pub use error::{AuraDiagnostic, AuraError, Result};
 pub use footer::{AuraFooter, CompressionDescriptor, CompressionKind};
-pub use format::{AuraContainerVersion, AURA_CHUNK_DESCRIPTOR_SIZE, MAX_AURA_CHUNK_COUNT};
+pub use format::{
+    AuraContainerVersion, AURA_CHUNK_DESCRIPTOR_SIZE, MAX_AURA_CHUNK_COUNT, MAX_V3_HEADER_BYTES,
+};
 pub use generic_planner::{
     decode_generic_i64_rows, decode_generic_i64_rows_body, encode_generic_i64_rows,
     encode_generic_i64_rows_body, encode_generic_i64_rows_with_plan, plan_generic_i64_rows,
@@ -46,7 +48,7 @@ pub use generic_planner::{
 };
 pub use header::{
     AuraHeader, DerivedExpression, DerivedExpressionOp, DerivedExpressionSource,
-    HEADER_PREFIX_SIZE, LEGACY_HEADER_PREFIX_SIZE,
+    HEADER_PREFIX_SIZE, LEGACY_HEADER_PREFIX_SIZE, V3_HEADER_PREFIX_SIZE,
 };
 pub use instructions::{
     DerivedOp, GenericGroupInstruction, GenericInstructionPlan, GenericStreamInstruction,
@@ -78,10 +80,14 @@ pub use records::{
     DecodedI64File, DecodedTypedFile, I64Event, I64EventFileInput, I64FileInput, TypedFileInput,
 };
 pub use schema::{
-    decode_schema_map, generic_i64_parent_schema, schema_parent_mapping, AuraField, AuraSchema,
-    AuraSchemaBuilder, AuraType, FieldDescriptor, FieldRelation, FieldRole, FieldScope,
-    FieldTransform, FieldType, I64SchemaDefinition, RelatedFieldMapping, SchemaBuilder,
-    SchemaDescriptor, SchemaMapEntry, SchemaMapHint, TransformCandidates,
+    decode_group_descriptor_table, decode_schema_descriptor, decode_schema_map,
+    decode_v3_schema_map, encode_group_descriptor_table, encode_schema_descriptor,
+    generic_i64_parent_schema, schema_parent_mapping, validate_schema_container_compatibility,
+    AuraField, AuraSchema, AuraSchemaBuilder, AuraType, DualDomainDescriptor, FieldDescriptor,
+    FieldRelation, FieldRole, FieldScope, FieldTransform, FieldType, GroupDescriptor, GroupKind,
+    I64SchemaDefinition, RelatedFieldMapping, RelationshipPermissions, SchemaBuilder,
+    SchemaDescriptor, SchemaEncodingVersion, SchemaMapEntry, SchemaMapHint, TransformCandidates,
+    AURA_V3_GROUP_DESCRIPTOR_TABLE_VERSION, MAX_DUAL_DOMAIN_COUNT,
 };
 pub use source::{
     AuraEventBatch, AuraEventSource, AuraEventSourceStats, AuraFileSource, AuraLiveFrameSource,

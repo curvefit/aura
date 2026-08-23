@@ -10,9 +10,9 @@ FooterLen
 Seal
 ```
 
-## Header
+## V2 header
 
-The front header starts at byte zero. Its fixed prefix is 25 bytes; `header_len`
+The V2 front header starts at byte zero. Its fixed prefix is 25 bytes; `header_len`
 is the total front-header size and is the byte offset where the body starts.
 
 ```text
@@ -104,6 +104,60 @@ The stamped footer schema remains the authoritative schema copy.
 Files without a `100` timestamp marker are treated as non-time-series data.
 Group-width bytes mark the current slot and the following `width - 1` slots as
 repeated fields.
+
+## V3 relationship/group header
+
+The implemented V3 front-header prefix is 39 bytes:
+
+```text
+offset  size  field
+0       4     magic          AURA
+4       2     version        3
+6       1     profile
+7       4     header_len     u32 little-endian
+11      8     start_time_ns
+19      2     stream_id
+21      2     dictionary_id
+23      4     schema_len     one byte per logical field
+27      4     derived_len
+31      4     group_len
+35      4     comment_len
+39      N     schema_map
+39+N    D     derived_exprs
+39+N+D  G     group_descriptors
+39+N+D+G M    comment_utf8
+```
+
+The complete V3 header is limited to 16 MiB. Length discovery enforces that
+ceiling before a file-backed reader allocates the advertised header. Encoding
+and decoding use checked section sums and fallible allocation.
+
+V3 relationship-map bytes are one-to-one with logical fields:
+
+```text
+0        root/no direct parent
+1-99     parent slot, byte - 1
+100      timestamp
+101-199  derived-expression reference
+200      this field is the dual-domain discriminator
+201-239  invalid in V3; V2 structural widths are not reused
+241      boolean
+242      small enum
+243      bitfield
+255      opaque/do-not-attempt arithmetic
+```
+
+The group table is versioned. Descriptors are serialized canonically by group
+ID and carry kind, semantic relationship permissions, dual-domain metadata,
+and strictly increasing child slots. The first table version supports repeated
+column subsets of one shared child row and exactly two domains. Unknown table
+versions, kinds, flags, permissions, overlapping children, mismatched byte 200,
+and expression cycles reject.
+
+The front V3 header authorizes relationships and groups. The full schema
+encoding tag 4 is authoritative for field names, exact types, roles, scales,
+nullability, and schema identity. Complete V3 footers/files are not yet enabled;
+production writers remain V2 and reject tag-4 schemas.
 
 ## Body
 

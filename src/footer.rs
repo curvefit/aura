@@ -7,7 +7,10 @@ use crate::format::{
 use crate::generic_planner::validate_generic_plan_schema_authorization;
 use crate::instructions::GenericInstructionPlan;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
-use crate::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
+use crate::schema::{
+    decode_schema_block, encode_schema_block, validate_schema_container_compatibility,
+    SchemaDescriptor,
+};
 use crate::stats::{
     FieldStats, FieldStatsSummary, IngestStats, PhysicalWidth, RelatedFieldStats,
     RunHistogramEntry, ShapeStats,
@@ -126,6 +129,7 @@ impl AuraFooter {
     }
 
     fn encode_v2(&self) -> Result<Vec<u8>> {
+        validate_schema_container_compatibility(&self.schema, self.container_version)?;
         let mut out = Vec::new();
         out.extend_from_slice(FOOTER_MAGIC);
         put_u16_le(&mut out, self.container_version.wire_value());
@@ -168,6 +172,7 @@ impl AuraFooter {
             level: reader.read_u8()?,
         };
         let schema = decode_schema_block(&mut reader)?;
+        validate_schema_container_compatibility(&schema, container_version)?;
         let stats = decode_stats(&mut reader)?;
         let (aura0_plan, aura1_plan, generic_aura0_plan) = decode_plans(&mut reader)?;
         let chunks = decode_chunks(&mut reader)?;

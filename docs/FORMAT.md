@@ -2,6 +2,12 @@
 
 This document describes the current implementation.
 
+Current production writers still emit container V2. The V3 relationship/group
+front header and full schema encoding are implemented and testable as standalone
+metadata, but complete V3 ingest/compiled footers and bodies are intentionally
+unsupported until Aura Plan V2 and the bounded writer path land. A V3 schema
+cannot be embedded in a V2 container.
+
 ## Roles
 
 - `.aura`: ingest/preservation file. It stores logical i64 or typed rows plus
@@ -26,10 +32,16 @@ footer length immediately before it, and locating the footer before that length.
 
 ## Header
 
-The header contains the profile, stream and dictionary IDs, base timestamp,
-schema parent mapping, derived expression table, and optional comment. The
-compiled profiles preserve the schema mapping and derived expression table from
-the logical schema.
+V2 and V3 use explicitly dispatched header layouts. Both contain the profile,
+stream and dictionary IDs, base timestamp, relationship map, derived expression
+table, and optional comment. V3 additionally carries canonical group
+descriptors and uses slot-level byte 200 for the actual dual-domain
+discriminator. See `docs/container.md` for exact layouts.
+
+The V3 front header is authoritative for relationship and group permissions.
+The versioned full schema descriptor is authoritative for names, types, roles,
+scales, and nullability. When complete V3 containers are enabled, header and
+full-schema maps, expressions, groups, and schema dialect must agree exactly.
 
 ## Metadata
 
@@ -77,7 +89,8 @@ chunk descriptors
 optional Aura1 byte-lane descriptor table (`AUBL`)
 ```
 
-Unsupported versions reject during footer decode.
+Unsupported versions reject during footer decode. Complete V3 footer decode is
+not enabled merely because V3 front-header metadata can be decoded.
 
 ## Aura1 Body
 

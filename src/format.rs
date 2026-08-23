@@ -8,8 +8,8 @@ pub const AURA1_MAGIC: &[u8; 4] = b"AUR1";
 pub const SEAL_MAGIC: &[u8; 8] = b"sealed:)";
 /// Aura container versions recognized by this implementation.
 ///
-/// Recognition and layout support are intentionally separate: V3 is reserved
-/// for the next container contract, but its wire layout is not defined here.
+/// Recognition and layout support are intentionally separate: the V3 front
+/// header is authoritative, while complete V3 container/footer support is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u16)]
 pub enum AuraContainerVersion {
@@ -37,8 +37,7 @@ impl AuraContainerVersion {
     /// Confirms that this crate can decode the selected front-header layout.
     pub fn require_supported_header_layout(self) -> Result<()> {
         match self {
-            Self::LegacyV1 | Self::V2 => Ok(()),
-            Self::V3 => Err(AuraError::UnsupportedVersion(self.wire_value())),
+            Self::LegacyV1 | Self::V2 | Self::V3 => Ok(()),
         }
     }
 
@@ -54,6 +53,8 @@ impl AuraContainerVersion {
 pub const DEFAULT_CONTAINER_VERSION: AuraContainerVersion = AuraContainerVersion::V2;
 pub const AURA_V2_WIRE_VERSION: u16 = AuraContainerVersion::V2.wire_value();
 pub const AURA_V3_WIRE_VERSION: u16 = AuraContainerVersion::V3.wire_value();
+/// Normative maximum encoded size of an Aura v3 front header (16 MiB).
+pub const MAX_V3_HEADER_BYTES: usize = 16 * 1024 * 1024;
 
 /// Exact V2+ wire size of one chunk descriptor in ingest or compiled footers.
 pub const AURA_CHUNK_DESCRIPTOR_SIZE: usize = 76;
@@ -118,7 +119,7 @@ mod tests {
         );
         assert_eq!(
             AuraContainerVersion::V3.require_supported_header_layout(),
-            Err(AuraError::UnsupportedVersion(AURA_V3_WIRE_VERSION))
+            Ok(())
         );
         assert_eq!(
             AuraContainerVersion::V3.require_supported_container_layout(),

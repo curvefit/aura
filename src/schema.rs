@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::bytes::{put_u16_le, put_u32_le, put_u8, ByteReader};
+use crate::format::AuraContainerVersion;
 use crate::header::{
     decode_derived_expression_table, encode_derived_expression_table, validate_derived_expressions,
     DerivedExpression, DerivedExpressionOp, HEADER_PREFIX_SIZE,
@@ -11,6 +12,10 @@ const SCHEMA_ENCODING_PARENT_VECTOR: u8 = 0;
 const SCHEMA_ENCODING_FULL_FIELDS: u8 = 1;
 const SCHEMA_ENCODING_NAMED_PARENT_VECTOR: u8 = 2;
 const SCHEMA_ENCODING_NAMED_FULL_FIELDS: u8 = 3;
+const SCHEMA_ENCODING_V3_NAMED_FULL_FIELDS: u8 = 4;
+pub const AURA_V3_GROUP_DESCRIPTOR_TABLE_VERSION: u8 = 1;
+pub const MAX_DUAL_DOMAIN_COUNT: u8 = 2;
+const GROUP_DESCRIPTOR_KNOWN_RELATIONSHIP_FLAGS: u8 = 0b0000_1111;
 const DECODED_SCHEMA_NAME: &str = "schema";
 pub(crate) const SCHEMA_MAP_PARENT_MAX: u8 = 99;
 pub(crate) const SCHEMA_MAP_TIME_SLOT: u8 = 100;
@@ -23,6 +28,178 @@ pub(crate) const SCHEMA_MAP_BOOL_1BIT: u8 = 241;
 pub(crate) const SCHEMA_MAP_ENUM_2BIT: u8 = 242;
 pub(crate) const SCHEMA_MAP_BITFIELD_8BIT: u8 = 243;
 pub(crate) const SCHEMA_MAP_DO_NOT_ATTEMPT: u8 = u8::MAX;
+
+/// Logical schema encoding selected independently of whether groups are present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum SchemaEncodingVersion {
+    V2 = 2,
+    V3 = 3,
+}
+
+/// Validate that a full logical schema may be serialized by a container wire version.
+///
+/// This is a cross-version gate: v2 containers may only carry the frozen v2
+/// schema dialect, and future v3 containers may only carry explicitly v3
+/// schemas. Complete v3 container serialization remains unsupported elsewhere.
+pub fn validate_schema_container_compatibility(
+    schema: &SchemaDescriptor,
+    container_version: AuraContainerVersion,
+) -> Result<()> {
+    let compatible = matches!(
+        (container_version, schema.encoding_version),
+        (AuraContainerVersion::V2, SchemaEncodingVersion::V2)
+            | (AuraContainerVersion::V3, SchemaEncodingVersion::V3)
+    );
+    if compatible {
+        Ok(())
+    } else {
+        Err(AuraError::InvalidValue("schema container version"))
+    }
+}
+
+/// The semantic shape of a group declared by an Aura v3 schema.
+///
+/// Repeated groups are column subsets of the single repeated child row owned
+/// by each logical event. All groups therefore share the same authoritative
+/// per-event child count; a group never introduces an independent row set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum GroupKind {
+    Repeated = 1,
+}
+
+impl GroupKind {
+    fn from_code(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::Repeated),
+            _ => Err(AuraError::InvalidValue("group kind")),
+        }
+    }
+}
+
+/// Relationship classes that a planner may test for a group.
+///
+/// These are semantic permissions, not codec or transform selections.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RelationshipPermissions(u8);
+
+impl RelationshipPermissions {
+    pub const SPLIT: u8 = 0b0000_0001;
+    pub const WITHIN_DOMAIN: u8 = 0b0000_0010;
+    pub const ACROSS_DOMAIN_SAME_FIELD: u8 = 0b0000_0100;
+    pub const JOINT_SAME_FIELD: u8 = 0b0000_1000;
+
+    pub const fn none() -> Self {
+        Self(0)
+    }
+
+    pub fn from_bits(bits: u8) -> Result<Self> {
+        if bits & !GROUP_DESCRIPTOR_KNOWN_RELATIONSHIP_FLAGS != 0 {
+            return Err(AuraError::InvalidValue("group relationship flags"));
+        }
+        Ok(Self(bits))
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub const fn with_split(self) -> Self {
+        Self(self.0 | Self::SPLIT)
+    }
+
+    pub const fn with_within_domain(self) -> Self {
+        Self(self.0 | Self::WITHIN_DOMAIN)
+    }
+
+    pub const fn with_across_domain_same_field(self) -> Self {
+        Self(self.0 | Self::ACROSS_DOMAIN_SAME_FIELD)
+    }
+
+    pub const fn with_joint_same_field(self) -> Self {
+        Self(self.0 | Self::JOINT_SAME_FIELD)
+    }
+
+    pub const fn allows_split(self) -> bool {
+        self.0 & Self::SPLIT != 0
+    }
+
+    pub const fn allows_within_domain(self) -> bool {
+        self.0 & Self::WITHIN_DOMAIN != 0
+    }
+
+    pub const fn allows_across_domain_same_field(self) -> bool {
+        self.0 & Self::ACROSS_DOMAIN_SAME_FIELD != 0
+    }
+
+    pub const fn allows_joint_same_field(self) -> bool {
+        self.0 & Self::JOINT_SAME_FIELD != 0
+    }
+}
+
+/// Dual-domain declaration attached to a repeated group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DualDomainDescriptor {
+    pub discriminator_slot: u16,
+    pub domain_count: u8,
+}
+
+impl DualDomainDescriptor {
+    pub fn new(discriminator_slot: u16) -> Self {
+        Self {
+            discriminator_slot,
+            domain_count: MAX_DUAL_DOMAIN_COUNT,
+        }
+    }
+}
+
+/// One explicitly declared group in an Aura v3 logical schema.
+///
+/// `child_slots` is a disjoint column subset of the event's shared repeated
+/// child row. Slots must be strictly increasing in global field order. Multiple
+/// groups may partition that row into disjoint column subsets, but all use the
+/// same authoritative per-event child count.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GroupDescriptor {
+    pub group_id: u16,
+    pub kind: GroupKind,
+    /// Logical slots in source order. Serialization never sorts this vector.
+    pub child_slots: Vec<u16>,
+    pub dual_domain: Option<DualDomainDescriptor>,
+    pub relationships: RelationshipPermissions,
+}
+
+impl GroupDescriptor {
+    pub fn repeated(
+        group_id: u16,
+        child_slots: Vec<u16>,
+        relationships: RelationshipPermissions,
+    ) -> Self {
+        Self {
+            group_id,
+            kind: GroupKind::Repeated,
+            child_slots,
+            dual_domain: None,
+            relationships,
+        }
+    }
+
+    pub fn dual_domain_repeated(
+        group_id: u16,
+        child_slots: Vec<u16>,
+        discriminator_slot: u16,
+        relationships: RelationshipPermissions,
+    ) -> Self {
+        Self {
+            group_id,
+            kind: GroupKind::Repeated,
+            child_slots,
+            dual_domain: Some(DualDomainDescriptor::new(discriminator_slot)),
+            relationships,
+        }
+    }
+}
 
 /// Public SDK field type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -605,14 +782,30 @@ pub struct FieldDescriptor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaMapHint {
     Root,
-    Parent { parent_index: u16 },
+    Parent {
+        parent_index: u16,
+    },
     Timestamp,
-    DerivedExpression { expression_index: u8 },
-    DualDomainGroup { width: u8 },
-    Group { width: u8 },
-    Boolean { bits: u8 },
-    Enum { bits: u8 },
-    Bitfield { bits: u8 },
+    DerivedExpression {
+        expression_index: u8,
+    },
+    DualDomainGroup {
+        width: u8,
+    },
+    /// Aura v3 slot-level discriminator. Unlike the v2 control byte, this is a field.
+    DualDomainDiscriminator,
+    Group {
+        width: u8,
+    },
+    Boolean {
+        bits: u8,
+    },
+    Enum {
+        bits: u8,
+    },
+    Bitfield {
+        bits: u8,
+    },
     DoNotAttempt,
 }
 
@@ -628,13 +821,20 @@ pub struct SchemaMapEntry {
 }
 
 /// Logical schema descriptor shared by ingest, Aura0, and Aura1.
+///
+/// For v3, the full schema block (encoding tag 4) is authoritative for field
+/// names, logical types, roles, scales, and nullability. The front header only
+/// carries relationship, expression, and repeated-group declarations needed
+/// before a footer/full-schema block is available.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaDescriptor {
     pub schema_id: u32,
+    pub encoding_version: SchemaEncodingVersion,
     pub name: String,
     pub fields: Vec<FieldDescriptor>,
     pub compact_schema_map: Option<Vec<u8>>,
     pub derived_expressions: Vec<DerivedExpression>,
+    pub groups: Vec<GroupDescriptor>,
 }
 
 impl SchemaDescriptor {
@@ -661,10 +861,60 @@ impl SchemaDescriptor {
             &self.fields,
             self.compact_schema_map.as_deref(),
             &derived_expressions,
+            self.encoding_version,
+            &self.groups,
         )?;
         self.derived_expressions = derived_expressions;
         self.refresh_schema_id();
         Ok(self)
+    }
+
+    /// Promote this descriptor to Aura v3 and install its authoritative groups.
+    pub fn with_v3_groups(mut self, groups: Vec<GroupDescriptor>) -> Result<Self> {
+        self.encoding_version = SchemaEncodingVersion::V3;
+        self.groups = groups;
+        self.groups.sort_by_key(|group| group.group_id);
+        if self.compact_schema_map.is_none() {
+            self.compact_schema_map = Some(derive_v3_schema_mapping(&self)?);
+        }
+        self.validate()?;
+        self.refresh_schema_id();
+        Ok(self)
+    }
+
+    /// Promote a flat descriptor to Aura v3 without inferring identity from groups.
+    pub fn into_v3(mut self) -> Result<Self> {
+        self.encoding_version = SchemaEncodingVersion::V3;
+        if self.compact_schema_map.is_none() {
+            self.compact_schema_map = Some(derive_v3_schema_mapping(&self)?);
+        }
+        self.validate()?;
+        self.refresh_schema_id();
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_stable_field_ids(&self.fields)?;
+        validate_field_descriptors(&self.fields)?;
+        self.validate_derived_expressions()?;
+        match self.encoding_version {
+            SchemaEncodingVersion::V2 => {
+                if !self.groups.is_empty() {
+                    return Err(AuraError::InvalidValue("v2 schema groups"));
+                }
+                if let Some(mapping) = self.compact_schema_map.as_deref() {
+                    if decode_schema_map(mapping)?.len() != self.fields.len() {
+                        return Err(AuraError::InvalidValue("schema parent mapping"));
+                    }
+                }
+            }
+            SchemaEncodingVersion::V3 => validate_v3_schema_parts(
+                &self.fields,
+                self.compact_schema_map.as_deref(),
+                &self.groups,
+            )?,
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_derived_expressions(&self) -> Result<()> {
@@ -672,16 +922,13 @@ impl SchemaDescriptor {
             &self.fields,
             self.compact_schema_map.as_deref(),
             &self.derived_expressions,
+            self.encoding_version,
+            &self.groups,
         )
     }
 
     fn refresh_schema_id(&mut self) {
-        self.schema_id = schema_hash(
-            &self.name,
-            &self.fields,
-            self.compact_schema_map.as_deref(),
-            &self.derived_expressions,
-        );
+        self.schema_id = schema_hash_for_version(self);
     }
 }
 
@@ -739,6 +986,9 @@ impl I64SchemaDefinition {
 pub struct SchemaBuilder {
     name: String,
     fields: Vec<FieldDescriptor>,
+    encoding_version: SchemaEncodingVersion,
+    compact_schema_map: Option<Vec<u8>>,
+    groups: Vec<GroupDescriptor>,
 }
 
 impl SchemaBuilder {
@@ -746,7 +996,57 @@ impl SchemaBuilder {
         Self {
             name: name.into(),
             fields: Vec::new(),
+            encoding_version: SchemaEncodingVersion::V2,
+            compact_schema_map: None,
+            groups: Vec::new(),
         }
+    }
+
+    /// Select Aura v3 schema semantics even for a flat schema.
+    pub fn v3(mut self) -> Self {
+        self.encoding_version = SchemaEncodingVersion::V3;
+        self
+    }
+
+    pub fn group(mut self, group: GroupDescriptor) -> Self {
+        self.encoding_version = SchemaEncodingVersion::V3;
+        self.groups.push(group);
+        self
+    }
+
+    /// Set the one-byte-per-field Aura v3 schema map.
+    pub fn v3_schema_mapping(mut self, schema_mapping: Vec<u8>) -> Self {
+        self.encoding_version = SchemaEncodingVersion::V3;
+        self.compact_schema_map = Some(schema_mapping);
+        self
+    }
+
+    pub fn repeated_group(
+        self,
+        group_id: u16,
+        child_slots: Vec<u16>,
+        relationships: RelationshipPermissions,
+    ) -> Self {
+        self.group(GroupDescriptor::repeated(
+            group_id,
+            child_slots,
+            relationships,
+        ))
+    }
+
+    pub fn dual_domain_repeated_group(
+        self,
+        group_id: u16,
+        child_slots: Vec<u16>,
+        discriminator_slot: u16,
+        relationships: RelationshipPermissions,
+    ) -> Self {
+        self.group(GroupDescriptor::dual_domain_repeated(
+            group_id,
+            child_slots,
+            discriminator_slot,
+            relationships,
+        ))
     }
 
     pub fn field(self, name: impl Into<String>, field_type: FieldType, role: FieldRole) -> Self {
@@ -940,13 +1240,25 @@ impl SchemaBuilder {
             }
         }
 
-        Ok(SchemaDescriptor {
+        let mut groups = self.groups;
+        groups.sort_by_key(|group| group.group_id);
+        let mut schema = SchemaDescriptor {
             schema_id: schema_hash(&self.name, &self.fields, None, &[]),
+            encoding_version: self.encoding_version,
             name: self.name,
             fields: self.fields,
-            compact_schema_map: None,
+            compact_schema_map: self.compact_schema_map,
             derived_expressions: Vec::new(),
-        })
+            groups,
+        };
+        if schema.encoding_version == SchemaEncodingVersion::V3
+            && schema.compact_schema_map.is_none()
+        {
+            schema.compact_schema_map = Some(derive_v3_schema_mapping(&schema)?);
+        }
+        schema.validate()?;
+        schema.refresh_schema_id();
+        Ok(schema)
     }
 }
 
@@ -1031,12 +1343,7 @@ pub fn generic_i64_parent_schema(name: &str, parent_slots: &[u8]) -> Result<Sche
     }
     let mut schema = builder.finish()?;
     schema.compact_schema_map = Some(parent_slots.to_vec());
-    schema.schema_id = schema_hash(
-        &schema.name,
-        &schema.fields,
-        schema.compact_schema_map.as_deref(),
-        &schema.derived_expressions,
-    );
+    schema.schema_id = schema_hash_for_version(&schema);
     Ok(schema)
 }
 
@@ -1171,10 +1478,384 @@ pub fn decode_schema_map(parent_slots: &[u8]) -> Result<Vec<SchemaMapEntry>> {
     Ok(entries)
 }
 
+/// Decode an Aura v3 one-byte-per-logical-field schema map.
+///
+/// Group membership comes only from `groups`; bytes `201..=239` retain no v2
+/// structural meaning. Byte `200` consumes the discriminator field at that slot.
+pub fn decode_v3_schema_map(
+    schema_mapping: &[u8],
+    groups: &[GroupDescriptor],
+) -> Result<Vec<SchemaMapEntry>> {
+    validate_v3_group_mapping(schema_mapping, groups)?;
+    let repeated_slots = groups
+        .iter()
+        .flat_map(|group| group.child_slots.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut time_slot = None;
+    let mut entries = Vec::with_capacity(schema_mapping.len());
+    for (index, byte) in schema_mapping.iter().copied().enumerate() {
+        let field_index =
+            u16::try_from(index).map_err(|_| AuraError::InvalidValue("field index"))?;
+        let scope = if repeated_slots.contains(&field_index) {
+            FieldScope::Repeated
+        } else {
+            FieldScope::Event
+        };
+        let (is_timestamp, relation, hint) = match byte {
+            SCHEMA_MAP_TIME_SLOT => {
+                if time_slot.replace(index).is_some() || index != 0 || scope != FieldScope::Event {
+                    return Err(AuraError::InvalidValue("time slot"));
+                }
+                (true, FieldRelation::None, SchemaMapHint::Timestamp)
+            }
+            0 => (false, FieldRelation::None, SchemaMapHint::Root),
+            1..=SCHEMA_MAP_PARENT_MAX => {
+                let parent_index = u16::from(byte - 1);
+                if usize::from(parent_index) >= index {
+                    return Err(AuraError::InvalidValue("parent slot"));
+                }
+                (
+                    false,
+                    FieldRelation::DeltaFromField(parent_index),
+                    SchemaMapHint::Parent { parent_index },
+                )
+            }
+            101..=SCHEMA_MAP_DERIVED_MAX => (
+                false,
+                FieldRelation::None,
+                SchemaMapHint::DerivedExpression {
+                    expression_index: byte - SCHEMA_MAP_DERIVED_EXPR_BASE,
+                },
+            ),
+            SCHEMA_MAP_DUAL_DOMAIN_GROUP => (
+                false,
+                FieldRelation::None,
+                SchemaMapHint::DualDomainDiscriminator,
+            ),
+            201..=SCHEMA_MAP_GROUP_MAX => {
+                return Err(AuraError::InvalidValue("v3 structural schema map byte"));
+            }
+            SCHEMA_MAP_BOOL_1BIT => (
+                false,
+                FieldRelation::None,
+                SchemaMapHint::Boolean { bits: 1 },
+            ),
+            SCHEMA_MAP_ENUM_2BIT => (false, FieldRelation::None, SchemaMapHint::Enum { bits: 2 }),
+            SCHEMA_MAP_BITFIELD_8BIT => (
+                false,
+                FieldRelation::None,
+                SchemaMapHint::Bitfield { bits: 8 },
+            ),
+            SCHEMA_MAP_DO_NOT_ATTEMPT => (false, FieldRelation::None, SchemaMapHint::DoNotAttempt),
+            _ => return Err(AuraError::InvalidValue("schema map byte")),
+        };
+        entries.push(SchemaMapEntry {
+            field_index,
+            raw_byte: byte,
+            scope,
+            is_timestamp,
+            relation,
+            hint,
+        });
+    }
+    Ok(entries)
+}
+
+fn validate_stable_field_ids(fields: &[FieldDescriptor]) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    for (slot, field) in fields.iter().enumerate() {
+        if !ids.insert(field.index) || usize::from(field.index) != slot {
+            return Err(AuraError::InvalidValue("stable field id"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_field_descriptors(fields: &[FieldDescriptor]) -> Result<()> {
+    if fields.is_empty() {
+        return Err(AuraError::InvalidValue("schema fields"));
+    }
+    let mut names = BTreeSet::new();
+    for field in fields {
+        validate_schema_name(&field.name)?;
+        if !names.insert(field.name.as_str()) {
+            return Err(AuraError::InvalidValue("duplicate field name"));
+        }
+        if field.role == FieldRole::Timestamp && field.scope != FieldScope::Event {
+            return Err(AuraError::InvalidValue("timestamp scope"));
+        }
+        if field.field_type == FieldType::Opaque16
+            && field.relation != FieldRelation::None
+            && field.candidates.contains(FieldTransform::DeltaRelated)
+        {
+            return Err(AuraError::InvalidValue("opaque field relation"));
+        }
+        if let FieldRelation::DeltaFromField(related_index) = field.relation {
+            if usize::from(related_index) >= fields.len() || related_index == field.index {
+                return Err(AuraError::InvalidValue("related field index"));
+            }
+            if !field.candidates.contains(FieldTransform::DeltaRelated) {
+                return Err(AuraError::InvalidValue("related field candidates"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_group_descriptors_basic(groups: &[GroupDescriptor]) -> Result<()> {
+    let mut group_ids = BTreeSet::new();
+    let mut claimed_slots = BTreeSet::new();
+    for group in groups {
+        if !group_ids.insert(group.group_id) {
+            return Err(AuraError::InvalidValue("duplicate group id"));
+        }
+        if group.kind != GroupKind::Repeated || group.child_slots.is_empty() {
+            return Err(AuraError::InvalidValue("group children"));
+        }
+        RelationshipPermissions::from_bits(group.relationships.bits())?;
+        let mut local_slots = BTreeSet::new();
+        let mut previous_slot = None;
+        for child_slot in &group.child_slots {
+            if !local_slots.insert(*child_slot) {
+                return Err(AuraError::InvalidValue("duplicate group child slot"));
+            }
+            if previous_slot.is_some_and(|previous| previous > *child_slot) {
+                return Err(AuraError::InvalidValue("group child slot order"));
+            }
+            if !claimed_slots.insert(*child_slot) {
+                return Err(AuraError::InvalidValue("overlapping group child slot"));
+            }
+            previous_slot = Some(*child_slot);
+        }
+        match group.dual_domain {
+            Some(dual) => {
+                if dual.domain_count != MAX_DUAL_DOMAIN_COUNT {
+                    return Err(AuraError::InvalidValue("dual-domain count"));
+                }
+                if group
+                    .child_slots
+                    .iter()
+                    .filter(|slot| **slot == dual.discriminator_slot)
+                    .count()
+                    != 1
+                {
+                    return Err(AuraError::InvalidValue("dual-domain discriminator slot"));
+                }
+            }
+            None => {
+                if group.relationships.allows_across_domain_same_field()
+                    || group.relationships.allows_joint_same_field()
+                {
+                    return Err(AuraError::InvalidValue("group relationship flags"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_v3_group_mapping(
+    schema_mapping: &[u8],
+    groups: &[GroupDescriptor],
+) -> Result<()> {
+    if schema_mapping.is_empty() || schema_mapping.len() > u32::MAX as usize {
+        return Err(AuraError::InvalidValue("schema mapping length"));
+    }
+    validate_group_descriptors_basic(groups)?;
+    let mut discriminator_slots = BTreeSet::new();
+    for group in groups {
+        for child_slot in &group.child_slots {
+            if usize::from(*child_slot) >= schema_mapping.len() {
+                return Err(AuraError::InvalidValue("group child slot"));
+            }
+        }
+        if let Some(dual) = group.dual_domain {
+            if !discriminator_slots.insert(dual.discriminator_slot) {
+                return Err(AuraError::InvalidValue("dual-domain discriminator slot"));
+            }
+            if schema_mapping[usize::from(dual.discriminator_slot)] != SCHEMA_MAP_DUAL_DOMAIN_GROUP
+            {
+                return Err(AuraError::InvalidValue("dual-domain schema marker"));
+            }
+        }
+    }
+    for (slot, byte) in schema_mapping.iter().copied().enumerate() {
+        if (201..=SCHEMA_MAP_GROUP_MAX).contains(&byte) {
+            return Err(AuraError::InvalidValue("v3 structural schema map byte"));
+        }
+        if byte == SCHEMA_MAP_DUAL_DOMAIN_GROUP
+            && !discriminator_slots
+                .contains(&u16::try_from(slot).map_err(|_| AuraError::InvalidValue("field index"))?)
+        {
+            return Err(AuraError::InvalidValue("dual-domain schema marker"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_v3_header_schema(
+    schema_mapping: &[u8],
+    groups: &[GroupDescriptor],
+    derived_expressions: &[DerivedExpression],
+) -> Result<()> {
+    let entries = decode_v3_schema_map(schema_mapping, groups)?;
+    for expression in derived_expressions {
+        if usize::from(expression.output_slot) >= schema_mapping.len()
+            || expression
+                .input_slots
+                .iter()
+                .any(|slot| usize::from(*slot) >= schema_mapping.len())
+        {
+            return Err(AuraError::InvalidValue("derived expression slot"));
+        }
+        validate_expression_shape(expression)?;
+    }
+    validate_compact_expression_refs(&entries, derived_expressions)?;
+    validate_expression_graph(derived_expressions)
+}
+
+fn validate_v3_schema_parts(
+    fields: &[FieldDescriptor],
+    schema_mapping: Option<&[u8]>,
+    groups: &[GroupDescriptor],
+) -> Result<()> {
+    validate_group_descriptors_basic(groups)?;
+    let mapping = schema_mapping.ok_or(AuraError::InvalidValue("v3 schema mapping"))?;
+    if mapping.len() != fields.len() {
+        return Err(AuraError::InvalidValue("schema parent mapping"));
+    }
+    let entries = decode_v3_schema_map(mapping, groups)?;
+    let claimed_slots = groups
+        .iter()
+        .flat_map(|group| group.child_slots.iter().copied())
+        .collect::<BTreeSet<_>>();
+    for (field, entry) in fields.iter().zip(entries) {
+        let expected_scope = if claimed_slots.contains(&field.index) {
+            FieldScope::Repeated
+        } else {
+            FieldScope::Event
+        };
+        if field.scope != expected_scope || entry.scope != expected_scope {
+            return Err(AuraError::InvalidValue("group field scope"));
+        }
+        if entry.relation != field.relation {
+            return Err(AuraError::InvalidValue("schema parent mapping"));
+        }
+        if entry.is_timestamp != (field.role == FieldRole::Timestamp) {
+            return Err(AuraError::InvalidValue("time slot"));
+        }
+    }
+    Ok(())
+}
+
+/// Encode the standalone, versioned Aura v3 group descriptor table.
+pub fn encode_group_descriptor_table(groups: &[GroupDescriptor]) -> Result<Vec<u8>> {
+    validate_group_descriptors_basic(groups)?;
+    let group_count =
+        u16::try_from(groups.len()).map_err(|_| AuraError::InvalidValue("group count"))?;
+    let encoded_len = groups.iter().try_fold(3usize, |len, group| {
+        len.checked_add(10)?
+            .checked_add(group.child_slots.len().checked_mul(2)?)
+    });
+    let encoded_len = encoded_len.ok_or(AuraError::InvalidValue("group descriptor length"))?;
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve_exact(groups.len())
+        .map_err(|_| AuraError::InvalidValue("group descriptor allocation"))?;
+    ordered.extend(groups.iter());
+    ordered.sort_by_key(|group| group.group_id);
+    let mut out = Vec::new();
+    out.try_reserve_exact(encoded_len)
+        .map_err(|_| AuraError::InvalidValue("group descriptor allocation"))?;
+    put_u8(&mut out, AURA_V3_GROUP_DESCRIPTOR_TABLE_VERSION);
+    put_u16_le(&mut out, group_count);
+    for group in ordered {
+        put_u16_le(&mut out, group.group_id);
+        put_u8(&mut out, group.kind as u8);
+        put_u8(&mut out, group.relationships.bits());
+        put_u8(&mut out, u8::from(group.dual_domain.is_some()));
+        let (domain_count, discriminator_slot) = group.dual_domain.map_or((0, u16::MAX), |dual| {
+            (dual.domain_count, dual.discriminator_slot)
+        });
+        put_u8(&mut out, domain_count);
+        put_u16_le(&mut out, discriminator_slot);
+        let child_count = u16::try_from(group.child_slots.len())
+            .map_err(|_| AuraError::InvalidValue("group child count"))?;
+        put_u16_le(&mut out, child_count);
+        for child_slot in &group.child_slots {
+            put_u16_le(&mut out, *child_slot);
+        }
+    }
+    Ok(out)
+}
+
+/// Decode the standalone, versioned Aura v3 group descriptor table.
+pub fn decode_group_descriptor_table(bytes: &[u8]) -> Result<Vec<GroupDescriptor>> {
+    let mut reader = ByteReader::new(bytes);
+    if reader.read_u8()? != AURA_V3_GROUP_DESCRIPTOR_TABLE_VERSION {
+        return Err(AuraError::InvalidValue("group descriptor table version"));
+    }
+    let group_count = reader.read_u16_le()? as usize;
+    if group_count > reader.remaining() / 10 {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(group_count)
+        .map_err(|_| AuraError::InvalidValue("group descriptor allocation"))?;
+    for _ in 0..group_count {
+        let group_id = reader.read_u16_le()?;
+        let kind = GroupKind::from_code(reader.read_u8()?)?;
+        let relationships = RelationshipPermissions::from_bits(reader.read_u8()?)?;
+        let descriptor_flags = reader.read_u8()?;
+        if descriptor_flags & !1 != 0 {
+            return Err(AuraError::InvalidValue("group descriptor flags"));
+        }
+        let domain_count = reader.read_u8()?;
+        let discriminator_slot = reader.read_u16_le()?;
+        let child_count = reader.read_u16_le()? as usize;
+        if child_count > reader.remaining() / 2 {
+            return Err(AuraError::UnexpectedEof);
+        }
+        let mut child_slots = Vec::new();
+        child_slots
+            .try_reserve_exact(child_count)
+            .map_err(|_| AuraError::InvalidValue("group child allocation"))?;
+        for _ in 0..child_count {
+            child_slots.push(reader.read_u16_le()?);
+        }
+        let dual_domain = if descriptor_flags == 1 {
+            Some(DualDomainDescriptor {
+                discriminator_slot,
+                domain_count,
+            })
+        } else {
+            if domain_count != 0 || discriminator_slot != u16::MAX {
+                return Err(AuraError::InvalidValue("group dual-domain fields"));
+            }
+            None
+        };
+        groups.push(GroupDescriptor {
+            group_id,
+            kind,
+            child_slots,
+            dual_domain,
+            relationships,
+        });
+    }
+    reader.finish()?;
+    validate_group_descriptors_basic(&groups)?;
+    groups.sort_by_key(|group| group.group_id);
+    Ok(groups)
+}
+
 pub fn schema_parent_mapping(schema: &SchemaDescriptor) -> Result<Vec<u8>> {
     schema.validate_derived_expressions()?;
     if let Some(mapping) = &schema.compact_schema_map {
-        let entries = decode_schema_map(mapping)?;
+        let entries = match schema.encoding_version {
+            SchemaEncodingVersion::V2 => decode_schema_map(mapping)?,
+            SchemaEncodingVersion::V3 => decode_v3_schema_map(mapping, &schema.groups)?,
+        };
         if entries.len() != schema.fields.len() {
             return Err(AuraError::InvalidValue("schema parent mapping"));
         }
@@ -1205,6 +1886,22 @@ pub fn schema_parent_mapping(schema: &SchemaDescriptor) -> Result<Vec<u8>> {
 
         mapping.push(schema_field_map_byte(field, &expression_ids)?);
         index += 1;
+    }
+    Ok(mapping)
+}
+
+fn derive_v3_schema_mapping(schema: &SchemaDescriptor) -> Result<Vec<u8>> {
+    let expression_ids = expression_ids_by_output(&schema.derived_expressions)?;
+    let mut mapping = schema
+        .fields
+        .iter()
+        .map(|field| schema_field_map_byte(field, &expression_ids))
+        .collect::<Result<Vec<_>>>()?;
+    for dual in schema.groups.iter().filter_map(|group| group.dual_domain) {
+        let byte = mapping
+            .get_mut(usize::from(dual.discriminator_slot))
+            .ok_or(AuraError::InvalidValue("dual-domain discriminator slot"))?;
+        *byte = SCHEMA_MAP_DUAL_DOMAIN_GROUP;
     }
     Ok(mapping)
 }
@@ -1308,8 +2005,16 @@ fn validate_i64_schema_definition_header(schema_len: usize, comment_len: usize) 
 }
 
 pub(crate) fn encode_schema_block(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Result<()> {
+    if schema.encoding_version == SchemaEncodingVersion::V3 {
+        schema.validate()?;
+        if schema.schema_id != schema_hash_for_version(schema) {
+            return Err(AuraError::InvalidValue("schema id"));
+        }
+    }
     let mut schema_encoding = Vec::new();
-    if let Some(parent_slots) = parent_slots_for_generic_i64_schema(schema) {
+    if schema.encoding_version == SchemaEncodingVersion::V3 {
+        encode_v3_full_field_schema(schema, &mut schema_encoding)?;
+    } else if let Some(parent_slots) = parent_slots_for_generic_i64_schema(schema) {
         put_u8(&mut schema_encoding, SCHEMA_ENCODING_NAMED_PARENT_VECTOR);
         put_string(&mut schema_encoding, &schema.name)?;
         put_u32_le(&mut schema_encoding, schema.schema_id);
@@ -1335,14 +2040,37 @@ pub(crate) fn decode_schema_block(reader: &mut ByteReader<'_>) -> Result<SchemaD
             decode_named_parent_vector_schema(&mut schema_reader)?
         }
         SCHEMA_ENCODING_NAMED_FULL_FIELDS => decode_named_full_field_schema(&mut schema_reader)?,
+        SCHEMA_ENCODING_V3_NAMED_FULL_FIELDS => {
+            decode_v3_named_full_field_schema(&mut schema_reader)?
+        }
         _ => return Err(AuraError::InvalidValue("schema encoding")),
     };
     schema_reader.finish()?;
     Ok(schema)
 }
 
+/// Encode one independently length-prefixed full schema descriptor block.
+///
+/// A v3 block is the authoritative in-file declaration of field names, logical
+/// types, roles, scales, and nullability.
+pub fn encode_schema_descriptor(schema: &SchemaDescriptor) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_schema_block(schema, &mut out)?;
+    Ok(out)
+}
+
+/// Decode one independently length-prefixed schema descriptor block.
+pub fn decode_schema_descriptor(bytes: &[u8]) -> Result<SchemaDescriptor> {
+    let mut reader = ByteReader::new(bytes);
+    let schema = decode_schema_block(&mut reader)?;
+    reader.finish()?;
+    Ok(schema)
+}
+
 fn parent_slots_for_generic_i64_schema(schema: &SchemaDescriptor) -> Option<Vec<u8>> {
-    if !schema.derived_expressions.is_empty() || schema.fields.iter().any(|field| field.scale != 0)
+    if schema.encoding_version != SchemaEncodingVersion::V2
+        || !schema.derived_expressions.is_empty()
+        || schema.fields.iter().any(|field| field.scale != 0)
     {
         return None;
     }
@@ -1435,6 +2163,45 @@ fn encode_full_field_schema_payload(schema: &SchemaDescriptor, out: &mut Vec<u8>
     Ok(())
 }
 
+fn encode_v3_full_field_schema(schema: &SchemaDescriptor, out: &mut Vec<u8>) -> Result<()> {
+    put_u8(out, SCHEMA_ENCODING_V3_NAMED_FULL_FIELDS);
+    put_string(out, &schema.name)?;
+    put_u32_le(out, schema.schema_id);
+    put_u32_len(out, schema.fields.len(), "schema field count")?;
+    for field in &schema.fields {
+        encode_field_descriptor(field, out)?;
+    }
+    let mapping = schema
+        .compact_schema_map
+        .as_deref()
+        .ok_or(AuraError::InvalidValue("v3 schema mapping"))?;
+    put_u32_len(out, mapping.len(), "schema mapping length")?;
+    out.extend_from_slice(mapping);
+    let expressions = encode_derived_expression_table(&schema.derived_expressions)?;
+    put_u32_len(out, expressions.len(), "derived expression length")?;
+    out.extend_from_slice(&expressions);
+    let groups = encode_group_descriptor_table(&schema.groups)?;
+    put_u32_len(out, groups.len(), "group descriptor length")?;
+    out.extend_from_slice(&groups);
+    Ok(())
+}
+
+fn encode_field_descriptor(field: &FieldDescriptor, out: &mut Vec<u8>) -> Result<()> {
+    put_u16_le(out, field.index);
+    put_u8(out, field.field_type as u8);
+    put_u8(out, field.role as u8);
+    put_u8(out, field.scale as u8);
+    put_u8(out, field.scope as u8);
+    put_u8(out, field.nullable as u8);
+    put_u8(out, field.relation.kind_code());
+    put_u16_le(
+        out,
+        field.relation.related_field_index().unwrap_or(u16::MAX),
+    );
+    put_u16_le(out, field.candidates.bits());
+    put_string(out, &field.name)
+}
+
 fn decode_full_field_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
     decode_full_field_schema_with_name(reader, DECODED_SCHEMA_NAME, None)
 }
@@ -1443,6 +2210,78 @@ fn decode_named_full_field_schema(reader: &mut ByteReader<'_>) -> Result<SchemaD
     let name = read_string(reader)?;
     let schema_id = reader.read_u32_le()?;
     decode_full_field_schema_with_name(reader, &name, Some(schema_id))
+}
+
+fn decode_v3_named_full_field_schema(reader: &mut ByteReader<'_>) -> Result<SchemaDescriptor> {
+    let name = read_string(reader)?;
+    let schema_id = reader.read_u32_le()?;
+    let field_count = reader.read_u32_le()? as usize;
+    // Every field requires at least its fixed 14 bytes, including an empty name.
+    if field_count > reader.remaining() / 14 || field_count > u16::MAX as usize {
+        return Err(AuraError::InvalidValue("schema field count"));
+    }
+    let mut fields = Vec::with_capacity(field_count);
+    for _ in 0..field_count {
+        fields.push(decode_field_descriptor(reader)?);
+    }
+    let mapping_len = reader.read_u32_le()? as usize;
+    if mapping_len != field_count || mapping_len > reader.remaining() {
+        return Err(AuraError::InvalidValue("schema mapping length"));
+    }
+    let compact_schema_map = Some(reader.read_exact(mapping_len)?.to_vec());
+    let expression_len = reader.read_u32_le()? as usize;
+    if expression_len > reader.remaining() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let derived_expressions = decode_derived_expression_table(reader.read_exact(expression_len)?)?;
+    let group_len = reader.read_u32_le()? as usize;
+    if group_len > reader.remaining() {
+        return Err(AuraError::UnexpectedEof);
+    }
+    let groups = decode_group_descriptor_table(reader.read_exact(group_len)?)?;
+    let mut schema = SchemaDescriptor {
+        schema_id,
+        encoding_version: SchemaEncodingVersion::V3,
+        name,
+        fields,
+        compact_schema_map,
+        derived_expressions,
+        groups,
+    };
+    schema.validate()?;
+    if schema_hash_for_version(&schema) != schema_id {
+        return Err(AuraError::InvalidValue("schema id"));
+    }
+    schema.schema_id = schema_id;
+    Ok(schema)
+}
+
+fn decode_field_descriptor(reader: &mut ByteReader<'_>) -> Result<FieldDescriptor> {
+    let index = reader.read_u16_le()?;
+    let field_type = FieldType::from_code(reader.read_u8()?)?;
+    let role = FieldRole::from_code(reader.read_u8()?)?;
+    let scale = reader.read_u8()? as i8;
+    let scope = FieldScope::from_code(reader.read_u8()?)?;
+    let nullable = match reader.read_u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(AuraError::InvalidValue("field nullable")),
+    };
+    let relation_kind = reader.read_u8()?;
+    let related_field_index = reader.read_u16_le()?;
+    let candidates = TransformCandidates::from_bits(reader.read_u16_le()?)?;
+    let name = read_string(reader)?;
+    Ok(FieldDescriptor {
+        index,
+        name,
+        field_type,
+        role,
+        scale,
+        scope,
+        nullable,
+        relation: FieldRelation::from_codes(relation_kind, related_field_index)?,
+        candidates,
+    })
 }
 
 fn decode_full_field_schema_with_name(
@@ -1509,6 +2348,8 @@ fn schema_from_fields(
         &fields,
         compact_schema_map.as_deref(),
         &derived_expressions,
+        SchemaEncodingVersion::V2,
+        &[],
     )?;
     Ok(SchemaDescriptor {
         schema_id: schema_hash(
@@ -1517,10 +2358,12 @@ fn schema_from_fields(
             compact_schema_map.as_deref(),
             &derived_expressions,
         ),
+        encoding_version: SchemaEncodingVersion::V2,
         name: name.to_owned(),
         fields,
         compact_schema_map,
         derived_expressions,
+        groups: Vec::new(),
     })
 }
 
@@ -1528,6 +2371,8 @@ fn validate_schema_derived_expressions(
     fields: &[FieldDescriptor],
     compact_schema_map: Option<&[u8]>,
     derived_expressions: &[DerivedExpression],
+    encoding_version: SchemaEncodingVersion,
+    groups: &[GroupDescriptor],
 ) -> Result<()> {
     validate_derived_expressions(derived_expressions)?;
     let field_count = fields.len();
@@ -1592,7 +2437,11 @@ fn validate_schema_derived_expressions(
     }
 
     if let Some(compact_schema_map) = compact_schema_map {
-        validate_compact_expression_refs(compact_schema_map, derived_expressions)?;
+        let entries = match encoding_version {
+            SchemaEncodingVersion::V2 => decode_schema_map(compact_schema_map)?,
+            SchemaEncodingVersion::V3 => decode_v3_schema_map(compact_schema_map, groups)?,
+        };
+        validate_compact_expression_refs(&entries, derived_expressions)?;
     }
     validate_expression_graph(derived_expressions)
 }
@@ -1648,10 +2497,9 @@ fn validate_expression_shape(expression: &DerivedExpression) -> Result<()> {
 }
 
 fn validate_compact_expression_refs(
-    compact_schema_map: &[u8],
+    entries: &[SchemaMapEntry],
     derived_expressions: &[DerivedExpression],
 ) -> Result<()> {
-    let entries = decode_schema_map(compact_schema_map)?;
     let expressions_by_id = derived_expressions
         .iter()
         .map(|expression| (expression.expression_id, expression))
@@ -1841,6 +2689,47 @@ fn schema_hash(
         }
         for literal in &expression.literals {
             update_hash(&mut hash, &literal.to_le_bytes());
+        }
+    }
+    hash
+}
+
+fn schema_hash_for_version(schema: &SchemaDescriptor) -> u32 {
+    let mut hash = schema_hash(
+        &schema.name,
+        &schema.fields,
+        schema.compact_schema_map.as_deref(),
+        &schema.derived_expressions,
+    );
+    if schema.encoding_version == SchemaEncodingVersion::V3 {
+        update_hash(&mut hash, b"AuraSchemaV3\0");
+        let mut groups = schema.groups.iter().collect::<Vec<_>>();
+        groups.sort_by_key(|group| group.group_id);
+        update_hash(&mut hash, &(groups.len() as u32).to_le_bytes());
+        for group in groups {
+            update_hash(&mut hash, &group.group_id.to_le_bytes());
+            update_hash(
+                &mut hash,
+                &[
+                    group.kind as u8,
+                    group.relationships.bits(),
+                    u8::from(group.dual_domain.is_some()),
+                ],
+            );
+            match group.dual_domain {
+                Some(dual) => {
+                    update_hash(&mut hash, &[dual.domain_count]);
+                    update_hash(&mut hash, &dual.discriminator_slot.to_le_bytes());
+                }
+                None => {
+                    update_hash(&mut hash, &[0]);
+                    update_hash(&mut hash, &u16::MAX.to_le_bytes());
+                }
+            }
+            update_hash(&mut hash, &(group.child_slots.len() as u32).to_le_bytes());
+            for child_slot in &group.child_slots {
+                update_hash(&mut hash, &child_slot.to_le_bytes());
+            }
         }
     }
     hash

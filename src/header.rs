@@ -1,11 +1,18 @@
 use std::collections::BTreeSet;
 
-use crate::bytes::{put_i64_le, put_u16_le, put_u8, ByteReader};
+use crate::bytes::{put_i64_le, put_u16_le, put_u32_le, put_u8, ByteReader};
+pub use crate::format::MAX_V3_HEADER_BYTES;
 use crate::format::{AuraContainerVersion, AURA_MAGIC, DEFAULT_CONTAINER_VERSION};
+use crate::schema::{
+    decode_group_descriptor_table, encode_group_descriptor_table, validate_v3_header_schema,
+    GroupDescriptor,
+};
 use crate::{AuraError, Profile, Result};
 
 pub const HEADER_PREFIX_SIZE: usize = 25;
 pub const LEGACY_HEADER_PREFIX_SIZE: usize = 22;
+/// Exact prefix size of the authoritative Aura v3 front-header layout.
+pub const V3_HEADER_PREFIX_SIZE: usize = 39;
 const HEADER_LEN_OFFSET: usize = 7;
 const HEADER_LEN_END: usize = 9;
 const DERIVED_EXPRESSION_ID_MIN: u8 = 1;
@@ -158,6 +165,12 @@ impl DerivedExpression {
 }
 
 /// Front Aura file header. The body starts at `header_len`.
+///
+/// In v3, this front header is authoritative for field relationships, derived
+/// expressions, and group membership. It does not define authoritative field
+/// names, logical types, roles, scales, or nullability; those belong to the
+/// full v3 schema block (encoding tag 4), or canonical external schema JSON
+/// before the file is sealed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuraHeader {
     pub container_version: AuraContainerVersion,
@@ -167,6 +180,7 @@ pub struct AuraHeader {
     pub base_time_ns: i64,
     pub schema_mapping: Vec<u8>,
     pub derived_expressions: Vec<DerivedExpression>,
+    pub groups: Vec<GroupDescriptor>,
     pub comment: String,
 }
 
@@ -180,6 +194,7 @@ impl AuraHeader {
             base_time_ns: 0,
             schema_mapping: Vec::new(),
             derived_expressions: Vec::new(),
+            groups: Vec::new(),
             comment: String::new(),
         }
     }
@@ -201,7 +216,7 @@ impl AuraHeader {
     }
 
     pub fn with_schema_mapping(mut self, schema_mapping: Vec<u8>) -> Result<Self> {
-        validate_header_lengths(
+        self.validate_builder_lengths(
             schema_mapping.len(),
             derived_expression_table_len(&self.derived_expressions)?,
             self.comment.len(),
@@ -215,7 +230,7 @@ impl AuraHeader {
         derived_expressions: Vec<DerivedExpression>,
     ) -> Result<Self> {
         validate_derived_expressions(&derived_expressions)?;
-        validate_header_lengths(
+        self.validate_builder_lengths(
             self.schema_mapping.len(),
             derived_expression_table_len(&derived_expressions)?,
             self.comment.len(),
@@ -224,9 +239,23 @@ impl AuraHeader {
         Ok(self)
     }
 
+    pub fn with_groups(mut self, groups: Vec<GroupDescriptor>) -> Result<Self> {
+        // The standalone encoder performs descriptor-only validation without
+        // making builder call order significant.
+        encode_group_descriptor_table(&groups)?;
+        self.groups = groups;
+        self.groups.sort_by_key(|group| group.group_id);
+        self.validate_builder_lengths(
+            self.schema_mapping.len(),
+            derived_expression_table_len(&self.derived_expressions)?,
+            self.comment.len(),
+        )?;
+        Ok(self)
+    }
+
     pub fn with_comment(mut self, comment: impl Into<String>) -> Result<Self> {
         let comment = comment.into();
-        validate_header_lengths(
+        self.validate_builder_lengths(
             self.schema_mapping.len(),
             derived_expression_table_len(&self.derived_expressions)?,
             comment.len(),
@@ -235,23 +264,80 @@ impl AuraHeader {
         Ok(self)
     }
 
+    fn validate_builder_lengths(
+        &self,
+        schema_len: usize,
+        expression_len: usize,
+        comment_len: usize,
+    ) -> Result<()> {
+        match self.container_version {
+            AuraContainerVersion::V3 => {
+                let group_len = encode_group_descriptor_table(&self.groups)?.len();
+                for (len, name) in [
+                    (schema_len, "schema mapping length"),
+                    (expression_len, "derived expression length"),
+                    (group_len, "group descriptor length"),
+                    (comment_len, "header comment length"),
+                ] {
+                    u32::try_from(len).map_err(|_| AuraError::InvalidValue(name))?;
+                }
+                V3_HEADER_PREFIX_SIZE
+                    .checked_add(schema_len)
+                    .and_then(|len| len.checked_add(expression_len))
+                    .and_then(|len| len.checked_add(group_len))
+                    .and_then(|len| len.checked_add(comment_len))
+                    .and_then(|len| u32::try_from(len).ok())
+                    .filter(|len| (*len as usize) <= MAX_V3_HEADER_BYTES)
+                    .ok_or(AuraError::InvalidValue("header length"))?;
+                Ok(())
+            }
+            AuraContainerVersion::LegacyV1 | AuraContainerVersion::V2 => {
+                validate_header_lengths(schema_len, expression_len, comment_len)
+            }
+        }
+    }
+
     pub fn header_len(&self) -> usize {
-        HEADER_PREFIX_SIZE
-            + self.schema_mapping.len()
-            + derived_expression_table_len(&self.derived_expressions).unwrap_or(usize::MAX)
-            + self.comment.len()
+        match self.container_version {
+            AuraContainerVersion::V3 => V3_HEADER_PREFIX_SIZE
+                .checked_add(self.schema_mapping.len())
+                .and_then(|len| {
+                    len.checked_add(
+                        derived_expression_table_len(&self.derived_expressions)
+                            .unwrap_or(usize::MAX),
+                    )
+                })
+                .and_then(|len| {
+                    len.checked_add(
+                        encode_group_descriptor_table(&self.groups)
+                            .map_or(usize::MAX, |table| table.len()),
+                    )
+                })
+                .and_then(|len| len.checked_add(self.comment.len()))
+                .unwrap_or(usize::MAX),
+            AuraContainerVersion::LegacyV1 | AuraContainerVersion::V2 => {
+                HEADER_PREFIX_SIZE
+                    + self.schema_mapping.len()
+                    + derived_expression_table_len(&self.derived_expressions).unwrap_or(usize::MAX)
+                    + self.comment.len()
+            }
+        }
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         match self.container_version {
             AuraContainerVersion::V2 => self.encode_v2(),
-            AuraContainerVersion::LegacyV1 | AuraContainerVersion::V3 => Err(
-                AuraError::UnsupportedVersion(self.container_version.wire_value()),
-            ),
+            AuraContainerVersion::V3 => self.encode_v3(),
+            AuraContainerVersion::LegacyV1 => Err(AuraError::UnsupportedVersion(
+                self.container_version.wire_value(),
+            )),
         }
     }
 
     fn encode_v2(&self) -> Result<Vec<u8>> {
+        if !self.groups.is_empty() {
+            return Err(AuraError::InvalidValue("v2 header groups"));
+        }
         validate_derived_expressions(&self.derived_expressions)?;
         let derived_expression_table = encode_derived_expression_table(&self.derived_expressions)?;
         validate_header_lengths(
@@ -285,6 +371,56 @@ impl AuraHeader {
         Ok(out)
     }
 
+    fn encode_v3(&self) -> Result<Vec<u8>> {
+        validate_derived_expressions(&self.derived_expressions)?;
+        validate_v3_header_schema(
+            &self.schema_mapping,
+            &self.groups,
+            &self.derived_expressions,
+        )?;
+        let expression_table = encode_derived_expression_table(&self.derived_expressions)?;
+        let group_table = encode_group_descriptor_table(&self.groups)?;
+        let header_len = V3_HEADER_PREFIX_SIZE
+            .checked_add(self.schema_mapping.len())
+            .and_then(|len| len.checked_add(expression_table.len()))
+            .and_then(|len| len.checked_add(group_table.len()))
+            .and_then(|len| len.checked_add(self.comment.len()))
+            .ok_or(AuraError::InvalidValue("header length"))?;
+        if header_len > MAX_V3_HEADER_BYTES {
+            return Err(AuraError::InvalidValue("header length"));
+        }
+        let header_len =
+            u32::try_from(header_len).map_err(|_| AuraError::InvalidValue("header length"))?;
+        let schema_len = u32::try_from(self.schema_mapping.len())
+            .map_err(|_| AuraError::InvalidValue("schema mapping length"))?;
+        let expression_len = u32::try_from(expression_table.len())
+            .map_err(|_| AuraError::InvalidValue("derived expression length"))?;
+        let group_len = u32::try_from(group_table.len())
+            .map_err(|_| AuraError::InvalidValue("group descriptor length"))?;
+        let comment_len = u32::try_from(self.comment.len())
+            .map_err(|_| AuraError::InvalidValue("header comment length"))?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(header_len as usize)
+            .map_err(|_| AuraError::InvalidValue("header allocation"))?;
+        out.extend_from_slice(AURA_MAGIC);
+        put_u16_le(&mut out, self.container_version.wire_value());
+        put_u8(&mut out, self.profile as u8);
+        put_u32_le(&mut out, header_len);
+        put_i64_le(&mut out, self.base_time_ns);
+        put_u16_le(&mut out, self.stream_id);
+        put_u16_le(&mut out, self.dictionary_id);
+        put_u32_le(&mut out, schema_len);
+        put_u32_le(&mut out, expression_len);
+        put_u32_le(&mut out, group_len);
+        put_u32_le(&mut out, comment_len);
+        out.extend_from_slice(&self.schema_mapping);
+        out.extend_from_slice(&expression_table);
+        out.extend_from_slice(&group_table);
+        out.extend_from_slice(self.comment.as_bytes());
+        debug_assert_eq!(header_len as usize, out.len());
+        Ok(out)
+    }
+
     pub fn encoded_len(bytes: &[u8]) -> Result<usize> {
         if bytes.len() < HEADER_LEN_OFFSET + 1 {
             return Err(AuraError::UnexpectedEof);
@@ -307,7 +443,7 @@ impl AuraHeader {
                     bytes[HEADER_LEN_OFFSET + 1],
                 ])))
             }
-            AuraContainerVersion::V3 => Self::encoded_len_v3(version),
+            AuraContainerVersion::V3 => Self::encoded_len_v3(bytes),
         }
     }
 
@@ -345,20 +481,75 @@ impl AuraHeader {
                     true,
                 )
             }
-            AuraContainerVersion::V3 => Self::decode_v3(container_version),
+            AuraContainerVersion::V3 => Self::decode_v3(reader, bytes, container_version),
         }
     }
 
-    fn encoded_len_v3(container_version: AuraContainerVersion) -> Result<usize> {
-        Err(AuraError::UnsupportedVersion(
-            container_version.wire_value(),
-        ))
+    fn encoded_len_v3(bytes: &[u8]) -> Result<usize> {
+        if bytes.len() < 11 {
+            return Err(AuraError::UnexpectedEof);
+        }
+        let header_len = u32::from_le_bytes(bytes[7..11].try_into().unwrap()) as usize;
+        if header_len < V3_HEADER_PREFIX_SIZE {
+            return Err(AuraError::InvalidValue("header length"));
+        }
+        if header_len > MAX_V3_HEADER_BYTES {
+            return Err(AuraError::InvalidValue("header length"));
+        }
+        Ok(header_len)
     }
 
-    fn decode_v3(container_version: AuraContainerVersion) -> Result<Self> {
-        Err(AuraError::UnsupportedVersion(
-            container_version.wire_value(),
-        ))
+    fn decode_v3(
+        mut reader: ByteReader<'_>,
+        bytes: &[u8],
+        container_version: AuraContainerVersion,
+    ) -> Result<Self> {
+        let profile = Profile::from_byte(reader.read_u8()?)?;
+        let header_len = reader.read_u32_le()? as usize;
+        if header_len != bytes.len()
+            || !(V3_HEADER_PREFIX_SIZE..=MAX_V3_HEADER_BYTES).contains(&header_len)
+        {
+            return Err(AuraError::InvalidValue("header length"));
+        }
+        let base_time_ns = reader.read_i64_le()?;
+        let stream_id = reader.read_u16_le()?;
+        let dictionary_id = reader.read_u16_le()?;
+        let schema_len = reader.read_u32_le()? as usize;
+        let expression_len = reader.read_u32_le()? as usize;
+        let group_len = reader.read_u32_le()? as usize;
+        let comment_len = reader.read_u32_le()? as usize;
+        let payload_len = schema_len
+            .checked_add(expression_len)
+            .and_then(|len| len.checked_add(group_len))
+            .and_then(|len| len.checked_add(comment_len))
+            .ok_or(AuraError::InvalidValue("header length"))?;
+        if V3_HEADER_PREFIX_SIZE.checked_add(payload_len) != Some(header_len) {
+            return Err(AuraError::InvalidValue("header length"));
+        }
+        // All four lengths are checked against the complete header before any
+        // length-controlled owned allocation occurs.
+        let schema_bytes = reader.read_exact(schema_len)?;
+        let expression_bytes = reader.read_exact(expression_len)?;
+        let group_bytes = reader.read_exact(group_len)?;
+        let comment_bytes = reader.read_exact(comment_len)?;
+        reader.finish()?;
+        let derived_expressions = decode_derived_expression_table(expression_bytes)?;
+        let groups = decode_group_descriptor_table(group_bytes)?;
+        validate_v3_header_schema(schema_bytes, &groups, &derived_expressions)?;
+        let comment = std::str::from_utf8(comment_bytes)
+            .map_err(|_| AuraError::InvalidValue("header comment"))?
+            .to_owned();
+        Ok(Self {
+            container_version,
+            profile,
+            stream_id,
+            dictionary_id,
+            base_time_ns,
+            schema_mapping: schema_bytes.to_vec(),
+            derived_expressions,
+            groups,
+            comment,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -403,6 +594,7 @@ impl AuraHeader {
             base_time_ns,
             schema_mapping,
             derived_expressions,
+            groups: Vec::new(),
             comment,
         })
     }
@@ -687,29 +879,19 @@ mod tests {
     }
 
     #[test]
-    fn v3_header_layout_is_an_explicit_unsupported_skeleton() {
-        let mut encoded = AuraHeader::new(Profile::Aura0).encode().unwrap();
-        encoded[4..6].copy_from_slice(&AuraContainerVersion::V3.wire_value().to_le_bytes());
+    fn v3_header_layout_is_distinct_from_v2() {
+        let encoded = AuraHeader::new(Profile::Aura0)
+            .with_container_version(AuraContainerVersion::V3)
+            .with_schema_mapping(vec![100, 0])
+            .unwrap()
+            .encode()
+            .unwrap();
 
+        assert_eq!(AuraHeader::encoded_len(&encoded), Ok(encoded.len()));
+        assert_eq!(V3_HEADER_PREFIX_SIZE + 2 + 3, encoded.len());
         assert_eq!(
-            AuraHeader::encoded_len(&encoded),
-            Err(AuraError::UnsupportedVersion(3))
-        );
-        assert_eq!(
-            AuraHeader::decode(&encoded),
-            Err(AuraError::UnsupportedVersion(3))
-        );
-        encoded[6] = u8::MAX;
-        assert_eq!(
-            AuraHeader::decode(&encoded),
-            Err(AuraError::UnsupportedVersion(3)),
-            "V3 dispatch must occur before parsing V2 profile/layout bytes"
-        );
-        assert_eq!(
-            AuraHeader::new(Profile::Aura0)
-                .with_container_version(AuraContainerVersion::V3)
-                .encode(),
-            Err(AuraError::UnsupportedVersion(3))
+            AuraContainerVersion::V3,
+            AuraHeader::decode(&encoded).unwrap().container_version
         );
     }
 }

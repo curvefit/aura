@@ -9,7 +9,8 @@ use crate::generic_planner::validate_generic_plan_schema_authorization;
 use crate::instructions::GenericInstructionPlan;
 use crate::plan::{Aura0Plan, Aura1Plan, FieldEncoding, PhysicalFieldPlan};
 use crate::schema::{
-    decode_schema_block, encode_schema_block, AuraSchema, FieldType, SchemaDescriptor,
+    decode_schema_block, encode_schema_block, validate_schema_container_compatibility, AuraSchema,
+    FieldType, SchemaDescriptor,
 };
 use crate::stats::PhysicalWidth;
 use crate::{AuraError, Result};
@@ -801,6 +802,7 @@ impl CompiledFooter {
     }
 
     fn encode_v2(&self) -> Result<Vec<u8>> {
+        validate_schema_container_compatibility(&self.schema, self.container_version)?;
         let mut out = Vec::new();
         out.extend_from_slice(COMPILED_FOOTER_MAGIC);
         put_u16_le(&mut out, self.container_version.wire_value());
@@ -849,6 +851,7 @@ impl CompiledFooter {
         let record_count = reader.read_u64_le()?;
         let block_capacity = reader.read_u16_le()?;
         let schema = decode_schema_block(&mut reader)?;
+        validate_schema_container_compatibility(&schema, container_version)?;
         let aura0_program = DecodeProgram::decode_from(&mut reader)?;
         let aura1_program = DecodeProgram::decode_from(&mut reader)?;
         let generic_aura0_plan = decode_generic_plan(&mut reader)?;
