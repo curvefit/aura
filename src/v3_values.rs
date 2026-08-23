@@ -471,32 +471,113 @@ pub fn canonical_v3_batch_sha256(
     batch: &AuraV3Batch,
     limits: V3ValueLimits,
 ) -> Result<[u8; 32]> {
-    validate_v3_batch(schema, batch, limits)?;
-    let schema_fingerprint = canonical_v3_schema_fingerprint(schema)?;
-    let mut hasher = Sha256::new();
-    hasher.update(HASH_DOMAIN);
-    hasher.update(batch.schema_id.to_le_bytes());
-    hasher.update(schema_fingerprint);
-    hasher.update(batch.row_count.to_le_bytes());
-    hasher.update(
-        u32::try_from(batch.columns.len())
-            .map_err(|_| AuraError::InvalidValue("v3 value column count"))?
-            .to_le_bytes(),
-    );
-    for row in 0..usize::try_from(batch.row_count)
-        .map_err(|_| AuraError::InvalidValue("v3 value row count"))?
-    {
-        for column in &batch.columns {
-            hasher.update(column.slot.to_le_bytes());
-            hasher.update([column.values.field_type() as u8]);
-            let present = is_present(column.validity.as_deref(), row);
-            hasher.update([u8::from(present)]);
-            if present {
-                hash_present_value(&mut hasher, &column.values, row)?;
+    let mut hasher = CanonicalV3RowHasher::new(schema, batch.row_count, limits)?;
+    hasher.update_batch(schema, batch)?;
+    hasher.finalize()
+}
+
+/// Incremental form of the canonical V3 logical-row hash.
+///
+/// The total row count is committed before any rows, so callers must know it
+/// when constructing the hasher. Batches can then be supplied in file order
+/// without retaining earlier decoded rows.
+#[derive(Clone)]
+pub struct CanonicalV3RowHasher {
+    hasher: Sha256,
+    schema_id: u32,
+    schema_fingerprint: [u8; 32],
+    column_count: usize,
+    total_rows: u32,
+    hashed_rows: u32,
+    limits: V3ValueLimits,
+}
+
+pub type V3CanonicalRowHasher = CanonicalV3RowHasher;
+
+impl core::fmt::Debug for CanonicalV3RowHasher {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("CanonicalV3RowHasher")
+            .field("schema_id", &self.schema_id)
+            .field("column_count", &self.column_count)
+            .field("total_rows", &self.total_rows)
+            .field("hashed_rows", &self.hashed_rows)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CanonicalV3RowHasher {
+    pub fn new(schema: &SchemaDescriptor, total_rows: u32, limits: V3ValueLimits) -> Result<Self> {
+        let limits = limits.effective();
+        validate_flat_v3_schema(schema)?;
+        if usize::try_from(total_rows).map_err(|_| AuraError::InvalidValue("v3 value row count"))?
+            > limits.max_rows
+        {
+            return Err(AuraError::InvalidValue("v3 value row count"));
+        }
+        let schema_fingerprint = canonical_v3_schema_fingerprint(schema)?;
+        let column_count = schema.fields.len();
+        let mut hasher = Sha256::new();
+        hasher.update(HASH_DOMAIN);
+        hasher.update(schema.schema_id.to_le_bytes());
+        hasher.update(schema_fingerprint);
+        hasher.update(total_rows.to_le_bytes());
+        hasher.update(
+            u32::try_from(column_count)
+                .map_err(|_| AuraError::InvalidValue("v3 value column count"))?
+                .to_le_bytes(),
+        );
+        Ok(Self {
+            hasher,
+            schema_id: schema.schema_id,
+            schema_fingerprint,
+            column_count,
+            total_rows,
+            hashed_rows: 0,
+            limits,
+        })
+    }
+
+    pub const fn hashed_rows(&self) -> u32 {
+        self.hashed_rows
+    }
+
+    pub fn update_batch(&mut self, schema: &SchemaDescriptor, batch: &AuraV3Batch) -> Result<()> {
+        validate_v3_batch(schema, batch, self.limits)?;
+        if schema.schema_id != self.schema_id
+            || schema.fields.len() != self.column_count
+            || canonical_v3_schema_fingerprint(schema)? != self.schema_fingerprint
+        {
+            return Err(AuraError::InvalidValue("v3 canonical hash schema"));
+        }
+        let next_rows = self
+            .hashed_rows
+            .checked_add(batch.row_count)
+            .filter(|rows| *rows <= self.total_rows)
+            .ok_or(AuraError::InvalidValue("v3 canonical hash row count"))?;
+        for row in 0..usize::try_from(batch.row_count)
+            .map_err(|_| AuraError::InvalidValue("v3 value row count"))?
+        {
+            for column in &batch.columns {
+                self.hasher.update(column.slot.to_le_bytes());
+                self.hasher.update([column.values.field_type() as u8]);
+                let present = is_present(column.validity.as_deref(), row);
+                self.hasher.update([u8::from(present)]);
+                if present {
+                    hash_present_value(&mut self.hasher, &column.values, row)?;
+                }
             }
         }
+        self.hashed_rows = next_rows;
+        Ok(())
     }
-    Ok(hasher.finalize().into())
+
+    pub fn finalize(self) -> Result<[u8; 32]> {
+        if self.hashed_rows != self.total_rows {
+            return Err(AuraError::InvalidValue("v3 canonical hash row count"));
+        }
+        Ok(self.hasher.finalize().into())
+    }
 }
 
 fn validate_flat_v3_schema(schema: &SchemaDescriptor) -> Result<()> {

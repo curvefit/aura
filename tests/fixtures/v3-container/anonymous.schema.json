@@ -1,0 +1,98 @@
+{
+  "schema_format": "aura-schema",
+  "schema_version": 1,
+  "schema_encoding": "v3",
+  "name": "anonymous_flat_events",
+  "schema_id": 3211208780,
+  "fields": [
+    {
+      "id": 0,
+      "name": "ts",
+      "type": "timestamp_ms",
+      "role": "timestamp",
+      "scale": 0,
+      "scope": "event",
+      "nullable": false,
+      "relation": {
+        "kind": "none"
+      },
+      "transform_candidates": [
+        "absolute",
+        "delta_base",
+        "delta_previous",
+        "fixed_step",
+        "rough_step"
+      ]
+    },
+    {
+      "id": 1,
+      "name": "seq",
+      "type": "u64",
+      "role": "sequence",
+      "scale": 0,
+      "scope": "event",
+      "nullable": true,
+      "relation": {
+        "kind": "none"
+      },
+      "transform_candidates": [
+        "absolute",
+        "delta_base",
+        "delta_previous",
+        "delta2",
+        "midpoint",
+        "zigzag_varint",
+        "bitpack"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "is_sell",
+      "type": "u8",
+      "role": "boolean",
+      "scale": 0,
+      "scope": "event",
+      "nullable": true,
+      "relation": {
+        "kind": "none"
+      },
+      "transform_candidates": [
+        "absolute",
+        "delta_base",
+        "bitpack"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "symbol",
+      "type": "utf8",
+      "role": "identifier",
+      "scale": 0,
+      "scope": "event",
+      "nullable": false,
+      "relation": {
+        "kind": "none"
+      },
+      "transform_candidates": [
+        "absolute"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "price",
+      "type": "decimal_text",
+      "role": "price",
+      "scale": 0,
+      "scope": "event",
+      "nullable": true,
+      "relation": {
+        "kind": "none"
+      },
+      "transform_candidates": [
+        "absolute"
+      ]
+    }
+  ],
+  "groups": [],
+  "derived_expressions": []
+}

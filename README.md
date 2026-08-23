@@ -65,11 +65,13 @@ cargo test
 cargo run --bin aura -- schema validate --input schema.json
 cargo run --bin aura -- schema canonicalize --input schema.json --output canonical-schema.json
 cargo run --bin aura -- shadow handshake --protocol aura-logical-arrow-ipc-v1 --json
+cargo test --test v3_aura0_container
 cargo run --bin aura-size -- 10000 1 8
 cargo run --example roundtrip
 ```
 
-The current code is experimental. Complete files still use the V2 container.
-The V3 schema/header, canonical external schema JSON, and standalone value block
-are offline shadow/reference contracts only. They do not enable complete V3 or
-Aura0 output. Aura0 is not yet ready to replace Parquet in Grimoire.
+The current code is experimental. Production writers still emit V2. A dedicated
+decode-first API now verifies one complete V3 Aura0 subset: flat event schemas
+with uncompressed exact-value blocks. There is not yet a public V3 writer, CLI,
+grouped/Flag-200 body, or optimized physical plan. Aura0 is therefore not ready
+to replace Parquet in Grimoire.

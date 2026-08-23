@@ -33,6 +33,7 @@ pub mod shadow_protocol;
 pub mod source;
 pub mod stats;
 pub mod types;
+pub mod v3_container;
 pub mod v3_values;
 pub mod varint;
 pub mod writer;
@@ -110,12 +111,24 @@ pub use types::{
     AuraBatch, AuraColumn, AuraColumnBatch, AuraColumnBatchBuilder, AuraRecordBatch,
     AuraTypedValue, AuraValue, Profile,
 };
+pub use v3_container::{
+    decode_any_compiled_footer, decode_v3_aura0_file, decode_v3_aura0_footer, decode_v3_flat_aura0,
+    decode_v3_flat_aura0_with_limits, decode_v3_flat_footer, decode_v3_flat_footer_with_limits,
+    encode_v3_aura0_footer, encode_v3_flat_footer, v3_flat_body_sha256, v3_flat_header_sha256,
+    AnyCompiledFooter, DecodedV3Aura0File, DecodedV3FlatAura0, V3Aura0ChunkDescriptor,
+    V3Aura0ColumnStats, V3Aura0Footer, V3FlatChunkDescriptor, V3FlatColumnStats, V3FlatFooter,
+    V3FlatLimits, DEFAULT_V3_FLAT_IN_MEMORY_BODY_BYTES, DEFAULT_V3_FLAT_IN_MEMORY_CHUNKS,
+    DEFAULT_V3_FLAT_IN_MEMORY_ROWS, DEFAULT_V3_FLAT_VALUE_BLOCK_BYTES, MAX_V3_FLAT_BODY_BYTES,
+    MAX_V3_FLAT_CHUNKS, MAX_V3_FLAT_FOOTER_BYTES, MAX_V3_FLAT_ROWS, MAX_V3_FLAT_SCHEMA_BYTES,
+    V3_FLAT_BODY_ENCODING_EXACT_BLOCKS, V3_FLAT_CHUNK_DESCRIPTOR_BYTES,
+    V3_FLAT_FOOTER_LAYOUT_VERSION, V3_FLAT_FOOTER_PREFIX_BYTES, V3_FLAT_STATS_DESCRIPTOR_BYTES,
+};
 pub use v3_values::{
     canonical_v3_batch_sha256, canonical_v3_schema_fingerprint, decode_v3_value_block,
     encode_v3_value_block, validate_decimal_text_v1, validate_v3_batch, AuraV3Batch, AuraV3Column,
-    AuraV3ColumnValues, AuraV3ValueRef, AuraV3VariableColumn, V3ValueLimits,
-    MAX_V3_SCHEMA_DESCRIPTOR_BYTES, MAX_V3_VALUE_BLOCK_BYTES, MAX_V3_VALUE_ROWS,
-    MAX_V3_VARIABLE_VALUE_BYTES,
+    AuraV3ColumnValues, AuraV3ValueRef, AuraV3VariableColumn, CanonicalV3RowHasher,
+    V3CanonicalRowHasher, V3ValueLimits, MAX_V3_SCHEMA_DESCRIPTOR_BYTES, MAX_V3_VALUE_BLOCK_BYTES,
+    MAX_V3_VALUE_ROWS, MAX_V3_VARIABLE_VALUE_BYTES,
 };
 pub use writer::{
     AuraI64EventWriter, AuraI64Writer, AuraTypedWriter, AuraWriteSummary, AuraWriter,

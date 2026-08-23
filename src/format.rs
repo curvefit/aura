@@ -8,8 +8,8 @@ pub const AURA1_MAGIC: &[u8; 4] = b"AUR1";
 pub const SEAL_MAGIC: &[u8; 8] = b"sealed:)";
 /// Aura container versions recognized by this implementation.
 ///
-/// Recognition and layout support are intentionally separate: the V3 front
-/// header is authoritative, while complete V3 container/footer support is not.
+/// Recognition and layout support are intentionally separate. V3 has an
+/// authoritative front header and a decode-first flat Aura0 container subset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u16)]
 pub enum AuraContainerVersion {
@@ -41,7 +41,8 @@ impl AuraContainerVersion {
         }
     }
 
-    /// Confirms that this crate implements a complete container/footer layout.
+    /// Confirms support in the established generic reader/writer container
+    /// paths. The decode-first V3 flat Aura0 API is intentionally separate.
     pub fn require_supported_container_layout(self) -> Result<()> {
         match self {
             Self::V2 => Ok(()),

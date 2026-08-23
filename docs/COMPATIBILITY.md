@@ -3,11 +3,12 @@
 The current format version is checked during footer decode. Unsupported versions
 return an error instead of falling back silently.
 
-Current writers emit complete V2 containers. The V3 front-header and schema
-descriptor codecs are implemented for development and validation, but complete
-V3 footers/bodies remain unsupported. V2 footers reject V3 schema tag 4, and V3
-footers reject until their plan/body contract is implemented. The V3 front
-header has a normative 16 MiB ceiling enforced before file-backed allocation.
+Current production writers emit complete V2 containers. V3 now has one
+complete decode-first compatibility subset: flat event-only, uncompressed
+Aura0 with concatenated exact-value blocks and the AURP V3 flat footer V1. It
+does not add a public streaming writer, CLI, ingest/Aura1 layout, stamping, or
+conversion path. V2 footers still reject V3 schema tag 4. The V3 front header
+has a normative 16 MiB ceiling enforced before file-backed allocation.
 
 The `AURAV3VB` exact-value reference block is a separate, explicitly V3 API.
 Its 32-bit schema ID is only a routing hint; a SHA-256 fingerprint of the
@@ -17,13 +18,23 @@ rejects repeated fields/groups rather than flattening child rows. V2 schema enco
 every current ingest/compiled writer path reject field codes 12
 (`TimestampMs`), 13 (`Utf8`), and 14 (`DecimalText`). Codes 1 through 11 and all
 checked-in V2 fixture bytes/hashes remain unchanged. Adding the reference block
-does not permit a V3 footer, body, writer, stamp, restamp, or profile conversion.
+does not by itself permit a V3 writer, stamp, restamp, or profile conversion.
 
 The versioned fixture under `tests/fixtures/v3/` freezes a canonical schema,
 hex-encoded reference-block bytes, schema fingerprint, block SHA-256, logical
 SHA-256, and row count. It is explicitly a standalone block fixture, not a
 complete Aura-file compatibility fixture. Regeneration is an ignored,
 explicitly invoked maintenance test; normal tests only verify checked-in bytes.
+
+`tests/fixtures/v3-container/` separately freezes an empty flat file and an
+exact three-row/two-chunk file with timestamp, nullable U64 sequence, nullable
+U8 boolean, required UTF-8 (including empty and embedded NUL), and nullable
+decimal text with Unicode outer whitespace. Its manifest records exact sizes
+and SHA-256 values. Regeneration is an ignored maintenance test only.
+
+`AnyCompiledFooter` provides version-aware AURP routing. It delegates V2 bytes
+to the unchanged `CompiledFooter` codec and routes only V3 flat-layout bytes to
+the new footer decoder. Checked-in V2 fixture routing and hashes are unchanged.
 
 `CompiledAuraPlan` now exposes typed `container_version` and a numeric
 `format_version()` compatibility accessor. Direct field access through the old

@@ -2,11 +2,11 @@
 
 This document describes the current implementation.
 
-Current production writers still emit container V2. The V3 relationship/group
-front header and full schema encoding are implemented and testable as standalone
-metadata, but complete V3 ingest/compiled footers and bodies are intentionally
-unsupported until Aura Plan V2 and the bounded writer path land. A V3 schema
-cannot be embedded in a V2 container.
+Current production writers still emit container V2. Aura also implements the
+first complete, decode-first V3 subset: flat, event-only, uncompressed Aura0
+files whose body is a concatenation of exact-value blocks. There is no public
+V3 streaming writer or CLI yet. A V3 schema cannot be embedded in a V2
+container.
 
 ## Standalone V3 exact-value reference block
 
@@ -81,6 +81,36 @@ fixed LE payload or a u32 length plus original variable bytes. Hashing never
 sorts rows, narrows U64, uses Rust `Hash`, or includes physical null
 placeholders.
 
+`CanonicalV3RowHasher` is the incremental form of this same contract. The
+caller commits the total row count at construction and supplies schema-bound
+batches in file order. This permits a complete-file decoder to verify the
+global logical hash chunk by chunk without retaining a second concatenated
+batch. The one-batch `canonical_v3_batch_sha256` output is unchanged.
+
+## Flat Aura0 V3 container V1
+
+The complete V3 subset has a V3 Aura0 header, a body containing contiguous
+positive-row `AURAV3VB` version-1 blocks, an `AURP` V3 flat footer, the common
+u32 footer length, and `sealed:)`. Compression kind, level, and flags are zero.
+There is no padding between blocks. A zero-row file has an empty body, no
+chunks, and one zero-valued stats descriptor per schema field.
+
+This V1 layout accepts only flat event fields. It rejects groups, repeated
+scope, derived fields/map bytes 101–239, byte 200, non-Aura0 profiles, and
+nonzero base time, stream ID, or dictionary ID. Header and footer schema maps
+must agree. If present, byte 100 declares the primary timestamp at slot 0;
+schemas with no primary timestamp store `ffff` in the footer and omit all
+timestamp chunk bounds. Byte 255 remains valid for auxiliary timestamps. At
+most one U64 field with role `sequence` is the primary sequence slot.
+
+The hard supported-subset ceilings are 64 MiB footer bytes, 1 TiB body bytes,
+65,536 chunks, 16,777,216 total rows, and 16 MiB for the encoded schema
+descriptor. The current complete-file API is in-memory and checks all lengths
+and counts before count-controlled allocation. Its safe defaults are 256 MiB
+for the body and each exact-value block, 4,194,304 total rows, and 4,096 chunks;
+`V3FlatLimits::HARD` explicitly opts into the absolute 1 TiB body, 1 GiB block,
+and 16,777,216-row format ceilings.
+
 ## Roles
 
 - `.aura`: ingest/preservation file. It stores logical i64 or typed rows plus
@@ -113,8 +143,8 @@ discriminator. See `docs/container.md` for exact layouts.
 
 The V3 front header is authoritative for relationship and group permissions.
 The versioned full schema descriptor is authoritative for names, types, roles,
-scales, and nullability. When complete V3 containers are enabled, header and
-full-schema maps, expressions, groups, and schema dialect must agree exactly.
+scales, and nullability. In the flat Aura0 V3 subset, header and full-schema
+maps, expressions, groups, and schema dialect agree exactly.
 Relationship byte 100 uniquely marks the primary event timestamp at slot 0.
 Additional event-scoped timestamp-role fields use byte 255 in the front map;
 their nanosecond, millisecond, or scaled-i64 units and nullability remain in the
@@ -167,8 +197,9 @@ chunk descriptors
 optional Aura1 byte-lane descriptor table (`AUBL`)
 ```
 
-Unsupported versions reject during footer decode. Complete V3 footer decode is
-not enabled merely because V3 front-header metadata can be decoded.
+Unsupported versions reject during footer decode. `AnyCompiledFooter` routes
+the unchanged V2 compiled footer to `CompiledFooter` and the V3 flat footer to
+its dedicated decoder.
 
 ## Aura1 Body
 
