@@ -6,9 +6,12 @@
 //! retains registry-1 and compact registry-2 direct fallbacks. Registry version
 //! 3 adds whole-file exact physical integer codecs to Direct streams only:
 //! fixed width, unsigned canonical ULEB128, and signed ZigZag canonical
-//! ULEB128. It adds no delta, residual, split, Huffman, Zstandard, or null
-//! sparsity. These registries specify no compression claim and carry no
-//! Parquet, holdout, production, or campaign-size claim.
+//! ULEB128. Registry version 4 adds only checked previous-within-domain
+//! residuals for authorized nonnullable repeated signed fields, resetting both
+//! domain states at every event and retaining absolute codec fallback. It adds
+//! no split, cross-domain, cross-event state, Huffman, Zstandard, null sparsity,
+//! or provider meaning. These registries specify no compression claim and carry
+//! no Parquet, holdout, production, or campaign-size claim.
 
 use sha2::{Digest, Sha256};
 
@@ -21,8 +24,14 @@ pub const AURA_PLAN_V2_VERSION: u16 = 2;
 pub const AURA_PLAN_V2_REGISTRY_VERSION: u16 = 1;
 pub const AURA_PLAN_V2_SPLIT_REGISTRY_VERSION: u16 = 2;
 pub const AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION: u16 = 3;
+pub const AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION: u16 = 4;
 pub const AURA_PLAN_V2_DIRECT_OP: u8 = 0;
 pub const AURA_PLAN_V2_SPLIT_DOMAIN_DIRECT_OP: u8 = 1;
+/// Registry-4 per-event/domain reset transform. The physical lane is normative
+/// `I64` for logical `I8/I16/I32/I64/TimestampNs`; first values are absolute
+/// and later values are checked signed residuals. Valid repeated TimestampMs is
+/// excluded by the schema contract and remains event-scoped absolute.
+pub const AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP: u8 = 2;
 pub const AURA_PLAN_V2_AUTHORITATIVE_SOURCE_ORDER: u8 = 1;
 pub const MAX_AURA_PLAN_V2_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_AURA_PLAN_V2_STREAMS: usize = 4_096;
@@ -35,6 +44,7 @@ const HASH_BYTES: usize = 32;
 const PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v1\0";
 const SPLIT_PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v2\0";
 const INTEGER_CODEC_PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v3\0";
+const WITHIN_DOMAIN_PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v4\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -60,6 +70,7 @@ impl PlanV2PhysicalCodec {
 pub enum PlanV2Selection {
     Direct = 0,
     SplitDomainDirect = 1,
+    PreviousWithinDomainMixed = 2,
 }
 
 impl PlanV2Selection {
@@ -67,6 +78,7 @@ impl PlanV2Selection {
         match code {
             0 => Ok(Self::Direct),
             1 => Ok(Self::SplitDomainDirect),
+            2 => Ok(Self::PreviousWithinDomainMixed),
             _ => Err(AuraError::InvalidValue("aura plan v2 selection")),
         }
     }
@@ -179,6 +191,31 @@ impl AuraPlanV2 {
         Ok(plan)
     }
 
+    pub fn within_domain_direct_for_schema(schema: &SchemaDescriptor) -> Result<Self> {
+        let mut plan = Self::integer_codec_direct_for_schema(schema)?;
+        plan.registry_version = AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION;
+        plan.validate(schema)?;
+        Ok(plan)
+    }
+
+    pub fn select_previous_within_domain(&mut self, slots: &[u16]) {
+        self.registry_version = AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION;
+        self.selection = if slots.is_empty() {
+            PlanV2Selection::Direct
+        } else {
+            PlanV2Selection::PreviousWithinDomainMixed
+        };
+        for stream in &mut self.streams {
+            if slots.contains(&stream.slot) {
+                stream.op = AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP;
+                stream.dependencies = vec![self.discriminator_slot];
+            } else {
+                stream.op = AURA_PLAN_V2_DIRECT_OP;
+                stream.dependencies.clear();
+            }
+        }
+    }
+
     pub fn candidate_for_schema(
         schema: &SchemaDescriptor,
         selection: PlanV2Selection,
@@ -222,6 +259,7 @@ impl AuraPlanV2 {
                 AURA_PLAN_V2_REGISTRY_VERSION
                     | AURA_PLAN_V2_SPLIT_REGISTRY_VERSION
                     | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                    | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
             )
             || self.schema_id != schema.schema_id
             || self.schema_fingerprint != canonical_v3_schema_fingerprint(schema)?
@@ -251,9 +289,20 @@ impl AuraPlanV2 {
         {
             return Err(AuraError::InvalidValue("aura plan v2 split authorization"));
         }
+        // The group-level permission carried by the authoritative V3 header is
+        // the sole authorization for this group transform. Per-field relation
+        // and transform-candidate entries are alternative planner evidence;
+        // they neither grant nor exclude previous-within-domain execution.
+        if self.selection == PlanV2Selection::PreviousWithinDomainMixed
+            && !group.relationships.allows_within_domain()
+        {
+            return Err(AuraError::InvalidValue("aura plan v2 within authorization"));
+        }
         if matches!(
             self.registry_version,
-            AURA_PLAN_V2_SPLIT_REGISTRY_VERSION | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+            AURA_PLAN_V2_SPLIT_REGISTRY_VERSION
+                | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
         ) && (self.event_child_offsets_stream_id != Some(0)
             || self.source_order_selector_stream_id.is_none())
         {
@@ -265,8 +314,11 @@ impl AuraPlanV2 {
         {
             return Err(AuraError::InvalidValue("aura plan v2 direct registry"));
         }
-        if self.registry_version != AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
-            && !self.physical_stream_codecs.is_empty()
+        if !matches!(
+            self.registry_version,
+            AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
+        ) && !self.physical_stream_codecs.is_empty()
         {
             return Err(AuraError::InvalidValue("aura plan v2 codec registry"));
         }
@@ -274,6 +326,22 @@ impl AuraPlanV2 {
             && self.selection != PlanV2Selection::Direct
         {
             return Err(AuraError::InvalidValue("aura plan v2 codec selection"));
+        }
+        if self.registry_version == AURA_PLAN_V2_SPLIT_REGISTRY_VERSION
+            && !matches!(
+                self.selection,
+                PlanV2Selection::Direct | PlanV2Selection::SplitDomainDirect
+            )
+        {
+            return Err(AuraError::InvalidValue("aura plan v2 split selection"));
+        }
+        if self.registry_version == AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
+            && !matches!(
+                self.selection,
+                PlanV2Selection::Direct | PlanV2Selection::PreviousWithinDomainMixed
+            )
+        {
+            return Err(AuraError::InvalidValue("aura plan v2 within selection"));
         }
 
         let mut seen = vec![false; schema.fields.len()];
@@ -315,12 +383,24 @@ impl AuraPlanV2 {
                 let split = self.selection == PlanV2Selection::SplitDomainDirect
                     && descriptor.scope == FieldScope::Repeated
                     && descriptor.slot != self.discriminator_slot;
+                let within = self.registry_version == AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
+                    && descriptor.op == AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP;
+                if within
+                    && (descriptor.scope != FieldScope::Repeated
+                        || descriptor.nullable
+                        || descriptor.slot == self.discriminator_slot
+                        || !is_within_domain_type(descriptor.field_type))
+                {
+                    return Err(AuraError::InvalidValue("aura plan v2 within stream"));
+                }
                 let expected_op = if split {
                     AURA_PLAN_V2_SPLIT_DOMAIN_DIRECT_OP
+                } else if within {
+                    AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP
                 } else {
                     AURA_PLAN_V2_DIRECT_OP
                 };
-                let expected_dependencies = if split {
+                let expected_dependencies = if split || within {
                     &[self.discriminator_slot][..]
                 } else {
                     &[][..]
@@ -347,7 +427,11 @@ impl AuraPlanV2 {
                         .ok_or(AuraError::InvalidValue("aura plan v2 physical stream id"))?;
                 }
             }
-            if self.registry_version == AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION {
+            if matches!(
+                self.registry_version,
+                AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                    | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
+            ) {
                 if self.physical_stream_codecs.len() != usize::from(next_physical)
                     || self.physical_stream_codecs.first() != Some(&PlanV2PhysicalCodec::FixedWidth)
                 {
@@ -364,6 +448,16 @@ impl AuraPlanV2 {
                         validate_codec_type(codec, descriptor.field_type)?;
                     }
                 }
+            }
+        }
+        if self.registry_version == AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION {
+            let count = self
+                .streams
+                .iter()
+                .filter(|stream| stream.op == AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP)
+                .count();
+            if (count == 0) != (self.selection == PlanV2Selection::Direct) {
+                return Err(AuraError::InvalidValue("aura plan v2 within selection"));
             }
         }
         for (index, slot) in self.decode_order.iter().copied().enumerate() {
@@ -385,7 +479,10 @@ impl AuraPlanV2 {
             authoritative_source_order: self.source_order
                 == AURA_PLAN_V2_AUTHORITATIVE_SOURCE_ORDER,
             authorized_relationship_bits: self.authorized_relationship_bits,
-            relationships_attempted: self.selection == PlanV2Selection::SplitDomainDirect,
+            relationships_attempted: matches!(
+                self.selection,
+                PlanV2Selection::SplitDomainDirect | PlanV2Selection::PreviousWithinDomainMixed
+            ),
         }
     }
 
@@ -401,15 +498,18 @@ impl AuraPlanV2 {
                 .checked_add(stream.physical_stream_ids.len())
                 .ok_or(AuraError::InvalidValue("aura plan v2 length"))
         })?;
-        let codec_table_len =
-            if self.registry_version == AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION {
-                self.physical_stream_codecs
-                    .len()
-                    .checked_add(2)
-                    .ok_or(AuraError::InvalidValue("aura plan v2 length"))?
-            } else {
-                0
-            };
+        let codec_table_len = if matches!(
+            self.registry_version,
+            AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
+        ) {
+            self.physical_stream_codecs
+                .len()
+                .checked_add(2)
+                .ok_or(AuraError::InvalidValue("aura plan v2 length"))?
+        } else {
+            0
+        };
         let stream_prefix = if self.registry_version == AURA_PLAN_V2_REGISTRY_VERSION {
             STREAM_PREFIX_BYTES
         } else {
@@ -471,7 +571,9 @@ impl AuraPlanV2 {
             put_u32(&mut bytes, 0);
             if matches!(
                 self.registry_version,
-                AURA_PLAN_V2_SPLIT_REGISTRY_VERSION | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                AURA_PLAN_V2_SPLIT_REGISTRY_VERSION
+                    | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                    | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
             ) {
                 put_u16_len(
                     &mut bytes,
@@ -486,7 +588,11 @@ impl AuraPlanV2 {
                 put_u16(&mut bytes, *physical);
             }
         }
-        if self.registry_version == AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION {
+        if matches!(
+            self.registry_version,
+            AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
+        ) {
             put_u16_len(
                 &mut bytes,
                 self.physical_stream_codecs.len(),
@@ -527,6 +633,7 @@ impl AuraPlanV2 {
                 AURA_PLAN_V2_REGISTRY_VERSION
                     | AURA_PLAN_V2_SPLIT_REGISTRY_VERSION
                     | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                    | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
             )
         {
             return Err(AuraError::InvalidValue("aura plan v2 registry"));
@@ -580,7 +687,9 @@ impl AuraPlanV2 {
             }
             let physical_count = if matches!(
                 registry_version,
-                AURA_PLAN_V2_SPLIT_REGISTRY_VERSION | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                AURA_PLAN_V2_SPLIT_REGISTRY_VERSION
+                    | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                    | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
             ) {
                 reader.u16()? as usize
             } else {
@@ -625,7 +734,11 @@ impl AuraPlanV2 {
             });
         }
         let mut physical_stream_codecs = Vec::new();
-        if registry_version == AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION {
+        if matches!(
+            registry_version,
+            AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
+        ) {
             let codec_count = reader.u16()? as usize;
             if codec_count > MAX_AURA_PLAN_V2_STREAMS * 2 || codec_count > reader.remaining() {
                 return Err(AuraError::InvalidValue("aura plan v2 codec count"));
@@ -662,12 +775,16 @@ impl AuraPlanV2 {
             authorized_relationship_bits,
             event_child_offsets_stream_id: matches!(
                 registry_version,
-                AURA_PLAN_V2_SPLIT_REGISTRY_VERSION | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                AURA_PLAN_V2_SPLIT_REGISTRY_VERSION
+                    | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                    | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
             )
             .then_some(offsets_stream_raw),
             source_order_selector_stream_id: matches!(
                 registry_version,
-                AURA_PLAN_V2_SPLIT_REGISTRY_VERSION | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                AURA_PLAN_V2_SPLIT_REGISTRY_VERSION
+                    | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+                    | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
             )
             .then_some(selector_stream_raw),
             streams,
@@ -737,6 +854,13 @@ fn validate_codec_type(codec: PlanV2PhysicalCodec, field_type: FieldType) -> Res
     }
 }
 
+const fn is_within_domain_type(field_type: FieldType) -> bool {
+    matches!(
+        field_type,
+        FieldType::I8 | FieldType::I16 | FieldType::I32 | FieldType::I64 | FieldType::TimestampNs
+    )
+}
+
 fn validate_acyclic(streams: &[PlanV2StreamDescriptor], field_count: usize) -> Result<()> {
     let mut outgoing = Vec::new();
     outgoing
@@ -801,6 +925,7 @@ fn plan_hash_bytes(bytes: &[u8], registry_version: u16) -> Result<[u8; 32]> {
     hasher.update(match registry_version {
         AURA_PLAN_V2_SPLIT_REGISTRY_VERSION => SPLIT_PLAN_HASH_DOMAIN,
         AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION => INTEGER_CODEC_PLAN_HASH_DOMAIN,
+        AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION => WITHIN_DOMAIN_PLAN_HASH_DOMAIN,
         _ => PLAN_HASH_DOMAIN,
     });
     hasher.update(len.to_le_bytes());
