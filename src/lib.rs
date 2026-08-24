@@ -40,6 +40,8 @@ pub mod v3_events;
 pub mod v3_grouped_container;
 pub mod v3_grouped_reader;
 pub mod v3_grouped_writer;
+pub mod v3_plan_v2;
+pub mod v3_planned_grouped;
 pub mod v3_reader;
 pub mod v3_values;
 pub mod v3_writer;
@@ -176,6 +178,21 @@ pub use v3_grouped_reader::{
 pub use v3_grouped_writer::{
     AuraV3GroupedWriter, V3GroupedAura0Writer, V3GroupedWriteSummary, V3GroupedWriterOptions,
     V3GroupedWriterState,
+};
+pub use v3_plan_v2::{
+    AuraPlanV2, PlanV2Inspection, PlanV2Selection, PlanV2StreamDescriptor,
+    AURA_PLAN_V2_AUTHORITATIVE_SOURCE_ORDER, AURA_PLAN_V2_DIRECT_OP, AURA_PLAN_V2_MAGIC,
+    AURA_PLAN_V2_REGISTRY_VERSION, AURA_PLAN_V2_VERSION, MAX_AURA_PLAN_V2_BYTES,
+    MAX_AURA_PLAN_V2_DEPENDENCIES, MAX_AURA_PLAN_V2_STREAMS,
+};
+pub use v3_planned_grouped::{
+    compile_v3_planned_grouped, decode_v3_planned_grouped, decode_v3_planned_grouped_footer,
+    encode_v3_planned_grouped_footer, DecodedV3PlannedGrouped, V3PlannedGroupedArtifact,
+    V3PlannedGroupedChunkDescriptor, V3PlannedGroupedFooter, V3PlannedGroupedInspection,
+    V3PlannedGroupedSummary, MAX_V3_PLANNED_GROUPED_FOOTER_BYTES, V3_PLANNED_GROUPED_BODY_ENCODING,
+    V3_PLANNED_GROUPED_BODY_LAYOUT_VERSION, V3_PLANNED_GROUPED_CHUNK_DESCRIPTOR_BYTES,
+    V3_PLANNED_GROUPED_DIRECT_BLOCK_VERSION, V3_PLANNED_GROUPED_FOOTER_LAYOUT_VERSION,
+    V3_PLANNED_GROUPED_FOOTER_PREFIX_BYTES,
 };
 pub use v3_reader::{
     AuraV3FlatReader, V3FlatAura0Reader, V3FlatReadAll, V3FlatReaderState, V3FlatVerifySummary,

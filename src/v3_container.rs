@@ -177,6 +177,7 @@ pub enum AnyCompiledFooter {
     V2(CompiledFooter),
     V3Flat(V3FlatFooter),
     V3Grouped(crate::v3_grouped_container::V3GroupedFooter),
+    V3PlannedGrouped(crate::v3_planned_grouped::V3PlannedGroupedFooter),
 }
 
 impl AnyCompiledFooter {
@@ -203,6 +204,14 @@ impl AnyCompiledFooter {
                         crate::v3_grouped_container::V3_GROUPED_BODY_ENCODING_EXACT_EVENTS,
                     ) => crate::v3_grouped_container::decode_v3_grouped_footer(bytes)
                         .map(Self::V3Grouped),
+                    (
+                        crate::v3_planned_grouped::V3_PLANNED_GROUPED_FOOTER_LAYOUT_VERSION,
+                        crate::v3_planned_grouped::V3_PLANNED_GROUPED_BODY_ENCODING,
+                    ) => crate::v3_planned_grouped::decode_v3_planned_grouped_footer(
+                        bytes,
+                        crate::V3GroupedLimits::HARD,
+                    )
+                    .map(Self::V3PlannedGrouped),
                     _ => Err(AuraError::InvalidValue("v3 compiled footer encoding")),
                 }
             }
@@ -216,6 +225,12 @@ impl AnyCompiledFooter {
             Self::V3Flat(footer) => encode_v3_flat_footer(footer),
             Self::V3Grouped(footer) => {
                 crate::v3_grouped_container::encode_v3_grouped_footer(footer)
+            }
+            Self::V3PlannedGrouped(footer) => {
+                crate::v3_planned_grouped::encode_v3_planned_grouped_footer(
+                    footer,
+                    crate::V3GroupedLimits::HARD,
+                )
             }
         }
     }
