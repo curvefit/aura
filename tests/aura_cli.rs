@@ -567,7 +567,7 @@ fn shadow_handshake_is_stable_json_and_has_no_side_effects() {
     );
     assert_eq!(
         value["complete_container_targets"],
-        serde_json::json!(["flat-aura0-v3-v1"])
+        serde_json::json!(["flat-aura0-v3-v1", "grouped-aura0-v3-exact-v1"])
     );
     assert!(value["package_version"].is_string());
     assert!(value["arrow_crate_version"].is_string());
@@ -633,6 +633,10 @@ fn v3_aura0_seal_from_arrow_stdin_and_verify_embedded_schema() {
         String::from_utf8_lossy(&sealed.stderr)
     );
     let seal_json: serde_json::Value = serde_json::from_slice(&sealed.stdout).unwrap();
+    assert_eq!(
+        seal_json["result_schema"],
+        "aura-v3-flat-aura0-seal-result-v1"
+    );
     assert_eq!(seal_json["container_target"], "flat-aura0-v3-v1");
     assert_eq!(seal_json["complete_aura_file"], true);
     assert_eq!(seal_json["container_version"], 3);
@@ -666,6 +670,10 @@ fn v3_aura0_seal_from_arrow_stdin_and_verify_embedded_schema() {
         String::from_utf8_lossy(&verified.stderr)
     );
     let verify_json: serde_json::Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert_eq!(
+        verify_json["result_schema"],
+        "aura-v3-flat-aura0-verify-result-v1"
+    );
     assert_eq!(verify_json["verified"], true);
     assert_eq!(verify_json["complete_aura_file"], true);
     assert_eq!(verify_json["protocol"], "aura-logical-arrow-ipc-v1");

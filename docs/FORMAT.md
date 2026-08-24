@@ -7,8 +7,8 @@ implements two complete, explicitly selected, uncompressed V3 Aura0 SDK
 flavors: flat event-scoped files whose body is a concatenation of exact-value
 `AURAV3VB` blocks, and grouped exact-event files whose body is a concatenation
 of `AURAV3EB` chunks. Both have seekable writers/readers and bounded
-verification. The explicit V3 CLI seal/verify commands cover the flat flavor
-only; there is no grouped CLI complete seal yet. V3 is not production-ready or
+verification. The explicit V3 CLI seal command covers both flavors and verify
+auto-dispatches from the held footer tuple. V3 is not production-ready or
 the default, and a V3 schema cannot be embedded in a V2 container.
 
 ## Standalone V3 exact-value reference block
@@ -146,8 +146,11 @@ chunk reads, and `verify_all` performs full body/hash/statistics verification
 with a second envelope/body check before marking the reader verified. A write
 that fails before the complete seal, or any writer/flush/sync or verification
 failure, is a failed/uncommitted result that callers must discard and must not
-publish, even if bytes happen to end in a seal. These SDK APIs do not provide a
-grouped CLI, physical relationship planner, compression, or Plan v2.
+publish, even if bytes happen to end in a seal. The grouped CLI accepts strict
+nested Arrow protocol v2, including a zero-record-batch stream as an empty
+complete file, and feeds the decoded exact event batch to this same writer. It
+shares the flat complete-file publication state machine. This path does not
+provide a physical relationship planner, compression, Plan v2, or Aura1.
 
 The grouped hard ceilings are a 64 MiB footer, 1 TiB body, 65,536 chunks,
 16,777,216 events, 67,108,864 children, and 16 MiB schema descriptor. Default

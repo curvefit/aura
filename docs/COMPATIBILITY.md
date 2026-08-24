@@ -7,8 +7,8 @@ Current production and default SDK writers emit complete V2 containers. V3 has
 two complete, explicitly selected, uncompressed Aura0 SDK compatibility
 subsets: flat event-only `AURAV3VB` exact-value blocks, and grouped exact-event
 `AURAV3EB` chunks with the AURP V3 grouped footer. Both have public seekable
-writers/readers and bounded verification. The flat flavor also has the V3 CLI;
-there is no grouped CLI complete-seal command yet. V3 adds no ingest/Aura1
+writers/readers and bounded verification. Both flavors have explicit V3 CLI
+complete-seal support and held-file auto-dispatch verification. V3 adds no ingest/Aura1
 layout, stamping, or conversion path, and is not a production/default
 replacement. V2 footers still reject V3 schema tag 4. Both V3 front headers
 have a normative 16 MiB ceiling enforced before file-backed allocation.
@@ -100,8 +100,10 @@ mutation; they do not promise concurrent-mutation exclusion or recovery.
 For both V3 SDK writers, a write before the complete seal, or any writer,
 flush, sync, or second-pass error, is a failed/uncommitted result that callers
 must discard and must not publish even if bytes happen to end in a valid seal.
-The flat CLI uses a synced temporary file and atomic publication; grouped has
-no equivalent CLI seal or recovery workflow.
+The flat and grouped CLI paths share one synced mode-0600 temporary-file,
+create-once publication and recovery state machine. Verification boundedly
+routes from the held footer tuple, then fully verifies and hashes that exact
+held file without an external schema.
 
 ## Default Path Matrix
 
@@ -113,7 +115,7 @@ no equivalent CLI seal or recovery workflow.
 | guard mode | `no_guard` | strict modes for verification only |
 | canonical hash | `none` | `verify` for correctness checks |
 | Aura0 profile | `hybrid` for speed + semantic fallback, `compact` for smallest archive | `fast` for byte-lane-only speed files |
-| V3 flat/grouped SDK | no production/default candidate; select the explicit API (flat also has the CLI) | `V3FlatLimits::HARD` / `V3GroupedLimits::HARD` for explicit hard-envelope tests |
+| V3 flat/grouped SDK | no production/default candidate; select the explicit API or CLI | `V3FlatLimits::HARD` / `V3GroupedLimits::HARD` for explicit hard-envelope tests |
 
 The default candidates are conservative. They are chosen from current test and
 benchmark evidence, not from an assertion that remaining materialization is

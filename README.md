@@ -12,9 +12,9 @@ The current implementation has two deliberately separate surfaces:
 * V3 has two complete, explicitly bounded, uncompressed Aura0 SDK flavors:
   flat event-scoped values in `AURAV3VB` blocks and grouped exact events in
   `AURAV3EB` chunks. Both have self-contained schema/footers, checksums,
-  hashes, and seekable writer/reader APIs. The flat flavor also has the
-  developer CLI; there is no grouped CLI complete-seal command yet. Neither
-  V3 flavor is production-ready or the default.
+  hashes, and seekable writer/reader APIs. Both flavors have the explicit
+  developer CLI complete-seal and auto-dispatch verification path. Neither V3
+  flavor is production-ready or the default.
 
 The public model is intentionally generic:
 
@@ -38,7 +38,7 @@ The public model is intentionally generic:
 
 The V2 levels trade disk for parsing speed. The generic V2 writer emits V2
 containers even when its profile is `.aura0` or `.aura1`; V3 is selected only
-through an explicit V3 API or the flat V3 CLI. V3 flat and grouped Aura0 files
+through an explicit V3 API or V3 CLI. V3 flat and grouped Aura0 files
 are self-contained and are not converted by the V2 compiled-profile conversion
 path.
 
@@ -89,6 +89,10 @@ cargo run --release --bin aura -- v3 aura0 seal \
   --protocol aura-logical-arrow-ipc-v1 \
   --schema <canonical-schema.json> \
   --output <new-file.aura0> --json < <arrow-ipc-stream.bin>
+cargo run --release --bin aura -- v3 aura0 seal \
+  --protocol aura-logical-arrow-ipc-v2 \
+  --schema <canonical-grouped-schema.json> \
+  --output <new-grouped-file.aura0> --json < <grouped-arrow-ipc-stream.bin>
 cargo run --release --bin aura -- v3 aura0 verify \
   --input <new-file.aura0> --json
 cargo test --test v3_aura0_container
@@ -97,7 +101,7 @@ cargo run --bin aura-size -- 10000 1 8
 cargo run --example roundtrip
 ```
 
-The flat V3 seal command reads one Arrow IPC stream from standard input and requires
+The V3 seal command reads one protocol-specific Arrow IPC stream from standard input and requires
 the schema file to already be Aura's canonical external schema JSON. It writes
 an absent `.aura0` destination through a temporary file, syncs it, and
 publishes it atomically. Verification reopens the complete file and checks the
@@ -105,9 +109,10 @@ header, footer, schema fingerprint, per-chunk stored and logical hashes, body
 hash, statistics, global logical hash, and exact file length. A write that fails
 before the complete seal, or any writer/flush/sync error, is a failed and
 uncommitted result that must not be published even if bytes happen to end in a
-seal. The flat CLI syncs a temporary file before atomic publication and never
-silently replaces an existing destination. The grouped SDK writer takes a
-seekable stream and has no corresponding CLI complete-seal command yet.
+seal. The shared flat/grouped CLI publisher syncs a mode-0600 temporary file
+before create-once publication and never silently replaces an existing
+destination. Verification boundedly routes the held file from its footer tuple
+and verifies the exact embedded flat or grouped schema and complete file.
 
 The supported V3 flat subset is intentionally narrow: event-scoped fields,
 exact fixed and variable values, and optional validity bitmaps. It rejects

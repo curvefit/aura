@@ -90,4 +90,9 @@ children, and 16 MiB schema. Per event-block defaults are 256 MiB,
 1,048,576 events, 4,194,304 children, and 16,777,216 values; hard limits are
 1 GiB, 4,194,304 events, 16,777,216 children, and 67,108,864 values.
 `V3GroupedLimits::HARD` is an explicit opt-in and all supplied limits are
-clamped to those ceilings.
+clamped to those ceilings. The developer CLI exposes this writer through
+`aura v3 aura0 seal --protocol aura-logical-arrow-ipc-v2`; it decodes the
+strict nested Arrow stream, seals empty input as an empty complete file, and
+uses the same create-once held-file publication state machine as the flat V3
+command. `aura v3 aura0 verify` routes flat/grouped files from their bounded
+footer tuple and verifies the embedded schema and exact held file.

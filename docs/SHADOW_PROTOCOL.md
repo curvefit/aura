@@ -4,9 +4,9 @@
 testing an external Aura compiler. It accepts one explicitly terminated Arrow
 IPC **stream** and emits `standalone-aura-v3-value-block-v1`. The artifact is a
 schema-bound reference block, not a complete `.aura`, `.aura0`, or `.aura1`
-file. The reference-block artifact remains unchanged; the same strict logical
-Arrow input can separately target the complete `flat-aura0-v3-v1` container
-through `aura v3 aura0 seal`.
+file. The reference-block artifacts remain unchanged; the strict flat and
+grouped Arrow inputs can separately target the complete `flat-aura0-v3-v1`
+and `grouped-aura0-v3-exact-v1` containers through `aura v3 aura0 seal`.
 
 Discover the exact compiler capability without reading stdin or creating files:
 
@@ -17,7 +17,7 @@ aura shadow handshake --protocol aura-logical-arrow-ipc-v1 --json
 The stable `aura-shadow-handshake-v1` result identifies the package version,
 full local Git commit and dirty state when available, provenance evidence class, Cargo
 lockfile SHA-256, supported
-protocol/schema/artifact lists, the single `flat-aura0-v3-v1` complete target,
+protocol/schema/artifact lists, both explicit Aura0 V3 complete targets,
 the hash-domain contracts, and the Rust Arrow version and IPC protocol.
 
 Encode a stream supplied on stdin:
@@ -52,9 +52,45 @@ reference block as a complete file.
 V3 seal and verify results identify container version 3, profile `aura0`, body
 encoding `flat_exact_blocks_v1`, footer layout version 1, all publication-size
 fields, schema and logical identities, and the exact artifact SHA-256. Both
-carry build provenance. V3 failures use `aura-v3-flat-error-v1`; committed
+carry build provenance. For backward compatibility, both complete V3 commands
+currently use the legacy-named `aura-v3-flat-error-v1` error envelope; their
+successful flat and grouped result schemas remain distinct. Committed
 result-delivery failure distinguishes whether stale temporary cleanup is also
 required.
+
+The grouped v2 stream has a corresponding complete-file command. It accepts
+the same canonical schema and strict nested Arrow contract as the standalone
+v2 boundary, and verification discovers the grouped footer tuple and embedded
+schema without a schema argument:
+
+```bash
+aura v3 aura0 seal \
+  --protocol aura-logical-arrow-ipc-v2 \
+  --schema canonical-grouped-schema.json \
+  --output grouped-events.aura0 \
+  --json < grouped.arrow-stream
+
+aura v3 aura0 verify --input grouped-events.aura0 --json
+```
+
+An explicitly terminated stream with no record batches seals as a complete
+zero-event, zero-child, zero-chunk file. Positive-event input seals as exact
+`AURAV3EB` version-1 chunks. Grouped seal and verify use the distinct stable
+result schemas `aura-v3-grouped-aura0-seal-result-v1` and
+`aura-v3-grouped-aura0-verify-result-v1`. Their results report protocol v2,
+the `grouped_exact_events_v1` body identity, body/event-block/footer layout
+versions, `compression: "none"`, event/child/chunk counts, schema and logical
+hashes, exact file bytes and artifact SHA-256, and pinned build evidence. They
+do not claim a physical planner, compression, Aura1 support, or default
+production status.
+
+Complete-file verification holds one regular non-symlink file, boundedly reads
+its footer routing tuple, dispatches to the flat or grouped reader, performs
+the complete reader verification, and hashes exactly the verified held file.
+Both seal flavors use the same mode-0600 temporary-file, create-once hard-link,
+held-identity, pre/post-link verification, directory-sync, rollback/ambiguity,
+and committed-stdout-loss recovery state machine. Existing destinations,
+symlinks, and group/world-writable parent directories are rejected.
 
 Verify and recover the path-free result for an already committed block without
 writing anything:

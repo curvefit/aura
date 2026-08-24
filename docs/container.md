@@ -14,8 +14,8 @@ The established SDK writer and generic reader use container V2 by default.
 Container V3 is explicitly dispatched and has two complete uncompressed Aura0
 SDK profiles: flat event-scoped exact-value blocks and grouped exact-event
 chunks. Both are exposed by seekable writer/reader APIs. The `aura v3 aura0
-seal` and `aura v3 aura0 verify` developer commands cover the flat profile only;
-there is no grouped CLI complete-seal command yet. Neither V3 profile is
+seal` developer command covers both protocol-specific profiles, and `aura v3
+aura0 verify` auto-dispatches them from the held footer tuple. Neither V3 profile is
 selected implicitly by the V2 SDK writer or promised as production/default.
 
 ## V2 header
@@ -295,8 +295,8 @@ The V3 writer emits body blocks first, then performs a second pass over the
 body to recompute hashes, statistics, and exact logical values before it writes
 the footer, footer length, and final seal. A reader opens the envelope and
 footer before trusting body-dependent claims; `verify_all` rechecks every block
-and global hash. The flat CLI publishes only a newly created, synced,
-atomically renamed destination and never replaces an existing path.
+and global hash. The shared flat/grouped CLI publisher exposes only a newly
+created, synced mode-0600 destination and never replaces an existing path.
 
 ### V3 grouped Aura0 footer
 
@@ -313,9 +313,11 @@ The grouped SDK writer streams `AURAV3EB` chunks and performs a bounded second
 pass before appending the grouped footer, u32 footer length, and final seal. The
 seekable grouped reader can locate chunks by global event or child, read an
 individual checked chunk, and run full verification with a second envelope/body
-check. It has no grouped CLI seal or production/default status. A failed write,
-flush, sync, or verification is a failed/uncommitted result that callers must
-discard and must not publish, even if bytes happen to end in a seal.
+check. The grouped CLI decodes strict nested Arrow protocol v2 into this writer
+and shares the flat create-once held-file publication state machine. It has no
+production/default status. A failed write, flush, sync, or verification is a
+failed/uncommitted result that callers must discard and must not publish, even
+if bytes happen to end in a seal.
 
 ## Footer length and seal
 

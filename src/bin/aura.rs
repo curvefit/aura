@@ -11,15 +11,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use aura_codec::{
     arrow_rust_version, build_provenance, canonical_v3_batch_sha256,
     canonical_v3_event_batch_sha256, canonical_v3_schema_fingerprint, cargo_lock_sha256,
-    compile_shadow_grouped_arrow_ipc, decode_shadow_arrow_ipc_batch, decode_v3_event_block,
-    decode_v3_value_block, encode_shadow_arrow_ipc, parse_schema_json, SchemaEncodingVersion,
-    ShadowEncodeResult, ShadowGroupedEncodeResult, ShadowGroupedProtocolLimits,
-    ShadowProtocolLimits, V3FlatAura0Reader, V3FlatAura0Writer, V3FlatWriteSummary,
-    V3FlatWriterOptions, V3ValueLimits, MAX_SCHEMA_JSON_BYTES, MAX_V3_EVENT_BLOCK_BYTES,
-    MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND, SHADOW_ARTIFACT_KIND_V2,
-    SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL, SHADOW_PROTOCOL_V2, SHADOW_RESULT_SCHEMA,
-    SHADOW_RESULT_SCHEMA_V2, SHADOW_SCHEMA_FORMAT, SHADOW_VERIFY_RESULT_SCHEMA,
-    SHADOW_VERIFY_RESULT_SCHEMA_V2,
+    compile_shadow_grouped_arrow_ipc, decode_shadow_arrow_ipc_batch,
+    decode_shadow_grouped_arrow_ipc_batch, decode_v3_event_block, decode_v3_value_block,
+    encode_shadow_arrow_ipc, parse_schema_json, SchemaEncodingVersion, ShadowEncodeResult,
+    ShadowGroupedEncodeResult, ShadowGroupedProtocolLimits, ShadowProtocolLimits,
+    V3FlatAura0Reader, V3FlatAura0Writer, V3FlatWriteSummary, V3FlatWriterOptions,
+    V3GroupedAura0Reader, V3GroupedAura0Writer, V3GroupedWriteSummary, V3GroupedWriterOptions,
+    V3ValueLimits, MAX_SCHEMA_JSON_BYTES, MAX_V3_EVENT_BLOCK_BYTES, MAX_V3_FLAT_FOOTER_BYTES,
+    MAX_V3_GROUPED_FOOTER_BYTES, MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL,
+    SHADOW_ARTIFACT_KIND, SHADOW_ARTIFACT_KIND_V2, SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL,
+    SHADOW_PROTOCOL_V2, SHADOW_RESULT_SCHEMA, SHADOW_RESULT_SCHEMA_V2, SHADOW_SCHEMA_FORMAT,
+    SHADOW_VERIFY_RESULT_SCHEMA, SHADOW_VERIFY_RESULT_SCHEMA_V2,
+    V3_FLAT_BODY_ENCODING_EXACT_BLOCKS, V3_FLAT_FOOTER_LAYOUT_VERSION,
+    V3_GROUPED_BODY_ENCODING_EXACT_EVENTS, V3_GROUPED_BODY_LAYOUT_VERSION,
+    V3_GROUPED_EVENT_BLOCK_VERSION, V3_GROUPED_FOOTER_LAYOUT_VERSION,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -40,6 +45,8 @@ Usage:
   aura shadow verify --protocol aura-logical-arrow-ipc-v2 --schema <path> \
     --input <existing.aurav3eb> --json
   aura v3 aura0 seal --protocol aura-logical-arrow-ipc-v1 --schema <canonical.json> \
+    --output <new.aura0> --json
+  aura v3 aura0 seal --protocol aura-logical-arrow-ipc-v2 --schema <canonical.json> \
     --output <new.aura0> --json
   aura v3 aura0 verify --input <file.aura0> --json
   aura --help
@@ -180,7 +187,7 @@ fn shadow_handshake_command(args: &[String]) -> Result<(), CliError> {
         "schema_formats": [SHADOW_SCHEMA_FORMAT],
         "artifact_kinds": [SHADOW_ARTIFACT_KIND, SHADOW_ARTIFACT_KIND_V2],
         "operations": ["encode", "verify", "v3-aura0-seal", "v3-aura0-verify"],
-        "complete_container_targets": ["flat-aura0-v3-v1"],
+        "complete_container_targets": ["flat-aura0-v3-v1", "grouped-aura0-v3-exact-v1"],
         "hash_contracts": {
             "schema_fingerprint": "sha256:aura-v3-schema-fingerprint-v1",
             "logical_values": "sha256:aura-v3-canonical-exact-values-v1",
@@ -371,7 +378,7 @@ fn v3_aura0_seal_command(args: &[String]) -> Result<(), CliError> {
         }
         _ => Err(CliError("unknown v3 aura0 seal option".to_owned())),
     })?;
-    require_protocol(protocol)?;
+    let protocol = require_shadow_protocol(protocol)?;
     if !json_output {
         return Err(CliError("v3 aura0 seal requires --json".to_owned()));
     }
@@ -397,38 +404,49 @@ fn v3_aura0_seal_command(args: &[String]) -> Result<(), CliError> {
     {
         return Err(CliError("v3 schema must be canonical JSON".to_owned()));
     }
-    let batch =
-        decode_shadow_arrow_ipc_batch(&schema, io::stdin().lock(), ShadowProtocolLimits::default())
+    let (publication, value) = match protocol {
+        ShadowProtocolVersion::V1 => {
+            let batch = decode_shadow_arrow_ipc_batch(
+                &schema,
+                io::stdin().lock(),
+                ShadowProtocolLimits::default(),
+            )
             .map_err(|error| CliError(error.to_string()))?;
-    let (publication, summary, artifact_sha256) = publish_verified_v3(&output, &schema, &batch)?;
-    let provenance = build_provenance();
-    let value = json!({
-        "result_schema": "aura-v3-flat-aura0-seal-result-v1",
-        "protocol": SHADOW_PROTOCOL,
-        "complete_aura_file": true,
-        "container_target": "flat-aura0-v3-v1",
-        "container_version": 3,
-        "profile": "aura0",
-        "body_encoding": "flat_exact_blocks_v1",
-        "footer_layout_version": 1,
-        "schema_id": schema.schema_id,
-        "schema_fingerprint_sha256": hex(&summary.schema_fingerprint),
-        "row_count": summary.record_count,
-        "chunk_count": summary.chunk_count,
-        "body_bytes": summary.body_bytes,
-        "footer_bytes": summary.footer_bytes,
-        "file_bytes": summary.file_bytes,
-        "logical_sha256": hex(&summary.global_logical_sha256),
-        "artifact_sha256": hex(&artifact_sha256),
-        "stale_temp_cleanup_required": publication.stale_temp_cleanup_required,
-        "build": {
-            "git_commit": provenance.git_commit,
-            "dirty": provenance.dirty,
-            "provenance_source": provenance.source,
-            "arrow_crate_version": arrow_rust_version(),
-            "cargo_lock_sha256": hex(&cargo_lock_sha256())
+            let (publication, summary, artifact_sha256) =
+                publish_verified_v3_flat(&output, &schema, &batch)?;
+            let value = flat_v3_seal_json(
+                &schema,
+                &summary,
+                artifact_sha256,
+                publication.stale_temp_cleanup_required,
+            );
+            (publication, value)
         }
-    });
+        ShadowProtocolVersion::V2 => {
+            let batch = decode_shadow_grouped_arrow_ipc_batch(
+                &schema,
+                io::stdin().lock(),
+                ShadowGroupedProtocolLimits::default(),
+            )
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("schema") {
+                    CliError(message)
+                } else {
+                    CliError("grouped v3 invalid ipc".to_owned())
+                }
+            })?;
+            let (publication, summary, artifact_sha256) =
+                publish_verified_v3_grouped(&output, &schema, &batch)?;
+            let value = grouped_v3_seal_json(
+                &schema,
+                &summary,
+                artifact_sha256,
+                publication.stale_temp_cleanup_required,
+            );
+            (publication, value)
+        }
+    };
     write_json_stdout(&value).map_err(|_| {
         if publication.stale_temp_cleanup_required {
             CliError("publication_committed_result_unavailable_cleanup_required".to_owned())
@@ -463,7 +481,140 @@ fn v3_aura0_verify_command(args: &[String]) -> Result<(), CliError> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(CliError("v3 input path rejected".to_owned()));
     }
-    let file = open_v3_input(&input, &metadata)?;
+    let mut file = open_v3_input(&input, &metadata)?;
+    let kind = inspect_v3_footer_kind(&mut file)?;
+    let value = match kind {
+        CompleteV3Kind::Flat => verify_v3_flat_value(file)?,
+        CompleteV3Kind::Grouped => verify_v3_grouped_value(file)?,
+    };
+    write_json_stdout(&value)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompleteV3Kind {
+    Flat,
+    Grouped,
+}
+
+fn inspect_v3_footer_kind(file: &mut File) -> Result<CompleteV3Kind, CliError> {
+    let file_len = file
+        .metadata()
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?
+        .len();
+    if file_len < 24 {
+        return Err(CliError("v3 invalid artifact".to_owned()));
+    }
+    file.seek(SeekFrom::End(-12))
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    let mut trailer = [0u8; 12];
+    file.read_exact(&mut trailer)
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    if &trailer[4..] != b"sealed:)" {
+        return Err(CliError("v3 invalid artifact".to_owned()));
+    }
+    let footer_len = u64::from(u32::from_le_bytes(trailer[..4].try_into().unwrap()));
+    let max_footer = MAX_V3_FLAT_FOOTER_BYTES.max(MAX_V3_GROUPED_FOOTER_BYTES) as u64;
+    if !(12..=max_footer).contains(&footer_len) {
+        return Err(CliError("v3 invalid artifact".to_owned()));
+    }
+    let footer_start = file_len
+        .checked_sub(12)
+        .and_then(|value| value.checked_sub(footer_len))
+        .ok_or_else(|| CliError("v3 invalid artifact".to_owned()))?;
+    file.seek(SeekFrom::Start(footer_start))
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    let mut tuple = [0u8; 12];
+    file.read_exact(&mut tuple)
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    if &tuple[..4] != b"AURP"
+        || u16::from_le_bytes(tuple[4..6].try_into().unwrap()) != 3
+        || tuple[9..12] != [0, 0, 0]
+    {
+        return Err(CliError("v3 invalid artifact".to_owned()));
+    }
+    let layout = u16::from_le_bytes(tuple[6..8].try_into().unwrap());
+    match (layout, tuple[8]) {
+        (V3_FLAT_FOOTER_LAYOUT_VERSION, V3_FLAT_BODY_ENCODING_EXACT_BLOCKS) => {
+            Ok(CompleteV3Kind::Flat)
+        }
+        (V3_GROUPED_FOOTER_LAYOUT_VERSION, V3_GROUPED_BODY_ENCODING_EXACT_EVENTS) => {
+            Ok(CompleteV3Kind::Grouped)
+        }
+        _ => Err(CliError("v3 invalid artifact".to_owned())),
+    }
+}
+
+fn flat_v3_seal_json(
+    schema: &aura_codec::SchemaDescriptor,
+    summary: &V3FlatWriteSummary,
+    artifact_sha256: [u8; 32],
+    stale_temp_cleanup_required: bool,
+) -> serde_json::Value {
+    let provenance = build_provenance();
+    json!({
+        "result_schema": "aura-v3-flat-aura0-seal-result-v1",
+        "protocol": SHADOW_PROTOCOL,
+        "complete_aura_file": true,
+        "container_target": "flat-aura0-v3-v1",
+        "container_version": 3,
+        "profile": "aura0",
+        "body_encoding": "flat_exact_blocks_v1",
+        "footer_layout_version": V3_FLAT_FOOTER_LAYOUT_VERSION,
+        "schema_id": schema.schema_id,
+        "schema_fingerprint_sha256": hex(&summary.schema_fingerprint),
+        "row_count": summary.record_count,
+        "chunk_count": summary.chunk_count,
+        "body_bytes": summary.body_bytes,
+        "footer_bytes": summary.footer_bytes,
+        "file_bytes": summary.file_bytes,
+        "logical_sha256": hex(&summary.global_logical_sha256),
+        "artifact_sha256": hex(&artifact_sha256),
+        "stale_temp_cleanup_required": stale_temp_cleanup_required,
+        "build": {
+            "git_commit": provenance.git_commit,
+            "dirty": provenance.dirty,
+            "provenance_source": provenance.source,
+            "arrow_crate_version": arrow_rust_version(),
+            "cargo_lock_sha256": hex(&cargo_lock_sha256())
+        }
+    })
+}
+
+fn grouped_v3_seal_json(
+    schema: &aura_codec::SchemaDescriptor,
+    summary: &V3GroupedWriteSummary,
+    artifact_sha256: [u8; 32],
+    stale_temp_cleanup_required: bool,
+) -> serde_json::Value {
+    let provenance = build_provenance();
+    json!({
+        "result_schema": "aura-v3-grouped-aura0-seal-result-v1",
+        "protocol": SHADOW_PROTOCOL_V2,
+        "complete_aura_file": true,
+        "container_target": "grouped-aura0-v3-exact-v1",
+        "container_version": 3,
+        "profile": "aura0",
+        "body_encoding": "grouped_exact_events_v1",
+        "body_layout_version": V3_GROUPED_BODY_LAYOUT_VERSION,
+        "event_block_version": V3_GROUPED_EVENT_BLOCK_VERSION,
+        "footer_layout_version": V3_GROUPED_FOOTER_LAYOUT_VERSION,
+        "compression": "none",
+        "schema_id": schema.schema_id,
+        "schema_fingerprint_sha256": hex(&summary.schema_fingerprint),
+        "event_count": summary.event_count,
+        "child_count": summary.child_count,
+        "chunk_count": summary.chunk_count,
+        "body_bytes": summary.body_bytes,
+        "footer_bytes": summary.footer_bytes,
+        "file_bytes": summary.file_bytes,
+        "logical_sha256": hex(&summary.global_logical_sha256),
+        "artifact_sha256": hex(&artifact_sha256),
+        "stale_temp_cleanup_required": stale_temp_cleanup_required,
+        "build": build_json(provenance)
+    })
+}
+
+fn verify_v3_flat_value(file: File) -> Result<serde_json::Value, CliError> {
     let mut reader =
         V3FlatAura0Reader::open(file).map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
     let schema_id = reader.embedded_footer().schema.schema_id;
@@ -475,7 +626,7 @@ fn v3_aura0_verify_command(args: &[String]) -> Result<(), CliError> {
     let artifact_sha256 = hash_file_exact(&mut file, summary.file_bytes)
         .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
     let provenance = build_provenance();
-    let value = json!({
+    Ok(json!({
         "result_schema": "aura-v3-flat-aura0-verify-result-v1",
         "protocol": SHADOW_PROTOCOL,
         "complete_aura_file": true,
@@ -483,7 +634,7 @@ fn v3_aura0_verify_command(args: &[String]) -> Result<(), CliError> {
         "container_version": 3,
         "profile": "aura0",
         "body_encoding": "flat_exact_blocks_v1",
-        "footer_layout_version": 1,
+        "footer_layout_version": V3_FLAT_FOOTER_LAYOUT_VERSION,
         "verified": true,
         "schema_id": schema_id,
         "schema_fingerprint_sha256": hex(&schema_fingerprint),
@@ -501,16 +652,46 @@ fn v3_aura0_verify_command(args: &[String]) -> Result<(), CliError> {
             "arrow_crate_version": arrow_rust_version(),
             "cargo_lock_sha256": hex(&cargo_lock_sha256())
         }
-    });
-    write_json_stdout(&value)
+    }))
 }
 
-fn require_protocol(protocol: Option<String>) -> Result<(), CliError> {
-    if protocol.as_deref() == Some(SHADOW_PROTOCOL) {
-        Ok(())
-    } else {
-        Err(CliError("unsupported or missing --protocol".to_owned()))
-    }
+fn verify_v3_grouped_value(file: File) -> Result<serde_json::Value, CliError> {
+    let mut reader =
+        V3GroupedAura0Reader::open(file).map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    let schema_id = reader.embedded_footer().schema.schema_id;
+    let schema_fingerprint = reader.embedded_footer().schema_fingerprint;
+    let summary = reader
+        .verify_all()
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    let mut file = reader.into_inner();
+    let artifact_sha256 = hash_file_exact(&mut file, summary.file_bytes)
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    let provenance = build_provenance();
+    Ok(json!({
+        "result_schema": "aura-v3-grouped-aura0-verify-result-v1",
+        "protocol": SHADOW_PROTOCOL_V2,
+        "complete_aura_file": true,
+        "container_target": "grouped-aura0-v3-exact-v1",
+        "container_version": 3,
+        "profile": "aura0",
+        "body_encoding": "grouped_exact_events_v1",
+        "body_layout_version": V3_GROUPED_BODY_LAYOUT_VERSION,
+        "event_block_version": V3_GROUPED_EVENT_BLOCK_VERSION,
+        "footer_layout_version": V3_GROUPED_FOOTER_LAYOUT_VERSION,
+        "compression": "none",
+        "verified": true,
+        "schema_id": schema_id,
+        "schema_fingerprint_sha256": hex(&schema_fingerprint),
+        "event_count": summary.event_count,
+        "child_count": summary.child_count,
+        "chunk_count": summary.chunk_count,
+        "body_bytes": summary.body_bytes,
+        "footer_bytes": summary.footer_bytes,
+        "file_bytes": summary.file_bytes,
+        "logical_sha256": hex(&summary.global_logical_sha256),
+        "artifact_sha256": hex(&artifact_sha256),
+        "build": build_json(provenance)
+    }))
 }
 
 fn require_shadow_protocol(protocol: Option<String>) -> Result<ShadowProtocolVersion, CliError> {
@@ -915,7 +1096,7 @@ fn publish_verified_block(
     }
 }
 
-fn publish_verified_v3(
+fn publish_verified_v3_flat(
     output: &Path,
     schema: &aura_codec::SchemaDescriptor,
     batch: &aura_codec::AuraV3Batch,
@@ -929,17 +1110,68 @@ fn publish_verified_v3(
     }
     #[cfg(unix)]
     {
-        publish_verified_v3_with_ops(output, schema, batch, &RealPublicationOps)
+        publish_verified_v3_flat_with_ops(output, schema, batch, &RealPublicationOps)
+    }
+}
+
+fn publish_verified_v3_grouped(
+    output: &Path,
+    schema: &aura_codec::SchemaDescriptor,
+    batch: &aura_codec::AuraV3EventBatch,
+) -> Result<(PublicationOutcome, V3GroupedWriteSummary, [u8; 32]), CliError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (output, schema, batch);
+        Err(CliError(
+            "trusted v3 publication is unsupported on this platform".to_owned(),
+        ))
+    }
+    #[cfg(unix)]
+    {
+        publish_verified_v3_grouped_with_ops(output, schema, batch, &RealPublicationOps)
     }
 }
 
 #[cfg(unix)]
-fn publish_verified_v3_with_ops(
+fn publish_verified_v3_flat_with_ops(
     output: &Path,
     schema: &aura_codec::SchemaDescriptor,
     batch: &aura_codec::AuraV3Batch,
     ops: &impl PublicationOps,
 ) -> Result<(PublicationOutcome, V3FlatWriteSummary, [u8; 32]), CliError> {
+    publish_verified_complete_v3_with_ops(
+        output,
+        ops,
+        |temp| seal_v3_flat_temp(temp, schema, batch),
+        verify_temp_v3_flat,
+        |summary| summary.file_bytes,
+    )
+}
+
+#[cfg(unix)]
+fn publish_verified_v3_grouped_with_ops(
+    output: &Path,
+    schema: &aura_codec::SchemaDescriptor,
+    batch: &aura_codec::AuraV3EventBatch,
+    ops: &impl PublicationOps,
+) -> Result<(PublicationOutcome, V3GroupedWriteSummary, [u8; 32]), CliError> {
+    publish_verified_complete_v3_with_ops(
+        output,
+        ops,
+        |temp| seal_v3_grouped_temp(temp, schema, batch),
+        verify_temp_v3_grouped,
+        |summary| summary.file_bytes,
+    )
+}
+
+#[cfg(unix)]
+fn publish_verified_complete_v3_with_ops<T>(
+    output: &Path,
+    ops: &impl PublicationOps,
+    mut seal: impl FnMut(File) -> Result<(File, T), CliError>,
+    mut verify: impl FnMut(&mut File, FileIdentity, &T) -> Result<[u8; 32], CliError>,
+    file_bytes: impl Fn(&T) -> u64,
+) -> Result<(PublicationOutcome, T, [u8; 32]), CliError> {
     let parent = normalized_parent(output);
     let directory = ops
         .open_parent(parent)
@@ -976,40 +1208,7 @@ fn publish_verified_v3_with_ops(
                 ))
             }
         };
-        let mut writer = match V3FlatAura0Writer::try_new(
-            temp,
-            schema.clone(),
-            V3FlatWriterOptions::default(),
-        ) {
-            Ok(writer) => writer,
-            Err(_) => {
-                let identity = held_guard
-                    .metadata()
-                    .ok()
-                    .map(|value| file_identity(&value));
-                return Err(prelink_failure(
-                    &directory,
-                    &temp_path,
-                    identity,
-                    ops,
-                    CliError("could not initialize v3 temporary output".to_owned()),
-                ));
-            }
-        };
-        if batch.row_count != 0 && writer.write_batch(batch).is_err() {
-            let identity = held_guard
-                .metadata()
-                .ok()
-                .map(|value| file_identity(&value));
-            return Err(prelink_failure(
-                &directory,
-                &temp_path,
-                identity,
-                ops,
-                CliError("could not write v3 temporary output".to_owned()),
-            ));
-        }
-        let (mut temp, summary) = match writer.finish_and_sync() {
+        let (mut temp, summary) = match seal(temp) {
             Ok(result) => result,
             Err(_) => {
                 let identity = held_guard
@@ -1039,7 +1238,19 @@ fn publish_verified_v3_with_ops(
                 CliError("held v3 output identity changed during write".to_owned()),
             ));
         }
-        if let Err(error) = verify_temp_v3(&mut temp, held_identity, &summary) {
+        if !temp
+            .metadata()
+            .is_ok_and(|value| value.len() == file_bytes(&summary))
+        {
+            return Err(prelink_failure(
+                &directory,
+                &temp_path,
+                Some(held_identity),
+                ops,
+                CliError("invalid v3 temporary output length".to_owned()),
+            ));
+        }
+        if let Err(error) = verify(&mut temp, held_identity, &summary) {
             return Err(prelink_failure(
                 &directory,
                 &temp_path,
@@ -1081,7 +1292,7 @@ fn publish_verified_v3_with_ops(
             && path_matches_identity(&temp_path, held_identity, ops)
             && path_matches_identity(output, held_identity, ops);
         let final_verification = if identity_ok {
-            verify_temp_v3(&mut temp, held_identity, &summary)
+            verify(&mut temp, held_identity, &summary)
         } else {
             Err(CliError("v3 publication identity changed".to_owned()))
         };
@@ -1121,7 +1332,45 @@ fn publish_verified_v3_with_ops(
 }
 
 #[cfg(unix)]
-fn verify_temp_v3(
+fn seal_v3_flat_temp(
+    temp: File,
+    schema: &aura_codec::SchemaDescriptor,
+    batch: &aura_codec::AuraV3Batch,
+) -> Result<(File, V3FlatWriteSummary), CliError> {
+    let mut writer =
+        V3FlatAura0Writer::try_new(temp, schema.clone(), V3FlatWriterOptions::default())
+            .map_err(|_| CliError("could not initialize v3 temporary output".to_owned()))?;
+    if batch.row_count != 0 {
+        writer
+            .write_batch(batch)
+            .map_err(|_| CliError("could not write v3 temporary output".to_owned()))?;
+    }
+    writer
+        .finish_and_sync()
+        .map_err(|_| CliError("could not seal v3 temporary output".to_owned()))
+}
+
+#[cfg(unix)]
+fn seal_v3_grouped_temp(
+    temp: File,
+    schema: &aura_codec::SchemaDescriptor,
+    batch: &aura_codec::AuraV3EventBatch,
+) -> Result<(File, V3GroupedWriteSummary), CliError> {
+    let mut writer =
+        V3GroupedAura0Writer::try_new(temp, schema.clone(), V3GroupedWriterOptions::default())
+            .map_err(|_| CliError("could not initialize grouped v3 temporary output".to_owned()))?;
+    if batch.event_count != 0 {
+        writer
+            .write_batch(batch)
+            .map_err(|_| CliError("could not write grouped v3 temporary output".to_owned()))?;
+    }
+    writer
+        .finish_and_sync()
+        .map_err(|_| CliError("could not seal grouped v3 temporary output".to_owned()))
+}
+
+#[cfg(unix)]
+fn verify_temp_v3_flat(
     temp: &mut File,
     expected_identity: FileIdentity,
     expected: &V3FlatWriteSummary,
@@ -1152,6 +1401,47 @@ fn verify_temp_v3(
         || verified.global_logical_sha256 != expected.global_logical_sha256
     {
         return Err(CliError("v3 temporary output summary mismatch".to_owned()));
+    }
+    hash_held_file(temp, expected.file_bytes)
+}
+
+#[cfg(unix)]
+fn verify_temp_v3_grouped(
+    temp: &mut File,
+    expected_identity: FileIdentity,
+    expected: &V3GroupedWriteSummary,
+) -> Result<[u8; 32], CliError> {
+    let metadata = temp
+        .metadata()
+        .map_err(|_| CliError("could not inspect grouped v3 temporary output".to_owned()))?;
+    if !metadata.is_file()
+        || metadata.len() != expected.file_bytes
+        || file_identity(&metadata) != expected_identity
+    {
+        return Err(CliError(
+            "invalid grouped v3 temporary output length".to_owned(),
+        ));
+    }
+    temp.seek(SeekFrom::Start(0))
+        .map_err(|_| CliError("could not seek grouped v3 temporary output".to_owned()))?;
+    let mut reader = V3GroupedAura0Reader::open(&mut *temp)
+        .map_err(|_| CliError("grouped v3 temporary output open failed".to_owned()))?;
+    let verified = reader
+        .verify_all()
+        .map_err(|_| CliError("grouped v3 temporary output verification failed".to_owned()))?;
+    if verified.event_count != expected.event_count
+        || verified.child_count != expected.child_count
+        || verified.chunk_count != expected.chunk_count
+        || verified.header_bytes != expected.header_bytes
+        || verified.body_bytes != expected.body_bytes
+        || verified.footer_bytes != expected.footer_bytes
+        || verified.file_bytes != expected.file_bytes
+        || verified.schema_fingerprint != expected.schema_fingerprint
+        || verified.global_logical_sha256 != expected.global_logical_sha256
+    {
+        return Err(CliError(
+            "grouped v3 temporary output summary mismatch".to_owned(),
+        ));
     }
     hash_held_file(temp, expected.file_bytes)
 }
@@ -1811,6 +2101,8 @@ fn v3_safe_error(message: &str) -> (&'static str, String) {
         ("output_exists", "v3 output is not a new regular path")
     } else if message.contains("protocol") {
         ("unsupported_contract", "v3 input protocol is unsupported")
+    } else if message == "grouped v3 invalid ipc" {
+        ("invalid_ipc", "grouped v3 Arrow IPC input is invalid")
     } else if message.contains("schema") {
         ("invalid_schema", "v3 schema is invalid or unavailable")
     } else if message.contains("publish") || message.contains("temporary output") {
@@ -1925,7 +2217,8 @@ mod publication_tests {
 
     use aura_codec::{
         canonical_v3_batch_sha256, canonical_v3_schema_fingerprint, encode_v3_value_block,
-        AuraV3Batch, AuraV3Column, AuraV3ColumnValues, FieldRole, FieldType, SchemaBuilder,
+        AuraV3Batch, AuraV3Column, AuraV3ColumnValues, AuraV3EventBatch, FieldRole, FieldType,
+        RelationshipPermissions, SchemaBuilder,
     };
 
     use super::*;
@@ -2093,6 +2386,48 @@ mod publication_tests {
         (schema, batch)
     }
 
+    fn grouped_v3_reference() -> (aura_codec::SchemaDescriptor, AuraV3EventBatch) {
+        let schema = SchemaBuilder::new("grouped-v3-publication")
+            .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
+            .repeated_field("side", FieldType::U8, FieldRole::Side)
+            .repeated_field("price", FieldType::I64, FieldRole::Price)
+            .dual_domain_repeated_group(
+                1,
+                vec![1, 2],
+                1,
+                RelationshipPermissions::none()
+                    .with_split()
+                    .with_within_domain(),
+            )
+            .finish()
+            .unwrap();
+        let groups = schema.groups.clone();
+        let schema = schema.with_v3_groups(groups).unwrap();
+        let batch = AuraV3EventBatch {
+            schema_id: schema.schema_id,
+            event_count: 1,
+            child_offsets: vec![0, 1],
+            event_columns: vec![AuraV3Column {
+                slot: 0,
+                validity: None,
+                values: AuraV3ColumnValues::TimestampMs(vec![42]),
+            }],
+            repeated_columns: vec![
+                AuraV3Column {
+                    slot: 1,
+                    validity: None,
+                    values: AuraV3ColumnValues::U8(vec![0]),
+                },
+                AuraV3Column {
+                    slot: 2,
+                    validity: None,
+                    values: AuraV3ColumnValues::I64(vec![100]),
+                },
+            ],
+        };
+        (schema, batch)
+    }
+
     #[test]
     fn directory_open_failure_creates_nothing() {
         let dir = TestDirectory::new();
@@ -2165,11 +2500,104 @@ mod publication_tests {
             replace_temp_before_link: true,
             ..Default::default()
         };
-        assert!(publish_verified_v3_with_ops(&dir.output(), &schema, &batch, &ops).is_err());
+        assert!(publish_verified_v3_flat_with_ops(&dir.output(), &schema, &batch, &ops).is_err());
         assert!(!dir.output().exists());
         let temps = dir.temp_paths();
         assert_eq!(temps.len(), 1);
         assert_eq!(fs::read(&temps[0]).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn grouped_v3_uses_shared_publication_identity_guard() {
+        let dir = TestDirectory::new();
+        let (schema, batch) = grouped_v3_reference();
+        let ops = FaultOps {
+            replace_temp_before_link: true,
+            ..Default::default()
+        };
+        assert!(
+            publish_verified_v3_grouped_with_ops(&dir.output(), &schema, &batch, &ops).is_err()
+        );
+        assert!(!dir.output().exists());
+        let temps = dir.temp_paths();
+        assert_eq!(temps.len(), 1);
+        assert_eq!(fs::read(&temps[0]).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn complete_v3_commit_fsync_failure_rolls_back() {
+        let dir = TestDirectory::new();
+        let (schema, batch) = v3_reference();
+        let ops = FaultOps {
+            fail_sync_call: Some(1),
+            ..Default::default()
+        };
+        let error =
+            publish_verified_v3_flat_with_ops(&dir.output(), &schema, &batch, &ops).unwrap_err();
+        assert_ne!(v3_safe_error(&error.0).0, "publication_ambiguous");
+        assert!(!dir.output().exists());
+        assert!(dir.temp_paths().is_empty());
+    }
+
+    #[test]
+    fn complete_v3_rollback_failure_is_ambiguous() {
+        let dir = TestDirectory::new();
+        let (schema, batch) = v3_reference();
+        let ops = FaultOps {
+            fail_sync_call: Some(1),
+            fail_all_remove_after_link: true,
+            ..Default::default()
+        };
+        let error =
+            publish_verified_v3_flat_with_ops(&dir.output(), &schema, &batch, &ops).unwrap_err();
+        assert_eq!(v3_safe_error(&error.0).0, "publication_ambiguous");
+        assert!(dir.output().exists());
+    }
+
+    #[test]
+    fn complete_v3_committed_cleanup_fault_sets_stale_flag() {
+        let dir = TestDirectory::new();
+        let (schema, batch) = v3_reference();
+        let ops = FaultOps {
+            fail_temp_remove_after_link: true,
+            ..Default::default()
+        };
+        let (outcome, _, _) =
+            publish_verified_v3_flat_with_ops(&dir.output(), &schema, &batch, &ops).unwrap();
+        assert!(outcome.stale_temp_cleanup_required);
+        assert!(dir.output().exists());
+        assert_eq!(dir.temp_paths().len(), 1);
+    }
+
+    #[test]
+    fn complete_v3_hardlink_collision_preserves_winner() {
+        let dir = TestDirectory::new();
+        fs::write(dir.output(), b"winner").unwrap();
+        let (schema, batch) = v3_reference();
+        assert!(publish_verified_v3_flat_with_ops(
+            &dir.output(),
+            &schema,
+            &batch,
+            &FaultOps::default()
+        )
+        .is_err());
+        assert_eq!(fs::read(dir.output()).unwrap(), b"winner");
+        assert!(dir.temp_paths().is_empty());
+    }
+
+    #[test]
+    fn complete_v3_cleanup_fsync_fault_sets_stale_flag() {
+        let dir = TestDirectory::new();
+        let (schema, batch) = v3_reference();
+        let ops = FaultOps {
+            fail_sync_call: Some(2),
+            ..Default::default()
+        };
+        let (outcome, _, _) =
+            publish_verified_v3_flat_with_ops(&dir.output(), &schema, &batch, &ops).unwrap();
+        assert!(outcome.stale_temp_cleanup_required);
+        assert!(dir.output().exists());
+        assert!(dir.temp_paths().is_empty());
     }
 
     #[test]
