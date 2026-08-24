@@ -19,21 +19,23 @@ use aura_codec::{
     V3FlatLimits, V3FlatWriteSummary, V3FlatWriterOptions, V3GroupedAura0Reader,
     V3GroupedAura0Writer, V3GroupedWriteSummary, V3GroupedWriterOptions, V3PlannedFlatArtifact,
     V3PlannedFlatSummary, V3ValueLimits, DEFAULT_V3_FLAT_IN_MEMORY_BODY_BYTES,
-    FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION, MAX_SCHEMA_JSON_BYTES, MAX_V3_EVENT_BLOCK_BYTES,
-    MAX_V3_FLAT_FOOTER_BYTES, MAX_V3_FLAT_SCHEMA_BYTES, MAX_V3_GROUPED_FOOTER_BYTES,
-    MAX_V3_PLANNED_FLAT_FOOTER_BYTES, MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL,
-    SHADOW_ARTIFACT_KIND, SHADOW_ARTIFACT_KIND_V2, SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL,
-    SHADOW_PROTOCOL_V2, SHADOW_RESULT_SCHEMA, SHADOW_RESULT_SCHEMA_V2, SHADOW_SCHEMA_FORMAT,
-    SHADOW_VERIFY_RESULT_SCHEMA, SHADOW_VERIFY_RESULT_SCHEMA_V2,
-    V3_FLAT_BODY_ENCODING_EXACT_BLOCKS, V3_FLAT_FOOTER_LAYOUT_VERSION,
-    V3_GROUPED_BODY_ENCODING_EXACT_EVENTS, V3_GROUPED_BODY_LAYOUT_VERSION,
-    V3_GROUPED_EVENT_BLOCK_VERSION, V3_GROUPED_FOOTER_LAYOUT_VERSION,
-    V3_PLANNED_FLAT_BLOCK_VERSION, V3_PLANNED_FLAT_BODY_ENCODING,
+    FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION, FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION,
+    MAX_SCHEMA_JSON_BYTES, MAX_V3_EVENT_BLOCK_BYTES, MAX_V3_FLAT_FOOTER_BYTES,
+    MAX_V3_FLAT_SCHEMA_BYTES, MAX_V3_GROUPED_FOOTER_BYTES, MAX_V3_PLANNED_FLAT_FOOTER_BYTES,
+    MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND, SHADOW_ARTIFACT_KIND_V2,
+    SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL, SHADOW_PROTOCOL_V2, SHADOW_RESULT_SCHEMA,
+    SHADOW_RESULT_SCHEMA_V2, SHADOW_SCHEMA_FORMAT, SHADOW_VERIFY_RESULT_SCHEMA,
+    SHADOW_VERIFY_RESULT_SCHEMA_V2, V3_FLAT_BODY_ENCODING_EXACT_BLOCKS,
+    V3_FLAT_FOOTER_LAYOUT_VERSION, V3_GROUPED_BODY_ENCODING_EXACT_EVENTS,
+    V3_GROUPED_BODY_LAYOUT_VERSION, V3_GROUPED_EVENT_BLOCK_VERSION,
+    V3_GROUPED_FOOTER_LAYOUT_VERSION, V3_PLANNED_FLAT_BLOCK_VERSION, V3_PLANNED_FLAT_BODY_ENCODING,
     V3_PLANNED_FLAT_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION,
     V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION,
-    V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION, V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION,
-    V3_PLANNED_FLAT_ZSTD_LEVEL, V3_PLANNED_FLAT_ZSTD_WINDOW_LOG,
-    V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION,
+    V3_PLANNED_FLAT_TEMPORAL_BLOCK_VERSION, V3_PLANNED_FLAT_TEMPORAL_BODY_LAYOUT_VERSION,
+    V3_PLANNED_FLAT_TEMPORAL_ZSTD_BLOCK_VERSION, V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION,
+    V3_PLANNED_FLAT_TEMPORAL_ZSTD_WRAPPER_VERSION, V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION,
+    V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_ZSTD_LEVEL,
+    V3_PLANNED_FLAT_ZSTD_WINDOW_LOG, V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -786,6 +788,12 @@ fn planned_flat_v3_seal_json(
         .iter()
         .map(planned_flat_codec_inspection_json)
         .collect::<Vec<_>>();
+    let temporal_candidate_codecs = artifact
+        .inspection
+        .temporal_candidate_codecs
+        .iter()
+        .map(planned_flat_codec_inspection_json)
+        .collect::<Vec<_>>();
     let zstd_candidate = artifact.inspection.zstd_candidate.as_ref().map(|zstd| {
         json!({
             "base_candidate_id": zstd.base_candidate_id,
@@ -803,12 +811,40 @@ fn planned_flat_v3_seal_json(
             "flags": 3,
         })
     });
+    let temporal_zstd_candidate =
+        artifact
+            .inspection
+            .temporal_zstd_candidate
+            .as_ref()
+            .map(|zstd| {
+                json!({
+                    "base_candidate_id": zstd.base_candidate_id,
+                    "base_registry_version": zstd.base_registry_version,
+                    "inner_body_layout_version": zstd.inner_body_layout_version,
+                    "inner_block_version": zstd.inner_block_version,
+                    "inner_body_bytes": zstd.inner_body_bytes,
+                    "compressed_payload_bytes": zstd.compressed_payload_bytes,
+                    "wrapper_overhead_bytes": zstd.wrapper_overhead_bytes,
+                    "stored_body_bytes": zstd.stored_body_bytes,
+                    "wrapper_version": V3_PLANNED_FLAT_TEMPORAL_ZSTD_WRAPPER_VERSION,
+                    "compression": "zstd",
+                    "compression_level": V3_PLANNED_FLAT_ZSTD_LEVEL,
+                    "window_log": V3_PLANNED_FLAT_ZSTD_WINDOW_LOG,
+                    "flags": 3,
+                })
+            });
     let plan_sha256 =
         (selection == PlannedFlatSelection::Planned).then(|| hex(&artifact.summary.plan_sha256));
     let dictionary_selected = selected_candidate == "planned-flat-variable-dictionary";
     let zstd_selected = selected_candidate == "planned-flat-zstd19-wrapper";
+    let temporal_selected = selected_candidate == "planned-flat-temporal-zstd19-wrapper";
     let (body_layout_version, block_version) = if selection == PlannedFlatSelection::Exact {
         (None, None)
+    } else if temporal_selected {
+        (
+            Some(V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION),
+            Some(V3_PLANNED_FLAT_TEMPORAL_ZSTD_BLOCK_VERSION),
+        )
     } else if zstd_selected {
         (
             Some(V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION),
@@ -825,14 +861,18 @@ fn planned_flat_v3_seal_json(
             Some(V3_PLANNED_FLAT_BLOCK_VERSION),
         )
     };
-    let container_target = if zstd_selected {
+    let container_target = if temporal_selected {
+        "flat-aura0-v3-planned-v4"
+    } else if zstd_selected {
         "flat-aura0-v3-planned-v3"
     } else if dictionary_selected {
         "flat-aura0-v3-planned-v2"
     } else {
         selection.container_target()
     };
-    let body_encoding = if zstd_selected {
+    let body_encoding = if temporal_selected {
+        "planned_flat_temporal_zstd19_v4"
+    } else if zstd_selected {
         "planned_flat_codecs_zstd19_v3"
     } else if dictionary_selected {
         "planned_flat_codecs_v2"
@@ -840,7 +880,7 @@ fn planned_flat_v3_seal_json(
         selection.body_encoding_name()
     };
     json!({
-        "result_schema": "aura-v3-flat-aura0-planned-request-seal-result-v3",
+        "result_schema": "aura-v3-flat-aura0-planned-request-seal-result-v4",
         "protocol": SHADOW_PROTOCOL,
         "complete_aura_file": true,
         "container_target": container_target,
@@ -852,16 +892,18 @@ fn planned_flat_v3_seal_json(
         "planner_candidates": candidates,
         "physical_codecs": codecs,
         "dictionary_candidate_codecs": dictionary_candidate_codecs,
+        "temporal_candidate_codecs": temporal_candidate_codecs,
         "zstd_candidate": zstd_candidate,
+        "temporal_zstd_candidate": temporal_zstd_candidate,
         "body_encoding": body_encoding,
         "body_encoding_code": selection.body_encoding_code(),
         "body_layout_version": body_layout_version,
         "block_version": block_version,
-        "compression": if zstd_selected { "zstd" } else { "none" },
-        "compression_level": zstd_selected.then_some(V3_PLANNED_FLAT_ZSTD_LEVEL),
-        "wrapper_version": zstd_selected.then_some(V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION),
-        "window_log": zstd_selected.then_some(V3_PLANNED_FLAT_ZSTD_WINDOW_LOG),
-        "wrapper_flags": zstd_selected.then_some(3),
+        "compression": if zstd_selected || temporal_selected { "zstd" } else { "none" },
+        "compression_level": (zstd_selected || temporal_selected).then_some(V3_PLANNED_FLAT_ZSTD_LEVEL),
+        "wrapper_version": if temporal_selected { Some(V3_PLANNED_FLAT_TEMPORAL_ZSTD_WRAPPER_VERSION) } else { zstd_selected.then_some(V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION) },
+        "window_log": (zstd_selected || temporal_selected).then_some(V3_PLANNED_FLAT_ZSTD_WINDOW_LOG),
+        "wrapper_flags": (zstd_selected || temporal_selected).then_some(3),
         "footer_layout_version": selection.footer_layout_version(),
         "plan_sha256": plan_sha256,
         "schema_id": schema.schema_id,
@@ -876,8 +918,8 @@ fn planned_flat_v3_seal_json(
         "stale_temp_cleanup_required": stale_temp_cleanup_required,
         "development_only": true,
         "streaming": false,
-        "memory_model": "bounded_all_memory_exact_fixed_mixed_dictionary_zstd_complete_candidates_v1",
-        "all_memory_limitation": "retains exact, fixed, mixed, dictionary, and zstd complete candidate artifacts plus lane/compression scratch during scoring",
+        "memory_model": "bounded_all_memory_six_complete_candidates_v1",
+        "all_memory_limitation": "retains exact, fixed, mixed, dictionary, zstd, and temporal-zstd complete candidate artifacts plus lane/compression scratch during scoring",
         "build": build_json(provenance)
     })
 }
@@ -891,6 +933,12 @@ fn planned_flat_codec_inspection_json(
         aura_codec::PlanV2PhysicalCodec::SignedZigZagUleb128 => "signed_zigzag_uleb128",
         aura_codec::PlanV2PhysicalCodec::VariableByteDictionaryBitpacked => {
             "variable_byte_dictionary_bitpacked"
+        }
+        aura_codec::PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128 => {
+            "timestamp_previous_delta_zigzag_uleb128"
+        }
+        aura_codec::PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128 => {
+            "timestamp_delta_of_delta_zigzag_uleb128"
         }
     };
     json!({
@@ -909,6 +957,13 @@ fn planned_flat_codec_inspection_json(
         "dictionary_index_bytes": codec.dictionary_index_bytes,
         "dictionary_selected": codec.dictionary_selected,
         "dictionary_rejection": codec.dictionary_rejection,
+        "temporal_direct_bytes": codec.temporal_direct_bytes,
+        "previous_delta_bytes": codec.previous_delta_bytes,
+        "delta_of_delta_bytes": codec.delta_of_delta_bytes,
+        "previous_delta_authorized": codec.previous_delta_authorized,
+        "delta_of_delta_authorized": codec.delta_of_delta_authorized,
+        "temporal_selected": codec.temporal_selected,
+        "temporal_rejection": codec.temporal_rejection,
         "selected_physical_codec": selected_physical_codec,
     })
 }
@@ -1002,9 +1057,18 @@ fn verify_v3_planned_flat_value(mut file: File) -> Result<serde_json::Value, Cli
     let provenance = build_provenance();
     let dictionary_registry =
         decoded.footer.plan.registry_version == FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION;
+    let temporal_registry =
+        decoded.footer.plan.registry_version == FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION;
     let zstd_wrapper =
         decoded.footer.body_layout_version == V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION;
-    let (inner_body_layout_version, inner_block_version) = if dictionary_registry {
+    let temporal_wrapper =
+        decoded.footer.body_layout_version == V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION;
+    let (inner_body_layout_version, inner_block_version) = if temporal_registry {
+        (
+            V3_PLANNED_FLAT_TEMPORAL_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_TEMPORAL_BLOCK_VERSION,
+        )
+    } else if dictionary_registry {
         (
             V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION,
             V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION,
@@ -1015,21 +1079,27 @@ fn verify_v3_planned_flat_value(mut file: File) -> Result<serde_json::Value, Cli
             V3_PLANNED_FLAT_BLOCK_VERSION,
         )
     };
-    let result_schema = if zstd_wrapper {
+    let result_schema = if temporal_wrapper {
+        "aura-v3-flat-aura0-planned-verify-result-v4"
+    } else if zstd_wrapper {
         "aura-v3-flat-aura0-planned-verify-result-v3"
     } else if dictionary_registry {
         "aura-v3-flat-aura0-planned-verify-result-v2"
     } else {
         "aura-v3-flat-aura0-planned-verify-result-v1"
     };
-    let container_target = if zstd_wrapper {
+    let container_target = if temporal_wrapper {
+        "flat-aura0-v3-planned-v4"
+    } else if zstd_wrapper {
         "flat-aura0-v3-planned-v3"
     } else if dictionary_registry {
         "flat-aura0-v3-planned-v2"
     } else {
         PlannedFlatSelection::Planned.container_target()
     };
-    let body_encoding = if zstd_wrapper {
+    let body_encoding = if temporal_wrapper {
+        "planned_flat_temporal_zstd19_v4"
+    } else if zstd_wrapper {
         "planned_flat_codecs_zstd19_v3"
     } else if dictionary_registry {
         "planned_flat_codecs_v2"
@@ -1047,14 +1117,14 @@ fn verify_v3_planned_flat_value(mut file: File) -> Result<serde_json::Value, Cli
         "body_encoding_code": V3_PLANNED_FLAT_BODY_ENCODING,
         "body_layout_version": decoded.footer.body_layout_version,
         "block_version": decoded.footer.block_version,
-        "inner_body_layout_version": zstd_wrapper.then_some(inner_body_layout_version),
-        "inner_block_version": zstd_wrapper.then_some(inner_block_version),
+        "inner_body_layout_version": (zstd_wrapper || temporal_wrapper).then_some(inner_body_layout_version),
+        "inner_block_version": (zstd_wrapper || temporal_wrapper).then_some(inner_block_version),
         "footer_layout_version": V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION,
-        "compression": if zstd_wrapper { "zstd" } else { "none" },
-        "compression_level": zstd_wrapper.then_some(V3_PLANNED_FLAT_ZSTD_LEVEL),
-        "wrapper_version": zstd_wrapper.then_some(V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION),
-        "window_log": zstd_wrapper.then_some(V3_PLANNED_FLAT_ZSTD_WINDOW_LOG),
-        "wrapper_flags": zstd_wrapper.then_some(3),
+        "compression": if zstd_wrapper || temporal_wrapper { "zstd" } else { "none" },
+        "compression_level": (zstd_wrapper || temporal_wrapper).then_some(V3_PLANNED_FLAT_ZSTD_LEVEL),
+        "wrapper_version": if temporal_wrapper { Some(V3_PLANNED_FLAT_TEMPORAL_ZSTD_WRAPPER_VERSION) } else { zstd_wrapper.then_some(V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION) },
+        "window_log": (zstd_wrapper || temporal_wrapper).then_some(V3_PLANNED_FLAT_ZSTD_WINDOW_LOG),
+        "wrapper_flags": (zstd_wrapper || temporal_wrapper).then_some(3),
         "verified": true,
         "schema_id": decoded.footer.schema.schema_id,
         "schema_fingerprint_sha256": hex(&decoded.summary.schema_fingerprint),

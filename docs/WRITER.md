@@ -103,4 +103,10 @@ chunk-local dictionaries with minimal bitpacked present-only indices for
 Utf8/DecimalText; it performs no normalization or entropy compression.
 One additional body-layout-3 candidate wraps the preselected registry1/2 block
 independently per chunk with the canonical bounded zstd19 profile. This does
-not make the complete planned reader streaming or production-ready.
+not make the complete planned reader streaming or production-ready. A sixth
+complete candidate inherits that selected registry1/2 plan, replaces only a
+strictly smaller schema-authorized primary timestamp lane with checked
+per-chunk previous-delta (or explicitly authorized delta-of-delta), encodes an
+`AUFPVB03` inner block, and stores it in the distinct `AUFPZB02` wrapper-v2
+layout 5. The compiler retains all six complete artifacts while scoring; this
+is a bounded all-memory development limitation, not a measured-size claim.

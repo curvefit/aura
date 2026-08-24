@@ -118,17 +118,23 @@ before create-once publication and never silently replaces an existing
 destination. Verification boundedly routes the held file from its footer tuple
 and verifies the exact embedded flat, planned-flat, or grouped schema and
 complete file. The optional flat `--mode planned` route is development-only:
-it scores exact and plan-bound fixed/absolute-varint lane encodings plus one
-canonical exact-byte dictionary/bitpacked-index candidate and one deterministic
-per-chunk zstd19 wrapper candidate as complete files
+it scores exact and plan-bound fixed/absolute-varint lane encodings, one
+canonical exact-byte dictionary/bitpacked-index candidate, the existing
+deterministic per-chunk zstd19 wrapper, and one additional wrapped temporal
+candidate as complete files
 using conservative bounds and publishes the smallest result (fixed ties,
 including an auditable exact fallback). Dictionaries apply generically only to
 Utf8 and DecimalText and never normalize bytes. Its receipt reports every
-candidate cost, per-lane dictionary attribution, wrapper/base/compressed-byte
-facts, and the actual selected wire tuple. Compression is independently
+candidate cost, per-lane dictionary and temporal attribution,
+wrapper/base/compressed-byte facts, and the actual selected wire tuple. The
+temporal candidate is limited to the non-null event-scope primary TimestampNs
+or TimestampMs field stamped by compact schema byte 100; it resets each chunk
+and uses only explicitly schema-authorized previous-delta or delta-of-delta
+math. Compression is independently
 decodable per chunk with a fixed 8 MiB window cap, but compilation and planned
 verification remain bounded all-memory reference paths, not seekable/streaming
-readiness or a production/Parquet-size claim.
+readiness or a production/Parquet-size claim. No measured-size target is
+claimed by this additive development route.
 
 The supported V3 flat subset is intentionally narrow: event-scoped fields,
 exact fixed and variable values, and optional validity bitmaps. It rejects

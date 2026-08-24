@@ -6,8 +6,9 @@ Current production and default SDK writers still emit container V2. Aura also
 implements three complete, explicitly selected V3 Aura0 flavors: uncompressed
 flat event-scoped files whose body is a concatenation of exact-value
 `AURAV3VB` blocks; a development-only planned-flat file with plan-bound fixed,
-absolute-varint, exact-byte variable-dictionary lanes, and one per-chunk zstd19
-wrapper candidate; and uncompressed grouped exact-event files whose body is a
+absolute-varint, exact-byte variable-dictionary lanes, the existing per-chunk
+zstd19 wrapper, and a distinct schema-authorized temporal wrapper candidate;
+and uncompressed grouped exact-event files whose body is a
 concatenation of `AURAV3EB` chunks.
 Exact-flat and grouped have seekable
 writers/readers. Planned-flat compilation and verification are bounded
@@ -126,9 +127,10 @@ Planned-flat is an additive group-free development format for the same logical
 flat schema subset. Its `AURP` route tuple is container version `3`, footer
 layout `3`, body encoding `4`, followed by three zero reserved bytes. The
 footer stamps body/block version `1` for registry 1, version `2` for registry
-2, or outer wrapper version `3`, plus the complete canonical schema descriptor
-and an `AUF2` plan. A decoder never replans and needs no dataset, venue, symbol,
-filename, or sidecar.
+2, outer wrapper version `3` for wrapper v1, or outer wrapper version `5` for
+the registry-3 temporal wrapper v2, plus the complete canonical schema
+descriptor and an `AUF2` plan. A decoder never replans and needs no dataset,
+venue, symbol, filename, or sidecar.
 
 Canonical `AUF2` plan version `2`, registry version `1`, starts with magic
 `AUF2`, total length, schema ID and fingerprint, field count, and reserved
@@ -145,6 +147,20 @@ only for Utf8 and DecimalText and requires at least one such lane; the other
 codec bytes retain registry-1 meaning. One registry covers both types because
 the schema binds the logical type and the codec preserves already-validated
 bytes without DecimalText normalization.
+
+Registry version `3` has another distinct plan-hash domain and inherits the
+registry-2 codecs. Physical code `4` means previous-delta ZigZag ULEB128 and
+code `5` means delta-of-delta ZigZag ULEB128. These codes are legal only for
+slot 0 when it is the event-scope, non-null TimestampNs/TimestampMs primary
+field whose compact schema map byte is `100`. Absolute and the chosen temporal
+transform must both be present in the field's schema candidates. The standard
+timestamp contract authorizes `DeltaPrevious`; it does not authorize `Delta2`
+unless that candidate is explicitly added. Each chunk starts with one absolute
+signed value. Previous-delta stores each following checked difference;
+delta-of-delta stores the first difference then checked differences of
+differences. Forward and inverse arithmetic use checked i128 intermediates and
+must fit i64 exactly. Auxiliary timestamp byte `255`, nullable timestamps, and
+arbitrary integer fields cannot use either codec.
 
 Each planned body chunk starts with `AUFPVB01`, block version `1`, zero flags,
 schema ID/fingerprint, row and field counts, zero reserved bytes, and the full
@@ -180,13 +196,23 @@ checks length/SHA/inner plan decode, then recompresses with the pinned profile
 and requires exact frame equality. Footer layout 3/body encoding 4 remain the
 planned-flat family route; old readers fail closed on unknown body layout 3.
 
-The reference compiler scores five complete artifacts: legacy exact flat,
+Registry-3 inner chunks use magic `AUFPVB03`, body layout `4`, and block
+version `4`. They retain registry-2 lane framing and stamp every selected
+physical codec in the registry-3 plan. The reference compiler emits them only
+inside the new `AUFPZB02` wrapper-v2 candidate. That wrapper retains the
+canonical 68-byte zstd19 profile but is stored as outer body layout `5` and
+block version `5`, so no wrapper-v1 artifact or receipt is reinterpreted.
+
+The reference compiler scores six complete artifacts: legacy exact flat,
 planned all-fixed, planned per-field fixed/varint, and one registry-2 candidate
 starting from the mixed plan and choosing a dictionary per eligible field only
 on a strict aggregate actual-lane byte win across chunks, followed by one
-zstd19 candidate. The wrapper base is chosen before compression: registry2
+zstd19 candidate and one registry-3 temporal-zstd19 candidate. The wrapper-v1
+base is chosen before compression: registry2
 when applicable, otherwise registry1 mixed; both bases are never compressed
-and compared retrospectively. It charges header,
+and compared retrospectively. Registry 3 inherits that chosen base and changes
+only authorized primary timestamp lanes that strictly reduce aggregate raw
+lane bytes; its resulting inner plan is wrapped once. It charges header,
 body, plan, schema, footer, descriptors, hashes, footer length, and seal, and
 uses stable candidate order for complete-file ties. Therefore an explicit
 planned request may truthfully publish the byte-identical legacy exact
@@ -194,10 +220,11 @@ fallback. The CLI receipt records requested mode, every candidate's
 cost/applicability/rejection, selected candidate, actual route tuple, and
 bounded per-slot direct/dictionary/count/index attribution plus wrapper base,
 inner, compressed, and overhead bytes. This reference compiler retains up to
-five complete candidates plus lane/dictionary/compression scratch; it is not
-the streaming ingest writer or a readiness claim. Registry 2 adds no RLE,
-Huffman, relationship math, or identity logic; layout 3 is the sole zstd19
-candidate.
+six complete candidates plus lane/dictionary/temporal/compression scratch; it
+is not the streaming ingest writer or a readiness claim. The additive
+registries use no RLE, Huffman, provider identity, or inferred economic
+semantics. Layouts 3 and 5 are distinct wrapper versions; neither is a
+streaming/readiness or measured-size claim.
 
 ## Grouped Aura0 V3 container V1
 

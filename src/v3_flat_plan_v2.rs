@@ -1,4 +1,8 @@
 //! Canonical group-free flat Aura Plan v2 (`AUF2`).
+//!
+//! Registry 1 is the frozen fixed/absolute-varint contract, registry 2 adds
+//! exact-byte variable dictionaries, and registry 3 additively authorizes
+//! per-chunk temporal lanes only for the schema-stamped primary timestamp.
 
 use sha2::{Digest, Sha256};
 
@@ -9,11 +13,13 @@ pub const FLAT_PLAN_V2_MAGIC: &[u8; 4] = b"AUF2";
 pub const FLAT_PLAN_V2_VERSION: u16 = 2;
 pub const FLAT_PLAN_V2_REGISTRY_VERSION: u16 = 1;
 pub const FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION: u16 = 2;
+pub const FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION: u16 = 3;
 pub const MAX_FLAT_PLAN_V2_BYTES: usize = 16 * 1024 * 1024;
 const HEADER_BYTES: usize = 52;
 const HASH_BYTES: usize = 32;
 const REGISTRY1_HASH_DOMAIN: &[u8] = b"aura-flat-plan-v2-registry-v1\0";
 const REGISTRY2_HASH_DOMAIN: &[u8] = b"aura-flat-plan-v2-registry-v2\0";
+const REGISTRY3_HASH_DOMAIN: &[u8] = b"aura-flat-plan-v2-registry-v3\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlatAuraPlanV2 {
@@ -73,6 +79,8 @@ impl FlatAuraPlanV2 {
                                 crate::FieldType::Utf8 | crate::FieldType::DecimalText
                             )
                         }
+                        PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128
+                        | PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128 => false,
                     };
                     if !valid {
                         return Err(AuraError::InvalidValue("flat plan v2 codec type"));
@@ -80,6 +88,40 @@ impl FlatAuraPlanV2 {
                 }
                 if !has_dictionary {
                     return Err(AuraError::InvalidValue("flat plan v2 dictionary registry"));
+                }
+            }
+            FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION => {
+                let mut has_temporal = false;
+                for (field, codec) in schema.fields.iter().zip(&self.codecs) {
+                    let valid = match codec {
+                        PlanV2PhysicalCodec::FixedWidth => true,
+                        PlanV2PhysicalCodec::UnsignedUleb128
+                        | PlanV2PhysicalCodec::SignedZigZagUleb128 => {
+                            integer_varint_codec(field.field_type) == Some(*codec)
+                        }
+                        PlanV2PhysicalCodec::VariableByteDictionaryBitpacked => matches!(
+                            field.field_type,
+                            crate::FieldType::Utf8 | crate::FieldType::DecimalText
+                        ),
+                        PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128 => {
+                            has_temporal = true;
+                            temporal_field_authorized(
+                                schema,
+                                field,
+                                crate::FieldTransform::DeltaPrevious,
+                            )
+                        }
+                        PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128 => {
+                            has_temporal = true;
+                            temporal_field_authorized(schema, field, crate::FieldTransform::Delta2)
+                        }
+                    };
+                    if !valid {
+                        return Err(AuraError::InvalidValue("flat plan v2 codec type"));
+                    }
+                }
+                if !has_temporal {
+                    return Err(AuraError::InvalidValue("flat plan v2 temporal registry"));
                 }
             }
             _ => return Err(AuraError::InvalidValue("flat plan v2 registry")),
@@ -167,6 +209,7 @@ fn hash_bytes(registry_version: u16, bytes: &[u8]) -> Result<[u8; 32]> {
     let domain = match registry_version {
         FLAT_PLAN_V2_REGISTRY_VERSION => REGISTRY1_HASH_DOMAIN,
         FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION => REGISTRY2_HASH_DOMAIN,
+        FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION => REGISTRY3_HASH_DOMAIN,
         _ => return Err(AuraError::InvalidValue("flat plan v2 registry")),
     };
     let mut hasher = Sha256::new();
@@ -180,9 +223,68 @@ fn hash_bytes(registry_version: u16, bytes: &[u8]) -> Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
+pub(crate) fn temporal_field_authorized(
+    schema: &SchemaDescriptor,
+    field: &crate::FieldDescriptor,
+    transform: crate::FieldTransform,
+) -> bool {
+    field.index == 0
+        && field.role == crate::FieldRole::Timestamp
+        && field.scope == crate::FieldScope::Event
+        && !field.nullable
+        && field.scale == 0
+        && field.relation == crate::FieldRelation::None
+        && matches!(
+            field.field_type,
+            crate::FieldType::TimestampNs | crate::FieldType::TimestampMs
+        )
+        && field.candidates.contains(crate::FieldTransform::Absolute)
+        && field.candidates.contains(transform)
+        && schema
+            .compact_schema_map
+            .as_deref()
+            .and_then(|mapping| mapping.get(usize::from(field.index)))
+            == Some(&100)
+}
+
 fn put_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(test)]
+mod temporal_authorization_tests {
+    use super::*;
+    use crate::{FieldRelation, FieldRole, FieldScope, FieldTransform, FieldType, SchemaBuilder};
+
+    #[test]
+    fn temporal_authorization_rejects_scale_relation_and_scope_gates() {
+        let schema = SchemaBuilder::new("anonymous_temporal_gates")
+            .v3()
+            .field("clock", FieldType::TimestampNs, FieldRole::Timestamp)
+            .finish()
+            .unwrap();
+        assert!(temporal_field_authorized(
+            &schema,
+            &schema.fields[0],
+            FieldTransform::DeltaPrevious
+        ));
+
+        let mutations: [fn(&mut crate::FieldDescriptor); 3] = [
+            |field: &mut crate::FieldDescriptor| field.scale = 1,
+            |field: &mut crate::FieldDescriptor| field.relation = FieldRelation::DeltaFromField(0),
+            |field: &mut crate::FieldDescriptor| field.scope = FieldScope::Repeated,
+        ];
+        for mutate in mutations {
+            let mut field = schema.fields[0].clone();
+            mutate(&mut field);
+            assert!(!temporal_field_authorized(
+                &schema,
+                &field,
+                FieldTransform::DeltaPrevious
+            ));
+        }
+    }
 }

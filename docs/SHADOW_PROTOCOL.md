@@ -58,9 +58,9 @@ aura v3 aura0 seal \
   --json < logical.arrow-stream
 ```
 
-The `aura-v3-flat-aura0-planned-request-seal-result-v3` schema reports all
-five candidates' applicability, rejection/cost attribution, selected physical
-codec rows, dictionary counts and byte attribution, wrapper/base/compressed
+The `aura-v3-flat-aura0-planned-request-seal-result-v4` schema reports all
+six candidates' applicability, rejection/cost attribution, selected physical
+codec rows, dictionary and temporal byte attribution, wrapper/base/compressed
 bytes, complete bytes, the
 selected candidate, the actual footer/body tuple, and a plan hash only when a
 planned tuple wins. Exact fallback is intentional and is verified with the
@@ -71,11 +71,14 @@ schema `aura-v3-flat-aura0-planned-verify-result-v1`. Registry-2/layout-2
 files use the corresponding `planned-v2`, `planned_flat_codecs_v2`, and
 planned-verify-result-v2 identities. Body-layout-3 wrapper files use
 `planned-v3`, `planned_flat_codecs_zstd19_v3`, and planned-verify-result-v3.
-This preserves attempt-6/7 receipt meaning rather than silently broadening v1
-or v2 result schemas. Both planned
+Registry-3 temporal inner blocks use `AUFPVB03` layout/block 4 only inside
+`AUFPZB02` wrapper-v2 outer layout/block 5; they use `planned-v4`,
+`planned_flat_temporal_zstd19_v4`, and planned-verify-result-v4. This preserves
+all v1-v3 receipt meanings rather than silently broadening them. Both planned
 compilation and verification are conservatively bounded all-memory reference
-operations: compilation retains the exact, fixed, mixed, dictionary, and
-zstd19 complete candidates plus lane/dictionary/compression scratch.
+operations: compilation retains the exact, fixed, mixed, dictionary, zstd19,
+and temporal-zstd19 complete candidates plus lane/dictionary/temporal/
+compression scratch.
 Registry-2 dictionaries are
 chunk-local, lexicographically canonical, exact-byte Utf8/DecimalText codecs
 with present-only minimal bitpacked indices. They do not normalize DecimalText
@@ -85,6 +88,14 @@ content size plus checksum, and an 8 MiB window cap. It never compresses both
 bases and chooses retrospectively. This is not a seekable, streaming,
 production, Parquet-size, or readiness claim. Planned mode is not accepted for
 grouped protocol v2.
+
+The temporal candidate resets per chunk and is restricted to a schema-stamped
+byte-100, non-null primary TimestampNs/TimestampMs lane. It may use checked
+previous-delta when explicitly authorized by the field candidates, and may use
+delta-of-delta only if `Delta2` is separately explicit. It never applies to an
+auxiliary byte-255 timestamp or infers a provider, field identity, or economic
+meaning. The v4 seal receipt reports direct/previous/delta-of-delta lane costs,
+authorization, selected transform, inner versions, and wrapper-v2 attribution.
 
 Seal accepts canonical schema JSON only and publishes a new mode-0600 path via
 the same create-once, held-handle verification and directory-fsync state

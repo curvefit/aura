@@ -1,11 +1,14 @@
 //! Bounded all-memory reference planned-flat Aura0 V3 container.
 //!
-//! Exact, all-fixed, mixed-integer, variable-dictionary, and one independently
-//! chunk-wrapped zstd19 complete artifact coexist during scoring; peak memory
-//! is therefore roughly their summed bytes plus lane/dictionary/compression
-//! scratch. This is an honest replayable reference API, not a streaming writer
-//! claim. Registry 2 dictionaries retain exact Utf8 and DecimalText bytes. The
-//! single wrapper candidate uses no RLE, relationship math, or identity logic.
+//! Exact, all-fixed, mixed-integer, variable-dictionary, the existing wrapped
+//! plan, and one primary-timestamp temporal wrapped artifact coexist during
+//! scoring. Peak memory is therefore roughly their summed bytes plus
+//! lane/dictionary/compression scratch. This is an honest replayable reference
+//! API, not a streaming writer claim. Registry 2 dictionaries retain exact
+//! Utf8 and DecimalText bytes. Registry 3 may use only schema-authorized
+//! previous-delta or explicitly authorized delta-of-delta for the non-null
+//! byte-100 primary timestamp, with a reset in every chunk. Neither wrapper
+//! uses RLE, provider identity, or inferred economic semantics.
 
 use std::io::{self, Cursor, Read, Write};
 use std::{cell::Cell, rc::Rc};
@@ -22,7 +25,8 @@ use crate::v3_codecs::{
     PlanV2PhysicalCodec,
 };
 use crate::v3_flat_plan_v2::{
-    FlatAuraPlanV2, FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION, FLAT_PLAN_V2_REGISTRY_VERSION,
+    temporal_field_authorized, FlatAuraPlanV2, FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION,
+    FLAT_PLAN_V2_REGISTRY_VERSION, FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION,
 };
 use crate::v3_values::{
     decode_column, encode_column, is_present, validate_bitmap_padding, AuraV3VariableColumn,
@@ -47,15 +51,22 @@ pub const V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION: u16 = 3;
 pub const V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION: u16 = 1;
 pub const V3_PLANNED_FLAT_ZSTD_LEVEL: i32 = 19;
 pub const V3_PLANNED_FLAT_ZSTD_WINDOW_LOG: u8 = 23;
+pub const V3_PLANNED_FLAT_TEMPORAL_BODY_LAYOUT_VERSION: u16 = 4;
+pub const V3_PLANNED_FLAT_TEMPORAL_BLOCK_VERSION: u16 = 4;
+pub const V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION: u16 = 5;
+pub const V3_PLANNED_FLAT_TEMPORAL_ZSTD_BLOCK_VERSION: u16 = 5;
+pub const V3_PLANNED_FLAT_TEMPORAL_ZSTD_WRAPPER_VERSION: u16 = 2;
 pub const V3_PLANNED_FLAT_FOOTER_PREFIX_BYTES: usize = 208;
 pub const V3_PLANNED_FLAT_CHUNK_DESCRIPTOR_BYTES: usize = 104;
 pub const MAX_V3_PLANNED_FLAT_FOOTER_BYTES: usize = 64 * 1024 * 1024;
 
 const BLOCK_MAGIC_V1: &[u8; 8] = b"AUFPVB01";
 const BLOCK_MAGIC_V2: &[u8; 8] = b"AUFPVB02";
+const BLOCK_MAGIC_V3: &[u8; 8] = b"AUFPVB03";
 const BLOCK_HEADER_BYTES: usize = 64;
 const DICTIONARY_LANE_PREFIX_BYTES: usize = 12;
 const ZSTD_WRAPPER_MAGIC: &[u8; 8] = b"AUFPZB01";
+const TEMPORAL_ZSTD_WRAPPER_MAGIC: &[u8; 8] = b"AUFPZB02";
 const ZSTD_WRAPPER_HEADER_BYTES: usize = 68;
 const ZSTD_CODEC_ID: u8 = 1;
 const ZSTD_WRAPPER_FLAGS: u8 = 0b0000_0011;
@@ -129,6 +140,13 @@ pub struct V3PlannedFlatCodecInspection {
     pub dictionary_index_bytes: Option<u64>,
     pub dictionary_selected: bool,
     pub dictionary_rejection: Option<String>,
+    pub temporal_direct_bytes: Option<u64>,
+    pub previous_delta_bytes: Option<u64>,
+    pub delta_of_delta_bytes: Option<u64>,
+    pub previous_delta_authorized: bool,
+    pub delta_of_delta_authorized: bool,
+    pub temporal_selected: bool,
+    pub temporal_rejection: Option<String>,
     pub selected: PlanV2PhysicalCodec,
 }
 
@@ -138,6 +156,8 @@ pub struct V3PlannedFlatInspection {
     pub codecs: Vec<V3PlannedFlatCodecInspection>,
     pub dictionary_candidate_codecs: Vec<V3PlannedFlatCodecInspection>,
     pub zstd_candidate: Option<V3PlannedFlatZstdInspection>,
+    pub temporal_zstd_candidate: Option<V3PlannedFlatZstdInspection>,
+    pub temporal_candidate_codecs: Vec<V3PlannedFlatCodecInspection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,36 +230,59 @@ pub fn compile_v3_planned_flat(
         )),
         Err(error) => Err(error.clone()),
     };
-    let (zstd, zstd_rows) = match (&dictionary, &dictionary_plan_rows) {
-        (Ok(_), Ok((Some(plan), _))) => (
-            compile_zstd_plan(
-                schema,
-                batches,
-                limits,
-                plan.clone(),
-                "planned-flat-variable-dictionary",
-            ),
+    let base_plan_rows = match (&dictionary, &dictionary_plan_rows) {
+        (Ok(_), Ok((Some(plan), _))) => Ok((
+            plan.clone(),
             dictionary_rows.clone(),
-        ),
+            "planned-flat-variable-dictionary",
+        )),
         _ => match &mixed_plan_rows {
-            Ok((plan, _)) => (
-                compile_zstd_plan(
-                    schema,
-                    batches,
-                    limits,
-                    plan.clone(),
-                    "planned-flat-integer-codecs",
-                ),
+            Ok((plan, _)) => Ok((
+                plan.clone(),
                 mixed_rows.clone(),
-            ),
-            Err(error) => (Err(error.clone()), Vec::new()),
+                "planned-flat-integer-codecs",
+            )),
+            Err(error) => Err(error.clone()),
         },
+    };
+    let (zstd, zstd_rows) = match &base_plan_rows {
+        Ok((plan, rows, base_candidate_id)) => (
+            compile_zstd_plan(schema, batches, limits, plan.clone(), base_candidate_id),
+            rows.clone(),
+        ),
+        Err(error) => (Err(error.clone()), Vec::new()),
     };
     let zstd_inspection = zstd
         .as_ref()
         .ok()
         .and_then(|artifact| artifact.inspection.zstd_candidate.clone());
-    let candidates = vec![exact, fixed, mixed, dictionary, zstd];
+    let temporal_plan_rows = match &base_plan_rows {
+        Ok((plan, rows, _)) => select_temporal_codecs(schema, batches, plan.clone(), rows.clone()),
+        Err(error) => Err(error.clone()),
+    };
+    let temporal_rows = temporal_plan_rows
+        .as_ref()
+        .ok()
+        .map(|(_, rows)| rows.clone())
+        .unwrap_or_default();
+    let temporal = match (&temporal_plan_rows, &base_plan_rows) {
+        (Ok((Some(plan), _)), Ok((base_plan, _, base_candidate_id))) => compile_temporal_zstd_plan(
+            schema,
+            batches,
+            limits,
+            plan.clone(),
+            base_candidate_id,
+            base_plan.registry_version,
+        ),
+        (Ok((None, _)), _) => Err(AuraError::InvalidValue("planned flat temporal no lane win")),
+        (Err(error), _) => Err(error.clone()),
+        (_, Err(error)) => Err(error.clone()),
+    };
+    let temporal_zstd_inspection = temporal
+        .as_ref()
+        .ok()
+        .and_then(|artifact| artifact.inspection.temporal_zstd_candidate.clone());
+    let candidates = vec![exact, fixed, mixed, dictionary, zstd, temporal];
     if let Some(error) = candidates
         .iter()
         .filter_map(|candidate| candidate.as_ref().err())
@@ -271,6 +314,7 @@ pub fn compile_v3_planned_flat(
         "planned-flat-integer-codecs",
         "planned-flat-variable-dictionary",
         "planned-flat-zstd19-wrapper",
+        "planned-flat-temporal-zstd19-wrapper",
     ];
     let candidate_rows = ids
         .iter()
@@ -293,10 +337,13 @@ pub fn compile_v3_planned_flat(
         2 => mixed_rows,
         3 => dictionary_rows.clone(),
         4 => zstd_rows,
+        5 => temporal_rows.clone(),
         _ => Vec::new(),
     };
     selected.inspection.dictionary_candidate_codecs = dictionary_rows;
     selected.inspection.zstd_candidate = zstd_inspection;
+    selected.inspection.temporal_candidate_codecs = temporal_rows;
+    selected.inspection.temporal_zstd_candidate = temporal_zstd_inspection;
     Ok(selected)
 }
 
@@ -364,6 +411,8 @@ fn compile_exact(
             codecs: Vec::new(),
             dictionary_candidate_codecs: Vec::new(),
             zstd_candidate: None,
+            temporal_zstd_candidate: None,
+            temporal_candidate_codecs: Vec::new(),
         },
     })
 }
@@ -404,6 +453,13 @@ fn select_codecs(
             dictionary_index_bytes: None,
             dictionary_selected: false,
             dictionary_rejection: None,
+            temporal_direct_bytes: None,
+            previous_delta_bytes: None,
+            delta_of_delta_bytes: None,
+            previous_delta_authorized: false,
+            delta_of_delta_authorized: false,
+            temporal_selected: false,
+            temporal_rejection: None,
             selected,
         });
     }
@@ -467,6 +523,113 @@ fn select_dictionary_codecs(
     } else {
         Ok((None, rows))
     }
+}
+
+fn select_temporal_codecs(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3Batch],
+    mut plan: FlatAuraPlanV2,
+    mut rows: Vec<V3PlannedFlatCodecInspection>,
+) -> Result<(Option<FlatAuraPlanV2>, Vec<V3PlannedFlatCodecInspection>)> {
+    if rows.len() != schema.fields.len()
+        || !matches!(
+            plan.registry_version,
+            FLAT_PLAN_V2_REGISTRY_VERSION | FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION
+        )
+    {
+        return Err(AuraError::InvalidValue("planned flat temporal analysis"));
+    }
+    plan.registry_version = FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION;
+    let mut selected_any = false;
+    for (field, row) in schema.fields.iter().zip(&mut rows) {
+        let previous_authorized =
+            temporal_field_authorized(schema, field, crate::FieldTransform::DeltaPrevious);
+        let delta2_authorized =
+            temporal_field_authorized(schema, field, crate::FieldTransform::Delta2);
+        row.previous_delta_authorized = previous_authorized;
+        row.delta_of_delta_authorized = delta2_authorized;
+        if !previous_authorized && !delta2_authorized {
+            row.temporal_rejection = Some(
+                "primary timestamp header and explicit transform do not authorize temporal codec"
+                    .to_owned(),
+            );
+            continue;
+        }
+        let direct = u64::try_from(lane_total(batches, usize::from(field.index), row.selected)?)
+            .map_err(|_| AuraError::InvalidValue("planned flat temporal lane length"))?;
+        row.temporal_direct_bytes = Some(direct);
+        let previous = if previous_authorized {
+            temporal_lane_total(
+                batches,
+                usize::from(field.index),
+                PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128,
+            )?
+        } else {
+            None
+        };
+        let delta2 = if delta2_authorized {
+            temporal_lane_total(
+                batches,
+                usize::from(field.index),
+                PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128,
+            )?
+        } else {
+            None
+        };
+        row.previous_delta_bytes = previous;
+        row.delta_of_delta_bytes = delta2;
+        let mut selected_codec = row.selected;
+        let mut selected_bytes = direct;
+        if previous.is_some_and(|bytes| bytes < selected_bytes) {
+            selected_codec = PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128;
+            selected_bytes = previous.unwrap();
+        }
+        if delta2.is_some_and(|bytes| bytes < selected_bytes) {
+            selected_codec = PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128;
+        }
+        if selected_codec == row.selected {
+            row.temporal_rejection = Some("temporal lane bytes did not win".to_owned());
+        } else {
+            row.selected = selected_codec;
+            row.temporal_selected = true;
+            row.temporal_rejection = None;
+            plan.codecs[usize::from(field.index)] = selected_codec;
+            selected_any = true;
+        }
+    }
+    if selected_any {
+        plan.validate(schema)?;
+        Ok((Some(plan), rows))
+    } else {
+        Ok((None, rows))
+    }
+}
+
+fn temporal_lane_total(
+    batches: &[AuraV3Batch],
+    slot: usize,
+    codec: PlanV2PhysicalCodec,
+) -> Result<Option<u64>> {
+    let mut total = 0u64;
+    for batch in batches {
+        let column = batch
+            .columns
+            .get(slot)
+            .ok_or(AuraError::InvalidValue("planned flat temporal slot"))?;
+        let mut encoded = Vec::new();
+        match encode_temporal_lane(column, codec, &mut encoded) {
+            Ok(()) => {}
+            Err(AuraError::InvalidValue("planned flat temporal overflow")) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        total = total
+            .checked_add(
+                u64::try_from(encoded.len())
+                    .map_err(|_| AuraError::InvalidValue("planned flat temporal lane length"))?,
+            )
+            .ok_or(AuraError::InvalidValue("planned flat temporal lane length"))?;
+    }
+    Ok(Some(total))
 }
 
 fn dictionary_lane_totals(batches: &[AuraV3Batch], slot: usize) -> Result<DictionaryLaneTotals> {
@@ -566,10 +729,36 @@ fn compile_zstd_plan(
     )
 }
 
+fn compile_temporal_zstd_plan(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3Batch],
+    limits: V3FlatLimits,
+    plan: FlatAuraPlanV2,
+    base_candidate_id: &'static str,
+    base_registry_version: u16,
+) -> Result<V3PlannedFlatArtifact> {
+    compile_plan_storage(
+        schema,
+        batches,
+        limits,
+        plan,
+        PlannedStorage::TemporalZstd19 {
+            base_candidate_id,
+            base_registry_version,
+        },
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlannedStorage {
     Direct,
-    Zstd19 { base_candidate_id: &'static str },
+    Zstd19 {
+        base_candidate_id: &'static str,
+    },
+    TemporalZstd19 {
+        base_candidate_id: &'static str,
+        base_registry_version: u16,
+    },
 }
 
 fn compile_plan_storage(
@@ -596,6 +785,10 @@ fn compile_plan_storage(
             V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION,
             V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION,
         ),
+        PlannedStorage::TemporalZstd19 { .. } => (
+            V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_TEMPORAL_ZSTD_BLOCK_VERSION,
+        ),
     };
     let mut inner_body_bytes = 0u64;
     let mut compressed_payload_bytes = 0u64;
@@ -616,13 +809,22 @@ fn compile_plan_storage(
             ))?;
         let block = match storage {
             PlannedStorage::Direct => inner_block,
-            PlannedStorage::Zstd19 { .. } => {
-                let wrapper = encode_zstd_wrapper(
-                    &inner_block,
-                    inner_body_layout_version,
-                    inner_block_version,
-                    limits.value_limits,
-                )?;
+            PlannedStorage::Zstd19 { .. } | PlannedStorage::TemporalZstd19 { .. } => {
+                let wrapper = if matches!(storage, PlannedStorage::TemporalZstd19 { .. }) {
+                    encode_temporal_zstd_wrapper(
+                        &inner_block,
+                        inner_body_layout_version,
+                        inner_block_version,
+                        limits.value_limits,
+                    )?
+                } else {
+                    encode_zstd_wrapper(
+                        &inner_block,
+                        inner_body_layout_version,
+                        inner_block_version,
+                        limits.value_limits,
+                    )?
+                };
                 compressed_payload_bytes = compressed_payload_bytes
                     .checked_add(
                         u64::try_from(wrapper.len() - ZSTD_WRAPPER_HEADER_BYTES).map_err(|_| {
@@ -669,21 +871,36 @@ fn compile_plan_storage(
         chunks,
     };
     let mut artifact = seal(header_bytes, body, footer, limits)?;
-    if let PlannedStorage::Zstd19 { base_candidate_id } = storage {
+    if let PlannedStorage::Zstd19 { base_candidate_id }
+    | PlannedStorage::TemporalZstd19 {
+        base_candidate_id, ..
+    } = storage
+    {
         let wrapper_overhead_bytes = u64::try_from(batches.len())
             .ok()
             .and_then(|chunks| chunks.checked_mul(ZSTD_WRAPPER_HEADER_BYTES as u64))
             .ok_or(AuraError::InvalidValue("planned flat zstd wrapper length"))?;
-        artifact.inspection.zstd_candidate = Some(V3PlannedFlatZstdInspection {
+        let inspection = V3PlannedFlatZstdInspection {
             base_candidate_id: base_candidate_id.to_owned(),
-            base_registry_version: plan.registry_version,
+            base_registry_version: match storage {
+                PlannedStorage::TemporalZstd19 {
+                    base_registry_version,
+                    ..
+                } => base_registry_version,
+                _ => plan.registry_version,
+            },
             inner_body_layout_version,
             inner_block_version,
             inner_body_bytes,
             compressed_payload_bytes,
             wrapper_overhead_bytes,
             stored_body_bytes: artifact.summary.body_bytes,
-        });
+        };
+        if matches!(storage, PlannedStorage::TemporalZstd19 { .. }) {
+            artifact.inspection.temporal_zstd_candidate = Some(inspection);
+        } else {
+            artifact.inspection.zstd_candidate = Some(inspection);
+        }
     }
     Ok(artifact)
 }
@@ -738,6 +955,59 @@ fn encode_zstd_wrapper(
     inner_block_version: u16,
     limits: V3ValueLimits,
 ) -> Result<Vec<u8>> {
+    encode_zstd_wrapper_profile(
+        inner_block,
+        inner_body_layout_version,
+        inner_block_version,
+        limits,
+        ZstdWrapperKind::V1,
+    )
+}
+
+fn encode_temporal_zstd_wrapper(
+    inner_block: &[u8],
+    inner_body_layout_version: u16,
+    inner_block_version: u16,
+    limits: V3ValueLimits,
+) -> Result<Vec<u8>> {
+    encode_zstd_wrapper_profile(
+        inner_block,
+        inner_body_layout_version,
+        inner_block_version,
+        limits,
+        ZstdWrapperKind::V2,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZstdWrapperKind {
+    V1,
+    V2,
+}
+
+impl ZstdWrapperKind {
+    const fn magic(self) -> &'static [u8; 8] {
+        match self {
+            Self::V1 => ZSTD_WRAPPER_MAGIC,
+            Self::V2 => TEMPORAL_ZSTD_WRAPPER_MAGIC,
+        }
+    }
+
+    const fn version(self) -> u16 {
+        match self {
+            Self::V1 => V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION,
+            Self::V2 => V3_PLANNED_FLAT_TEMPORAL_ZSTD_WRAPPER_VERSION,
+        }
+    }
+}
+
+fn encode_zstd_wrapper_profile(
+    inner_block: &[u8],
+    inner_body_layout_version: u16,
+    inner_block_version: u16,
+    limits: V3ValueLimits,
+    wrapper_kind: ZstdWrapperKind,
+) -> Result<Vec<u8>> {
     let inner_len = u64::try_from(inner_block.len())
         .map_err(|_| AuraError::InvalidValue("planned flat zstd inner length"))?;
     if inner_block.len() > limits.max_block_bytes {
@@ -789,8 +1059,8 @@ fn encode_zstd_wrapper(
     wrapper
         .try_reserve_exact(wrapper_len)
         .map_err(|_| AuraError::InvalidValue("planned flat zstd allocation"))?;
-    wrapper.extend_from_slice(ZSTD_WRAPPER_MAGIC);
-    wrapper.extend_from_slice(&V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION.to_le_bytes());
+    wrapper.extend_from_slice(wrapper_kind.magic());
+    wrapper.extend_from_slice(&wrapper_kind.version().to_le_bytes());
     wrapper.push(ZSTD_CODEC_ID);
     wrapper.push(V3_PLANNED_FLAT_ZSTD_LEVEL as u8);
     wrapper.push(V3_PLANNED_FLAT_ZSTD_WINDOW_LOG);
@@ -812,12 +1082,29 @@ fn decode_zstd_wrapper(
     plan: &FlatAuraPlanV2,
     limits: V3ValueLimits,
 ) -> Result<Vec<u8>> {
+    decode_zstd_wrapper_profile(wrapper, plan, limits, ZstdWrapperKind::V1)
+}
+
+fn decode_temporal_zstd_wrapper(
+    wrapper: &[u8],
+    plan: &FlatAuraPlanV2,
+    limits: V3ValueLimits,
+) -> Result<Vec<u8>> {
+    decode_zstd_wrapper_profile(wrapper, plan, limits, ZstdWrapperKind::V2)
+}
+
+fn decode_zstd_wrapper_profile(
+    wrapper: &[u8],
+    plan: &FlatAuraPlanV2,
+    limits: V3ValueLimits,
+    wrapper_kind: ZstdWrapperKind,
+) -> Result<Vec<u8>> {
     if wrapper.len() < ZSTD_WRAPPER_HEADER_BYTES || wrapper.len() > limits.max_block_bytes {
         return Err(AuraError::InvalidValue("planned flat zstd wrapper length"));
     }
     let mut reader = ByteReader::new(wrapper);
-    if reader.read_exact(8)? != ZSTD_WRAPPER_MAGIC
-        || reader.read_u16_le()? != V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION
+    if reader.read_exact(8)? != wrapper_kind.magic()
+        || reader.read_u16_le()? != wrapper_kind.version()
         || reader.read_u8()? != ZSTD_CODEC_ID
         || reader.read_u8()? != V3_PLANNED_FLAT_ZSTD_LEVEL as u8
         || reader.read_u8()? != V3_PLANNED_FLAT_ZSTD_WINDOW_LOG
@@ -889,11 +1176,12 @@ fn decode_zstd_wrapper(
     if Sha256::digest(&inner).as_slice() != inner_sha256 {
         return Err(AuraError::InvalidValue("planned flat zstd inner hash"));
     }
-    if encode_zstd_wrapper(
+    if encode_zstd_wrapper_profile(
         &inner,
         inner_body_layout_version,
         inner_block_version,
         limits,
+        wrapper_kind,
     )? != wrapper
     {
         return Err(AuraError::InvalidValue("planned flat zstd noncanonical"));
@@ -1071,7 +1359,7 @@ fn encode_block(
             ..limits
         },
     )?;
-    if plan.registry_version == FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION {
+    if plan.registry_version != FLAT_PLAN_V2_REGISTRY_VERSION {
         let mut logical_output_bytes = BLOCK_HEADER_BYTES;
         for column in &batch.columns {
             logical_output_bytes = logical_output_bytes
@@ -1120,6 +1408,13 @@ fn encode_lane(
     codec: PlanV2PhysicalCodec,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    if matches!(
+        codec,
+        PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128
+            | PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128
+    ) {
+        return encode_temporal_lane(column, codec, out);
+    }
     if codec == PlanV2PhysicalCodec::VariableByteDictionaryBitpacked {
         out.extend_from_slice(&encode_dictionary_lane(column, rows)?.bytes);
         return Ok(());
@@ -1174,6 +1469,48 @@ fn encode_lane(
     Ok(())
 }
 
+fn encode_temporal_lane(
+    column: &AuraV3Column,
+    codec: PlanV2PhysicalCodec,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if column.validity.is_some() {
+        return Err(AuraError::InvalidValue("planned flat temporal nullable"));
+    }
+    let values = match &column.values {
+        AuraV3ColumnValues::TimestampNs(values) | AuraV3ColumnValues::TimestampMs(values) => values,
+        _ => return Err(AuraError::InvalidValue("planned flat temporal type")),
+    };
+    let Some(first) = values.first().copied() else {
+        return Ok(());
+    };
+    crate::varint::encode_i64(first, out);
+    let mut previous_value = first;
+    let mut previous_delta = None::<i64>;
+    for value in values.iter().copied().skip(1) {
+        let delta = i64::try_from(i128::from(value) - i128::from(previous_value))
+            .map_err(|_| AuraError::InvalidValue("planned flat temporal overflow"))?;
+        match codec {
+            PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128 => {
+                crate::varint::encode_i64(delta, out);
+            }
+            PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128 => {
+                if let Some(previous_delta) = previous_delta {
+                    let delta2 = i64::try_from(i128::from(delta) - i128::from(previous_delta))
+                        .map_err(|_| AuraError::InvalidValue("planned flat temporal overflow"))?;
+                    crate::varint::encode_i64(delta2, out);
+                } else {
+                    crate::varint::encode_i64(delta, out);
+                }
+            }
+            _ => return Err(AuraError::InvalidValue("planned flat temporal codec")),
+        }
+        previous_value = value;
+        previous_delta = Some(delta);
+    }
+    Ok(())
+}
+
 fn planned_body_versions(plan: &FlatAuraPlanV2) -> Result<(u16, u16, &'static [u8; 8])> {
     match plan.registry_version {
         FLAT_PLAN_V2_REGISTRY_VERSION => Ok((
@@ -1186,6 +1523,11 @@ fn planned_body_versions(plan: &FlatAuraPlanV2) -> Result<(u16, u16, &'static [u
             V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION,
             BLOCK_MAGIC_V2,
         )),
+        FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION => Ok((
+            V3_PLANNED_FLAT_TEMPORAL_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_TEMPORAL_BLOCK_VERSION,
+            BLOCK_MAGIC_V3,
+        )),
         _ => Err(AuraError::InvalidValue("planned flat plan registry")),
     }
 }
@@ -1196,10 +1538,15 @@ fn validate_stored_body_versions(
     block_version: u16,
 ) -> Result<()> {
     let (inner_body_layout_version, inner_block_version, _) = planned_body_versions(plan)?;
-    if (body_layout_version == inner_body_layout_version && block_version == inner_block_version)
-        || (body_layout_version == V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION
-            && block_version == V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION)
-    {
+    let valid = if plan.registry_version == FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION {
+        body_layout_version == V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION
+            && block_version == V3_PLANNED_FLAT_TEMPORAL_ZSTD_BLOCK_VERSION
+    } else {
+        (body_layout_version == inner_body_layout_version && block_version == inner_block_version)
+            || (body_layout_version == V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION
+                && block_version == V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION)
+    };
+    if valid {
         Ok(())
     } else {
         Err(AuraError::InvalidValue("planned flat versions"))
@@ -1247,19 +1594,18 @@ fn decode_block(
     columns
         .try_reserve_exact(schema.fields.len())
         .map_err(|_| AuraError::InvalidValue("planned flat column allocation"))?;
-    let mut remaining_logical_bytes =
-        if plan.registry_version == FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION {
-            Some(
-                limits
-                    .max_block_bytes
-                    .checked_sub(BLOCK_HEADER_BYTES)
-                    .ok_or(AuraError::InvalidValue(
-                        "planned flat logical output length",
-                    ))?,
-            )
-        } else {
-            None
-        };
+    let mut remaining_logical_bytes = if plan.registry_version != FLAT_PLAN_V2_REGISTRY_VERSION {
+        Some(
+            limits
+                .max_block_bytes
+                .checked_sub(BLOCK_HEADER_BYTES)
+                .ok_or(AuraError::InvalidValue(
+                    "planned flat logical output length",
+                ))?,
+        )
+    } else {
+        None
+    };
     for field in &schema.fields {
         let codec = *plan
             .codecs
@@ -1301,7 +1647,7 @@ fn decode_block(
             ..limits
         },
     )?;
-    if plan.registry_version == FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION
+    if plan.registry_version != FLAT_PLAN_V2_REGISTRY_VERSION
         && encode_block(schema, &batch, plan, limits)? != bytes
     {
         return Err(AuraError::InvalidValue(
@@ -1334,6 +1680,21 @@ fn decode_lane(
         codec,
         logical_budget,
     } = spec;
+    if matches!(
+        codec,
+        PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128
+            | PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128
+    ) {
+        return decode_temporal_lane(
+            slot,
+            field_type,
+            nullable,
+            rows,
+            codec,
+            reader,
+            logical_budget,
+        );
+    }
     if codec == PlanV2PhysicalCodec::VariableByteDictionaryBitpacked {
         return decode_dictionary_lane(
             slot,
@@ -1430,6 +1791,69 @@ fn decode_lane(
     Ok(AuraV3Column {
         slot,
         validity,
+        values,
+    })
+}
+
+fn decode_temporal_lane(
+    slot: u16,
+    field_type: crate::FieldType,
+    nullable: bool,
+    rows: usize,
+    codec: PlanV2PhysicalCodec,
+    reader: &mut ByteReader<'_>,
+    logical_budget: usize,
+) -> Result<AuraV3Column> {
+    if nullable
+        || !matches!(
+            field_type,
+            crate::FieldType::TimestampNs | crate::FieldType::TimestampMs
+        )
+        || rows
+            .checked_mul(8)
+            .is_none_or(|length| length > logical_budget)
+    {
+        return Err(AuraError::InvalidValue("planned flat temporal type"));
+    }
+    let mut values = Vec::<i64>::new();
+    values
+        .try_reserve_exact(rows)
+        .map_err(|_| AuraError::InvalidValue("planned flat temporal allocation"))?;
+    if rows != 0 {
+        let first = decode_canonical_zigzag(reader)?;
+        values.push(first);
+        let mut previous_value = first;
+        let mut previous_delta = None::<i64>;
+        for _ in 1..rows {
+            let encoded = decode_canonical_zigzag(reader)?;
+            let delta = match codec {
+                PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128 => encoded,
+                PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128 => {
+                    if let Some(previous_delta) = previous_delta {
+                        i64::try_from(i128::from(previous_delta) + i128::from(encoded)).map_err(
+                            |_| AuraError::InvalidValue("planned flat temporal overflow"),
+                        )?
+                    } else {
+                        encoded
+                    }
+                }
+                _ => return Err(AuraError::InvalidValue("planned flat temporal codec")),
+            };
+            let value = i64::try_from(i128::from(previous_value) + i128::from(delta))
+                .map_err(|_| AuraError::InvalidValue("planned flat temporal overflow"))?;
+            values.push(value);
+            previous_value = value;
+            previous_delta = Some(delta);
+        }
+    }
+    let values = match field_type {
+        crate::FieldType::TimestampNs => AuraV3ColumnValues::TimestampNs(values),
+        crate::FieldType::TimestampMs => AuraV3ColumnValues::TimestampMs(values),
+        _ => return Err(AuraError::InvalidValue("planned flat temporal type")),
+    };
+    Ok(AuraV3Column {
+        slot,
+        validity: None,
         values,
     })
 }
@@ -1810,6 +2234,8 @@ fn seal(
             codecs: Vec::new(),
             dictionary_candidate_codecs: Vec::new(),
             zstd_candidate: None,
+            temporal_zstd_candidate: None,
+            temporal_candidate_codecs: Vec::new(),
         },
     })
 }
@@ -2060,7 +2486,12 @@ pub fn decode_v3_planned_flat(bytes: &[u8], limits: V3FlatLimits) -> Result<Deco
             return Err(AuraError::InvalidValue("planned flat stored hash"));
         }
         let inner_block;
-        let block = if footer.body_layout_version == V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION {
+        let block = if footer.body_layout_version
+            == V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION
+        {
+            inner_block = decode_temporal_zstd_wrapper(stored, &footer.plan, limits.value_limits)?;
+            inner_block.as_slice()
+        } else if footer.body_layout_version == V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION {
             inner_block = decode_zstd_wrapper(stored, &footer.plan, limits.value_limits)?;
             inner_block.as_slice()
         } else {
@@ -2161,6 +2592,7 @@ fn candidate_inapplicable(error: &AuraError) -> bool {
                 | "planned flat zstd block length"
                 | "planned flat zstd wrapper length"
                 | "planned flat zstd compressed length"
+                | "planned flat temporal no lane win"
         )
     )
 }
@@ -2194,7 +2626,7 @@ fn put64(out: &mut Vec<u8>, v: u64) {
 #[cfg(test)]
 mod dictionary_tests {
     use super::*;
-    use crate::{FieldRole, FieldType, SchemaBuilder};
+    use crate::{FieldRole, FieldTransform, FieldType, SchemaBuilder, TransformCandidates};
 
     fn variable(parts: &[&[u8]]) -> AuraV3VariableColumn {
         let mut offsets = vec![0u32];
@@ -2457,6 +2889,176 @@ mod dictionary_tests {
                 "planned flat dictionary inverse length"
             ))
         );
+    }
+
+    fn temporal_plan(
+        field_type: FieldType,
+        codec: PlanV2PhysicalCodec,
+        delta2: bool,
+    ) -> (SchemaDescriptor, FlatAuraPlanV2) {
+        let mut candidates = TransformCandidates::default_for_role(FieldRole::Timestamp);
+        if delta2 {
+            candidates = candidates.with(FieldTransform::Delta2);
+        }
+        let schema = SchemaBuilder::new("anonymous_temporal_lane")
+            .v3()
+            .field_with_candidates("clock", field_type, FieldRole::Timestamp, candidates)
+            .finish()
+            .unwrap();
+        let mut plan = FlatAuraPlanV2::all_fixed(&schema).unwrap();
+        plan.registry_version = FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION;
+        plan.codecs[0] = codec;
+        plan.validate(&schema).unwrap();
+        (schema, plan)
+    }
+
+    #[test]
+    fn temporal_lanes_roundtrip_reset_and_reject_noncanonical_or_overflow_inverse() {
+        for (field_type, codec) in [
+            (
+                FieldType::TimestampNs,
+                PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128,
+            ),
+            (
+                FieldType::TimestampMs,
+                PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128,
+            ),
+        ] {
+            let values = vec![100, 107, 114, 114, 108, -3];
+            let column = AuraV3Column {
+                slot: 0,
+                validity: None,
+                values: match field_type {
+                    FieldType::TimestampNs => AuraV3ColumnValues::TimestampNs(values.clone()),
+                    FieldType::TimestampMs => AuraV3ColumnValues::TimestampMs(values.clone()),
+                    _ => unreachable!(),
+                },
+            };
+            let mut bytes = Vec::new();
+            encode_temporal_lane(&column, codec, &mut bytes).unwrap();
+            let mut reader = ByteReader::new(&bytes);
+            let decoded = decode_temporal_lane(
+                0,
+                field_type,
+                false,
+                values.len(),
+                codec,
+                &mut reader,
+                values.len() * 8,
+            )
+            .unwrap();
+            reader.finish().unwrap();
+            assert_eq!(decoded, column);
+            for length in 0..bytes.len() {
+                let mut reader = ByteReader::new(&bytes[..length]);
+                assert!(decode_temporal_lane(
+                    0,
+                    field_type,
+                    false,
+                    values.len(),
+                    codec,
+                    &mut reader,
+                    values.len() * 8,
+                )
+                .is_err());
+            }
+        }
+
+        let mut nonminimal_zero = ByteReader::new(&[0x80, 0]);
+        assert!(decode_temporal_lane(
+            0,
+            FieldType::TimestampNs,
+            false,
+            1,
+            PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128,
+            &mut nonminimal_zero,
+            8,
+        )
+        .is_err());
+
+        let mut previous_overflow = Vec::new();
+        crate::varint::encode_i64(i64::MAX, &mut previous_overflow);
+        crate::varint::encode_i64(1, &mut previous_overflow);
+        let mut reader = ByteReader::new(&previous_overflow);
+        assert!(decode_temporal_lane(
+            0,
+            FieldType::TimestampNs,
+            false,
+            2,
+            PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128,
+            &mut reader,
+            16,
+        )
+        .is_err());
+
+        let mut delta2_overflow = Vec::new();
+        crate::varint::encode_i64(0, &mut delta2_overflow);
+        crate::varint::encode_i64(i64::MAX, &mut delta2_overflow);
+        crate::varint::encode_i64(1, &mut delta2_overflow);
+        let mut reader = ByteReader::new(&delta2_overflow);
+        assert!(decode_temporal_lane(
+            0,
+            FieldType::TimestampMs,
+            false,
+            3,
+            PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128,
+            &mut reader,
+            24,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn temporal_wrapper_v2_is_distinct_deterministic_and_canonical() {
+        let (schema, plan) = temporal_plan(
+            FieldType::TimestampNs,
+            PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128,
+            false,
+        );
+        let batch = AuraV3Batch {
+            schema_id: schema.schema_id,
+            row_count: 512,
+            columns: vec![AuraV3Column {
+                slot: 0,
+                validity: None,
+                values: AuraV3ColumnValues::TimestampNs(
+                    (0..512).map(|row| 1_000 + row * 7).collect(),
+                ),
+            }],
+        };
+        let inner = encode_block(&schema, &batch, &plan, V3ValueLimits::HARD).unwrap();
+        assert_eq!(&inner[..8], BLOCK_MAGIC_V3);
+        let first = encode_temporal_zstd_wrapper(
+            &inner,
+            V3_PLANNED_FLAT_TEMPORAL_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_TEMPORAL_BLOCK_VERSION,
+            V3ValueLimits::HARD,
+        )
+        .unwrap();
+        let second = encode_temporal_zstd_wrapper(
+            &inner,
+            V3_PLANNED_FLAT_TEMPORAL_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_TEMPORAL_BLOCK_VERSION,
+            V3ValueLimits::HARD,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(&first[..8], TEMPORAL_ZSTD_WRAPPER_MAGIC);
+        assert_eq!(
+            decode_temporal_zstd_wrapper(&first, &plan, V3ValueLimits::HARD).unwrap(),
+            inner
+        );
+        assert!(decode_zstd_wrapper(&first, &plan, V3ValueLimits::HARD).is_err());
+        for length in 0..first.len() {
+            assert!(
+                decode_temporal_zstd_wrapper(&first[..length], &plan, V3ValueLimits::HARD).is_err()
+            );
+        }
+        for offset in [0usize, 8, 10, 11, 12, 13, 14, 16, 18, 20, 28, 36] {
+            let mut corrupted = first.clone();
+            corrupted[offset] ^= 1;
+            assert!(decode_temporal_zstd_wrapper(&corrupted, &plan, V3ValueLimits::HARD).is_err());
+        }
     }
 
     fn zstd_test_inner() -> (SchemaDescriptor, FlatAuraPlanV2, Vec<u8>) {

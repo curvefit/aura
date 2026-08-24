@@ -219,10 +219,17 @@ Flat protocol v1 also accepts explicit development mode `--mode planned`.
 This does not change the schema contract or default exact command; it asks the
 bounded all-memory planner to score complete exact/fixed/mixed files, one
 exact-byte variable-dictionary candidate, and one deterministic per-chunk
-zstd19 wrapper candidate. It may still select the byte-identical exact
+zstd19 wrapper candidate, plus one distinct wrapped temporal candidate. It may
+still select the byte-identical exact
 fallback. Dictionary eligibility follows only the logical Utf8/DecimalText
 type; field names and DecimalText normalization are excluded. The wrapper
 compresses the already selected registry1/2 block and adds no schema semantics.
+The temporal registry is separately authorized only by a non-null event-scope
+slot-0 TimestampNs/TimestampMs primary carrying compact schema byte `100`,
+`Absolute`, and the exact requested transform. `DeltaPrevious` is present in
+the standard timestamp candidates; `Delta2` is never inferred and is usable
+only when explicitly present. Auxiliary timestamp byte `255`, nullable
+timestamps, and arbitrary I64 fields remain on absolute codecs.
 
 The schema author supplies the logical field declarations and relationship
 permissions. Aura's pinned implementation validates them; the decoder does not
