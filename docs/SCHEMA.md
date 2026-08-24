@@ -99,6 +99,21 @@ event/child values are encoded exactly. Both complete V3 writers reject
 non-empty derived-expression tables. V2 writers reject V3 schemas rather than
 emitting cross-wired files.
 
+The separate all-memory planned-grouped development compiler does consume
+these permissions. Plan-v2 registry 5 may test both checked cross-domain
+same-slot residual orientations for a non-null repeated signed integer stream.
+Within each event, values are paired by ordinal occurrence in discriminator
+domain 0 and domain 1. The selected target is stored relative to the same-slot
+source value; an unmatched tail stays absolute. Event/child offsets, the
+slot-level byte-200 selector, source order, exact op orientation, physical
+codec table, schema fingerprint, and complete inverse plan are embedded in the
+artifact. Every subtraction/addition uses checked i128 intermediate math and
+must narrow exactly to the declared type. Nullable, unsigned, incompatible, or
+overflowing streams remain absolute. The compiler scores the complete sealed
+artifact and retains an earlier Direct candidate on ties. It does not infer
+domain meaning from field, schema, dataset, venue, or symbol names, and it
+does not authorize cross-event state or lifecycle inference.
+
 ### V3 exact field types
 
 Field type codes 1 through 11 are frozen. V3 appends, without renumbering:

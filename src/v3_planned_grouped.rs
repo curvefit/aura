@@ -8,8 +8,10 @@
 //! registry-3 all-fixed, and registry-3 per-stream fixed/absolute-varint files.
 //! Attempt 4 separately scores schema-authorized previous-within-domain math,
 //! with event/domain resets and checked inverse, against all accepted absolute
-//! fallbacks. Field roles such as price or quantity carry no economic meaning.
-//! Split, cross-domain and cross-event state remain excluded. Nothing here
+//! fallbacks. Attempt 5 adds both schema-authorized cross-domain same-slot
+//! orientations, pairing ordinal occurrences per event and retaining unmatched
+//! tails as absolute values. Field roles such as price or quantity carry no
+//! economic meaning. Cross-event state remains excluded. Nothing here
 //! claims compression, Parquet comparison, holdout evidence, production
 //! readiness, or the campaign size goal.
 
@@ -32,8 +34,9 @@ use crate::v3_events::{
 use crate::v3_grouped_container::V3GroupedLimits;
 use crate::v3_plan_v2::{AuraPlanV2, PlanV2Inspection, PlanV2Selection, MAX_AURA_PLAN_V2_BYTES};
 use crate::v3_plan_v2::{
-    AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION, AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP,
-    AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION,
+    AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION, AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP,
+    AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP, AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION,
+    AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP, AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION,
 };
 use crate::v3_values::{
     canonical_v3_schema_fingerprint, decode_column, encode_column, AuraV3Column,
@@ -51,6 +54,8 @@ pub const V3_PLANNED_GROUPED_INTEGER_CODEC_BODY_LAYOUT_VERSION: u16 = 3;
 pub const V3_PLANNED_GROUPED_INTEGER_CODEC_BLOCK_VERSION: u16 = 3;
 pub const V3_PLANNED_GROUPED_WITHIN_DOMAIN_BODY_LAYOUT_VERSION: u16 = 4;
 pub const V3_PLANNED_GROUPED_WITHIN_DOMAIN_BLOCK_VERSION: u16 = 4;
+pub const V3_PLANNED_GROUPED_CROSS_DOMAIN_BODY_LAYOUT_VERSION: u16 = 5;
+pub const V3_PLANNED_GROUPED_CROSS_DOMAIN_BLOCK_VERSION: u16 = 5;
 pub const V3_PLANNED_GROUPED_FOOTER_PREFIX_BYTES: usize = 216;
 pub const V3_PLANNED_GROUPED_CHUNK_DESCRIPTOR_BYTES: usize = 120;
 pub const MAX_V3_PLANNED_GROUPED_FOOTER_BYTES: usize = 64 * 1024 * 1024;
@@ -120,6 +125,26 @@ pub struct V3PlannedGroupedInspection {
     pub candidates: Vec<V3PlannedGroupedCandidateInspection>,
     pub codecs: Vec<V3PlannedGroupedCodecInspection>,
     pub within_domain: Vec<V3PlannedGroupedWithinInspection>,
+    pub cross_domain: Vec<V3PlannedGroupedCrossInspection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V3PlannedGroupedCrossInspection {
+    pub logical_slot: u16,
+    pub field_type: crate::FieldType,
+    pub authorized: bool,
+    pub eligible: bool,
+    pub applicable: bool,
+    pub rejection: Option<String>,
+    pub absolute_bytes: u64,
+    pub domain0_from_domain1_fixed_bytes: Option<u64>,
+    pub domain0_from_domain1_varint_bytes: Option<u64>,
+    pub domain1_from_domain0_fixed_bytes: Option<u64>,
+    pub domain1_from_domain0_varint_bytes: Option<u64>,
+    pub selected_op: u8,
+    pub selected_codec: PlanV2PhysicalCodec,
+    pub candidate_selected: bool,
+    pub selected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,6 +658,297 @@ pub fn compile_v3_planned_grouped_attempt4_candidate(
     compile_compact_candidate_with_plan(schema, batches, limits, plan)
 }
 
+/// Size-attempt 5: score both reversible cross-domain same-slot orientations.
+/// Pairing restarts at each event and uses ordinal occurrence within each
+/// discriminator domain. The source domain and every unmatched tail value are
+/// absolute, so asymmetric and empty domains require no side metadata.
+pub fn compile_v3_planned_grouped_attempt5(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    limits: V3GroupedLimits,
+) -> Result<V3PlannedGroupedArtifact> {
+    validate_attempt3_inputs(schema, batches, limits)?;
+    let r3_fixed_plan = AuraPlanV2::integer_codec_direct_for_schema(schema);
+    let r3_mixed = r3_fixed_plan
+        .clone()
+        .and_then(|plan| select_integer_codecs(schema, batches, plan));
+    let r4_absolute = AuraPlanV2::within_domain_direct_for_schema(schema)
+        .and_then(|plan| select_integer_codecs(schema, batches, plan));
+    let within_authorized = schema
+        .groups
+        .first()
+        .is_some_and(|group| group.relationships.allows_within_domain());
+    let r4_within = if within_authorized {
+        r4_absolute
+            .clone()
+            .and_then(|(plan, _)| select_previous_within_domain(schema, batches, plan))
+    } else {
+        Err(AuraError::InvalidValue("v3 planned within unauthorized"))
+    };
+    let cross_authorized = schema
+        .groups
+        .first()
+        .is_some_and(|group| group.relationships.allows_across_domain_same_field());
+    let r5_cross = if cross_authorized {
+        AuraPlanV2::cross_domain_direct_for_schema(schema)
+            .and_then(|plan| select_integer_codecs(schema, batches, plan))
+            .and_then(|(plan, _)| select_cross_domain_same_field(schema, batches, plan))
+    } else {
+        Err(AuraError::InvalidValue("v3 planned cross unauthorized"))
+    };
+    let cross_rows = r5_cross.as_ref().ok().map(|(_, rows)| rows.clone());
+    let candidates = vec![
+        compile_v3_planned_grouped(schema, batches, limits),
+        compile_attempt2_candidate(schema, batches, limits, PlanV2Selection::Direct),
+        r3_fixed_plan
+            .and_then(|plan| compile_compact_candidate_with_plan(schema, batches, limits, plan)),
+        r3_mixed.and_then(|(plan, _)| {
+            compile_compact_candidate_with_plan(schema, batches, limits, plan)
+        }),
+        r4_absolute.clone().and_then(|(plan, _)| {
+            compile_compact_candidate_with_plan(schema, batches, limits, plan)
+        }),
+        r4_within.and_then(|(plan, _)| {
+            compile_compact_candidate_with_plan(schema, batches, limits, plan)
+        }),
+        r5_cross.clone().and_then(|(plan, _)| {
+            compile_compact_candidate_with_plan(schema, batches, limits, plan)
+        }),
+    ];
+    if let Some(error) = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            let authorized = match index {
+                5 => within_authorized,
+                6 => cross_authorized,
+                _ => true,
+            };
+            authorized.then(|| candidate.as_ref().err()).flatten()
+        })
+        .find(|error| !is_expected_candidate_limit(error))
+    {
+        return Err(error.clone());
+    }
+    let sizes = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .as_ref()
+                .ok()
+                .map(|value| value.summary.file_bytes)
+        })
+        .collect::<Vec<_>>();
+    let selected_index = sizes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, bytes)| bytes.map(|bytes| (index, bytes)))
+        .min_by_key(|(index, bytes)| (*bytes, *index))
+        .map(|(index, _)| index)
+        .ok_or(AuraError::InvalidValue(
+            "v3 planned no applicable candidate",
+        ))?;
+    let ids = [
+        "registry1-direct",
+        "registry2-compact-direct",
+        "registry3-compact-fixed",
+        "registry3-compact-integer-codecs",
+        "registry4-absolute-integer-codecs",
+        "registry4-previous-within-domain",
+        "registry5-cross-domain-same-field",
+    ];
+    let candidate_rows = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let (selection, authorized, unauthorized_reason) = match index {
+                5 => (
+                    PlanV2Selection::PreviousWithinDomainMixed,
+                    within_authorized,
+                    "schema does not authorize within-domain",
+                ),
+                6 => (
+                    PlanV2Selection::CrossDomainSameFieldMixed,
+                    cross_authorized,
+                    "schema does not authorize cross-domain same-field",
+                ),
+                _ => (PlanV2Selection::Direct, true, ""),
+            };
+            V3PlannedGroupedCandidateInspection {
+                candidate_id: (*id).to_owned(),
+                selection,
+                authorized,
+                applicable: authorized && candidates[index].is_ok(),
+                rejection: if !authorized {
+                    Some(unauthorized_reason.to_owned())
+                } else {
+                    match &candidates[index] {
+                        Err(error) => Some(sanitize_candidate_error(error)),
+                        Ok(_) if index != selected_index => {
+                            Some("complete cost did not beat selected candidate".to_owned())
+                        }
+                        Ok(_) => None,
+                    }
+                },
+                complete_bytes: authorized.then_some(sizes[index]).flatten(),
+                selected: index == selected_index,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut selected = candidates.into_iter().nth(selected_index).unwrap()?;
+    selected.inspection.candidates = candidate_rows;
+    let mut rows = cross_rows.unwrap_or_default();
+    if selected_index == 6 {
+        for row in &mut rows {
+            row.selected = row.candidate_selected;
+        }
+    }
+    selected.inspection.cross_domain = rows;
+    Ok(selected)
+}
+
+/// Encode an explicit registry-5 candidate for inverse and corruption tests.
+pub fn compile_v3_planned_grouped_attempt5_candidate(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    limits: V3GroupedLimits,
+    ops: &[(u16, u8)],
+    codec: PlanV2PhysicalCodec,
+) -> Result<V3PlannedGroupedArtifact> {
+    let mut plan = AuraPlanV2::cross_domain_direct_for_schema(schema)?;
+    plan.select_cross_domain_same_field(ops);
+    for (slot, _) in ops {
+        let physical = plan
+            .streams
+            .get(usize::from(*slot))
+            .and_then(|stream| stream.physical_stream_ids.first())
+            .copied()
+            .ok_or(AuraError::InvalidValue("v3 planned cross slot"))?;
+        plan.physical_stream_codecs[usize::from(physical)] = codec;
+    }
+    plan.validate(schema)?;
+    compile_compact_candidate_with_plan(schema, batches, limits, plan)
+}
+
+fn select_cross_domain_same_field(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    mut plan: AuraPlanV2,
+) -> Result<(AuraPlanV2, Vec<V3PlannedGroupedCrossInspection>)> {
+    let authorized = schema
+        .groups
+        .first()
+        .is_some_and(|group| group.relationships.allows_across_domain_same_field());
+    let mut selected_ops = Vec::new();
+    let mut rows = Vec::new();
+    for field in &schema.fields {
+        if field.scope != FieldScope::Repeated || field.index == plan.discriminator_slot {
+            continue;
+        }
+        let physical = plan.streams[usize::from(field.index)].physical_stream_ids[0];
+        let absolute_codec = plan.physical_stream_codecs[usize::from(physical)];
+        let absolute_bytes = encoded_codec_bytes(schema, batches, field.index, absolute_codec)?;
+        let eligible = authorized && !field.nullable && is_within_field_type(field.field_type);
+        let orientation = |op| {
+            if eligible {
+                encoded_cross_domain_bytes(schema, batches, field.index, op)
+            } else {
+                Err(AuraError::InvalidValue("v3 planned cross ineligible"))
+            }
+        };
+        let zero = orientation(AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP);
+        let one = orientation(AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP);
+        for result in [&zero, &one] {
+            if let Err(error) = result {
+                let expected = !eligible
+                    || matches!(error, AuraError::InvalidValue("v3 planned cross overflow"));
+                if !expected {
+                    return Err(error.clone());
+                }
+            }
+        }
+        let score = |columns: &Vec<(AuraV3Column, usize)>,
+                     op|
+         -> Result<(usize, usize, usize, u8, PlanV2PhysicalCodec)> {
+            let fixed = encoded_columns_bytes(columns, PlanV2PhysicalCodec::FixedWidth)?;
+            let varint = encoded_columns_bytes(columns, PlanV2PhysicalCodec::SignedZigZagUleb128)?;
+            let (bytes, codec) = if varint < fixed {
+                (varint, PlanV2PhysicalCodec::SignedZigZagUleb128)
+            } else {
+                (fixed, PlanV2PhysicalCodec::FixedWidth)
+            };
+            Ok((bytes, fixed, varint, op, codec))
+        };
+        let zero_score = zero
+            .as_ref()
+            .ok()
+            .map(|columns| score(columns, AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP))
+            .transpose()?;
+        let one_score = one
+            .as_ref()
+            .ok()
+            .map(|columns| score(columns, AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP))
+            .transpose()?;
+        let best = [zero_score, one_score]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(bytes, _, _, op, _)| (*bytes, *op));
+        let select = best.is_some_and(|(bytes, _, _, _, _)| {
+            bytes
+                .checked_add(2)
+                .is_some_and(|cost| cost < absolute_bytes)
+        });
+        let (selected_op, selected_codec) = if select {
+            let (_, _, _, op, codec) = best.unwrap();
+            selected_ops.push((field.index, op));
+            plan.physical_stream_codecs[usize::from(physical)] = codec;
+            (op, codec)
+        } else {
+            (crate::AURA_PLAN_V2_DIRECT_OP, absolute_codec)
+        };
+        let overflow = matches!(
+            zero,
+            Err(AuraError::InvalidValue("v3 planned cross overflow"))
+        ) || matches!(
+            one,
+            Err(AuraError::InvalidValue("v3 planned cross overflow"))
+        );
+        let rejection = if select {
+            None
+        } else if !authorized {
+            Some("schema does not authorize cross-domain same-field".to_owned())
+        } else if field.nullable {
+            Some("nullable fields remain absolute".to_owned())
+        } else if !is_within_field_type(field.field_type) {
+            Some("logical type is ineligible".to_owned())
+        } else if overflow {
+            Some("signed residual overflow".to_owned())
+        } else {
+            Some("relationship did not beat absolute codec".to_owned())
+        };
+        rows.push(V3PlannedGroupedCrossInspection {
+            logical_slot: field.index,
+            field_type: field.field_type,
+            authorized,
+            eligible,
+            applicable: best.is_some(),
+            rejection,
+            absolute_bytes: absolute_bytes as u64,
+            domain0_from_domain1_fixed_bytes: zero_score.map(|(_, fixed, _, _, _)| fixed as u64),
+            domain0_from_domain1_varint_bytes: zero_score.map(|(_, _, varint, _, _)| varint as u64),
+            domain1_from_domain0_fixed_bytes: one_score.map(|(_, fixed, _, _, _)| fixed as u64),
+            domain1_from_domain0_varint_bytes: one_score.map(|(_, _, varint, _, _)| varint as u64),
+            selected_op,
+            selected_codec,
+            candidate_selected: select,
+            selected: false,
+        });
+    }
+    plan.select_cross_domain_same_field(&selected_ops);
+    plan.validate(schema)?;
+    Ok((plan, rows))
+}
+
 fn select_previous_within_domain(
     schema: &SchemaDescriptor,
     batches: &[AuraV3EventBatch],
@@ -926,6 +1242,43 @@ fn encoded_previous_within_bytes(
     Ok(columns)
 }
 
+fn encoded_cross_domain_bytes(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    slot: u16,
+    op: u8,
+) -> Result<Vec<(AuraV3Column, usize)>> {
+    let repeated = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Repeated)
+        .collect::<Vec<_>>();
+    let position = repeated
+        .iter()
+        .position(|field| field.index == slot)
+        .ok_or(AuraError::InvalidValue("v3 planned cross slot"))?;
+    let discriminator = schema.groups[0].dual_domain.unwrap().discriminator_slot;
+    let discriminator_position = repeated
+        .iter()
+        .position(|field| field.index == discriminator)
+        .ok_or(AuraError::InvalidValue("v3 planned cross discriminator"))?;
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(batches.len())
+        .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
+    for batch in batches {
+        let selector = match &batch.repeated_columns[discriminator_position].values {
+            AuraV3ColumnValues::U8(values) => values,
+            _ => return Err(AuraError::InvalidValue("v3 planned cross discriminator")),
+        };
+        columns.push((
+            cross_domain_same_field_values(batch, &batch.repeated_columns[position], selector, op)?,
+            batch.child_count() as usize,
+        ));
+    }
+    Ok(columns)
+}
+
 fn encoded_columns_bytes(
     columns: &[(AuraV3Column, usize)],
     codec: PlanV2PhysicalCodec,
@@ -1067,6 +1420,10 @@ fn compile_compact_candidate_with_plan(
 
 const fn body_versions(plan: &AuraPlanV2) -> (u16, u16) {
     match plan.registry_version {
+        AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION => (
+            V3_PLANNED_GROUPED_CROSS_DOMAIN_BODY_LAYOUT_VERSION,
+            V3_PLANNED_GROUPED_CROSS_DOMAIN_BLOCK_VERSION,
+        ),
         AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION => (
             V3_PLANNED_GROUPED_WITHIN_DOMAIN_BODY_LAYOUT_VERSION,
             V3_PLANNED_GROUPED_WITHIN_DOMAIN_BLOCK_VERSION,
@@ -1193,6 +1550,18 @@ fn encode_attempt2_block(
         let descriptor = &plan.streams[usize::from(field.index)];
         if descriptor.op == AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP {
             let transformed = previous_within_domain_values(batch, column, selector)?;
+            encode_codec_lane(
+                &transformed,
+                batch.child_count() as usize,
+                codec_for_column(plan, column.slot)?,
+                &mut out,
+            )?;
+        } else if matches!(
+            descriptor.op,
+            AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP | AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP
+        ) {
+            let transformed =
+                cross_domain_same_field_values(batch, column, selector, descriptor.op)?;
             encode_codec_lane(
                 &transformed,
                 batch.child_count() as usize,
@@ -1346,6 +1715,27 @@ fn decode_attempt2_block(
                 &child_offsets,
                 &selector,
             )?);
+        } else if matches!(
+            plan.streams[usize::from(field.index)].op,
+            AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP | AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP
+        ) {
+            let op = plan.streams[usize::from(field.index)].op;
+            let physical = decode_codec_lane(
+                field.index,
+                crate::FieldType::I64,
+                false,
+                child_count as usize,
+                codec_for_column(plan, field.index)?,
+                &mut reader,
+                value_limits,
+            )?;
+            repeated_columns.push(inverse_cross_domain_same_field(
+                field,
+                &physical,
+                &child_offsets,
+                &selector,
+                op,
+            )?);
         } else if plan.selection != PlanV2Selection::SplitDomainDirect {
             let column = decode_codec_lane(
                 field.index,
@@ -1435,6 +1825,103 @@ fn previous_within_domain_values(
     })
 }
 
+fn cross_domain_same_field_values(
+    batch: &AuraV3EventBatch,
+    column: &AuraV3Column,
+    selector: &[u8],
+    op: u8,
+) -> Result<AuraV3Column> {
+    let target_domain = cross_target_domain(op)?;
+    let source_domain = 1usize - target_domain;
+    let logical = signed_values_as_i64(&column.values)?;
+    let mut transformed = logical.clone();
+    for offsets in batch.child_offsets.windows(2) {
+        let start = offsets[0] as usize;
+        let end = offsets[1] as usize;
+        let mut source_positions = Vec::new();
+        source_positions
+            .try_reserve_exact(end - start)
+            .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
+        for (relative, side) in selector[start..end].iter().copied().enumerate() {
+            let child = start + relative;
+            if usize::from(side) == source_domain {
+                source_positions.push(child);
+            }
+        }
+        let mut target_ordinal = 0usize;
+        for (relative, side) in selector[start..end].iter().copied().enumerate() {
+            let target = start + relative;
+            if usize::from(side) == target_domain {
+                if let Some(source) = source_positions.get(target_ordinal).copied() {
+                    transformed[target] =
+                        i64::try_from(i128::from(logical[target]) - i128::from(logical[source]))
+                            .map_err(|_| AuraError::InvalidValue("v3 planned cross overflow"))?;
+                }
+                target_ordinal += 1;
+            }
+        }
+    }
+    Ok(AuraV3Column {
+        slot: column.slot,
+        validity: None,
+        values: AuraV3ColumnValues::I64(transformed),
+    })
+}
+
+fn inverse_cross_domain_same_field(
+    field: &crate::FieldDescriptor,
+    physical: &AuraV3Column,
+    child_offsets: &[u32],
+    selector: &[u8],
+    op: u8,
+) -> Result<AuraV3Column> {
+    let AuraV3ColumnValues::I64(stored) = &physical.values else {
+        return Err(AuraError::InvalidValue("v3 planned cross physical type"));
+    };
+    let target_domain = cross_target_domain(op)?;
+    let source_domain = 1usize - target_domain;
+    let mut logical = stored.clone();
+    for offsets in child_offsets.windows(2) {
+        let start = offsets[0] as usize;
+        let end = offsets[1] as usize;
+        let mut source_positions = Vec::new();
+        source_positions
+            .try_reserve_exact(end - start)
+            .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
+        for (relative, side) in selector[start..end].iter().copied().enumerate() {
+            let child = start + relative;
+            if usize::from(side) == source_domain {
+                source_positions.push(child);
+            }
+        }
+        let mut target_ordinal = 0usize;
+        for (relative, side) in selector[start..end].iter().copied().enumerate() {
+            let target = start + relative;
+            if usize::from(side) == target_domain {
+                if let Some(source) = source_positions.get(target_ordinal).copied() {
+                    logical[target] =
+                        i64::try_from(i128::from(stored[source]) + i128::from(stored[target]))
+                            .map_err(|_| AuraError::InvalidValue("v3 planned cross inverse"))?;
+                }
+                target_ordinal += 1;
+            }
+        }
+    }
+    Ok(AuraV3Column {
+        slot: field.index,
+        validity: None,
+        values: signed_i64_to_values(field.field_type, logical)?,
+    })
+}
+
+fn cross_target_domain(op: u8) -> Result<usize> {
+    match op {
+        AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP => Ok(0),
+        AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP => Ok(1),
+        _ => Err(AuraError::InvalidValue("v3 planned cross op")),
+    }
+}
+
 fn inverse_previous_within_domain(
     field: &crate::FieldDescriptor,
     physical: &AuraV3Column,
@@ -1512,7 +1999,9 @@ fn signed_i64_to_values(
 fn codec_for_column(plan: &AuraPlanV2, slot: u16) -> Result<PlanV2PhysicalCodec> {
     if !matches!(
         plan.registry_version,
-        AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
+        AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+            | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
+            | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
     ) {
         return Ok(PlanV2PhysicalCodec::FixedWidth);
     }
@@ -2246,6 +2735,9 @@ pub fn decode_v3_planned_grouped_footer(
         ) | (
             V3_PLANNED_GROUPED_WITHIN_DOMAIN_BODY_LAYOUT_VERSION,
             V3_PLANNED_GROUPED_WITHIN_DOMAIN_BLOCK_VERSION
+        ) | (
+            V3_PLANNED_GROUPED_CROSS_DOMAIN_BODY_LAYOUT_VERSION,
+            V3_PLANNED_GROUPED_CROSS_DOMAIN_BLOCK_VERSION
         )
     ) {
         return Err(AuraError::InvalidValue("v3 planned grouped body layout"));
@@ -2360,6 +2852,10 @@ fn validate_footer(footer: &V3PlannedGroupedFooter, limits: V3GroupedLimits) -> 
             V3_PLANNED_GROUPED_WITHIN_DOMAIN_BODY_LAYOUT_VERSION,
             V3_PLANNED_GROUPED_WITHIN_DOMAIN_BLOCK_VERSION,
             crate::AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION,
+        ) | (
+            V3_PLANNED_GROUPED_CROSS_DOMAIN_BODY_LAYOUT_VERSION,
+            V3_PLANNED_GROUPED_CROSS_DOMAIN_BLOCK_VERSION,
+            crate::AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION,
         )
     );
     if !version_contract
@@ -2546,6 +3042,7 @@ fn inspection(footer: &V3PlannedGroupedFooter) -> V3PlannedGroupedInspection {
         candidates: Vec::new(),
         codecs: Vec::new(),
         within_domain: Vec::new(),
+        cross_domain: Vec::new(),
     }
 }
 

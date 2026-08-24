@@ -179,6 +179,19 @@ the non-null U8 `side` discriminator marked by byte `200`, and no derived
 expressions. Group/Flag200 execution is exact logical event/child execution;
 it does not choose a physical relationship transform, compression, or Plan v2.
 
+An additive planned-grouped reference route is separate from that seekable
+compatibility writer. Its registry/layout dispatch preserves registries 1-4
+and adds registry/body version 5 for schema-authorized cross-domain same-slot
+residuals. Op 3 stores paired domain-0 values relative to domain 1; op 4 stores
+paired domain-1 values relative to domain 0. Pairing restarts at every event by
+ordinal occurrence, unequal tails remain absolute, and byte 200 remains the
+actual discriminator slot. The footer embeds the complete versioned Plan v2,
+codec table, schema and plan hashes, chunk ranges, and logical checksums; a
+reader never replans or needs an identity string or sidecar. Unknown layout,
+registry, selection, op, dependency, length, range, or checksum values reject.
+This route is an all-memory development compiler, not the streaming grouped
+writer and not a compression or production-readiness claim.
+
 The V2 SDK writer remains the production compatibility path. It rejects V3
 schemas and emits V2 containers; callers that need V3 must select the explicit
 V3 API or CLI.
