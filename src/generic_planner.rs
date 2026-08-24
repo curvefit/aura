@@ -3157,11 +3157,6 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
             .saturating_add(field_specs_ns);
     }
 
-    let stage_start = measure_stages.then(Instant::now);
-    let body_len = record_count
-        .checked_mul(row_width)
-        .ok_or(AuraError::InvalidValue("body length"))?;
-    let body_start = out.len();
     let fixed_row_writer = is_partitioned_sparse_aura1_plan(aura1_plan) && field_count == 8;
     if fixed_row_writer {
         for source in sources.iter().take(8) {
@@ -3170,6 +3165,25 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
             }
         }
     }
+    let tape_validation_start = measure_stages.then(Instant::now);
+    let direct_row_store_tape = if !fixed_row_writer && output_guard.is_none() {
+        try_prepare_direct_row_store_tape(&sources, aura1_plan, record_count, field_count)?
+    } else {
+        None
+    };
+    let tape_validation_ns = tape_validation_start
+        .as_ref()
+        .map(|start| start.elapsed().as_nanos())
+        .unwrap_or(0);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.bounds_checks_ns = timings.bounds_checks_ns.saturating_add(tape_validation_ns);
+    }
+
+    let stage_start = measure_stages.then(Instant::now);
+    let body_len = record_count
+        .checked_mul(row_width)
+        .ok_or(AuraError::InvalidValue("body length"))?;
+    let body_start = out.len();
     if fixed_row_writer || output_guard.is_none() {
         out.resize(
             body_start
@@ -3189,6 +3203,7 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
     }
 
     let stage_start = measure_stages.then(Instant::now);
+    let mut direct_tape_writer_validation_checks = 0usize;
     if fixed_row_writer {
         const ROW_WIDTH: usize = 46;
         for row_index in 0..record_count {
@@ -3214,6 +3229,10 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
                 write_partitioned_sparse_aura1_row(&mut out[offset..row_end], values)?;
             }
         }
+    } else if let Some((tape, tape_row_width, _)) = direct_row_store_tape.as_ref() {
+        debug_assert_eq!(row_width, *tape_row_width);
+        direct_tape_writer_validation_checks =
+            write_direct_row_store_tape(tape, record_count, *tape_row_width, body_start, out)?;
     } else if output_guard.is_none() {
         for row_index in 0..record_count {
             let row_start = body_start + row_index * row_width;
@@ -3290,6 +3309,8 @@ fn try_write_generic_i64_aura1_body_from_streams_inner(
         stats.output_offset_calculations = if fixed_row_writer { record_count } else { 0 };
         stats.bounds_checks = if fixed_row_writer {
             record_count
+        } else if let Some((_, _, prepare_validation_checks)) = &direct_row_store_tape {
+            prepare_validation_checks.saturating_add(direct_tape_writer_validation_checks)
         } else {
             field_specs.len() * record_count
         };
@@ -4968,6 +4989,201 @@ enum DirectAura1SlotSource<'a> {
         bit: i64,
         value: i64,
     },
+}
+
+enum DirectRowStore<'a> {
+    Zero { values: &'a [i64], offset: usize },
+    I8 { values: &'a [i64], offset: usize },
+    I16 { values: &'a [i64], offset: usize },
+    I32 { values: &'a [i64], offset: usize },
+    I64 { values: &'a [i64], offset: usize },
+    I128 { values: &'a [i64], offset: usize },
+}
+
+fn try_prepare_direct_row_store_tape<'a>(
+    sources: &[DirectAura1SlotSource<'a>],
+    aura1_plan: &Aura1Plan,
+    record_count: usize,
+    field_count: usize,
+) -> Result<Option<(Vec<DirectRowStore<'a>>, usize, usize)>> {
+    let mut validation_checks = 1usize;
+    if aura1_plan.fields.len() != field_count {
+        return Ok(None);
+    }
+    validation_checks = validation_checks.saturating_add(1);
+    if sources.len() < field_count {
+        return Ok(None);
+    }
+    let mut seen = vec![false; field_count];
+    let mut tape = Vec::with_capacity(field_count);
+    let mut row_width = 0usize;
+    for field in &aura1_plan.fields {
+        let slot = usize::from(field.field_index);
+        validation_checks = validation_checks.saturating_add(1);
+        if slot >= field_count {
+            return Err(AuraError::InvalidValue("field index"));
+        }
+        validation_checks = validation_checks.saturating_add(1);
+        if seen[slot] {
+            return Err(AuraError::InvalidValue("field index"));
+        }
+        seen[slot] = true;
+        validation_checks = validation_checks.saturating_add(1);
+        let values = match &sources[slot] {
+            DirectAura1SlotSource::Direct(values) => *values,
+            _ => return Ok(None),
+        };
+        validation_checks = validation_checks.saturating_add(1);
+        if values.len() != record_count {
+            return Err(AuraError::InvalidValue("stream value count"));
+        }
+        let offset = row_width;
+        validation_checks = validation_checks.saturating_add(1);
+        row_width = row_width
+            .checked_add(usize::from(field.width.byte_width()))
+            .ok_or(AuraError::InvalidValue("body length"))?;
+        tape.push(match field.width {
+            PhysicalWidth::Zero => DirectRowStore::Zero { values, offset },
+            PhysicalWidth::I8 => DirectRowStore::I8 { values, offset },
+            PhysicalWidth::I16 => DirectRowStore::I16 { values, offset },
+            PhysicalWidth::I32 => DirectRowStore::I32 { values, offset },
+            PhysicalWidth::I64 => DirectRowStore::I64 { values, offset },
+            PhysicalWidth::I128 => DirectRowStore::I128 { values, offset },
+        });
+    }
+    validation_checks = validation_checks.saturating_add(1);
+    if seen.iter().any(|seen| !*seen) {
+        return Ok(None);
+    }
+    Ok(Some((tape, row_width, validation_checks)))
+}
+
+fn write_direct_row_store_tape(
+    tape: &[DirectRowStore<'_>],
+    record_count: usize,
+    row_width: usize,
+    body_start: usize,
+    out: &mut Vec<u8>,
+) -> Result<usize> {
+    let mut validation_checks = 1usize;
+    let body_len = record_count
+        .checked_mul(row_width)
+        .ok_or(AuraError::InvalidValue("body length"))?;
+    validation_checks = validation_checks.saturating_add(1);
+    let body_end = body_start
+        .checked_add(body_len)
+        .ok_or(AuraError::InvalidValue("body length"))?;
+    validation_checks = validation_checks.saturating_add(1);
+    if body_end > out.len() {
+        return Err(AuraError::InvalidValue("body length"));
+    }
+    for store in tape {
+        validation_checks = validation_checks.saturating_add(1);
+        if store.values_len() < record_count {
+            return Err(AuraError::InvalidValue("stream value count"));
+        }
+        validation_checks = validation_checks.saturating_add(1);
+        let end = store
+            .offset()
+            .checked_add(store.width_bytes())
+            .ok_or(AuraError::InvalidValue("body length"))?;
+        validation_checks = validation_checks.saturating_add(1);
+        if end > row_width {
+            return Err(AuraError::InvalidValue("body length"));
+        }
+    }
+    let mut row = unsafe { out.as_mut_ptr().add(body_start) };
+    for row_index in 0..record_count {
+        for store in tape {
+            unsafe { store.write(row, row_index)? };
+        }
+        row = unsafe { row.add(row_width) };
+    }
+    Ok(validation_checks)
+}
+
+impl DirectRowStore<'_> {
+    fn values_len(&self) -> usize {
+        match self {
+            Self::Zero { values, .. }
+            | Self::I8 { values, .. }
+            | Self::I16 { values, .. }
+            | Self::I32 { values, .. }
+            | Self::I64 { values, .. }
+            | Self::I128 { values, .. } => values.len(),
+        }
+    }
+
+    fn offset(&self) -> usize {
+        match self {
+            Self::Zero { offset, .. }
+            | Self::I8 { offset, .. }
+            | Self::I16 { offset, .. }
+            | Self::I32 { offset, .. }
+            | Self::I64 { offset, .. }
+            | Self::I128 { offset, .. } => *offset,
+        }
+    }
+
+    const fn width_bytes(&self) -> usize {
+        match self {
+            Self::Zero { .. } => 0,
+            Self::I8 { .. } => 1,
+            Self::I16 { .. } => 2,
+            Self::I32 { .. } => 4,
+            Self::I64 { .. } => 8,
+            Self::I128 { .. } => 16,
+        }
+    }
+
+    /// Write one prevalidated row slot.
+    ///
+    /// # Safety
+    /// The tape builder must have validated `row_index` against every source
+    /// and `row` must address a complete row of the stamped width.
+    unsafe fn write(&self, row: *mut u8, row_index: usize) -> Result<()> {
+        match self {
+            Self::Zero { values, .. } => {
+                if unsafe { *values.get_unchecked(row_index) } != 0 {
+                    return Err(AuraError::InvalidValue("zero-width value"));
+                }
+            }
+            Self::I8 { values, offset } => {
+                let value = i8::try_from(unsafe { *values.get_unchecked(row_index) })
+                    .map_err(|_| AuraError::InvalidValue("i8 value"))?;
+                unsafe { row.add(*offset).write(value as u8) };
+            }
+            Self::I16 { values, offset } => {
+                let value = i16::try_from(unsafe { *values.get_unchecked(row_index) })
+                    .map_err(|_| AuraError::InvalidValue("i16 value"))?;
+                unsafe {
+                    row.add(*offset)
+                        .cast::<i16>()
+                        .write_unaligned(value.to_le())
+                };
+            }
+            Self::I32 { values, offset } => {
+                let value = i32::try_from(unsafe { *values.get_unchecked(row_index) })
+                    .map_err(|_| AuraError::InvalidValue("i32 value"))?;
+                unsafe {
+                    row.add(*offset)
+                        .cast::<i32>()
+                        .write_unaligned(value.to_le())
+                };
+            }
+            Self::I64 { values, offset } => unsafe {
+                row.add(*offset)
+                    .cast::<i64>()
+                    .write_unaligned(values.get_unchecked(row_index).to_le())
+            },
+            Self::I128 { values, offset } => unsafe {
+                row.add(*offset)
+                    .cast::<i128>()
+                    .write_unaligned(i128::from(*values.get_unchecked(row_index)).to_le())
+            },
+        }
+        Ok(())
+    }
 }
 
 impl<'a> DirectAura1SlotSource<'a> {
@@ -11718,6 +11934,148 @@ fn put_u32_len(out: &mut Vec<u8>, len: usize, name: &'static str) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn absolute_aura1_plan(fields: &[(u16, PhysicalWidth)]) -> Aura1Plan {
+        Aura1Plan {
+            block_capacity: 1,
+            fields: fields
+                .iter()
+                .map(|(field_index, width)| crate::plan::PhysicalFieldPlan {
+                    field_index: *field_index,
+                    encoding: crate::plan::FieldEncoding::Absolute,
+                    width: *width,
+                    bit_width: 0,
+                    reference_field_index: None,
+                    base_value: 0,
+                    step: 0,
+                    estimated_bytes: 0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn direct_row_store_tape_matches_safe_reordered_mixed_width_writer() {
+        let columns = [
+            vec![0, 0, 0],
+            vec![-128, 0, 127],
+            vec![-50_000, 0, 50_000],
+            vec![-32_768, 0, 32_767],
+            vec![i64::MIN, 0, i64::MAX],
+            vec![-9, 0, 9],
+        ];
+        let sources = columns
+            .iter()
+            .map(|values| DirectAura1SlotSource::Direct(values))
+            .collect::<Vec<_>>();
+        let fields = [
+            (2, PhysicalWidth::I32),
+            (0, PhysicalWidth::Zero),
+            (5, PhysicalWidth::I128),
+            (1, PhysicalWidth::I8),
+            (4, PhysicalWidth::I64),
+            (3, PhysicalWidth::I16),
+        ];
+        let plan = absolute_aura1_plan(&fields);
+        let (tape, row_width, prepare_validation_checks) =
+            try_prepare_direct_row_store_tape(&sources, &plan, columns[0].len(), columns.len())
+                .unwrap()
+                .expect("direct tape");
+        assert_eq!(3 + 5 * columns.len(), prepare_validation_checks);
+        let body_start = 3;
+        let mut actual = vec![0xaa; body_start + row_width * columns[0].len()];
+        let writer_validation_checks = write_direct_row_store_tape(
+            &tape,
+            columns[0].len(),
+            row_width,
+            body_start,
+            &mut actual,
+        )
+        .unwrap();
+        assert_eq!(3 + 3 * columns.len(), writer_validation_checks);
+
+        let mut expected = vec![0xaa; body_start];
+        for row_index in 0..columns[0].len() {
+            for (slot, width) in fields {
+                write_direct_i64_width(&mut expected, columns[usize::from(slot)][row_index], width)
+                    .unwrap();
+            }
+        }
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn direct_row_store_tape_prevalidation_and_narrowing_fail_closed() {
+        let short = [1, 2];
+        let short_sources = [DirectAura1SlotSource::Direct(&short)];
+        let i8_plan = absolute_aura1_plan(&[(0, PhysicalWidth::I8)]);
+        assert!(matches!(
+            try_prepare_direct_row_store_tape(&short_sources, &i8_plan, 3, 1),
+            Err(AuraError::InvalidValue("stream value count"))
+        ));
+
+        let partition_runs = [PartitionRun {
+            start: 0,
+            end: 2,
+            value: 1,
+        }];
+        let unsupported = [DirectAura1SlotSource::Partition {
+            runs: &partition_runs,
+            run_index: 0,
+        }];
+        assert!(
+            try_prepare_direct_row_store_tape(&unsupported, &i8_plan, 2, 1)
+                .unwrap()
+                .is_none()
+        );
+
+        let overflow = [1, 128];
+        let overflow_sources = [DirectAura1SlotSource::Direct(&overflow)];
+        let (tape, row_width, _) =
+            try_prepare_direct_row_store_tape(&overflow_sources, &i8_plan, overflow.len(), 1)
+                .unwrap()
+                .expect("direct tape");
+        let mut out = vec![0; row_width * overflow.len()];
+        assert_eq!(
+            Err(AuraError::InvalidValue("i8 value")),
+            write_direct_row_store_tape(&tape, overflow.len(), row_width, 0, &mut out)
+        );
+        assert_eq!(1, out[0]);
+
+        let short_tape = [DirectRowStore::I64 {
+            values: &short,
+            offset: 0,
+        }];
+        let mut short_out = vec![0x5a; 24];
+        let short_before = short_out.clone();
+        assert_eq!(
+            Err(AuraError::InvalidValue("stream value count")),
+            write_direct_row_store_tape(&short_tape, 3, 8, 0, &mut short_out)
+        );
+        assert_eq!(short_before, short_out);
+
+        let malicious_offset_tape = [DirectRowStore::I8 {
+            values: &[1],
+            offset: usize::MAX,
+        }];
+        let mut offset_out = vec![0x6b; 1];
+        let offset_before = offset_out.clone();
+        assert_eq!(
+            Err(AuraError::InvalidValue("body length")),
+            write_direct_row_store_tape(&malicious_offset_tape, 1, 1, 0, &mut offset_out)
+        );
+        assert_eq!(offset_before, offset_out);
+
+        let malicious_zero_tape = [DirectRowStore::Zero {
+            values: &[0],
+            offset: usize::MAX,
+        }];
+        assert_eq!(
+            Err(AuraError::InvalidValue("body length")),
+            write_direct_row_store_tape(&malicious_zero_tape, 1, 0, 0, &mut Vec::new())
+        );
+    }
 
     fn contains_zstd_varint(op: &GenericStreamOp) -> bool {
         match op {

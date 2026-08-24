@@ -370,6 +370,13 @@ fn aura0_to_aura1_profiled_generic_writer_matches_reference_rows() {
     assert!(timings.decode_input_streams.total_ns > 0);
     assert!(timings.partitioned_sparse_writer.total_ns > 0);
     assert!(timings.partitioned_sparse_writer.output_byte_stores_ns > 0);
+    let stats = profiled.stats.aura0_to_aura1.expect("aura0 to aura1 stats");
+    let field_count = fixture_rows()[0].len();
+    assert_eq!(
+        6 + 8 * field_count,
+        stats.writer.bounds_checks,
+        "direct row tape reports shape, per-field preparation, and writer range validations"
+    );
     assert_eq!(
         records::decode_i64_file(&aura1).unwrap().rows,
         records::decode_i64_file(&profiled.bytes).unwrap().rows
