@@ -1,0 +1,45 @@
+{
+  "schema_format": "aura-schema",
+  "schema_version": 1,
+  "schema_encoding": "v3",
+  "name": "compat-planned-v5-prefix-suffix",
+  "schema_id": 2452472687,
+  "fields": [
+    {
+      "id": 0,
+      "name": "ts",
+      "type": "timestamp_ns",
+      "role": "timestamp",
+      "scale": 0,
+      "scope": "event",
+      "nullable": false,
+      "relation": {
+        "kind": "none"
+      },
+      "transform_candidates": [
+        "absolute",
+        "delta_base",
+        "delta_previous",
+        "fixed_step",
+        "rough_step"
+      ]
+    },
+    {
+      "id": 1,
+      "name": "text",
+      "type": "utf8",
+      "role": "value",
+      "scale": 0,
+      "scope": "event",
+      "nullable": true,
+      "relation": {
+        "kind": "none"
+      },
+      "transform_candidates": [
+        "absolute"
+      ]
+    }
+  ],
+  "groups": [],
+  "derived_expressions": []
+}

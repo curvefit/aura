@@ -50,6 +50,28 @@ versions, and the artifact SHA-256. These bytes and hashes are the grouped
 compatibility promise; normal tests regenerate the in-memory artifact and
 compare it with these checked-in bytes.
 
+## Planned-flat v5 reader compatibility fixture
+
+`tests/fixtures/v3-planned-v5/` freezes one small, complete registry-4/layout-7
+planned-flat Aura0 artifact: a two-field schema (`TimestampNs` plus nullable
+`Utf8`) in two 256-row batches with deterministic common-prefix/suffix text.
+Its manifest binds the complete artifact, schema and plan IDs/fingerprints,
+header/body/footer/global-logical hashes, chunk descriptors, route tuple,
+`AUFPZB03`/`AUFPVB04`/`AUF2` markers, and registry-4 codec class. The normal
+reader test verifies those fields, exact decoded values, and canonical hashes.
+
+This is a reader-compatibility promise only. It deliberately does not freeze
+the seven-candidate planner cost table, planner tie behavior, future writer
+selection, schema-label invariance, or a production/default path. Registry-1,
+-2, and -3 route coverage remains in the existing generated planned-flat CLI
+tests referenced by the fixture manifest; no duplicate binaries are retained.
+
+Regeneration is an explicit maintenance action and is not part of normal CI:
+
+```text
+AURA_PLANNED_V5_FIXTURE_GENERATE=1 cargo test --offline --test planned_v5_compatibility -- --ignored generate_planned_v5_compatibility_fixture
+```
+
 `AnyCompiledFooter` provides version-aware AURP routing. It delegates V2 bytes
 to the unchanged `CompiledFooter` codec, routes V3 body encoding 1 to the flat
 footer decoder, and routes V3 body encoding 2 to the grouped footer decoder.

@@ -222,6 +222,16 @@ never emitted as a raw complete candidate. They exist only inside the distinct
 Wrapper v3 retains the canonical bounded 68-byte zstd19 framing without
 reinterpreting wrapper v1 or v2.
 
+The checked-in reader compatibility fixture under
+`tests/fixtures/v3-planned-v5/` freezes one registry-4/layout-7 winner and its
+schema, plan, chunk, artifact, and logical hash identities. The fixture covers
+two 256-row chunks with required timestamps and nullable all-present UTF-8
+values. It freezes reader routing, bounds, canonical re-encoding, and logical
+reconstruction only; it does not freeze planner candidate costs, tie rules,
+future writer choice, or production/default behavior. Existing generated
+planned-flat tests retain registry-1/2/3 route coverage. Fixture regeneration
+is an ignored, environment-gated maintenance test.
+
 The reference compiler scores seven complete artifacts: legacy exact flat,
 planned all-fixed, planned per-field fixed/varint, and one registry-2 candidate
 starting from the mixed plan and choosing a dictionary per eligible field only

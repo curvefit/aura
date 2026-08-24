@@ -1,0 +1,86 @@
+{
+  "$schema": "aura-v3-planned-v5-compatibility-fixture-v1",
+  "compatibility_promise": "reader routing, schema/plan binding, bounded verification, logical reconstruction, and canonical hashes for one planned-flat registry-4/layout-7 artifact; planner costs and future writer selection are not frozen",
+  "fixture": {
+    "artifact_sha256": "cddce6955f5a791a2eb53d47e4d5f0d937e92bebf4c2edd2d025b1b92ec102ac",
+    "block_version": 7,
+    "body_bytes": 533,
+    "body_encoding": 4,
+    "body_layout_version": 7,
+    "body_rehash_sha256": "6407e8856132df5093c5e3f52c7cf8501b3d9b5dd9651dc8626a73135be62d08",
+    "body_sha256": "2d5f204c7c35c5f6b5b6372fa4793f1e385e4ecf9aea59626a65ef0a61ffd645",
+    "chunk_count": 2,
+    "chunks": [
+      {
+        "body_relative_offset": 0,
+        "chunk_id": 0,
+        "first_global_row": 0,
+        "logical_sha256": "0c7afecd5b6c4cf1ae6be9a9ca4a426bc07db01c83ce43f6fee8247a82a52342",
+        "row_count": 256,
+        "stored_len": 260,
+        "stored_sha256": "206c8b6dec497ad137fe023f375e75ae2a4f3275d1c783c7d7428e3e2044c508"
+      },
+      {
+        "body_relative_offset": 260,
+        "chunk_id": 1,
+        "first_global_row": 256,
+        "logical_sha256": "9ee485c5d0bfb36261125b943dbc2c0247ad9c1211bccf108f3060db0beed36a",
+        "row_count": 256,
+        "stored_len": 273,
+        "stored_sha256": "1039c4b6583d122d61b50a581bf98d6b04383bad48713e6a05d226944f7b4210"
+      }
+    ],
+    "container_version": 3,
+    "file": "prefix-suffix-layout7.aura0",
+    "file_bytes": 1228,
+    "footer_bytes": 639,
+    "footer_layout_version": 3,
+    "global_logical_sha256": "568bd7a2cae2ba9328be72bf3eafe9e3c018346c0fc89b3889caf2b176a84db5",
+    "header_bytes": 44,
+    "header_sha256": "aebd066cc0b4c1b35193d413582a0a27d477af8665095f56efb84dc0b52f7324",
+    "inner_block_version": 6,
+    "inner_body_layout_version": 6,
+    "inner_magic": "AUFPVB04",
+    "physical_codec": "previous_common_prefix_suffix_bytes",
+    "plan_bytes": 86,
+    "plan_magic": "AUF2",
+    "plan_sha256": "464db5ca3ab26c7b5e638f5f8368ddd9d717900c9e5cda11d6b4cd804513977f",
+    "record_count": 512,
+    "registry_version": 4,
+    "schema_fingerprint_sha256": "c5128df77724943959787b24b437931bdebfc2cd400f32c0e3dcf814e2153525",
+    "schema_id": 2452472687,
+    "wrapper_magic": "AUFPZB03",
+    "wrapper_version": 3
+  },
+  "generation": {
+    "aura_commit": "66b230ae22d71b61a30494a6538fd78130a8233f",
+    "command": "AURA_PLANNED_V5_FIXTURE_GENERATE=1 cargo test --offline --test planned_v5_compatibility -- --ignored generate_planned_v5_compatibility_fixture",
+    "test": "tests/planned_v5_compatibility.rs::generate_planned_v5_compatibility_fixture"
+  },
+  "manifest_version": 1,
+  "route_coverage": [
+    {
+      "registry": 1,
+      "test": "v3_planned_cli::registry1_planned_file_preserves_v1_verify_receipt"
+    },
+    {
+      "registry": 2,
+      "test": "v3_planned_cli::registry2_file_preserves_v2_verify_receipt"
+    },
+    {
+      "registry": 3,
+      "test": "v3_planned_cli::planned_v1_seal_selects_planned_tuple_and_auto_verifies"
+    },
+    {
+      "registry": 4,
+      "test": "v3_planned_cli::prefix_suffix_seal_and_verify_use_v5_without_changing_prior_receipt_identities"
+    }
+  ],
+  "schema": {
+    "bytes": 869,
+    "file": "schema.json",
+    "fingerprint_sha256": "c5128df77724943959787b24b437931bdebfc2cd400f32c0e3dcf814e2153525",
+    "schema_id": 2452472687,
+    "sha256": "95c088663c73ad2d1bfea4e68c9c70ef7b65564dd574fbd0f1744e3c573d92f3"
+  }
+}
