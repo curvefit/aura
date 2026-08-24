@@ -101,3 +101,6 @@ development path and may select the existing exact file; it is not a
 streaming-writer claim. Its one registry-2 extension uses exact-byte,
 chunk-local dictionaries with minimal bitpacked present-only indices for
 Utf8/DecimalText; it performs no normalization or entropy compression.
+One additional body-layout-3 candidate wraps the preselected registry1/2 block
+independently per chunk with the canonical bounded zstd19 profile. This does
+not make the complete planned reader streaming or production-ready.

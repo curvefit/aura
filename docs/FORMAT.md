@@ -3,11 +3,12 @@
 This document describes the current implementation.
 
 Current production and default SDK writers still emit container V2. Aura also
-implements three complete, explicitly selected, uncompressed V3 Aura0
-flavors: flat event-scoped files whose body is a concatenation of exact-value
+implements three complete, explicitly selected V3 Aura0 flavors: uncompressed
+flat event-scoped files whose body is a concatenation of exact-value
 `AURAV3VB` blocks; a development-only planned-flat file with plan-bound fixed,
-absolute-varint, or exact-byte variable-dictionary lanes; and grouped
-exact-event files whose body is a concatenation of `AURAV3EB` chunks.
+absolute-varint, exact-byte variable-dictionary lanes, and one per-chunk zstd19
+wrapper candidate; and uncompressed grouped exact-event files whose body is a
+concatenation of `AURAV3EB` chunks.
 Exact-flat and grouped have seekable
 writers/readers. Planned-flat compilation and verification are bounded
 all-memory reference paths. The explicit V3 CLI seal command covers all three
@@ -124,10 +125,10 @@ and 16,777,216-row format ceilings.
 Planned-flat is an additive group-free development format for the same logical
 flat schema subset. Its `AURP` route tuple is container version `3`, footer
 layout `3`, body encoding `4`, followed by three zero reserved bytes. The
-footer stamps body/block version `1` for registry 1 and version `2` for
-registry 2, plus the complete canonical schema descriptor and an `AUF2` plan.
-A decoder never replans and needs no dataset, venue, symbol, filename, or
-sidecar.
+footer stamps body/block version `1` for registry 1, version `2` for registry
+2, or outer wrapper version `3`, plus the complete canonical schema descriptor
+and an `AUF2` plan. A decoder never replans and needs no dataset, venue, symbol,
+filename, or sidecar.
 
 Canonical `AUF2` plan version `2`, registry version `1`, starts with magic
 `AUF2`, total length, schema ID and fingerprint, field count, and reserved
@@ -167,19 +168,36 @@ is a real dictionary entry. Width and packed length are minimal, unused high
 bits are zero, every entry is referenced, and offsets plus decoded output are
 checked against caller bounds before allocation.
 
-The reference compiler scores four complete artifacts: legacy exact flat,
+Body-layout-3 chunks store an independently decodable `AUFPZB01` wrapper around
+one unchanged registry1/2 block. Its fixed 68-byte header stamps wrapper
+version 1, zstd codec, level 19, window log 23, required content-size/checksum
+flags, zero reserved bytes, inner body/block versions, uncompressed and
+compressed lengths, and SHA-256 of the exact inner block. One canonical zstd
+frame follows with standard magic, exact pledged/content size, checksum, no
+dictionary ID, no long-distance matching, and zero workers. The decoder
+requires one exact frame, enforces WindowLogMax 23 before bounded output,
+checks length/SHA/inner plan decode, then recompresses with the pinned profile
+and requires exact frame equality. Footer layout 3/body encoding 4 remain the
+planned-flat family route; old readers fail closed on unknown body layout 3.
+
+The reference compiler scores five complete artifacts: legacy exact flat,
 planned all-fixed, planned per-field fixed/varint, and one registry-2 candidate
 starting from the mixed plan and choosing a dictionary per eligible field only
-on a strict aggregate actual-lane byte win across chunks. It charges header,
+on a strict aggregate actual-lane byte win across chunks, followed by one
+zstd19 candidate. The wrapper base is chosen before compression: registry2
+when applicable, otherwise registry1 mixed; both bases are never compressed
+and compared retrospectively. It charges header,
 body, plan, schema, footer, descriptors, hashes, footer length, and seal, and
 uses stable candidate order for complete-file ties. Therefore an explicit
 planned request may truthfully publish the byte-identical legacy exact
 fallback. The CLI receipt records requested mode, every candidate's
 cost/applicability/rejection, selected candidate, actual route tuple, and
-bounded per-slot direct/dictionary/count/index attribution. This reference
-compiler retains up to four complete candidates plus lane/dictionary scratch;
-it is not the streaming ingest writer or a readiness claim. Registry 2 adds no
-RLE, Huffman, general compression, relationship math, or identity logic.
+bounded per-slot direct/dictionary/count/index attribution plus wrapper base,
+inner, compressed, and overhead bytes. This reference compiler retains up to
+five complete candidates plus lane/dictionary/compression scratch; it is not
+the streaming ingest writer or a readiness claim. Registry 2 adds no RLE,
+Huffman, relationship math, or identity logic; layout 3 is the sole zstd19
+candidate.
 
 ## Grouped Aura0 V3 container V1
 

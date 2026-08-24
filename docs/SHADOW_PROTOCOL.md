@@ -58,10 +58,10 @@ aura v3 aura0 seal \
   --json < logical.arrow-stream
 ```
 
-The `aura-v3-flat-aura0-planned-request-seal-result-v2` schema reports all
-four candidates' applicability,
-rejection/cost attribution, selected physical codec rows, dictionary counts
-and byte attribution, complete bytes, the
+The `aura-v3-flat-aura0-planned-request-seal-result-v3` schema reports all
+five candidates' applicability, rejection/cost attribution, selected physical
+codec rows, dictionary counts and byte attribution, wrapper/base/compressed
+bytes, complete bytes, the
 selected candidate, the actual footer/body tuple, and a plan hash only when a
 planned tuple wins. Exact fallback is intentional and is verified with the
 unchanged exact verify schema. A selected planned tuple uses footer layout 3
@@ -69,15 +69,21 @@ and body encoding 4. Registry-1/layout-1 files retain container target
 `flat-aura0-v3-planned-v1`, format label `planned_flat_codecs_v1`, and verify
 schema `aura-v3-flat-aura0-planned-verify-result-v1`. Registry-2/layout-2
 files use the corresponding `planned-v2`, `planned_flat_codecs_v2`, and
-planned-verify-result-v2 identities. This preserves attempt-6 receipt meaning
-rather than silently broadening a v1 result schema. Both planned
+planned-verify-result-v2 identities. Body-layout-3 wrapper files use
+`planned-v3`, `planned_flat_codecs_zstd19_v3`, and planned-verify-result-v3.
+This preserves attempt-6/7 receipt meaning rather than silently broadening v1
+or v2 result schemas. Both planned
 compilation and verification are conservatively bounded all-memory reference
-operations: compilation retains the exact, fixed, mixed, and dictionary
-complete candidates plus lane/dictionary scratch. Registry-2 dictionaries are
+operations: compilation retains the exact, fixed, mixed, dictionary, and
+zstd19 complete candidates plus lane/dictionary/compression scratch.
+Registry-2 dictionaries are
 chunk-local, lexicographically canonical, exact-byte Utf8/DecimalText codecs
 with present-only minimal bitpacked indices. They do not normalize DecimalText
-or use RLE, Huffman, general compression, or field identity. This is not a
-seekable or streaming readiness claim. Planned mode is not accepted for
+or use RLE, Huffman, or field identity. The sole compression candidate wraps
+the preselected registry1/2 block independently per chunk using zstd19,
+content size plus checksum, and an 8 MiB window cap. It never compresses both
+bases and chooses retrospectively. This is not a seekable, streaming,
+production, Parquet-size, or readiness claim. Planned mode is not accepted for
 grouped protocol v2.
 
 Seal accepts canonical schema JSON only and publishes a new mode-0600 path via

@@ -1,12 +1,14 @@
 //! Bounded all-memory reference planned-flat Aura0 V3 container.
 //!
-//! Exact, all-fixed, mixed-integer, and variable-dictionary complete artifacts
-//! coexist during scoring; peak memory is therefore roughly their summed bytes
-//! plus lane/dictionary scratch. This is an honest replayable reference API,
-//! not a streaming writer claim. Registry 2 dictionaries retain exact Utf8 and
-//! DecimalText bytes and use no RLE, entropy codec, or normalization.
+//! Exact, all-fixed, mixed-integer, variable-dictionary, and one independently
+//! chunk-wrapped zstd19 complete artifact coexist during scoring; peak memory
+//! is therefore roughly their summed bytes plus lane/dictionary/compression
+//! scratch. This is an honest replayable reference API, not a streaming writer
+//! claim. Registry 2 dictionaries retain exact Utf8 and DecimalText bytes. The
+//! single wrapper candidate uses no RLE, relationship math, or identity logic.
 
-use std::io::Cursor;
+use std::io::{self, Cursor, Read, Write};
+use std::{cell::Cell, rc::Rc};
 
 use sha2::{Digest, Sha256};
 
@@ -40,6 +42,11 @@ pub const V3_PLANNED_FLAT_BODY_LAYOUT_VERSION: u16 = 1;
 pub const V3_PLANNED_FLAT_BLOCK_VERSION: u16 = 1;
 pub const V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION: u16 = 2;
 pub const V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION: u16 = 2;
+pub const V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION: u16 = 3;
+pub const V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION: u16 = 3;
+pub const V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION: u16 = 1;
+pub const V3_PLANNED_FLAT_ZSTD_LEVEL: i32 = 19;
+pub const V3_PLANNED_FLAT_ZSTD_WINDOW_LOG: u8 = 23;
 pub const V3_PLANNED_FLAT_FOOTER_PREFIX_BYTES: usize = 208;
 pub const V3_PLANNED_FLAT_CHUNK_DESCRIPTOR_BYTES: usize = 104;
 pub const MAX_V3_PLANNED_FLAT_FOOTER_BYTES: usize = 64 * 1024 * 1024;
@@ -48,6 +55,10 @@ const BLOCK_MAGIC_V1: &[u8; 8] = b"AUFPVB01";
 const BLOCK_MAGIC_V2: &[u8; 8] = b"AUFPVB02";
 const BLOCK_HEADER_BYTES: usize = 64;
 const DICTIONARY_LANE_PREFIX_BYTES: usize = 12;
+const ZSTD_WRAPPER_MAGIC: &[u8; 8] = b"AUFPZB01";
+const ZSTD_WRAPPER_HEADER_BYTES: usize = 68;
+const ZSTD_CODEC_ID: u8 = 1;
+const ZSTD_WRAPPER_FLAGS: u8 = 0b0000_0011;
 const FOOTER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-flat-footer-v1\0";
 const HEADER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-flat-header-v1\0";
 const BODY_HASH_DOMAIN: &[u8] = b"aura-v3-planned-flat-body-v1\0";
@@ -67,6 +78,8 @@ pub struct V3PlannedFlatChunkDescriptor {
 pub struct V3PlannedFlatFooter {
     pub record_count: u64,
     pub body_len: u64,
+    pub body_layout_version: u16,
+    pub block_version: u16,
     pub schema: SchemaDescriptor,
     pub plan: FlatAuraPlanV2,
     pub schema_fingerprint: [u8; 32],
@@ -124,6 +137,19 @@ pub struct V3PlannedFlatInspection {
     pub candidates: Vec<V3PlannedFlatCandidateInspection>,
     pub codecs: Vec<V3PlannedFlatCodecInspection>,
     pub dictionary_candidate_codecs: Vec<V3PlannedFlatCodecInspection>,
+    pub zstd_candidate: Option<V3PlannedFlatZstdInspection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V3PlannedFlatZstdInspection {
+    pub base_candidate_id: String,
+    pub base_registry_version: u16,
+    pub inner_body_layout_version: u16,
+    pub inner_block_version: u16,
+    pub inner_body_bytes: u64,
+    pub compressed_payload_bytes: u64,
+    pub wrapper_overhead_bytes: u64,
+    pub stored_body_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,7 +210,36 @@ pub fn compile_v3_planned_flat(
         )),
         Err(error) => Err(error.clone()),
     };
-    let candidates = vec![exact, fixed, mixed, dictionary];
+    let (zstd, zstd_rows) = match (&dictionary, &dictionary_plan_rows) {
+        (Ok(_), Ok((Some(plan), _))) => (
+            compile_zstd_plan(
+                schema,
+                batches,
+                limits,
+                plan.clone(),
+                "planned-flat-variable-dictionary",
+            ),
+            dictionary_rows.clone(),
+        ),
+        _ => match &mixed_plan_rows {
+            Ok((plan, _)) => (
+                compile_zstd_plan(
+                    schema,
+                    batches,
+                    limits,
+                    plan.clone(),
+                    "planned-flat-integer-codecs",
+                ),
+                mixed_rows.clone(),
+            ),
+            Err(error) => (Err(error.clone()), Vec::new()),
+        },
+    };
+    let zstd_inspection = zstd
+        .as_ref()
+        .ok()
+        .and_then(|artifact| artifact.inspection.zstd_candidate.clone());
+    let candidates = vec![exact, fixed, mixed, dictionary, zstd];
     if let Some(error) = candidates
         .iter()
         .filter_map(|candidate| candidate.as_ref().err())
@@ -215,6 +270,7 @@ pub fn compile_v3_planned_flat(
         "planned-flat-fixed",
         "planned-flat-integer-codecs",
         "planned-flat-variable-dictionary",
+        "planned-flat-zstd19-wrapper",
     ];
     let candidate_rows = ids
         .iter()
@@ -236,9 +292,11 @@ pub fn compile_v3_planned_flat(
     selected.inspection.codecs = match selected_index {
         2 => mixed_rows,
         3 => dictionary_rows.clone(),
+        4 => zstd_rows,
         _ => Vec::new(),
     };
     selected.inspection.dictionary_candidate_codecs = dictionary_rows;
+    selected.inspection.zstd_candidate = zstd_inspection;
     Ok(selected)
 }
 
@@ -305,6 +363,7 @@ fn compile_exact(
             candidates: Vec::new(),
             codecs: Vec::new(),
             dictionary_candidate_codecs: Vec::new(),
+            zstd_candidate: None,
         },
     })
 }
@@ -488,6 +547,38 @@ fn compile_plan(
     limits: V3FlatLimits,
     plan: FlatAuraPlanV2,
 ) -> Result<V3PlannedFlatArtifact> {
+    compile_plan_storage(schema, batches, limits, plan, PlannedStorage::Direct)
+}
+
+fn compile_zstd_plan(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3Batch],
+    limits: V3FlatLimits,
+    plan: FlatAuraPlanV2,
+    base_candidate_id: &'static str,
+) -> Result<V3PlannedFlatArtifact> {
+    compile_plan_storage(
+        schema,
+        batches,
+        limits,
+        plan,
+        PlannedStorage::Zstd19 { base_candidate_id },
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannedStorage {
+    Direct,
+    Zstd19 { base_candidate_id: &'static str },
+}
+
+fn compile_plan_storage(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3Batch],
+    limits: V3FlatLimits,
+    plan: FlatAuraPlanV2,
+    storage: PlannedStorage,
+) -> Result<V3PlannedFlatArtifact> {
     let limits = limits.effective();
     let structural = V3ValueLimits {
         max_block_bytes: MAX_V3_VALUE_BLOCK_BYTES,
@@ -498,13 +589,52 @@ fn compile_plan(
     let mut body = Vec::new();
     let mut chunks = Vec::new();
     let mut first_row = 0u64;
+    let (inner_body_layout_version, inner_block_version, _) = planned_body_versions(&plan)?;
+    let (body_layout_version, block_version) = match storage {
+        PlannedStorage::Direct => (inner_body_layout_version, inner_block_version),
+        PlannedStorage::Zstd19 { .. } => (
+            V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION,
+        ),
+    };
+    let mut inner_body_bytes = 0u64;
+    let mut compressed_payload_bytes = 0u64;
     let total_rows = batches
         .iter()
         .map(|batch| u64::from(batch.row_count))
         .sum::<u64>();
     let mut global = CanonicalV3RowHasher::new(schema, total_rows as u32, structural)?;
     for (index, batch) in batches.iter().enumerate() {
-        let block = encode_block(schema, batch, &plan, limits.value_limits)?;
+        let inner_block = encode_block(schema, batch, &plan, limits.value_limits)?;
+        inner_body_bytes = inner_body_bytes
+            .checked_add(
+                u64::try_from(inner_block.len())
+                    .map_err(|_| AuraError::InvalidValue("planned flat zstd inner body length"))?,
+            )
+            .ok_or(AuraError::InvalidValue(
+                "planned flat zstd inner body length",
+            ))?;
+        let block = match storage {
+            PlannedStorage::Direct => inner_block,
+            PlannedStorage::Zstd19 { .. } => {
+                let wrapper = encode_zstd_wrapper(
+                    &inner_block,
+                    inner_body_layout_version,
+                    inner_block_version,
+                    limits.value_limits,
+                )?;
+                compressed_payload_bytes = compressed_payload_bytes
+                    .checked_add(
+                        u64::try_from(wrapper.len() - ZSTD_WRAPPER_HEADER_BYTES).map_err(|_| {
+                            AuraError::InvalidValue("planned flat zstd compressed length")
+                        })?,
+                    )
+                    .ok_or(AuraError::InvalidValue(
+                        "planned flat zstd compressed length",
+                    ))?;
+                wrapper
+            }
+        };
         let next = body
             .len()
             .checked_add(block.len())
@@ -527,6 +657,8 @@ fn compile_plan(
     let footer = V3PlannedFlatFooter {
         record_count: total_rows,
         body_len: body.len() as u64,
+        body_layout_version,
+        block_version,
         schema: schema.clone(),
         plan: plan.clone(),
         schema_fingerprint: canonical_v3_schema_fingerprint(schema)?,
@@ -536,7 +668,237 @@ fn compile_plan(
         global_logical_sha256: global.finalize()?,
         chunks,
     };
-    seal(header_bytes, body, footer, limits)
+    let mut artifact = seal(header_bytes, body, footer, limits)?;
+    if let PlannedStorage::Zstd19 { base_candidate_id } = storage {
+        let wrapper_overhead_bytes = u64::try_from(batches.len())
+            .ok()
+            .and_then(|chunks| chunks.checked_mul(ZSTD_WRAPPER_HEADER_BYTES as u64))
+            .ok_or(AuraError::InvalidValue("planned flat zstd wrapper length"))?;
+        artifact.inspection.zstd_candidate = Some(V3PlannedFlatZstdInspection {
+            base_candidate_id: base_candidate_id.to_owned(),
+            base_registry_version: plan.registry_version,
+            inner_body_layout_version,
+            inner_block_version,
+            inner_body_bytes,
+            compressed_payload_bytes,
+            wrapper_overhead_bytes,
+            stored_body_bytes: artifact.summary.body_bytes,
+        });
+    }
+    Ok(artifact)
+}
+
+#[derive(Debug)]
+struct BoundedZstdWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: Rc<Cell<bool>>,
+}
+
+impl BoundedZstdWriter {
+    fn new(limit: usize, reserve: usize, exceeded: Rc<Cell<bool>>) -> Result<Self> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(reserve.min(limit))
+            .map_err(|_| AuraError::InvalidValue("planned flat zstd allocation"))?;
+        Ok(Self {
+            bytes,
+            limit,
+            exceeded,
+        })
+    }
+}
+
+impl Write for BoundedZstdWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self
+            .bytes
+            .len()
+            .checked_add(buffer.len())
+            .is_none_or(|length| length > self.limit)
+        {
+            self.exceeded.set(true);
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "planned flat zstd output bound",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_zstd_wrapper(
+    inner_block: &[u8],
+    inner_body_layout_version: u16,
+    inner_block_version: u16,
+    limits: V3ValueLimits,
+) -> Result<Vec<u8>> {
+    let inner_len = u64::try_from(inner_block.len())
+        .map_err(|_| AuraError::InvalidValue("planned flat zstd inner length"))?;
+    if inner_block.len() > limits.max_block_bytes {
+        return Err(AuraError::InvalidValue("planned flat zstd inner length"));
+    }
+    let payload_limit = limits
+        .max_block_bytes
+        .checked_sub(ZSTD_WRAPPER_HEADER_BYTES)
+        .ok_or(AuraError::InvalidValue("planned flat zstd wrapper length"))?;
+    let compress_bound = zstd::zstd_safe::compress_bound(inner_block.len());
+    let exceeded = Rc::new(Cell::new(false));
+    let writer = BoundedZstdWriter::new(payload_limit, compress_bound, Rc::clone(&exceeded))?;
+    let mut encoder = zstd::stream::write::Encoder::new(writer, V3_PLANNED_FLAT_ZSTD_LEVEL)
+        .map_err(|_| AuraError::InvalidValue("planned flat zstd encoder"))?;
+    encoder
+        .set_pledged_src_size(Some(inner_len))
+        .and_then(|_| encoder.include_contentsize(true))
+        .and_then(|_| encoder.include_checksum(true))
+        .and_then(|_| encoder.include_dictid(false))
+        .and_then(|_| encoder.long_distance_matching(false))
+        .and_then(|_| encoder.window_log(u32::from(V3_PLANNED_FLAT_ZSTD_WINDOW_LOG)))
+        .and_then(|_| encoder.set_parameter(zstd::zstd_safe::CParameter::NbWorkers(0)))
+        .and_then(|_| encoder.set_target_cblock_size(None))
+        .map_err(|_| AuraError::InvalidValue("planned flat zstd encoder profile"))?;
+    encoder.write_all(inner_block).map_err(|_| {
+        if exceeded.get() {
+            AuraError::InvalidValue("planned flat zstd block length")
+        } else {
+            AuraError::InvalidValue("planned flat zstd frame")
+        }
+    })?;
+    let compressed = encoder
+        .finish()
+        .map_err(|_| {
+            if exceeded.get() {
+                AuraError::InvalidValue("planned flat zstd block length")
+            } else {
+                AuraError::InvalidValue("planned flat zstd frame")
+            }
+        })?
+        .bytes;
+    let compressed_len = u64::try_from(compressed.len())
+        .map_err(|_| AuraError::InvalidValue("planned flat zstd compressed length"))?;
+    let wrapper_len = ZSTD_WRAPPER_HEADER_BYTES
+        .checked_add(compressed.len())
+        .filter(|length| *length <= limits.max_block_bytes)
+        .ok_or(AuraError::InvalidValue("planned flat zstd wrapper length"))?;
+    let mut wrapper = Vec::new();
+    wrapper
+        .try_reserve_exact(wrapper_len)
+        .map_err(|_| AuraError::InvalidValue("planned flat zstd allocation"))?;
+    wrapper.extend_from_slice(ZSTD_WRAPPER_MAGIC);
+    wrapper.extend_from_slice(&V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION.to_le_bytes());
+    wrapper.push(ZSTD_CODEC_ID);
+    wrapper.push(V3_PLANNED_FLAT_ZSTD_LEVEL as u8);
+    wrapper.push(V3_PLANNED_FLAT_ZSTD_WINDOW_LOG);
+    wrapper.push(ZSTD_WRAPPER_FLAGS);
+    wrapper.extend_from_slice(&0u16.to_le_bytes());
+    wrapper.extend_from_slice(&inner_body_layout_version.to_le_bytes());
+    wrapper.extend_from_slice(&inner_block_version.to_le_bytes());
+    wrapper.extend_from_slice(&inner_len.to_le_bytes());
+    wrapper.extend_from_slice(&compressed_len.to_le_bytes());
+    let inner_sha256: [u8; 32] = Sha256::digest(inner_block).into();
+    wrapper.extend_from_slice(&inner_sha256);
+    debug_assert_eq!(wrapper.len(), ZSTD_WRAPPER_HEADER_BYTES);
+    wrapper.extend_from_slice(&compressed);
+    Ok(wrapper)
+}
+
+fn decode_zstd_wrapper(
+    wrapper: &[u8],
+    plan: &FlatAuraPlanV2,
+    limits: V3ValueLimits,
+) -> Result<Vec<u8>> {
+    if wrapper.len() < ZSTD_WRAPPER_HEADER_BYTES || wrapper.len() > limits.max_block_bytes {
+        return Err(AuraError::InvalidValue("planned flat zstd wrapper length"));
+    }
+    let mut reader = ByteReader::new(wrapper);
+    if reader.read_exact(8)? != ZSTD_WRAPPER_MAGIC
+        || reader.read_u16_le()? != V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION
+        || reader.read_u8()? != ZSTD_CODEC_ID
+        || reader.read_u8()? != V3_PLANNED_FLAT_ZSTD_LEVEL as u8
+        || reader.read_u8()? != V3_PLANNED_FLAT_ZSTD_WINDOW_LOG
+        || reader.read_u8()? != ZSTD_WRAPPER_FLAGS
+        || reader.read_u16_le()? != 0
+    {
+        return Err(AuraError::InvalidValue("planned flat zstd wrapper header"));
+    }
+    let inner_body_layout_version = reader.read_u16_le()?;
+    let inner_block_version = reader.read_u16_le()?;
+    let (expected_inner_layout, expected_inner_block, _) = planned_body_versions(plan)?;
+    if inner_body_layout_version != expected_inner_layout
+        || inner_block_version != expected_inner_block
+    {
+        return Err(AuraError::InvalidValue("planned flat zstd inner versions"));
+    }
+    let inner_len_u64 = reader.read_u64_le()?;
+    let compressed_len_u64 = reader.read_u64_le()?;
+    let inner_sha256: [u8; 32] = reader.read_exact(32)?.try_into().unwrap();
+    let inner_len = usize::try_from(inner_len_u64)
+        .map_err(|_| AuraError::InvalidValue("planned flat zstd inner length"))?;
+    let compressed_len = usize::try_from(compressed_len_u64)
+        .map_err(|_| AuraError::InvalidValue("planned flat zstd compressed length"))?;
+    if inner_len > limits.max_block_bytes
+        || ZSTD_WRAPPER_HEADER_BYTES
+            .checked_add(compressed_len)
+            .is_none_or(|length| length != wrapper.len())
+    {
+        return Err(AuraError::InvalidValue("planned flat zstd wrapper length"));
+    }
+    let compressed = reader.read_exact(compressed_len)?;
+    reader.finish()?;
+    if !compressed.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        return Err(AuraError::InvalidValue("planned flat zstd frame magic"));
+    }
+    let frame_len = zstd::zstd_safe::find_frame_compressed_size(compressed)
+        .map_err(|_| AuraError::InvalidValue("planned flat zstd frame"))?;
+    if frame_len != compressed.len() {
+        return Err(AuraError::InvalidValue("planned flat zstd frame length"));
+    }
+    match zstd::zstd_safe::get_frame_content_size(compressed) {
+        Ok(Some(content_size)) if content_size == inner_len_u64 => {}
+        _ => {
+            return Err(AuraError::InvalidValue(
+                "planned flat zstd frame content size",
+            ))
+        }
+    }
+    let mut inner = Vec::new();
+    inner
+        .try_reserve_exact(
+            inner_len
+                .checked_add(1)
+                .ok_or(AuraError::InvalidValue("planned flat zstd inner length"))?,
+        )
+        .map_err(|_| AuraError::InvalidValue("planned flat zstd allocation"))?;
+    let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))
+        .map_err(|_| AuraError::InvalidValue("planned flat zstd frame"))?;
+    decoder
+        .window_log_max(u32::from(V3_PLANNED_FLAT_ZSTD_WINDOW_LOG))
+        .map_err(|_| AuraError::InvalidValue("planned flat zstd window"))?;
+    decoder
+        .take(inner_len_u64.saturating_add(1))
+        .read_to_end(&mut inner)
+        .map_err(|_| AuraError::InvalidValue("planned flat zstd frame"))?;
+    if inner.len() != inner_len {
+        return Err(AuraError::InvalidValue("planned flat zstd output length"));
+    }
+    if Sha256::digest(&inner).as_slice() != inner_sha256 {
+        return Err(AuraError::InvalidValue("planned flat zstd inner hash"));
+    }
+    if encode_zstd_wrapper(
+        &inner,
+        inner_body_layout_version,
+        inner_block_version,
+        limits,
+    )? != wrapper
+    {
+        return Err(AuraError::InvalidValue("planned flat zstd noncanonical"));
+    }
+    Ok(inner)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -825,6 +1187,22 @@ fn planned_body_versions(plan: &FlatAuraPlanV2) -> Result<(u16, u16, &'static [u
             BLOCK_MAGIC_V2,
         )),
         _ => Err(AuraError::InvalidValue("planned flat plan registry")),
+    }
+}
+
+fn validate_stored_body_versions(
+    plan: &FlatAuraPlanV2,
+    body_layout_version: u16,
+    block_version: u16,
+) -> Result<()> {
+    let (inner_body_layout_version, inner_block_version, _) = planned_body_versions(plan)?;
+    if (body_layout_version == inner_body_layout_version && block_version == inner_block_version)
+        || (body_layout_version == V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION
+            && block_version == V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION)
+    {
+        Ok(())
+    } else {
+        Err(AuraError::InvalidValue("planned flat versions"))
     }
 }
 
@@ -1431,6 +1809,7 @@ fn seal(
             candidates: Vec::new(),
             codecs: Vec::new(),
             dictionary_candidate_codecs: Vec::new(),
+            zstd_candidate: None,
         },
     })
 }
@@ -1449,7 +1828,11 @@ pub fn encode_v3_planned_flat_footer(
     }
     let schema = encode_schema_descriptor(&footer.schema)?;
     let plan = footer.plan.encode(&footer.schema)?;
-    let (body_layout_version, block_version, _) = planned_body_versions(&footer.plan)?;
+    validate_stored_body_versions(
+        &footer.plan,
+        footer.body_layout_version,
+        footer.block_version,
+    )?;
     let len = 208usize
         .checked_add(schema.len())
         .and_then(|v| v.checked_add(plan.len()))
@@ -1469,8 +1852,8 @@ pub fn encode_v3_planned_flat_footer(
     put64(&mut out, footer.body_len);
     put32(&mut out, footer.chunks.len() as u32);
     put32(&mut out, footer.schema.schema_id);
-    put16(&mut out, body_layout_version);
-    put16(&mut out, block_version);
+    put16(&mut out, footer.body_layout_version);
+    put16(&mut out, footer.block_version);
     put32(&mut out, schema.len() as u32);
     put32(&mut out, plan.len() as u32);
     for hash in [
@@ -1504,7 +1887,7 @@ pub fn encode_v3_planned_flat_footer(
         put32(&mut out, 0);
         put64(&mut out, chunk.first_global_row);
         put32(&mut out, chunk.row_count);
-        put16(&mut out, block_version);
+        put16(&mut out, footer.block_version);
         put16(&mut out, 0);
         put64(&mut out, chunk.body_relative_offset);
         put64(&mut out, chunk.stored_len);
@@ -1565,12 +1948,7 @@ pub fn decode_v3_planned_flat_footer(
         return Err(AuraError::InvalidValue("planned flat schema"));
     }
     let plan = FlatAuraPlanV2::decode(&schema, r.read_exact(pl)?)?;
-    let (expected_body_layout_version, expected_block_version, _) = planned_body_versions(&plan)?;
-    if body_layout_version != expected_body_layout_version
-        || block_version != expected_block_version
-    {
-        return Err(AuraError::InvalidValue("planned flat versions"));
-    }
+    validate_stored_body_versions(&plan, body_layout_version, block_version)?;
     if r.read_u16_le() != Ok(1)
         || r.read_u16_le() != Ok(104)
         || r.read_u32_le()? as usize != count
@@ -1587,7 +1965,7 @@ pub fn decode_v3_planned_flat_footer(
         }
         let first = r.read_u64_le()?;
         let rows = r.read_u32_le()?;
-        if r.read_u16_le()? != expected_block_version || r.read_u16_le()? != 0 {
+        if r.read_u16_le()? != block_version || r.read_u16_le()? != 0 {
             return Err(AuraError::InvalidValue("planned flat chunk version"));
         }
         let off = r.read_u64_le()?;
@@ -1608,6 +1986,8 @@ pub fn decode_v3_planned_flat_footer(
     let footer = V3PlannedFlatFooter {
         record_count,
         body_len,
+        body_layout_version,
+        block_version,
         schema,
         plan,
         schema_fingerprint,
@@ -1679,7 +2059,14 @@ pub fn decode_v3_planned_flat(bytes: &[u8], limits: V3FlatLimits) -> Result<Deco
         if Sha256::digest(stored).as_slice() != chunk.stored_sha256 {
             return Err(AuraError::InvalidValue("planned flat stored hash"));
         }
-        let batch = decode_block(&footer.schema, stored, &footer.plan, limits.value_limits)?;
+        let inner_block;
+        let block = if footer.body_layout_version == V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION {
+            inner_block = decode_zstd_wrapper(stored, &footer.plan, limits.value_limits)?;
+            inner_block.as_slice()
+        } else {
+            stored
+        };
+        let batch = decode_block(&footer.schema, block, &footer.plan, limits.value_limits)?;
         if batch.row_count != chunk.row_count
             || canonical_v3_batch_sha256(&footer.schema, &batch, structural)?
                 != chunk.chunk_logical_sha256
@@ -1771,6 +2158,9 @@ fn candidate_inapplicable(error: &AuraError) -> bool {
                 | "planned flat footer length"
                 | "planned flat dictionary no lane win"
                 | "planned flat logical output length"
+                | "planned flat zstd block length"
+                | "planned flat zstd wrapper length"
+                | "planned flat zstd compressed length"
         )
     )
 }
@@ -2067,6 +2457,235 @@ mod dictionary_tests {
                 "planned flat dictionary inverse length"
             ))
         );
+    }
+
+    fn zstd_test_inner() -> (SchemaDescriptor, FlatAuraPlanV2, Vec<u8>) {
+        let schema = SchemaBuilder::new("anonymous_zstd_wrapper")
+            .v3()
+            .field("value", FieldType::I64, FieldRole::Value)
+            .finish()
+            .unwrap();
+        let batch = AuraV3Batch {
+            schema_id: schema.schema_id,
+            row_count: 512,
+            columns: vec![AuraV3Column {
+                slot: 0,
+                validity: None,
+                values: AuraV3ColumnValues::I64(vec![7; 512]),
+            }],
+        };
+        let plan = FlatAuraPlanV2::all_fixed(&schema).unwrap();
+        let inner = encode_block(&schema, &batch, &plan, V3ValueLimits::HARD).unwrap();
+        (schema, plan, inner)
+    }
+
+    fn alternate_zstd_frame(
+        inner: &[u8],
+        level: i32,
+        checksum: bool,
+        content_size: bool,
+    ) -> Vec<u8> {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+        encoder
+            .set_pledged_src_size(Some(inner.len() as u64))
+            .unwrap();
+        encoder.include_contentsize(content_size).unwrap();
+        encoder.include_checksum(checksum).unwrap();
+        encoder.include_dictid(false).unwrap();
+        encoder.long_distance_matching(false).unwrap();
+        encoder
+            .window_log(u32::from(V3_PLANNED_FLAT_ZSTD_WINDOW_LOG))
+            .unwrap();
+        encoder.write_all(inner).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn wrapper_with_frame(canonical: &[u8], frame: &[u8]) -> Vec<u8> {
+        let mut wrapper = canonical[..ZSTD_WRAPPER_HEADER_BYTES].to_vec();
+        wrapper[28..36].copy_from_slice(&(frame.len() as u64).to_le_bytes());
+        wrapper.extend_from_slice(frame);
+        wrapper
+    }
+
+    #[test]
+    fn zstd_wrapper_profile_is_deterministic_exact_and_canonical() {
+        let (_, plan, inner) = zstd_test_inner();
+        let first = encode_zstd_wrapper(
+            &inner,
+            V3_PLANNED_FLAT_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_BLOCK_VERSION,
+            V3ValueLimits::HARD,
+        )
+        .unwrap();
+        let second = encode_zstd_wrapper(
+            &inner,
+            V3_PLANNED_FLAT_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_BLOCK_VERSION,
+            V3ValueLimits::HARD,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(&first[..8], ZSTD_WRAPPER_MAGIC);
+        assert_eq!(
+            first.len(),
+            ZSTD_WRAPPER_HEADER_BYTES
+                + u64::from_le_bytes(first[28..36].try_into().unwrap()) as usize
+        );
+        assert_eq!(
+            decode_zstd_wrapper(&first, &plan, V3ValueLimits::HARD).unwrap(),
+            inner
+        );
+        for length in 0..first.len() {
+            assert!(decode_zstd_wrapper(&first[..length], &plan, V3ValueLimits::HARD).is_err());
+        }
+    }
+
+    #[test]
+    fn zstd_wrapper_fields_frames_and_declarations_fail_closed() {
+        let (_, plan, inner) = zstd_test_inner();
+        let canonical = encode_zstd_wrapper(
+            &inner,
+            V3_PLANNED_FLAT_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_BLOCK_VERSION,
+            V3ValueLimits::HARD,
+        )
+        .unwrap();
+        for offset in [0usize, 8, 10, 11, 12, 13, 14, 16, 18, 20, 28, 36] {
+            let mut corrupted = canonical.clone();
+            corrupted[offset] ^= 1;
+            assert!(decode_zstd_wrapper(&corrupted, &plan, V3ValueLimits::HARD).is_err());
+        }
+        for (offset, value) in [(20usize, u64::MAX), (28, u64::MAX)] {
+            let mut bomb = canonical.clone();
+            bomb[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            assert!(decode_zstd_wrapper(&bomb, &plan, V3ValueLimits::HARD).is_err());
+        }
+        let compressed = &canonical[ZSTD_WRAPPER_HEADER_BYTES..];
+        let mut concatenated = compressed.to_vec();
+        concatenated.extend_from_slice(compressed);
+        assert!(decode_zstd_wrapper(
+            &wrapper_with_frame(&canonical, &concatenated),
+            &plan,
+            V3ValueLimits::HARD,
+        )
+        .is_err());
+        let mut trailing = compressed.to_vec();
+        trailing.push(0);
+        assert!(decode_zstd_wrapper(
+            &wrapper_with_frame(&canonical, &trailing),
+            &plan,
+            V3ValueLimits::HARD,
+        )
+        .is_err());
+        let mut skippable = compressed.to_vec();
+        skippable[..4].copy_from_slice(&[0x50, 0x2a, 0x4d, 0x18]);
+        assert!(decode_zstd_wrapper(
+            &wrapper_with_frame(&canonical, &skippable),
+            &plan,
+            V3ValueLimits::HARD,
+        )
+        .is_err());
+        let mut checksum = compressed.to_vec();
+        *checksum.last_mut().unwrap() ^= 1;
+        assert!(decode_zstd_wrapper(
+            &wrapper_with_frame(&canonical, &checksum),
+            &plan,
+            V3ValueLimits::HARD,
+        )
+        .is_err());
+        for frame in [
+            alternate_zstd_frame(&inner, 3, true, true),
+            alternate_zstd_frame(&inner, V3_PLANNED_FLAT_ZSTD_LEVEL, false, true),
+            alternate_zstd_frame(&inner, V3_PLANNED_FLAT_ZSTD_LEVEL, true, false),
+        ] {
+            assert!(decode_zstd_wrapper(
+                &wrapper_with_frame(&canonical, &frame),
+                &plan,
+                V3ValueLimits::HARD,
+            )
+            .is_err());
+        }
+        let mut low_limits = V3ValueLimits::HARD;
+        low_limits.max_block_bytes = inner.len() - 1;
+        assert!(decode_zstd_wrapper(&canonical, &plan, low_limits).is_err());
+    }
+
+    #[test]
+    fn zstd_wrapper_inner_schema_plan_and_version_mismatch_fail_closed() {
+        let (schema, plan, inner) = zstd_test_inner();
+        let mut wrong_schema = inner.clone();
+        wrong_schema[12..16].copy_from_slice(&schema.schema_id.wrapping_add(1).to_le_bytes());
+        let wrapper = encode_zstd_wrapper(
+            &wrong_schema,
+            V3_PLANNED_FLAT_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_BLOCK_VERSION,
+            V3ValueLimits::HARD,
+        )
+        .unwrap();
+        let decoded = decode_zstd_wrapper(&wrapper, &plan, V3ValueLimits::HARD).unwrap();
+        assert!(decode_block(&schema, &decoded, &plan, V3ValueLimits::HARD).is_err());
+
+        let mut wrong_version = inner.clone();
+        wrong_version[8..10].copy_from_slice(&99u16.to_le_bytes());
+        let wrapper = encode_zstd_wrapper(
+            &wrong_version,
+            V3_PLANNED_FLAT_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_BLOCK_VERSION,
+            V3ValueLimits::HARD,
+        )
+        .unwrap();
+        let decoded = decode_zstd_wrapper(&wrapper, &plan, V3ValueLimits::HARD).unwrap();
+        assert!(decode_block(&schema, &decoded, &plan, V3ValueLimits::HARD).is_err());
+
+        let mut wrong_plan = plan.clone();
+        wrong_plan.codecs[0] = PlanV2PhysicalCodec::SignedZigZagUleb128;
+        wrong_plan.validate(&schema).unwrap();
+        let wrapper = encode_zstd_wrapper(
+            &inner,
+            V3_PLANNED_FLAT_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_BLOCK_VERSION,
+            V3ValueLimits::HARD,
+        )
+        .unwrap();
+        let decoded = decode_zstd_wrapper(&wrapper, &wrong_plan, V3ValueLimits::HARD).unwrap();
+        assert!(decode_block(&schema, &decoded, &wrong_plan, V3ValueLimits::HARD).is_err());
+    }
+
+    #[test]
+    fn zstd_wrapper_rejects_frame_requiring_window_above_profile_cap() {
+        let (_, plan, small_inner) = zstd_test_inner();
+        let canonical = encode_zstd_wrapper(
+            &small_inner,
+            V3_PLANNED_FLAT_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_BLOCK_VERSION,
+            V3ValueLimits::HARD,
+        )
+        .unwrap();
+        let inner = vec![0x5au8; (8 * 1024 * 1024) + 1];
+        let mut encoder =
+            zstd::stream::write::Encoder::new(Vec::new(), V3_PLANNED_FLAT_ZSTD_LEVEL).unwrap();
+        encoder
+            .set_pledged_src_size(Some(inner.len() as u64))
+            .unwrap();
+        encoder.include_contentsize(true).unwrap();
+        encoder.include_checksum(true).unwrap();
+        encoder.include_dictid(false).unwrap();
+        encoder.long_distance_matching(false).unwrap();
+        encoder.window_log(24).unwrap();
+        encoder.write_all(&inner).unwrap();
+        let frame = encoder.finish().unwrap();
+        let mut permissive =
+            zstd::stream::read::Decoder::new(Cursor::new(frame.as_slice())).unwrap();
+        permissive.window_log_max(24).unwrap();
+        let mut decoded = Vec::new();
+        permissive.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, inner);
+
+        let mut wrapper = wrapper_with_frame(&canonical, &frame);
+        wrapper[20..28].copy_from_slice(&(inner.len() as u64).to_le_bytes());
+        let inner_sha256: [u8; 32] = Sha256::digest(&inner).into();
+        wrapper[36..68].copy_from_slice(&inner_sha256);
+        assert!(decode_zstd_wrapper(&wrapper, &plan, V3ValueLimits::HARD).is_err());
     }
 
     #[test]

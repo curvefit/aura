@@ -201,11 +201,14 @@ pub use v3_planned_flat::{
     decode_v3_selected_flat, encode_v3_planned_flat_footer, DecodedV3PlannedFlat,
     DecodedV3SelectedFlat, V3PlannedFlatArtifact, V3PlannedFlatCandidateInspection,
     V3PlannedFlatChunkDescriptor, V3PlannedFlatCodecInspection, V3PlannedFlatFooter,
-    V3PlannedFlatInspection, V3PlannedFlatSummary, MAX_V3_PLANNED_FLAT_FOOTER_BYTES,
-    V3_PLANNED_FLAT_BLOCK_VERSION, V3_PLANNED_FLAT_BODY_ENCODING,
+    V3PlannedFlatInspection, V3PlannedFlatSummary, V3PlannedFlatZstdInspection,
+    MAX_V3_PLANNED_FLAT_FOOTER_BYTES, V3_PLANNED_FLAT_BLOCK_VERSION, V3_PLANNED_FLAT_BODY_ENCODING,
     V3_PLANNED_FLAT_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_CHUNK_DESCRIPTOR_BYTES,
     V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION, V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION,
     V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION, V3_PLANNED_FLAT_FOOTER_PREFIX_BYTES,
+    V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION, V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION,
+    V3_PLANNED_FLAT_ZSTD_LEVEL, V3_PLANNED_FLAT_ZSTD_WINDOW_LOG,
+    V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION,
 };
 pub use v3_planned_grouped::{
     compile_v3_planned_grouped, compile_v3_planned_grouped_attempt2,

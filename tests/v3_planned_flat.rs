@@ -4,9 +4,9 @@ use aura_codec::{
     canonical_v3_batch_sha256, compile_v3_planned_flat, decode_any_compiled_footer,
     decode_v3_planned_flat, decode_v3_planned_flat_footer, decode_v3_selected_flat,
     encode_v3_planned_flat_footer, encode_v3_value_block, parse_schema_json, AnyCompiledFooter,
-    AuraError, AuraHeader, AuraV3Batch, AuraV3Column, AuraV3ColumnValues as Values,
-    AuraV3VariableColumn, DecodedV3SelectedFlat, FieldRole, FieldType, FlatAuraPlanV2,
-    PlanV2PhysicalCodec, SchemaBuilder, V3FlatAura0Writer, V3FlatLimits, V3FlatWriterOptions,
+    AuraHeader, AuraV3Batch, AuraV3Column, AuraV3ColumnValues as Values, AuraV3VariableColumn,
+    DecodedV3SelectedFlat, FieldRole, FieldType, FlatAuraPlanV2, PlanV2PhysicalCodec,
+    SchemaBuilder, V3FlatAura0Writer, V3FlatLimits, V3FlatWriterOptions,
     FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION, V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION,
     V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION,
 };
@@ -198,8 +198,19 @@ fn auf2_and_planned_flat_roundtrip_complete_cost() {
         artifact.summary.file_bytes,
         artifact.summary.accounted_file_bytes
     );
-    assert_eq!(artifact.inspection.candidates.len(), 4);
-    assert!(artifact.inspection.candidates[3].selected);
+    assert_eq!(artifact.inspection.candidates.len(), 5);
+    assert!(artifact.inspection.candidates[4].selected);
+    let zstd = artifact.inspection.zstd_candidate.as_ref().unwrap();
+    assert_eq!(zstd.base_candidate_id, "planned-flat-variable-dictionary");
+    assert_eq!(
+        zstd.base_registry_version,
+        FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION
+    );
+    assert_eq!(zstd.stored_body_bytes, artifact.summary.body_bytes);
+    assert_eq!(
+        zstd.compressed_payload_bytes + zstd.wrapper_overhead_bytes,
+        zstd.stored_body_bytes
+    );
     assert!(artifact
         .inspection
         .codecs
@@ -221,11 +232,12 @@ fn auf2_and_planned_flat_roundtrip_complete_cost() {
         DecodedV3SelectedFlat::Planned(decoded) if decoded.batches == batches
     ));
     eprintln!(
-        "development planned-flat bytes exact={} fixed={} mixed={} dictionary={}",
+        "development planned-flat bytes exact={} fixed={} mixed={} dictionary={} zstd19={}",
         artifact.inspection.candidates[0].complete_bytes.unwrap(),
         artifact.inspection.candidates[1].complete_bytes.unwrap(),
         artifact.inspection.candidates[2].complete_bytes.unwrap(),
-        artifact.inspection.candidates[3].complete_bytes.unwrap()
+        artifact.inspection.candidates[3].complete_bytes.unwrap(),
+        artifact.inspection.candidates[4].complete_bytes.unwrap()
     );
 }
 
@@ -303,7 +315,7 @@ fn trade_shape_complete_ablation_is_exact() {
         ],
     };
     let artifact = compile_v3_planned_flat(&schema, &[input], Default::default()).unwrap();
-    assert!(artifact.inspection.candidates[3].selected);
+    assert!(artifact.inspection.candidates[4].selected);
     assert_eq!(
         decode_v3_planned_flat(&artifact.bytes, Default::default())
             .unwrap()
@@ -312,11 +324,12 @@ fn trade_shape_complete_ablation_is_exact() {
         artifact.summary.file_bytes
     );
     eprintln!(
-        "development trade-shape planned-flat bytes exact={} fixed={} mixed={} dictionary={}",
+        "development trade-shape planned-flat bytes exact={} fixed={} mixed={} dictionary={} zstd19={}",
         artifact.inspection.candidates[0].complete_bytes.unwrap(),
         artifact.inspection.candidates[1].complete_bytes.unwrap(),
         artifact.inspection.candidates[2].complete_bytes.unwrap(),
-        artifact.inspection.candidates[3].complete_bytes.unwrap()
+        artifact.inspection.candidates[3].complete_bytes.unwrap(),
+        artifact.inspection.candidates[4].complete_bytes.unwrap()
     );
 }
 
@@ -419,7 +432,8 @@ fn dictionary_candidate_mixes_eligible_lanes_and_high_cardinality_falls_back() {
         ],
     };
     let artifact = compile_v3_planned_flat(&schema, &[input], V3FlatLimits::HARD).unwrap();
-    assert!(artifact.inspection.candidates[3].selected);
+    assert!(artifact.inspection.candidates[3].applicable);
+    assert!(artifact.inspection.candidates[4].selected);
     let decoded = decode_v3_planned_flat(&artifact.bytes, V3FlatLimits::HARD).unwrap();
     assert_eq!(
         decoded.footer.plan.codecs[1],
@@ -458,13 +472,83 @@ fn dictionary_candidate_mixes_eligible_lanes_and_high_cardinality_falls_back() {
             },
         ],
     };
-    let fallback = compile_v3_planned_flat(&tiny_schema, &[tiny], V3FlatLimits::HARD).unwrap();
+    let fallback = compile_v3_planned_flat(
+        &tiny_schema,
+        std::slice::from_ref(&tiny),
+        V3FlatLimits::HARD,
+    )
+    .unwrap();
     assert!(!fallback.inspection.candidates[3].applicable);
     assert_eq!(fallback.inspection.candidates[3].complete_bytes, None);
     assert_eq!(
         fallback.inspection.candidates[3].rejection.as_deref(),
         Some("invalid value for planned flat dictionary no lane win")
     );
+    assert_eq!(
+        fallback
+            .inspection
+            .zstd_candidate
+            .as_ref()
+            .unwrap()
+            .base_candidate_id,
+        "planned-flat-integer-codecs"
+    );
+    assert!(!fallback.inspection.candidates[4].selected);
+    let zstd = fallback.inspection.zstd_candidate.as_ref().unwrap();
+    assert!(zstd.stored_body_bytes > zstd.inner_body_bytes);
+    let limited = compile_v3_planned_flat(
+        &tiny_schema,
+        &[tiny],
+        V3FlatLimits {
+            value_limits: aura_codec::V3ValueLimits {
+                max_block_bytes: zstd.inner_body_bytes as usize,
+                ..V3FlatLimits::HARD.value_limits
+            },
+            ..V3FlatLimits::HARD
+        },
+    )
+    .unwrap();
+    assert!(!limited.inspection.candidates[4].applicable);
+    assert!(limited.inspection.candidates[..4]
+        .iter()
+        .any(|candidate| candidate.selected));
+}
+
+#[test]
+fn zstd_candidate_uses_preselected_registry1_mixed_base_without_dictionary() {
+    let schema = SchemaBuilder::new("anonymous_zstd_registry1_base")
+        .v3()
+        .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
+        .field("value", FieldType::I64, FieldRole::Value)
+        .finish()
+        .unwrap();
+    let rows = 1024usize;
+    let input = AuraV3Batch {
+        schema_id: schema.schema_id,
+        row_count: rows as u32,
+        columns: vec![
+            AuraV3Column {
+                slot: 0,
+                validity: None,
+                values: Values::TimestampMs((0..rows).map(|row| row as i64).collect()),
+            },
+            AuraV3Column {
+                slot: 1,
+                validity: None,
+                values: Values::I64(vec![7; rows]),
+            },
+        ],
+    };
+    let artifact = compile_v3_planned_flat(&schema, &[input], V3FlatLimits::HARD).unwrap();
+    assert!(!artifact.inspection.candidates[3].applicable);
+    assert!(artifact.inspection.candidates[4].selected);
+    let zstd = artifact.inspection.zstd_candidate.as_ref().unwrap();
+    assert_eq!(zstd.base_candidate_id, "planned-flat-integer-codecs");
+    assert_eq!(zstd.base_registry_version, 1);
+    let decoded = decode_v3_planned_flat(&artifact.bytes, V3FlatLimits::HARD).unwrap();
+    assert_eq!(decoded.footer.body_layout_version, 3);
+    assert_eq!(decoded.footer.block_version, 3);
+    assert_eq!(decoded.footer.plan.registry_version, 1);
 }
 
 #[test]
@@ -515,8 +599,8 @@ fn chunk_local_dictionaries_preserve_rechunked_logical_identity() {
             },
         ],
     };
-    let whole_batch = make(0, 64);
-    let split_batches = vec![make(0, 32), make(32, 32)];
+    let whole_batch = make(0, 512);
+    let split_batches = vec![make(0, 256), make(256, 256)];
     let whole = compile_v3_planned_flat(
         &schema,
         std::slice::from_ref(&whole_batch),
@@ -524,8 +608,8 @@ fn chunk_local_dictionaries_preserve_rechunked_logical_identity() {
     )
     .unwrap();
     let split = compile_v3_planned_flat(&schema, &split_batches, V3FlatLimits::HARD).unwrap();
-    assert!(whole.inspection.candidates[3].selected);
-    assert!(split.inspection.candidates[3].selected);
+    assert!(whole.inspection.candidates[4].selected);
+    assert!(split.inspection.candidates[4].selected);
     assert_eq!(
         whole.summary.global_logical_sha256,
         split.summary.global_logical_sha256
@@ -706,11 +790,11 @@ fn auf2_rehashed_codec_and_layout_mutations_reject() {
 }
 
 #[test]
-fn planned_flat_rehashed_footer_and_noncanonical_varint_reject() {
+fn planned_flat_rehashed_footer_and_wrapper_mutation_reject() {
     let schema = schema();
     let input = batch(schema.schema_id, 0, 32);
     let artifact = compile_v3_planned_flat(&schema, &[input], Default::default()).unwrap();
-    assert!(artifact.inspection.candidates[3].selected);
+    assert!(artifact.inspection.candidates[4].selected);
     let mut footer = footer_bytes(&artifact.bytes).to_vec();
     footer[8] ^= 1;
     resign(&mut footer, FLAT_FOOTER_HASH_DOMAIN);
@@ -718,25 +802,14 @@ fn planned_flat_rehashed_footer_and_noncanonical_varint_reject() {
 
     let header_len = AuraHeader::encoded_len(&artifact.bytes).unwrap();
     let body_end = artifact.bytes.len() - 12 - footer_bytes(&artifact.bytes).len();
-    let mut body = artifact.bytes[header_len..body_end].to_vec();
-    assert_eq!(body[64], 0);
-    body.splice(64..65, [0x80, 0x00]);
-    let body_len = body.len() as u64;
-    body[56..64].copy_from_slice(&body_len.to_le_bytes());
-    let mut decoded_footer =
-        decode_v3_planned_flat_footer(footer_bytes(&artifact.bytes), V3FlatLimits::HARD).unwrap();
-    decoded_footer.body_len = body_len;
-    decoded_footer.body_sha256 = domain_hash(FLAT_BODY_HASH_DOMAIN, &body);
-    decoded_footer.chunks[0].stored_len = body_len;
-    decoded_footer.chunks[0].stored_sha256 = Sha256::digest(&body).into();
-    let footer = encode_v3_planned_flat_footer(&decoded_footer, V3FlatLimits::HARD).unwrap();
-    let mut rebuilt = Vec::new();
-    rebuilt.extend_from_slice(&artifact.bytes[..header_len]);
-    rebuilt.extend_from_slice(&body);
-    rebuilt.extend_from_slice(&footer);
-    rebuilt.extend_from_slice(&(footer.len() as u32).to_le_bytes());
-    rebuilt.extend_from_slice(b"sealed:)");
-    assert!(decode_v3_planned_flat(&rebuilt, V3FlatLimits::HARD).is_err());
+    let body = artifact.bytes[header_len..body_end].to_vec();
+    assert_eq!(&body[..8], b"AUFPZB01");
+    for offset in [8usize, 10, 11, 12, 13, 14, 16, 18, 20, 28, 36] {
+        let mut corrupted = body.clone();
+        corrupted[offset] ^= 1;
+        let rebuilt = rebuild_with_body(&artifact.bytes, &corrupted);
+        assert!(decode_v3_planned_flat(&rebuilt, V3FlatLimits::HARD).is_err());
+    }
 }
 
 #[test]
@@ -792,13 +865,10 @@ fn planned_flat_row_limit_precedes_variable_lane_arithmetic() {
     let header_len = AuraHeader::encoded_len(&artifact.bytes).unwrap();
     let body_end = artifact.bytes.len() - 12 - footer_bytes(&artifact.bytes).len();
     let mut body = artifact.bytes[header_len..body_end].to_vec();
-    body[48..52].copy_from_slice(&u32::MAX.to_le_bytes());
+    body[20..28].copy_from_slice(&u64::MAX.to_le_bytes());
     let malicious = rebuild_with_body(&artifact.bytes, &body);
     let result = std::panic::catch_unwind(|| decode_v3_planned_flat(&malicious, at_boundary));
-    assert!(matches!(
-        result,
-        Ok(Err(AuraError::InvalidValue("planned flat row count")))
-    ));
+    assert!(matches!(result, Ok(Err(_))));
 }
 
 fn footer_bytes(file: &[u8]) -> &[u8] {

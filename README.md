@@ -119,13 +119,16 @@ destination. Verification boundedly routes the held file from its footer tuple
 and verifies the exact embedded flat, planned-flat, or grouped schema and
 complete file. The optional flat `--mode planned` route is development-only:
 it scores exact and plan-bound fixed/absolute-varint lane encodings plus one
-canonical exact-byte dictionary/bitpacked-index candidate as complete files
+canonical exact-byte dictionary/bitpacked-index candidate and one deterministic
+per-chunk zstd19 wrapper candidate as complete files
 using conservative bounds and publishes the smallest result (fixed ties,
 including an auditable exact fallback). Dictionaries apply generically only to
 Utf8 and DecimalText and never normalize bytes. Its receipt reports every
-candidate cost, per-lane dictionary attribution, and the actual selected wire
-tuple. Compilation and planned verification are bounded all-memory reference
-paths, not seekable/streaming readiness.
+candidate cost, per-lane dictionary attribution, wrapper/base/compressed-byte
+facts, and the actual selected wire tuple. Compression is independently
+decodable per chunk with a fixed 8 MiB window cap, but compilation and planned
+verification remain bounded all-memory reference paths, not seekable/streaming
+readiness or a production/Parquet-size claim.
 
 The supported V3 flat subset is intentionally narrow: event-scoped fields,
 exact fixed and variable values, and optional validity bitmaps. It rejects

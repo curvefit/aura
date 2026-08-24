@@ -31,6 +31,9 @@ use aura_codec::{
     V3_PLANNED_FLAT_BLOCK_VERSION, V3_PLANNED_FLAT_BODY_ENCODING,
     V3_PLANNED_FLAT_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION,
     V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION,
+    V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION, V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION,
+    V3_PLANNED_FLAT_ZSTD_LEVEL, V3_PLANNED_FLAT_ZSTD_WINDOW_LOG,
+    V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -783,11 +786,34 @@ fn planned_flat_v3_seal_json(
         .iter()
         .map(planned_flat_codec_inspection_json)
         .collect::<Vec<_>>();
+    let zstd_candidate = artifact.inspection.zstd_candidate.as_ref().map(|zstd| {
+        json!({
+            "base_candidate_id": zstd.base_candidate_id,
+            "base_registry_version": zstd.base_registry_version,
+            "inner_body_layout_version": zstd.inner_body_layout_version,
+            "inner_block_version": zstd.inner_block_version,
+            "inner_body_bytes": zstd.inner_body_bytes,
+            "compressed_payload_bytes": zstd.compressed_payload_bytes,
+            "wrapper_overhead_bytes": zstd.wrapper_overhead_bytes,
+            "stored_body_bytes": zstd.stored_body_bytes,
+            "wrapper_version": V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION,
+            "compression": "zstd",
+            "compression_level": V3_PLANNED_FLAT_ZSTD_LEVEL,
+            "window_log": V3_PLANNED_FLAT_ZSTD_WINDOW_LOG,
+            "flags": 3,
+        })
+    });
     let plan_sha256 =
         (selection == PlannedFlatSelection::Planned).then(|| hex(&artifact.summary.plan_sha256));
     let dictionary_selected = selected_candidate == "planned-flat-variable-dictionary";
+    let zstd_selected = selected_candidate == "planned-flat-zstd19-wrapper";
     let (body_layout_version, block_version) = if selection == PlannedFlatSelection::Exact {
         (None, None)
+    } else if zstd_selected {
+        (
+            Some(V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION),
+            Some(V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION),
+        )
     } else if dictionary_selected {
         (
             Some(V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION),
@@ -799,18 +825,22 @@ fn planned_flat_v3_seal_json(
             Some(V3_PLANNED_FLAT_BLOCK_VERSION),
         )
     };
-    let container_target = if dictionary_selected {
+    let container_target = if zstd_selected {
+        "flat-aura0-v3-planned-v3"
+    } else if dictionary_selected {
         "flat-aura0-v3-planned-v2"
     } else {
         selection.container_target()
     };
-    let body_encoding = if dictionary_selected {
+    let body_encoding = if zstd_selected {
+        "planned_flat_codecs_zstd19_v3"
+    } else if dictionary_selected {
         "planned_flat_codecs_v2"
     } else {
         selection.body_encoding_name()
     };
     json!({
-        "result_schema": "aura-v3-flat-aura0-planned-request-seal-result-v2",
+        "result_schema": "aura-v3-flat-aura0-planned-request-seal-result-v3",
         "protocol": SHADOW_PROTOCOL,
         "complete_aura_file": true,
         "container_target": container_target,
@@ -822,10 +852,16 @@ fn planned_flat_v3_seal_json(
         "planner_candidates": candidates,
         "physical_codecs": codecs,
         "dictionary_candidate_codecs": dictionary_candidate_codecs,
+        "zstd_candidate": zstd_candidate,
         "body_encoding": body_encoding,
         "body_encoding_code": selection.body_encoding_code(),
         "body_layout_version": body_layout_version,
         "block_version": block_version,
+        "compression": if zstd_selected { "zstd" } else { "none" },
+        "compression_level": zstd_selected.then_some(V3_PLANNED_FLAT_ZSTD_LEVEL),
+        "wrapper_version": zstd_selected.then_some(V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION),
+        "window_log": zstd_selected.then_some(V3_PLANNED_FLAT_ZSTD_WINDOW_LOG),
+        "wrapper_flags": zstd_selected.then_some(3),
         "footer_layout_version": selection.footer_layout_version(),
         "plan_sha256": plan_sha256,
         "schema_id": schema.schema_id,
@@ -840,8 +876,8 @@ fn planned_flat_v3_seal_json(
         "stale_temp_cleanup_required": stale_temp_cleanup_required,
         "development_only": true,
         "streaming": false,
-        "memory_model": "bounded_all_memory_exact_fixed_mixed_dictionary_complete_candidates_v1",
-        "all_memory_limitation": "retains exact, fixed, mixed, and dictionary complete candidate artifacts plus lane scratch during scoring",
+        "memory_model": "bounded_all_memory_exact_fixed_mixed_dictionary_zstd_complete_candidates_v1",
+        "all_memory_limitation": "retains exact, fixed, mixed, dictionary, and zstd complete candidate artifacts plus lane/compression scratch during scoring",
         "build": build_json(provenance)
     })
 }
@@ -966,7 +1002,9 @@ fn verify_v3_planned_flat_value(mut file: File) -> Result<serde_json::Value, Cli
     let provenance = build_provenance();
     let dictionary_registry =
         decoded.footer.plan.registry_version == FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION;
-    let (body_layout_version, block_version) = if dictionary_registry {
+    let zstd_wrapper =
+        decoded.footer.body_layout_version == V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION;
+    let (inner_body_layout_version, inner_block_version) = if dictionary_registry {
         (
             V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION,
             V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION,
@@ -977,17 +1015,23 @@ fn verify_v3_planned_flat_value(mut file: File) -> Result<serde_json::Value, Cli
             V3_PLANNED_FLAT_BLOCK_VERSION,
         )
     };
-    let result_schema = if dictionary_registry {
+    let result_schema = if zstd_wrapper {
+        "aura-v3-flat-aura0-planned-verify-result-v3"
+    } else if dictionary_registry {
         "aura-v3-flat-aura0-planned-verify-result-v2"
     } else {
         "aura-v3-flat-aura0-planned-verify-result-v1"
     };
-    let container_target = if dictionary_registry {
+    let container_target = if zstd_wrapper {
+        "flat-aura0-v3-planned-v3"
+    } else if dictionary_registry {
         "flat-aura0-v3-planned-v2"
     } else {
         PlannedFlatSelection::Planned.container_target()
     };
-    let body_encoding = if dictionary_registry {
+    let body_encoding = if zstd_wrapper {
+        "planned_flat_codecs_zstd19_v3"
+    } else if dictionary_registry {
         "planned_flat_codecs_v2"
     } else {
         PlannedFlatSelection::Planned.body_encoding_name()
@@ -1001,10 +1045,16 @@ fn verify_v3_planned_flat_value(mut file: File) -> Result<serde_json::Value, Cli
         "profile": "aura0",
         "body_encoding": body_encoding,
         "body_encoding_code": V3_PLANNED_FLAT_BODY_ENCODING,
-        "body_layout_version": body_layout_version,
-        "block_version": block_version,
+        "body_layout_version": decoded.footer.body_layout_version,
+        "block_version": decoded.footer.block_version,
+        "inner_body_layout_version": zstd_wrapper.then_some(inner_body_layout_version),
+        "inner_block_version": zstd_wrapper.then_some(inner_block_version),
         "footer_layout_version": V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION,
-        "compression": "none",
+        "compression": if zstd_wrapper { "zstd" } else { "none" },
+        "compression_level": zstd_wrapper.then_some(V3_PLANNED_FLAT_ZSTD_LEVEL),
+        "wrapper_version": zstd_wrapper.then_some(V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION),
+        "window_log": zstd_wrapper.then_some(V3_PLANNED_FLAT_ZSTD_WINDOW_LOG),
+        "wrapper_flags": zstd_wrapper.then_some(3),
         "verified": true,
         "schema_id": decoded.footer.schema.schema_id,
         "schema_fingerprint_sha256": hex(&decoded.summary.schema_fingerprint),
