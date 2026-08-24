@@ -192,6 +192,18 @@ to 16 MiB. Parsing and emission use checked, fallible allocation and reject
 documents outside the schema-JSON resource envelope. Canonicalization preserves
 exact UTF-8 strings; it does not Unicode-normalize names.
 
+Schema inputs normally must be regular, non-symlink filesystem paths. On Linux,
+the CLI also accepts an intentionally inherited readable descriptor using the
+exact canonical path `/proc/self/fd/<fd>`, where `<fd>` is a nonnegative decimal
+file descriptor without a sign, leading zero, or path suffix. Aura opens that
+exact procfs capability, verifies from the held descriptor that it is a regular
+file no larger than 16 MiB, and still performs a capped read. Callers must pass
+the descriptor into the Aura process, for example with Python `pass_fds`.
+Relative or aliased descriptor spellings, `/dev/fd`, other `/proc` forms,
+malformed descriptor paths, and all other symlink inputs receive no exception.
+Ordinary relative schema paths retain their existing behavior. Non-Linux
+behavior is unchanged.
+
 Use the unified developer CLI without editing Rust source:
 
 ```bash

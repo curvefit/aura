@@ -3,6 +3,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
+use std::{os::fd::AsRawFd, os::unix::process::CommandExt};
 
 use arrow::array::{Int64Array, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -94,6 +96,44 @@ fn aura_with_stdin(args: &[&str], stdin: &[u8]) -> Output {
         .spawn()
         .unwrap();
     let _ = child.stdin.take().unwrap().write_all(stdin);
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn fcntl(fd: i32, command: i32, ...) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+fn aura_with_inherited_file(args: &[&str], held: &fs::File, stdin: Option<&[u8]>) -> Output {
+    const F_SETFD: i32 = 2;
+
+    let descriptor = held.as_raw_fd();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aura"));
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+    // SAFETY: fcntl(F_SETFD, 0) is async-signal-safe and only clears
+    // FD_CLOEXEC on this already-open descriptor in the forked child.
+    unsafe {
+        command.pre_exec(move || {
+            if fcntl(descriptor, F_SETFD, 0) == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    if let Some(bytes) = stdin {
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+    }
     child.wait_with_output().unwrap()
 }
 
@@ -362,6 +402,163 @@ fn schema_inspect_rejects_symlink_input_without_writes() {
         .is_symlink());
     assert_eq!(fs::read_to_string(target).unwrap(), MINIMAL);
     assert_no_temp_files(&dir);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn held_schema_descriptor_supports_inspect_canonicalize_and_v3_seal() {
+    let dir = TestDir::new();
+    let schema_path = dir.path("held-schema.json");
+    let output = dir.path("held-schema.aura0");
+    let canonical = canonicalize_schema_json(MINIMAL).unwrap();
+    fs::write(&schema_path, &canonical).unwrap();
+    let held = fs::File::open(&schema_path).unwrap();
+    fs::remove_file(&schema_path).unwrap();
+    let descriptor_path = format!("/proc/self/fd/{}", held.as_raw_fd());
+
+    let inspected = aura_with_inherited_file(
+        &["schema", "inspect", "--input", &descriptor_path, "--json"],
+        &held,
+        None,
+    );
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let inspection: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_schema_inspection(&canonical, &inspection);
+
+    let canonicalized = aura_with_inherited_file(
+        &["schema", "canonicalize", "--input", &descriptor_path],
+        &held,
+        None,
+    );
+    assert!(
+        canonicalized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&canonicalized.stderr)
+    );
+    assert_eq!(canonicalized.stdout, canonical.as_bytes());
+
+    let sealed = aura_with_inherited_file(
+        &[
+            "v3",
+            "aura0",
+            "seal",
+            "--protocol",
+            "aura-logical-arrow-ipc-v1",
+            "--schema",
+            &descriptor_path,
+            "--output",
+            output.to_str().unwrap(),
+            "--json",
+        ],
+        &held,
+        Some(&minimal_ipc()),
+    );
+    assert!(
+        sealed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sealed.stderr)
+    );
+    let seal: serde_json::Value = serde_json::from_slice(&sealed.stdout).unwrap();
+    assert_eq!(seal["result_schema"], "aura-v3-flat-aura0-seal-result-v1");
+
+    let verified = aura(&[
+        "v3",
+        "aura0",
+        "verify",
+        "--input",
+        output.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    let verify: serde_json::Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert_eq!(verify["verified"], true);
+    assert_eq!(verify["artifact_sha256"], seal["artifact_sha256"]);
+    assert!(!schema_path.exists());
+    assert_no_temp_files(&dir);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn held_schema_descriptor_rejects_invalid_nonregular_oversize_and_suffix_paths() {
+    let dir = TestDir::new();
+    let schema_path = dir.path("closed-schema.json");
+    fs::write(&schema_path, MINIMAL).unwrap();
+    let closed_descriptor = {
+        let file = fs::File::open(&schema_path).unwrap();
+        file.as_raw_fd()
+    };
+    let closed_path = format!("/proc/self/fd/{closed_descriptor}");
+    let closed = aura(&["schema", "inspect", "--input", &closed_path, "--json"]);
+    assert!(!closed.status.success());
+
+    let directory = fs::File::open(&dir.0).unwrap();
+    let directory_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
+    let nonregular = aura_with_inherited_file(
+        &["schema", "inspect", "--input", &directory_path, "--json"],
+        &directory,
+        None,
+    );
+    assert!(!nonregular.status.success());
+
+    let suffix_path = format!("{directory_path}/closed-schema.json");
+    let suffix = aura_with_inherited_file(
+        &["schema", "validate", "--input", &suffix_path],
+        &directory,
+        None,
+    );
+    assert!(!suffix.status.success());
+    assert!(String::from_utf8_lossy(&suffix.stderr).contains("invalid held schema descriptor path"));
+
+    for alternate in [
+        format!("/dev/fd/{}/closed-schema.json", directory.as_raw_fd()),
+        format!(
+            "/proc/thread-self/fd/{}/closed-schema.json",
+            directory.as_raw_fd()
+        ),
+    ] {
+        let result = aura_with_inherited_file(
+            &["schema", "validate", "--input", &alternate],
+            &directory,
+            None,
+        );
+        assert!(!result.status.success(), "accepted {alternate}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("invalid held schema descriptor path")
+        );
+    }
+
+    for malformed in ["/proc/self/fd/-1", "/proc/self/fd/00", "/proc/self/fd/3/"] {
+        let result = aura(&["schema", "validate", "--input", malformed]);
+        assert!(!result.status.success(), "accepted {malformed}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("invalid held schema descriptor path")
+        );
+    }
+
+    let oversize_path = dir.path("oversize-held-schema.json");
+    fs::File::create(&oversize_path)
+        .unwrap()
+        .set_len((MAX_SCHEMA_JSON_BYTES + 1) as u64)
+        .unwrap();
+    let oversize = fs::File::open(&oversize_path).unwrap();
+    fs::remove_file(&oversize_path).unwrap();
+    let oversize_descriptor_path = format!("/proc/self/fd/{}", oversize.as_raw_fd());
+    let rejected = aura_with_inherited_file(
+        &["schema", "validate", "--input", &oversize_descriptor_path],
+        &oversize,
+        None,
+    );
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr)
+        .contains(&format!("exceeds {MAX_SCHEMA_JSON_BYTES} bytes")));
 }
 
 #[test]

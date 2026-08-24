@@ -2833,6 +2833,26 @@ fn v3_safe_error(message: &str) -> (&'static str, String) {
 }
 
 fn read_bounded_schema(path: &Path) -> Result<String, CliError> {
+    #[cfg(target_os = "linux")]
+    if is_held_schema_fd_path(path)? {
+        let file = File::open(path)
+            .map_err(|_| CliError("could not open held schema input".to_owned()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| CliError("could not inspect held schema input".to_owned()))?;
+        if !metadata.is_file() {
+            return Err(CliError(
+                "held schema input is not a regular file".to_owned(),
+            ));
+        }
+        if metadata.len() > MAX_SCHEMA_JSON_BYTES as u64 {
+            return Err(CliError(format!(
+                "schema input exceeds {MAX_SCHEMA_JSON_BYTES} bytes"
+            )));
+        }
+        return read_bounded_schema_file(file, metadata.len(), path, true);
+    }
+
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         CliError(format!(
             "could not inspect input {}: {error}",
@@ -2863,13 +2883,59 @@ fn read_bounded_schema(path: &Path) -> Result<String, CliError> {
     if !held.is_file() || held.len() != metadata.len() {
         return Err(CliError("schema input identity changed".to_owned()));
     }
+    read_bounded_schema_file(file, metadata.len(), path, false)
+}
+
+#[cfg(target_os = "linux")]
+fn is_held_schema_fd_path(path: &Path) -> Result<bool, CliError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    const PREFIX: &[u8] = b"/proc/self/fd/";
+    let bytes = path.as_os_str().as_bytes();
+    let Some(digits) = bytes.strip_prefix(PREFIX) else {
+        if bytes.starts_with(b"/dev/fd/")
+            || bytes.starts_with(b"/proc/thread-self/fd/")
+            || (bytes.starts_with(b"/proc/")
+                && bytes.windows(b"/fd/".len()).any(|part| part == b"/fd/"))
+        {
+            return Err(CliError("invalid held schema descriptor path".to_owned()));
+        }
+        return Ok(false);
+    };
+    if digits.is_empty()
+        || (digits.len() > 1 && digits[0] == b'0')
+        || !digits.iter().all(u8::is_ascii_digit)
+    {
+        return Err(CliError("invalid held schema descriptor path".to_owned()));
+    }
+    let descriptor = digits.iter().try_fold(0u32, |value, digit| {
+        value.checked_mul(10)?.checked_add(u32::from(*digit - b'0'))
+    });
+    if descriptor.is_none_or(|value| value > i32::MAX as u32) {
+        return Err(CliError("invalid held schema descriptor path".to_owned()));
+    }
+    Ok(true)
+}
+
+fn read_bounded_schema_file(
+    file: File,
+    expected_len: u64,
+    path: &Path,
+    held_descriptor: bool,
+) -> Result<String, CliError> {
     let mut bytes = Vec::new();
     bytes
-        .try_reserve_exact(metadata.len() as usize)
+        .try_reserve_exact(expected_len as usize)
         .map_err(|_| CliError("could not allocate schema input buffer".to_owned()))?;
     file.take((MAX_SCHEMA_JSON_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|error| CliError(format!("could not read input {}: {error}", path.display())))?;
+        .map_err(|error| {
+            if held_descriptor {
+                CliError("could not read held schema input".to_owned())
+            } else {
+                CliError(format!("could not read input {}: {error}", path.display()))
+            }
+        })?;
     if bytes.len() > MAX_SCHEMA_JSON_BYTES {
         return Err(CliError(format!(
             "schema input exceeds {MAX_SCHEMA_JSON_BYTES} bytes"
