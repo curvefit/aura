@@ -35,12 +35,15 @@ pub mod shadow_protocol_v2;
 pub mod source;
 pub mod stats;
 pub mod types;
+pub mod v3_codecs;
 pub mod v3_container;
 pub mod v3_events;
+pub mod v3_flat_plan_v2;
 pub mod v3_grouped_container;
 pub mod v3_grouped_reader;
 pub mod v3_grouped_writer;
 pub mod v3_plan_v2;
+pub mod v3_planned_flat;
 pub mod v3_planned_grouped;
 pub mod v3_reader;
 pub mod v3_values;
@@ -137,6 +140,7 @@ pub use types::{
     AuraBatch, AuraColumn, AuraColumnBatch, AuraColumnBatchBuilder, AuraRecordBatch,
     AuraTypedValue, AuraValue, Profile,
 };
+pub use v3_codecs::{fixed_width as v3_physical_fixed_width, integer_varint_codec};
 pub use v3_container::{
     decode_any_compiled_footer, decode_v3_aura0_file, decode_v3_aura0_footer, decode_v3_flat_aura0,
     decode_v3_flat_aura0_with_limits, decode_v3_flat_footer, decode_v3_flat_footer_with_limits,
@@ -156,6 +160,10 @@ pub use v3_events::{
     DEFAULT_V3_EVENT_EVENTS, DEFAULT_V3_EVENT_VALUES, MAX_V3_EVENT_BLOCK_BYTES,
     MAX_V3_EVENT_CHILDREN, MAX_V3_EVENT_EVENTS, MAX_V3_EVENT_OFFSETS_BYTES, MAX_V3_EVENT_VALUES,
     V3_EVENT_BLOCK_VERSION,
+};
+pub use v3_flat_plan_v2::{
+    FlatAuraPlanV2, FLAT_PLAN_V2_MAGIC, FLAT_PLAN_V2_REGISTRY_VERSION, FLAT_PLAN_V2_VERSION,
+    MAX_FLAT_PLAN_V2_BYTES,
 };
 pub use v3_grouped_container::{
     decode_v3_grouped_aura0, decode_v3_grouped_aura0_with_limits, decode_v3_grouped_footer,
@@ -187,6 +195,16 @@ pub use v3_plan_v2::{
     AURA_PLAN_V2_SPLIT_DOMAIN_DIRECT_OP, AURA_PLAN_V2_SPLIT_REGISTRY_VERSION, AURA_PLAN_V2_VERSION,
     AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION, MAX_AURA_PLAN_V2_BYTES,
     MAX_AURA_PLAN_V2_DEPENDENCIES, MAX_AURA_PLAN_V2_STREAMS,
+};
+pub use v3_planned_flat::{
+    compile_v3_planned_flat, decode_v3_planned_flat, decode_v3_planned_flat_footer,
+    decode_v3_selected_flat, encode_v3_planned_flat_footer, DecodedV3PlannedFlat,
+    DecodedV3SelectedFlat, V3PlannedFlatArtifact, V3PlannedFlatCandidateInspection,
+    V3PlannedFlatChunkDescriptor, V3PlannedFlatCodecInspection, V3PlannedFlatFooter,
+    V3PlannedFlatInspection, V3PlannedFlatSummary, MAX_V3_PLANNED_FLAT_FOOTER_BYTES,
+    V3_PLANNED_FLAT_BLOCK_VERSION, V3_PLANNED_FLAT_BODY_ENCODING,
+    V3_PLANNED_FLAT_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_CHUNK_DESCRIPTOR_BYTES,
+    V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION, V3_PLANNED_FLAT_FOOTER_PREFIX_BYTES,
 };
 pub use v3_planned_grouped::{
     compile_v3_planned_grouped, compile_v3_planned_grouped_attempt2,

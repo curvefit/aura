@@ -16,6 +16,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::schema::{FieldScope, FieldType, SchemaDescriptor};
+pub use crate::v3_codecs::PlanV2PhysicalCodec;
 use crate::v3_values::canonical_v3_schema_fingerprint;
 use crate::{AuraError, Result};
 
@@ -45,25 +46,6 @@ const PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v1\0";
 const SPLIT_PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v2\0";
 const INTEGER_CODEC_PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v3\0";
 const WITHIN_DOMAIN_PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v4\0";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PlanV2PhysicalCodec {
-    FixedWidth = 0,
-    UnsignedUleb128 = 1,
-    SignedZigZagUleb128 = 2,
-}
-
-impl PlanV2PhysicalCodec {
-    fn from_code(code: u8) -> Result<Self> {
-        match code {
-            0 => Ok(Self::FixedWidth),
-            1 => Ok(Self::UnsignedUleb128),
-            2 => Ok(Self::SignedZigZagUleb128),
-            _ => Err(AuraError::InvalidValue("aura plan v2 physical codec")),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

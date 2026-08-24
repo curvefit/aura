@@ -178,6 +178,7 @@ pub enum AnyCompiledFooter {
     V3Flat(V3FlatFooter),
     V3Grouped(crate::v3_grouped_container::V3GroupedFooter),
     V3PlannedGrouped(crate::v3_planned_grouped::V3PlannedGroupedFooter),
+    V3PlannedFlat(crate::v3_planned_flat::V3PlannedFlatFooter),
 }
 
 impl AnyCompiledFooter {
@@ -212,6 +213,14 @@ impl AnyCompiledFooter {
                         crate::V3GroupedLimits::HARD,
                     )
                     .map(Self::V3PlannedGrouped),
+                    (
+                        crate::v3_planned_flat::V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION,
+                        crate::v3_planned_flat::V3_PLANNED_FLAT_BODY_ENCODING,
+                    ) => crate::v3_planned_flat::decode_v3_planned_flat_footer(
+                        bytes,
+                        crate::V3FlatLimits::HARD,
+                    )
+                    .map(Self::V3PlannedFlat),
                     _ => Err(AuraError::InvalidValue("v3 compiled footer encoding")),
                 }
             }
@@ -232,6 +241,10 @@ impl AnyCompiledFooter {
                     crate::V3GroupedLimits::HARD,
                 )
             }
+            Self::V3PlannedFlat(footer) => crate::v3_planned_flat::encode_v3_planned_flat_footer(
+                footer,
+                crate::V3FlatLimits::HARD,
+            ),
         }
     }
 }

@@ -20,6 +20,10 @@ use crate::format::{AuraContainerVersion, SEAL_MAGIC};
 use crate::schema::{
     decode_schema_descriptor, encode_schema_descriptor, FieldScope, SchemaDescriptor,
 };
+use crate::v3_codecs::{
+    decode_canonical_uleb128, decode_canonical_zigzag, fixed_width, integer_varint_codec,
+    PlanV2PhysicalCodec,
+};
 use crate::v3_events::{
     canonical_v3_event_batch_sha256, decode_v3_event_block, encode_v3_event_block,
     validate_v3_event_batch, AuraV3EventBatch, CanonicalV3EventHasher, V3EventLimits,
@@ -28,8 +32,8 @@ use crate::v3_events::{
 use crate::v3_grouped_container::V3GroupedLimits;
 use crate::v3_plan_v2::{AuraPlanV2, PlanV2Inspection, PlanV2Selection, MAX_AURA_PLAN_V2_BYTES};
 use crate::v3_plan_v2::{
-    PlanV2PhysicalCodec, AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION,
-    AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP, AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION,
+    AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION, AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP,
+    AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION,
 };
 use crate::v3_values::{
     canonical_v3_schema_fingerprint, decode_column, encode_column, AuraV3Column,
@@ -948,25 +952,6 @@ const fn is_within_field_type(field_type: crate::FieldType) -> bool {
     )
 }
 
-const fn integer_varint_codec(field_type: crate::FieldType) -> Option<PlanV2PhysicalCodec> {
-    match field_type {
-        crate::FieldType::U8
-        | crate::FieldType::U16
-        | crate::FieldType::U32
-        | crate::FieldType::U64 => Some(PlanV2PhysicalCodec::UnsignedUleb128),
-        crate::FieldType::I8
-        | crate::FieldType::I16
-        | crate::FieldType::I32
-        | crate::FieldType::I64
-        | crate::FieldType::TimestampNs
-        | crate::FieldType::TimestampMs => Some(PlanV2PhysicalCodec::SignedZigZagUleb128),
-        crate::FieldType::I128
-        | crate::FieldType::Opaque16
-        | crate::FieldType::Utf8
-        | crate::FieldType::DecimalText => None,
-    }
-}
-
 fn compile_attempt2_candidate(
     schema: &SchemaDescriptor,
     batches: &[AuraV3EventBatch],
@@ -1696,38 +1681,6 @@ fn decode_codec_lane(
     })
 }
 
-fn decode_canonical_uleb128(reader: &mut ByteReader<'_>) -> Result<u64> {
-    let mut value = 0u64;
-    for index in 0..10u32 {
-        let byte = reader.read_u8()?;
-        if index == 9 && (byte & 0xfe) != 0 {
-            return Err(AuraError::InvalidValue("v3 planned varint overflow"));
-        }
-        value |= u64::from(byte & 0x7f) << (index * 7);
-        if byte & 0x80 == 0 {
-            if usize::try_from(index + 1).unwrap() != uleb128_len(value) {
-                return Err(AuraError::InvalidValue("v3 planned varint noncanonical"));
-            }
-            return Ok(value);
-        }
-    }
-    Err(AuraError::InvalidValue("v3 planned varint overflow"))
-}
-
-fn decode_canonical_zigzag(reader: &mut ByteReader<'_>) -> Result<i64> {
-    let value = decode_canonical_uleb128(reader)?;
-    Ok(((value >> 1) as i64) ^ (-((value & 1) as i64)))
-}
-
-const fn uleb128_len(mut value: u64) -> usize {
-    let mut len = 1usize;
-    while value >= 0x80 {
-        value >>= 7;
-        len += 1;
-    }
-    len
-}
-
 fn decode_compact_lane(
     slot: u16,
     field_type: crate::FieldType,
@@ -1830,20 +1783,6 @@ fn compact_column_header(
         );
     }
     Ok(out)
-}
-
-const fn fixed_width(field_type: crate::FieldType) -> Option<usize> {
-    match field_type {
-        crate::FieldType::I8 | crate::FieldType::U8 => Some(1),
-        crate::FieldType::I16 | crate::FieldType::U16 => Some(2),
-        crate::FieldType::I32 | crate::FieldType::U32 => Some(4),
-        crate::FieldType::I64
-        | crate::FieldType::U64
-        | crate::FieldType::TimestampNs
-        | crate::FieldType::TimestampMs => Some(8),
-        crate::FieldType::I128 | crate::FieldType::Opaque16 => Some(16),
-        crate::FieldType::Utf8 | crate::FieldType::DecimalText => None,
-    }
 }
 
 fn select_column(column: &AuraV3Column, indexes: &[usize]) -> Result<AuraV3Column> {
