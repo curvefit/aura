@@ -217,8 +217,10 @@ cargo run --release --bin aura -- v3 aura0 verify \
 
 Flat protocol v1 also accepts explicit development mode `--mode planned`.
 This does not change the schema contract or default exact command; it asks the
-bounded all-memory planner to score complete exact/fixed/mixed files and may
-still select the byte-identical exact fallback.
+bounded all-memory planner to score complete exact/fixed/mixed files plus one
+exact-byte variable-dictionary candidate and may still select the
+byte-identical exact fallback. Dictionary eligibility follows only the logical
+Utf8/DecimalText type; field names and DecimalText normalization are excluded.
 
 The schema author supplies the logical field declarations and relationship
 permissions. Aura's pinned implementation validates them; the decoder does not

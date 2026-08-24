@@ -9,6 +9,7 @@ pub enum PlanV2PhysicalCodec {
     FixedWidth = 0,
     UnsignedUleb128 = 1,
     SignedZigZagUleb128 = 2,
+    VariableByteDictionaryBitpacked = 3,
 }
 
 impl PlanV2PhysicalCodec {
@@ -17,6 +18,7 @@ impl PlanV2PhysicalCodec {
             0 => Ok(Self::FixedWidth),
             1 => Ok(Self::UnsignedUleb128),
             2 => Ok(Self::SignedZigZagUleb128),
+            3 => Ok(Self::VariableByteDictionaryBitpacked),
             _ => Err(AuraError::InvalidValue("v3 physical codec")),
         }
     }

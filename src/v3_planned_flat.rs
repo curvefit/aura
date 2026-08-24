@@ -1,27 +1,36 @@
 //! Bounded all-memory reference planned-flat Aura0 V3 container.
 //!
-//! Exact, all-fixed and mixed-codec complete artifacts coexist during scoring;
-//! peak memory is therefore roughly their summed bytes plus lane scratch. This
-//! is an honest replayable reference API, not a streaming writer claim.
+//! Exact, all-fixed, mixed-integer, and variable-dictionary complete artifacts
+//! coexist during scoring; peak memory is therefore roughly their summed bytes
+//! plus lane/dictionary scratch. This is an honest replayable reference API,
+//! not a streaming writer claim. Registry 2 dictionaries retain exact Utf8 and
+//! DecimalText bytes and use no RLE, entropy codec, or normalization.
 
 use std::io::Cursor;
 
 use sha2::{Digest, Sha256};
 
+use crate::bitpack::{
+    bitpacked_byte_len, pack_unsigned_values, unpack_unsigned_values, unsigned_bitpack_width,
+};
 use crate::bytes::ByteReader;
 use crate::format::{AuraContainerVersion, SEAL_MAGIC};
 use crate::v3_codecs::{
     decode_canonical_uleb128, decode_canonical_zigzag, fixed_width, integer_varint_codec,
     PlanV2PhysicalCodec,
 };
-use crate::v3_flat_plan_v2::FlatAuraPlanV2;
-use crate::v3_values::{decode_column, encode_column};
+use crate::v3_flat_plan_v2::{
+    FlatAuraPlanV2, FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION, FLAT_PLAN_V2_REGISTRY_VERSION,
+};
+use crate::v3_values::{
+    decode_column, encode_column, is_present, validate_bitmap_padding, AuraV3VariableColumn,
+};
 use crate::{
     canonical_v3_batch_sha256, canonical_v3_schema_fingerprint, decode_schema_descriptor,
-    decode_v3_flat_aura0_with_limits, encode_schema_descriptor, validate_v3_batch, AuraError,
-    AuraHeader, AuraV3Batch, AuraV3Column, AuraV3ColumnValues, CanonicalV3RowHasher,
-    DecodedV3FlatAura0, Profile, Result, SchemaDescriptor, V3FlatAura0Writer, V3FlatLimits,
-    V3FlatWriterOptions, V3ValueLimits, MAX_V3_VALUE_BLOCK_BYTES,
+    decode_v3_flat_aura0_with_limits, encode_schema_descriptor, validate_decimal_text_v1,
+    validate_v3_batch, AuraError, AuraHeader, AuraV3Batch, AuraV3Column, AuraV3ColumnValues,
+    CanonicalV3RowHasher, DecodedV3FlatAura0, Profile, Result, SchemaDescriptor, V3FlatAura0Writer,
+    V3FlatLimits, V3FlatWriterOptions, V3ValueLimits, MAX_V3_VALUE_BLOCK_BYTES,
     V3_FLAT_BODY_ENCODING_EXACT_BLOCKS, V3_FLAT_FOOTER_LAYOUT_VERSION,
 };
 
@@ -29,12 +38,16 @@ pub const V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION: u16 = 3;
 pub const V3_PLANNED_FLAT_BODY_ENCODING: u8 = 4;
 pub const V3_PLANNED_FLAT_BODY_LAYOUT_VERSION: u16 = 1;
 pub const V3_PLANNED_FLAT_BLOCK_VERSION: u16 = 1;
+pub const V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION: u16 = 2;
+pub const V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION: u16 = 2;
 pub const V3_PLANNED_FLAT_FOOTER_PREFIX_BYTES: usize = 208;
 pub const V3_PLANNED_FLAT_CHUNK_DESCRIPTOR_BYTES: usize = 104;
 pub const MAX_V3_PLANNED_FLAT_FOOTER_BYTES: usize = 64 * 1024 * 1024;
 
-const BLOCK_MAGIC: &[u8; 8] = b"AUFPVB01";
+const BLOCK_MAGIC_V1: &[u8; 8] = b"AUFPVB01";
+const BLOCK_MAGIC_V2: &[u8; 8] = b"AUFPVB02";
 const BLOCK_HEADER_BYTES: usize = 64;
+const DICTIONARY_LANE_PREFIX_BYTES: usize = 12;
 const FOOTER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-flat-footer-v1\0";
 const HEADER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-flat-header-v1\0";
 const BODY_HASH_DOMAIN: &[u8] = b"aura-v3-planned-flat-body-v1\0";
@@ -93,6 +106,16 @@ pub struct V3PlannedFlatCodecInspection {
     pub field_type: crate::FieldType,
     pub fixed_bytes: u64,
     pub varint_bytes: Option<u64>,
+    pub dictionary_bytes: Option<u64>,
+    pub present_count: Option<u64>,
+    pub null_count: Option<u64>,
+    pub present_empty_count: Option<u64>,
+    pub dictionary_entries: Option<u64>,
+    pub max_chunk_dictionary_entries: Option<u32>,
+    pub unique_data_bytes: Option<u64>,
+    pub dictionary_index_bytes: Option<u64>,
+    pub dictionary_selected: bool,
+    pub dictionary_rejection: Option<String>,
     pub selected: PlanV2PhysicalCodec,
 }
 
@@ -100,6 +123,7 @@ pub struct V3PlannedFlatCodecInspection {
 pub struct V3PlannedFlatInspection {
     pub candidates: Vec<V3PlannedFlatCandidateInspection>,
     pub codecs: Vec<V3PlannedFlatCodecInspection>,
+    pub dictionary_candidate_codecs: Vec<V3PlannedFlatCodecInspection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,13 +159,36 @@ pub fn compile_v3_planned_flat(
         .clone()
         .and_then(|plan| compile_plan(schema, batches, limits, plan));
     let mixed_plan_rows = fixed_plan.and_then(|plan| select_codecs(schema, batches, plan));
-    let rows = mixed_plan_rows.as_ref().ok().map(|(_, rows)| rows.clone());
-    let mixed = mixed_plan_rows.and_then(|(plan, _)| compile_plan(schema, batches, limits, plan));
-    let candidates = vec![exact, fixed, mixed];
+    let mixed_rows = mixed_plan_rows
+        .as_ref()
+        .ok()
+        .map(|(_, rows)| rows.clone())
+        .unwrap_or_default();
+    let mixed = match &mixed_plan_rows {
+        Ok((plan, _)) => compile_plan(schema, batches, limits, plan.clone()),
+        Err(error) => Err(error.clone()),
+    };
+    let dictionary_plan_rows = match &mixed_plan_rows {
+        Ok((plan, rows)) => select_dictionary_codecs(schema, batches, plan.clone(), rows.clone()),
+        Err(error) => Err(error.clone()),
+    };
+    let dictionary_rows = dictionary_plan_rows
+        .as_ref()
+        .ok()
+        .map(|(_, rows)| rows.clone())
+        .unwrap_or_default();
+    let dictionary = match &dictionary_plan_rows {
+        Ok((Some(plan), _)) => compile_plan(schema, batches, limits, plan.clone()),
+        Ok((None, _)) => Err(AuraError::InvalidValue(
+            "planned flat dictionary no lane win",
+        )),
+        Err(error) => Err(error.clone()),
+    };
+    let candidates = vec![exact, fixed, mixed, dictionary];
     if let Some(error) = candidates
         .iter()
         .filter_map(|candidate| candidate.as_ref().err())
-        .find(|error| !candidate_limit(error))
+        .find(|error| !candidate_inapplicable(error))
     {
         return Err(error.clone());
     }
@@ -167,6 +214,7 @@ pub fn compile_v3_planned_flat(
         "exact-flat",
         "planned-flat-fixed",
         "planned-flat-integer-codecs",
+        "planned-flat-variable-dictionary",
     ];
     let candidate_rows = ids
         .iter()
@@ -185,11 +233,12 @@ pub fn compile_v3_planned_flat(
         .collect();
     let mut selected = candidates.into_iter().nth(selected_index).unwrap()?;
     selected.inspection.candidates = candidate_rows;
-    selected.inspection.codecs = if selected_index == 2 {
-        rows.unwrap_or_default()
-    } else {
-        Vec::new()
+    selected.inspection.codecs = match selected_index {
+        2 => mixed_rows,
+        3 => dictionary_rows.clone(),
+        _ => Vec::new(),
     };
+    selected.inspection.dictionary_candidate_codecs = dictionary_rows;
     Ok(selected)
 }
 
@@ -255,6 +304,7 @@ fn compile_exact(
         inspection: V3PlannedFlatInspection {
             candidates: Vec::new(),
             codecs: Vec::new(),
+            dictionary_candidate_codecs: Vec::new(),
         },
     })
 }
@@ -285,11 +335,134 @@ fn select_codecs(
             field_type: field.field_type,
             fixed_bytes: fixed as u64,
             varint_bytes: varint.map(|v| v as u64),
+            dictionary_bytes: None,
+            present_count: None,
+            null_count: None,
+            present_empty_count: None,
+            dictionary_entries: None,
+            max_chunk_dictionary_entries: None,
+            unique_data_bytes: None,
+            dictionary_index_bytes: None,
+            dictionary_selected: false,
+            dictionary_rejection: None,
             selected,
         });
     }
     plan.validate(schema)?;
     Ok((plan, rows))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DictionaryLaneTotals {
+    encoded_bytes: u64,
+    present_count: u64,
+    null_count: u64,
+    present_empty_count: u64,
+    dictionary_entries: u64,
+    max_chunk_dictionary_entries: u32,
+    unique_data_bytes: u64,
+    index_bytes: u64,
+}
+
+fn select_dictionary_codecs(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3Batch],
+    mut plan: FlatAuraPlanV2,
+    mut rows: Vec<V3PlannedFlatCodecInspection>,
+) -> Result<(Option<FlatAuraPlanV2>, Vec<V3PlannedFlatCodecInspection>)> {
+    if rows.len() != schema.fields.len() || plan.registry_version != FLAT_PLAN_V2_REGISTRY_VERSION {
+        return Err(AuraError::InvalidValue("planned flat dictionary analysis"));
+    }
+    plan.registry_version = FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION;
+    let mut selected_any = false;
+    for (field, row) in schema.fields.iter().zip(&mut rows) {
+        if !matches!(
+            field.field_type,
+            crate::FieldType::Utf8 | crate::FieldType::DecimalText
+        ) {
+            row.dictionary_rejection = Some("logical type is not dictionary-eligible".to_owned());
+            continue;
+        }
+        let totals = dictionary_lane_totals(batches, usize::from(field.index))?;
+        row.dictionary_bytes = Some(totals.encoded_bytes);
+        row.present_count = Some(totals.present_count);
+        row.null_count = Some(totals.null_count);
+        row.present_empty_count = Some(totals.present_empty_count);
+        row.dictionary_entries = Some(totals.dictionary_entries);
+        row.max_chunk_dictionary_entries = Some(totals.max_chunk_dictionary_entries);
+        row.unique_data_bytes = Some(totals.unique_data_bytes);
+        row.dictionary_index_bytes = Some(totals.index_bytes);
+        if totals.encoded_bytes < row.fixed_bytes {
+            row.dictionary_selected = true;
+            row.dictionary_rejection = None;
+            row.selected = PlanV2PhysicalCodec::VariableByteDictionaryBitpacked;
+            plan.codecs[usize::from(field.index)] = row.selected;
+            selected_any = true;
+        } else {
+            row.dictionary_rejection = Some("dictionary lane bytes did not win".to_owned());
+        }
+    }
+    if selected_any {
+        plan.validate(schema)?;
+        Ok((Some(plan), rows))
+    } else {
+        Ok((None, rows))
+    }
+}
+
+fn dictionary_lane_totals(batches: &[AuraV3Batch], slot: usize) -> Result<DictionaryLaneTotals> {
+    let mut totals = DictionaryLaneTotals::default();
+    for batch in batches {
+        let encoded = encode_dictionary_lane(
+            batch
+                .columns
+                .get(slot)
+                .ok_or(AuraError::InvalidValue("planned flat dictionary slot"))?,
+            usize::try_from(batch.row_count)
+                .map_err(|_| AuraError::InvalidValue("planned flat row count"))?,
+        )?;
+        totals.encoded_bytes = totals
+            .encoded_bytes
+            .checked_add(
+                u64::try_from(encoded.bytes.len())
+                    .map_err(|_| AuraError::InvalidValue("planned flat dictionary lane length"))?,
+            )
+            .ok_or(AuraError::InvalidValue(
+                "planned flat dictionary lane length",
+            ))?;
+        totals.present_count = totals
+            .present_count
+            .checked_add(encoded.present_count)
+            .ok_or(AuraError::InvalidValue("planned flat dictionary count"))?;
+        totals.null_count = totals
+            .null_count
+            .checked_add(encoded.null_count)
+            .ok_or(AuraError::InvalidValue("planned flat dictionary count"))?;
+        totals.present_empty_count = totals
+            .present_empty_count
+            .checked_add(encoded.present_empty_count)
+            .ok_or(AuraError::InvalidValue("planned flat dictionary count"))?;
+        totals.dictionary_entries = totals
+            .dictionary_entries
+            .checked_add(u64::from(encoded.entry_count))
+            .ok_or(AuraError::InvalidValue("planned flat dictionary count"))?;
+        totals.max_chunk_dictionary_entries =
+            totals.max_chunk_dictionary_entries.max(encoded.entry_count);
+        totals.unique_data_bytes = totals
+            .unique_data_bytes
+            .checked_add(encoded.unique_data_bytes)
+            .ok_or(AuraError::InvalidValue(
+                "planned flat dictionary data length",
+            ))?;
+        totals.index_bytes =
+            totals
+                .index_bytes
+                .checked_add(encoded.index_bytes)
+                .ok_or(AuraError::InvalidValue(
+                    "planned flat dictionary index length",
+                ))?;
+    }
+    Ok(totals)
 }
 
 fn lane_total(batches: &[AuraV3Batch], slot: usize, codec: PlanV2PhysicalCodec) -> Result<usize> {
@@ -366,6 +539,162 @@ fn compile_plan(
     seal(header_bytes, body, footer, limits)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DictionaryLaneEncoding {
+    bytes: Vec<u8>,
+    present_count: u64,
+    null_count: u64,
+    present_empty_count: u64,
+    entry_count: u32,
+    unique_data_bytes: u64,
+    index_bytes: u64,
+}
+
+fn encode_dictionary_lane(column: &AuraV3Column, rows: usize) -> Result<DictionaryLaneEncoding> {
+    let variable = match &column.values {
+        AuraV3ColumnValues::Utf8(variable) | AuraV3ColumnValues::DecimalText(variable) => variable,
+        _ => return Err(AuraError::InvalidValue("planned flat dictionary type")),
+    };
+    let validity = column.validity.as_deref();
+    let mut ranges = Vec::<(usize, usize)>::new();
+    ranges
+        .try_reserve_exact(rows)
+        .map_err(|_| AuraError::InvalidValue("planned flat dictionary allocation"))?;
+    let mut present_count = 0u64;
+    let mut present_empty_count = 0u64;
+    for row in 0..rows {
+        if is_present(validity, row) {
+            let start = usize::try_from(variable.offsets[row])
+                .map_err(|_| AuraError::InvalidValue("planned flat dictionary offsets"))?;
+            let end = usize::try_from(variable.offsets[row + 1])
+                .map_err(|_| AuraError::InvalidValue("planned flat dictionary offsets"))?;
+            let _ = variable
+                .data
+                .get(start..end)
+                .ok_or(AuraError::InvalidValue("planned flat dictionary offsets"))?;
+            present_count = present_count
+                .checked_add(1)
+                .ok_or(AuraError::InvalidValue("planned flat dictionary count"))?;
+            if start == end {
+                present_empty_count = present_empty_count
+                    .checked_add(1)
+                    .ok_or(AuraError::InvalidValue("planned flat dictionary count"))?;
+            }
+            ranges.push((start, end));
+        }
+    }
+    ranges.sort_unstable_by(|left, right| {
+        variable.data[left.0..left.1].cmp(&variable.data[right.0..right.1])
+    });
+    ranges.dedup_by(|left, right| variable.data[left.0..left.1] == variable.data[right.0..right.1]);
+    let entry_count = u32::try_from(ranges.len())
+        .map_err(|_| AuraError::InvalidValue("planned flat dictionary count"))?;
+    if (present_count == 0) != (entry_count == 0) {
+        return Err(AuraError::InvalidValue("planned flat dictionary count"));
+    }
+    let mut unique_data_len = 0usize;
+    for (start, end) in &ranges {
+        unique_data_len =
+            unique_data_len
+                .checked_add(end - start)
+                .ok_or(AuraError::InvalidValue(
+                    "planned flat dictionary data length",
+                ))?;
+    }
+    let unique_data_len_u32 = u32::try_from(unique_data_len)
+        .map_err(|_| AuraError::InvalidValue("planned flat dictionary data length"))?;
+    let max_index = u64::from(entry_count.saturating_sub(1));
+    let index_bit_width = unsigned_bitpack_width(max_index);
+    let present_count_usize = usize::try_from(present_count)
+        .map_err(|_| AuraError::InvalidValue("planned flat dictionary count"))?;
+    let mut indexes = Vec::<u64>::new();
+    indexes
+        .try_reserve_exact(present_count_usize)
+        .map_err(|_| AuraError::InvalidValue("planned flat dictionary allocation"))?;
+    for row in 0..rows {
+        if !is_present(validity, row) {
+            continue;
+        }
+        let start = usize::try_from(variable.offsets[row])
+            .map_err(|_| AuraError::InvalidValue("planned flat dictionary offsets"))?;
+        let end = usize::try_from(variable.offsets[row + 1])
+            .map_err(|_| AuraError::InvalidValue("planned flat dictionary offsets"))?;
+        let value = &variable.data[start..end];
+        let index = ranges
+            .binary_search_by(|range| variable.data[range.0..range.1].cmp(value))
+            .map_err(|_| AuraError::InvalidValue("planned flat dictionary inverse"))?;
+        indexes.push(
+            u64::try_from(index)
+                .map_err(|_| AuraError::InvalidValue("planned flat dictionary index"))?,
+        );
+    }
+    let packed_indexes = pack_unsigned_values(&indexes, index_bit_width)?;
+    let offsets_len = ranges
+        .len()
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(4))
+        .ok_or(AuraError::InvalidValue(
+            "planned flat dictionary offsets length",
+        ))?;
+    let validity_len = column.validity.as_ref().map_or(0, Vec::len);
+    let total_len = validity_len
+        .checked_add(DICTIONARY_LANE_PREFIX_BYTES)
+        .and_then(|length| length.checked_add(offsets_len))
+        .and_then(|length| length.checked_add(unique_data_len))
+        .and_then(|length| length.checked_add(packed_indexes.len()))
+        .ok_or(AuraError::InvalidValue(
+            "planned flat dictionary lane length",
+        ))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(total_len)
+        .map_err(|_| AuraError::InvalidValue("planned flat dictionary allocation"))?;
+    if let Some(validity) = validity {
+        bytes.extend_from_slice(validity);
+    }
+    bytes.extend_from_slice(&entry_count.to_le_bytes());
+    bytes.extend_from_slice(&unique_data_len_u32.to_le_bytes());
+    bytes.push(index_bit_width);
+    bytes.extend_from_slice(&[0, 0, 0]);
+    let mut offset = 0u32;
+    bytes.extend_from_slice(&offset.to_le_bytes());
+    for (start, end) in &ranges {
+        offset = offset
+            .checked_add(
+                u32::try_from(end - start)
+                    .map_err(|_| AuraError::InvalidValue("planned flat dictionary data length"))?,
+            )
+            .ok_or(AuraError::InvalidValue(
+                "planned flat dictionary data length",
+            ))?;
+        bytes.extend_from_slice(&offset.to_le_bytes());
+    }
+    if offset != unique_data_len_u32 {
+        return Err(AuraError::InvalidValue(
+            "planned flat dictionary data length",
+        ));
+    }
+    for (start, end) in &ranges {
+        bytes.extend_from_slice(&variable.data[*start..*end]);
+    }
+    bytes.extend_from_slice(&packed_indexes);
+    debug_assert_eq!(bytes.len(), total_len);
+    let row_count = u64::try_from(rows)
+        .map_err(|_| AuraError::InvalidValue("planned flat dictionary count"))?;
+    Ok(DictionaryLaneEncoding {
+        bytes,
+        present_count,
+        null_count: row_count
+            .checked_sub(present_count)
+            .ok_or(AuraError::InvalidValue("planned flat dictionary count"))?,
+        present_empty_count,
+        entry_count,
+        unique_data_bytes: u64::from(unique_data_len_u32),
+        index_bytes: u64::try_from(packed_indexes.len())
+            .map_err(|_| AuraError::InvalidValue("planned flat dictionary index length"))?,
+    })
+}
+
 fn encode_block(
     schema: &SchemaDescriptor,
     batch: &AuraV3Batch,
@@ -380,9 +709,26 @@ fn encode_block(
             ..limits
         },
     )?;
+    if plan.registry_version == FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION {
+        let mut logical_output_bytes = BLOCK_HEADER_BYTES;
+        for column in &batch.columns {
+            logical_output_bytes = logical_output_bytes
+                .checked_add(decoded_lane_logical_bytes(
+                    column,
+                    usize::try_from(batch.row_count)
+                        .map_err(|_| AuraError::InvalidValue("planned flat row count"))?,
+                )?)
+                .filter(|length| *length <= limits.max_block_bytes)
+                .ok_or(AuraError::InvalidValue(
+                    "planned flat logical output length",
+                ))?;
+        }
+    }
+    let (body_layout_version, block_version, block_magic) = planned_body_versions(plan)?;
+    let _ = body_layout_version;
     let mut out = Vec::new();
-    out.extend_from_slice(BLOCK_MAGIC);
-    out.extend_from_slice(&V3_PLANNED_FLAT_BLOCK_VERSION.to_le_bytes());
+    out.extend_from_slice(block_magic);
+    out.extend_from_slice(&block_version.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&schema.schema_id.to_le_bytes());
     out.extend_from_slice(&canonical_v3_schema_fingerprint(schema)?);
@@ -412,6 +758,10 @@ fn encode_lane(
     codec: PlanV2PhysicalCodec,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    if codec == PlanV2PhysicalCodec::VariableByteDictionaryBitpacked {
+        out.extend_from_slice(&encode_dictionary_lane(column, rows)?.bytes);
+        return Ok(());
+    }
     if codec == PlanV2PhysicalCodec::FixedWidth {
         let mut encoded = Vec::new();
         encode_column(column, rows, &mut encoded)?;
@@ -462,6 +812,22 @@ fn encode_lane(
     Ok(())
 }
 
+fn planned_body_versions(plan: &FlatAuraPlanV2) -> Result<(u16, u16, &'static [u8; 8])> {
+    match plan.registry_version {
+        FLAT_PLAN_V2_REGISTRY_VERSION => Ok((
+            V3_PLANNED_FLAT_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_BLOCK_VERSION,
+            BLOCK_MAGIC_V1,
+        )),
+        FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION => Ok((
+            V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION,
+            BLOCK_MAGIC_V2,
+        )),
+        _ => Err(AuraError::InvalidValue("planned flat plan registry")),
+    }
+}
+
 fn decode_block(
     schema: &SchemaDescriptor,
     bytes: &[u8],
@@ -469,12 +835,13 @@ fn decode_block(
     limits: V3ValueLimits,
 ) -> Result<AuraV3Batch> {
     let limits = limits.effective();
+    let (_, expected_block_version, expected_magic) = planned_body_versions(plan)?;
     if bytes.len() > limits.max_block_bytes || bytes.len() < BLOCK_HEADER_BYTES {
         return Err(AuraError::InvalidValue("planned flat block length"));
     }
     let mut reader = ByteReader::new(bytes);
-    if reader.read_exact(8)? != BLOCK_MAGIC
-        || reader.read_u16_le()? != 1
+    if reader.read_exact(8)? != expected_magic
+        || reader.read_u16_le()? != expected_block_version
         || reader.read_u16_le()? != 0
         || reader.read_u32_le()? != schema.schema_id
         || reader.read_exact(32)? != canonical_v3_schema_fingerprint(schema)?
@@ -502,20 +869,45 @@ fn decode_block(
     columns
         .try_reserve_exact(schema.fields.len())
         .map_err(|_| AuraError::InvalidValue("planned flat column allocation"))?;
+    let mut remaining_logical_bytes =
+        if plan.registry_version == FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION {
+            Some(
+                limits
+                    .max_block_bytes
+                    .checked_sub(BLOCK_HEADER_BYTES)
+                    .ok_or(AuraError::InvalidValue(
+                        "planned flat logical output length",
+                    ))?,
+            )
+        } else {
+            None
+        };
     for field in &schema.fields {
         let codec = *plan
             .codecs
             .get(usize::from(field.index))
             .ok_or(AuraError::InvalidValue("planned flat codec slot"))?;
-        columns.push(decode_lane(
-            field.index,
-            field.field_type,
-            field.nullable,
-            rows_usize,
-            codec,
+        let column = decode_lane(
+            FlatLaneDecodeSpec {
+                slot: field.index,
+                field_type: field.field_type,
+                nullable: field.nullable,
+                rows: rows_usize,
+                codec,
+                logical_budget: remaining_logical_bytes.unwrap_or(usize::MAX),
+            },
             &mut reader,
             limits,
-        )?);
+        )?;
+        if let Some(remaining) = &mut remaining_logical_bytes {
+            let logical_bytes = decoded_lane_logical_bytes(&column, rows_usize)?;
+            *remaining = remaining
+                .checked_sub(logical_bytes)
+                .ok_or(AuraError::InvalidValue(
+                    "planned flat logical output length",
+                ))?;
+        }
+        columns.push(column);
     }
     reader.finish()?;
     let batch = AuraV3Batch {
@@ -531,20 +923,60 @@ fn decode_block(
             ..limits
         },
     )?;
+    if plan.registry_version == FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION
+        && encode_block(schema, &batch, plan, limits)? != bytes
+    {
+        return Err(AuraError::InvalidValue(
+            "planned flat dictionary noncanonical",
+        ));
+    }
     Ok(batch)
 }
 
-fn decode_lane(
+#[derive(Debug, Clone, Copy)]
+struct FlatLaneDecodeSpec {
     slot: u16,
     field_type: crate::FieldType,
     nullable: bool,
     rows: usize,
     codec: PlanV2PhysicalCodec,
+    logical_budget: usize,
+}
+
+fn decode_lane(
+    spec: FlatLaneDecodeSpec,
     reader: &mut ByteReader<'_>,
     limits: V3ValueLimits,
 ) -> Result<AuraV3Column> {
+    let FlatLaneDecodeSpec {
+        slot,
+        field_type,
+        nullable,
+        rows,
+        codec,
+        logical_budget,
+    } = spec;
+    if codec == PlanV2PhysicalCodec::VariableByteDictionaryBitpacked {
+        return decode_dictionary_lane(
+            slot,
+            field_type,
+            nullable,
+            rows,
+            reader,
+            limits,
+            logical_budget,
+        );
+    }
     if codec == PlanV2PhysicalCodec::FixedWidth {
-        return decode_fixed_lane(slot, field_type, nullable, rows, reader, limits);
+        return decode_fixed_lane(
+            slot,
+            field_type,
+            nullable,
+            rows,
+            reader,
+            limits,
+            logical_budget,
+        );
     }
     let validity = if nullable {
         let len = checked_validity_len(rows)?;
@@ -552,6 +984,26 @@ fn decode_lane(
     } else {
         None
     };
+    let logical_validity_len = if nullable {
+        checked_validity_len(rows)?
+    } else {
+        0
+    };
+    let logical_bytes = logical_validity_len
+        .checked_add(
+            rows.checked_mul(
+                fixed_width(field_type)
+                    .ok_or(AuraError::InvalidValue("planned flat fixed width"))?,
+            )
+            .ok_or(AuraError::InvalidValue(
+                "planned flat logical output length",
+            ))?,
+        )
+        .filter(|length| *length <= logical_budget)
+        .ok_or(AuraError::InvalidValue(
+            "planned flat logical output length",
+        ))?;
+    let _ = logical_bytes;
     macro_rules! u {
         ($variant:ident,$type:ty) => {{
             let mut v = Vec::new();
@@ -604,6 +1056,224 @@ fn decode_lane(
     })
 }
 
+fn decode_dictionary_lane(
+    slot: u16,
+    field_type: crate::FieldType,
+    nullable: bool,
+    rows: usize,
+    reader: &mut ByteReader<'_>,
+    limits: V3ValueLimits,
+    logical_budget: usize,
+) -> Result<AuraV3Column> {
+    if !matches!(
+        field_type,
+        crate::FieldType::Utf8 | crate::FieldType::DecimalText
+    ) {
+        return Err(AuraError::InvalidValue("planned flat dictionary type"));
+    }
+    let validity = if nullable {
+        let length = checked_validity_len(rows)?;
+        let bytes = reader.read_exact(length)?.to_vec();
+        validate_bitmap_padding(&bytes, rows)?;
+        Some(bytes)
+    } else {
+        None
+    };
+    let entry_count_u32 = reader.read_u32_le()?;
+    let entry_count = usize::try_from(entry_count_u32)
+        .map_err(|_| AuraError::InvalidValue("planned flat dictionary count"))?;
+    let dictionary_data_len = usize::try_from(reader.read_u32_le()?)
+        .map_err(|_| AuraError::InvalidValue("planned flat dictionary data length"))?;
+    let index_bit_width = reader.read_u8()?;
+    if reader.read_exact(3)? != [0, 0, 0] {
+        return Err(AuraError::InvalidValue("planned flat dictionary reserved"));
+    }
+    let present_count = (0..rows)
+        .filter(|row| is_present(validity.as_deref(), *row))
+        .count();
+    if entry_count > present_count || (present_count == 0) != (entry_count == 0) {
+        return Err(AuraError::InvalidValue("planned flat dictionary count"));
+    }
+    let expected_width = unsigned_bitpack_width(u64::from(entry_count_u32.saturating_sub(1)));
+    if index_bit_width != expected_width {
+        return Err(AuraError::InvalidValue(
+            "planned flat dictionary index width",
+        ));
+    }
+    let offsets_count = entry_count.checked_add(1).ok_or(AuraError::InvalidValue(
+        "planned flat dictionary offsets length",
+    ))?;
+    let offsets_len = offsets_count.checked_mul(4).ok_or(AuraError::InvalidValue(
+        "planned flat dictionary offsets length",
+    ))?;
+    let offsets_bytes = reader.read_exact(offsets_len)?;
+    let mut dictionary_offsets = Vec::<u32>::new();
+    dictionary_offsets
+        .try_reserve_exact(offsets_count)
+        .map_err(|_| AuraError::InvalidValue("planned flat dictionary allocation"))?;
+    for chunk in offsets_bytes.chunks_exact(4) {
+        dictionary_offsets.push(u32::from_le_bytes(
+            chunk
+                .try_into()
+                .map_err(|_| AuraError::InvalidValue("planned flat dictionary offsets"))?,
+        ));
+    }
+    if dictionary_offsets.first() != Some(&0)
+        || dictionary_offsets.last().copied()
+            != Some(
+                u32::try_from(dictionary_data_len)
+                    .map_err(|_| AuraError::InvalidValue("planned flat dictionary data length"))?,
+            )
+    {
+        return Err(AuraError::InvalidValue("planned flat dictionary offsets"));
+    }
+    let dictionary_data = reader.read_exact(dictionary_data_len)?;
+    let mut previous: Option<&[u8]> = None;
+    for pair in dictionary_offsets.windows(2) {
+        let start = usize::try_from(pair[0])
+            .map_err(|_| AuraError::InvalidValue("planned flat dictionary offsets"))?;
+        let end = usize::try_from(pair[1])
+            .map_err(|_| AuraError::InvalidValue("planned flat dictionary offsets"))?;
+        let value = dictionary_data
+            .get(start..end)
+            .filter(|value| value.len() <= limits.max_variable_value_bytes)
+            .ok_or(AuraError::InvalidValue("planned flat dictionary offsets"))?;
+        if previous.is_some_and(|previous| previous >= value) {
+            return Err(AuraError::InvalidValue("planned flat dictionary order"));
+        }
+        let text = std::str::from_utf8(value)
+            .map_err(|_| AuraError::InvalidValue("planned flat dictionary utf8"))?;
+        if field_type == crate::FieldType::DecimalText {
+            validate_decimal_text_v1(text)?;
+        }
+        previous = Some(value);
+    }
+    let index_bytes_len = usize::try_from(bitpacked_byte_len(
+        u64::try_from(present_count)
+            .map_err(|_| AuraError::InvalidValue("planned flat dictionary count"))?,
+        index_bit_width,
+    ))
+    .map_err(|_| AuraError::InvalidValue("planned flat dictionary index length"))?;
+    let index_bytes = reader.read_exact(index_bytes_len)?;
+    validate_zero_bitpack_padding(index_bytes, present_count, index_bit_width)?;
+    let indexes = unpack_unsigned_values(index_bytes, index_bit_width, present_count)?;
+    let mut referenced = Vec::<bool>::new();
+    referenced
+        .try_reserve_exact(entry_count)
+        .map_err(|_| AuraError::InvalidValue("planned flat dictionary allocation"))?;
+    referenced.resize(entry_count, false);
+    for index in &indexes {
+        let index = usize::try_from(*index)
+            .map_err(|_| AuraError::InvalidValue("planned flat dictionary index"))?;
+        let referenced = referenced
+            .get_mut(index)
+            .ok_or(AuraError::InvalidValue("planned flat dictionary index"))?;
+        *referenced = true;
+    }
+    if referenced.iter().any(|referenced| !referenced) {
+        return Err(AuraError::InvalidValue(
+            "planned flat dictionary unreferenced entry",
+        ));
+    }
+    let logical_validity_len = if nullable {
+        checked_validity_len(rows)?
+    } else {
+        0
+    };
+    let logical_prefix_len = logical_validity_len
+        .checked_add(
+            rows.checked_add(1)
+                .and_then(|count| count.checked_mul(4))
+                .ok_or(AuraError::InvalidValue(
+                    "planned flat logical output length",
+                ))?,
+        )
+        .filter(|length| *length <= logical_budget)
+        .ok_or(AuraError::InvalidValue(
+            "planned flat logical output length",
+        ))?;
+    let max_reconstructed_len = logical_budget - logical_prefix_len;
+    let mut reconstructed_len = 0usize;
+    for index in &indexes {
+        let index = usize::try_from(*index)
+            .map_err(|_| AuraError::InvalidValue("planned flat dictionary index"))?;
+        let start = usize::try_from(dictionary_offsets[index])
+            .map_err(|_| AuraError::InvalidValue("planned flat dictionary offsets"))?;
+        let end = usize::try_from(dictionary_offsets[index + 1])
+            .map_err(|_| AuraError::InvalidValue("planned flat dictionary offsets"))?;
+        reconstructed_len = reconstructed_len
+            .checked_add(end - start)
+            .filter(|length| *length <= max_reconstructed_len)
+            .ok_or(AuraError::InvalidValue(
+                "planned flat dictionary inverse length",
+            ))?;
+    }
+    let mut offsets = Vec::<u32>::new();
+    offsets
+        .try_reserve_exact(
+            rows.checked_add(1)
+                .ok_or(AuraError::InvalidValue("planned flat dictionary offsets"))?,
+        )
+        .map_err(|_| AuraError::InvalidValue("planned flat dictionary allocation"))?;
+    let mut data = Vec::<u8>::new();
+    data.try_reserve_exact(reconstructed_len)
+        .map_err(|_| AuraError::InvalidValue("planned flat dictionary allocation"))?;
+    offsets.push(0);
+    let mut indexes = indexes.into_iter();
+    for row in 0..rows {
+        if is_present(validity.as_deref(), row) {
+            let index = usize::try_from(
+                indexes
+                    .next()
+                    .ok_or(AuraError::InvalidValue("planned flat dictionary index"))?,
+            )
+            .map_err(|_| AuraError::InvalidValue("planned flat dictionary index"))?;
+            let start = usize::try_from(dictionary_offsets[index])
+                .map_err(|_| AuraError::InvalidValue("planned flat dictionary offsets"))?;
+            let end = usize::try_from(dictionary_offsets[index + 1])
+                .map_err(|_| AuraError::InvalidValue("planned flat dictionary offsets"))?;
+            data.extend_from_slice(&dictionary_data[start..end]);
+        }
+        offsets.push(
+            u32::try_from(data.len())
+                .map_err(|_| AuraError::InvalidValue("planned flat dictionary inverse length"))?,
+        );
+    }
+    if indexes.next().is_some() {
+        return Err(AuraError::InvalidValue("planned flat dictionary index"));
+    }
+    let variable = AuraV3VariableColumn { offsets, data };
+    let values = match field_type {
+        crate::FieldType::Utf8 => AuraV3ColumnValues::Utf8(variable),
+        crate::FieldType::DecimalText => AuraV3ColumnValues::DecimalText(variable),
+        _ => return Err(AuraError::InvalidValue("planned flat dictionary type")),
+    };
+    Ok(AuraV3Column {
+        slot,
+        validity,
+        values,
+    })
+}
+
+fn validate_zero_bitpack_padding(bytes: &[u8], count: usize, width: u8) -> Result<()> {
+    let used = u64::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_mul(u64::from(width)))
+        .ok_or(AuraError::InvalidValue(
+            "planned flat dictionary index length",
+        ))?
+        % 8;
+    if used != 0 {
+        let mask = !((1u8 << used) - 1);
+        if bytes.last().is_some_and(|byte| byte & mask != 0) {
+            return Err(AuraError::InvalidValue(
+                "planned flat dictionary index padding",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn decode_fixed_lane(
     slot: u16,
     field_type: crate::FieldType,
@@ -611,6 +1281,7 @@ fn decode_fixed_lane(
     rows: usize,
     reader: &mut ByteReader<'_>,
     limits: V3ValueLimits,
+    logical_budget: usize,
 ) -> Result<AuraV3Column> {
     let validity_len = if nullable {
         checked_validity_len(rows)?
@@ -641,6 +1312,14 @@ fn decode_fixed_lane(
         if data_len > limits.max_variable_value_bytes {
             return Err(AuraError::InvalidValue("planned flat variable data length"));
         }
+        if prefix_len
+            .checked_add(data_len)
+            .is_none_or(|length| length > logical_budget)
+        {
+            return Err(AuraError::InvalidValue(
+                "planned flat logical output length",
+            ));
+        }
         let data = reader.read_exact(data_len)?;
         let payload_len = prefix_len
             .checked_add(data_len)
@@ -659,6 +1338,11 @@ fn decode_fixed_lane(
         let payload_len = validity_len
             .checked_add(fixed_len)
             .ok_or(AuraError::InvalidValue("planned flat lane length"))?;
+        if payload_len > logical_budget {
+            return Err(AuraError::InvalidValue(
+                "planned flat logical output length",
+            ));
+        }
         (fixed_len, 0, 0, reader.read_exact(payload_len)?.to_vec())
     };
     let synthetic_len = 20usize
@@ -685,6 +1369,25 @@ fn decode_fixed_lane(
         &mut ByteReader::new(&synthetic),
         limits,
     )
+}
+
+fn decoded_lane_logical_bytes(column: &AuraV3Column, rows: usize) -> Result<usize> {
+    let validity_len = column.validity.as_ref().map_or(0, Vec::len);
+    let payload_len = match &column.values {
+        AuraV3ColumnValues::Utf8(variable) | AuraV3ColumnValues::DecimalText(variable) => rows
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(4))
+            .and_then(|length| length.checked_add(variable.data.len())),
+        values => fixed_width(values.field_type()).and_then(|width| rows.checked_mul(width)),
+    }
+    .ok_or(AuraError::InvalidValue(
+        "planned flat logical output length",
+    ))?;
+    validity_len
+        .checked_add(payload_len)
+        .ok_or(AuraError::InvalidValue(
+            "planned flat logical output length",
+        ))
 }
 
 fn checked_validity_len(rows: usize) -> Result<usize> {
@@ -727,6 +1430,7 @@ fn seal(
         inspection: V3PlannedFlatInspection {
             candidates: Vec::new(),
             codecs: Vec::new(),
+            dictionary_candidate_codecs: Vec::new(),
         },
     })
 }
@@ -745,6 +1449,7 @@ pub fn encode_v3_planned_flat_footer(
     }
     let schema = encode_schema_descriptor(&footer.schema)?;
     let plan = footer.plan.encode(&footer.schema)?;
+    let (body_layout_version, block_version, _) = planned_body_versions(&footer.plan)?;
     let len = 208usize
         .checked_add(schema.len())
         .and_then(|v| v.checked_add(plan.len()))
@@ -764,8 +1469,8 @@ pub fn encode_v3_planned_flat_footer(
     put64(&mut out, footer.body_len);
     put32(&mut out, footer.chunks.len() as u32);
     put32(&mut out, footer.schema.schema_id);
-    put16(&mut out, 1);
-    put16(&mut out, 1);
+    put16(&mut out, body_layout_version);
+    put16(&mut out, block_version);
     put32(&mut out, schema.len() as u32);
     put32(&mut out, plan.len() as u32);
     for hash in [
@@ -799,7 +1504,7 @@ pub fn encode_v3_planned_flat_footer(
         put32(&mut out, 0);
         put64(&mut out, chunk.first_global_row);
         put32(&mut out, chunk.row_count);
-        put16(&mut out, 1);
+        put16(&mut out, block_version);
         put16(&mut out, 0);
         put64(&mut out, chunk.body_relative_offset);
         put64(&mut out, chunk.stored_len);
@@ -846,9 +1551,8 @@ pub fn decode_v3_planned_flat_footer(
     let body_len = r.read_u64_le()?;
     let count = r.read_u32_le()? as usize;
     let schema_id = r.read_u32_le()?;
-    if r.read_u16_le() != Ok(1) || r.read_u16_le() != Ok(1) {
-        return Err(AuraError::InvalidValue("planned flat versions"));
-    }
+    let body_layout_version = r.read_u16_le()?;
+    let block_version = r.read_u16_le()?;
     let sl = r.read_u32_le()? as usize;
     let pl = r.read_u32_le()? as usize;
     let schema_fingerprint = r.read_exact(32)?.try_into().unwrap();
@@ -861,6 +1565,12 @@ pub fn decode_v3_planned_flat_footer(
         return Err(AuraError::InvalidValue("planned flat schema"));
     }
     let plan = FlatAuraPlanV2::decode(&schema, r.read_exact(pl)?)?;
+    let (expected_body_layout_version, expected_block_version, _) = planned_body_versions(&plan)?;
+    if body_layout_version != expected_body_layout_version
+        || block_version != expected_block_version
+    {
+        return Err(AuraError::InvalidValue("planned flat versions"));
+    }
     if r.read_u16_le() != Ok(1)
         || r.read_u16_le() != Ok(104)
         || r.read_u32_le()? as usize != count
@@ -877,7 +1587,7 @@ pub fn decode_v3_planned_flat_footer(
         }
         let first = r.read_u64_le()?;
         let rows = r.read_u32_le()?;
-        if r.read_u16_le() != Ok(1) || r.read_u16_le() != Ok(0) {
+        if r.read_u16_le()? != expected_block_version || r.read_u16_le()? != 0 {
             return Err(AuraError::InvalidValue("planned flat chunk version"));
         }
         let off = r.read_u64_le()?;
@@ -1049,7 +1759,7 @@ pub fn decode_v3_selected_flat(
     }
 }
 
-fn candidate_limit(error: &AuraError) -> bool {
+fn candidate_inapplicable(error: &AuraError) -> bool {
     matches!(
         error,
         AuraError::InvalidValue(
@@ -1059,6 +1769,8 @@ fn candidate_limit(error: &AuraError) -> bool {
                 | "planned flat body length"
                 | "v3 flat footer length"
                 | "planned flat footer length"
+                | "planned flat dictionary no lane win"
+                | "planned flat logical output length"
         )
     )
 }
@@ -1087,4 +1799,317 @@ fn put32(out: &mut Vec<u8>, v: u32) {
 }
 fn put64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
+}
+
+#[cfg(test)]
+mod dictionary_tests {
+    use super::*;
+    use crate::{FieldRole, FieldType, SchemaBuilder};
+
+    fn variable(parts: &[&[u8]]) -> AuraV3VariableColumn {
+        let mut offsets = vec![0u32];
+        let mut data = Vec::new();
+        for part in parts {
+            data.extend_from_slice(part);
+            offsets.push(u32::try_from(data.len()).unwrap());
+        }
+        AuraV3VariableColumn { offsets, data }
+    }
+
+    fn utf8_column(parts: &[&[u8]], validity: Option<Vec<u8>>) -> AuraV3Column {
+        AuraV3Column {
+            slot: 0,
+            validity,
+            values: AuraV3ColumnValues::Utf8(variable(parts)),
+        }
+    }
+
+    fn decode_lane_bytes(
+        bytes: &[u8],
+        rows: usize,
+        field_type: FieldType,
+        nullable: bool,
+        max_block_bytes: usize,
+    ) -> Result<AuraV3Column> {
+        let mut reader = ByteReader::new(bytes);
+        let decoded = decode_dictionary_lane(
+            0,
+            field_type,
+            nullable,
+            rows,
+            &mut reader,
+            V3ValueLimits {
+                max_block_bytes,
+                ..V3ValueLimits::HARD
+            },
+            max_block_bytes,
+        )?;
+        reader.finish()?;
+        Ok(decoded)
+    }
+
+    #[test]
+    fn dictionary_cardinality_widths_nulls_and_present_empty_are_canonical() {
+        let cases = [
+            (vec![b"".as_slice(), b"", b""], Some(vec![0]), 0, 0),
+            (vec![b"a".as_slice(), b"a", b"a"], None, 1, 0),
+            (vec![b"a".as_slice(), b"b", b"a"], None, 2, 1),
+            (vec![b"a".as_slice(), b"b", b"c", b"d"], None, 4, 2),
+            (vec![b"a".as_slice(), b"b", b"c", b"d", b"e"], None, 5, 3),
+        ];
+        for (parts, validity, expected_entries, expected_width) in cases {
+            let column = utf8_column(&parts, validity);
+            let encoded = encode_dictionary_lane(&column, parts.len()).unwrap();
+            let validity_len = column.validity.as_ref().map_or(0, Vec::len);
+            assert_eq!(
+                u32::from_le_bytes(
+                    encoded.bytes[validity_len..validity_len + 4]
+                        .try_into()
+                        .unwrap()
+                ),
+                expected_entries
+            );
+            assert_eq!(encoded.bytes[validity_len + 8], expected_width);
+            assert_eq!(
+                decode_lane_bytes(
+                    &encoded.bytes,
+                    parts.len(),
+                    FieldType::Utf8,
+                    column.validity.is_some(),
+                    V3ValueLimits::HARD.max_block_bytes,
+                )
+                .unwrap(),
+                column
+            );
+        }
+        for (cardinality, expected_width) in [(8usize, 3u8), (9, 4), (256, 8), (257, 9)] {
+            let owned = (0..cardinality)
+                .map(|index| format!("value-{index:04}"))
+                .collect::<Vec<_>>();
+            let parts = owned
+                .iter()
+                .map(|value| value.as_bytes())
+                .collect::<Vec<_>>();
+            let column = utf8_column(&parts, None);
+            let encoded = encode_dictionary_lane(&column, cardinality).unwrap();
+            assert_eq!(
+                u32::from_le_bytes(encoded.bytes[..4].try_into().unwrap()),
+                cardinality as u32
+            );
+            assert_eq!(encoded.bytes[8], expected_width);
+            assert_eq!(
+                decode_lane_bytes(
+                    &encoded.bytes,
+                    cardinality,
+                    FieldType::Utf8,
+                    false,
+                    V3ValueLimits::HARD.max_block_bytes,
+                )
+                .unwrap(),
+                column
+            );
+        }
+    }
+
+    #[test]
+    fn dictionary_lane_malformed_forms_fail_closed() {
+        let column = utf8_column(&[b"a", b"b", b"a"], None);
+        let encoded = encode_dictionary_lane(&column, 3).unwrap().bytes;
+        assert_eq!(encoded[8], 1);
+        let dictionary_data_start = 12 + 3 * 4;
+        let index_start = dictionary_data_start + 2;
+
+        let mut mutations = Vec::new();
+        let mut bad_count = encoded.clone();
+        bad_count[..4].copy_from_slice(&4u32.to_le_bytes());
+        mutations.push(bad_count);
+        let mut bad_reserved = encoded.clone();
+        bad_reserved[9] = 1;
+        mutations.push(bad_reserved);
+        let mut bad_width = encoded.clone();
+        bad_width[8] = 2;
+        mutations.push(bad_width);
+        let mut bad_offsets = encoded.clone();
+        bad_offsets[16..20].copy_from_slice(&3u32.to_le_bytes());
+        mutations.push(bad_offsets);
+        let mut duplicate = encoded.clone();
+        duplicate[dictionary_data_start + 1] = b'a';
+        mutations.push(duplicate);
+        let mut unsorted = encoded.clone();
+        unsorted[dictionary_data_start] = b'b';
+        unsorted[dictionary_data_start + 1] = b'a';
+        mutations.push(unsorted);
+        let mut invalid_utf8 = encoded.clone();
+        invalid_utf8[dictionary_data_start] = 0xff;
+        mutations.push(invalid_utf8);
+        let mut bad_padding = encoded.clone();
+        bad_padding[index_start] |= 0x80;
+        mutations.push(bad_padding);
+        for mutation in mutations {
+            assert!(decode_lane_bytes(
+                &mutation,
+                3,
+                FieldType::Utf8,
+                false,
+                V3ValueLimits::HARD.max_block_bytes,
+            )
+            .is_err());
+        }
+        for length in 0..encoded.len() {
+            assert!(decode_lane_bytes(
+                &encoded[..length],
+                3,
+                FieldType::Utf8,
+                false,
+                V3ValueLimits::HARD.max_block_bytes,
+            )
+            .is_err());
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode_lane_bytes(
+            &trailing,
+            3,
+            FieldType::Utf8,
+            false,
+            V3ValueLimits::HARD.max_block_bytes,
+        )
+        .is_err());
+
+        let three = utf8_column(&[b"a", b"b", b"c"], None);
+        let mut unreferenced = encode_dictionary_lane(&three, 3).unwrap().bytes;
+        let three_data_start = 12 + 4 * 4;
+        let three_index_start = three_data_start + 3;
+        unreferenced[three_index_start] = 0b0001_0100;
+        assert!(decode_lane_bytes(
+            &unreferenced,
+            3,
+            FieldType::Utf8,
+            false,
+            V3ValueLimits::HARD.max_block_bytes,
+        )
+        .is_err());
+        let mut out_of_range = encode_dictionary_lane(&three, 3).unwrap().bytes;
+        out_of_range[three_index_start] |= 0b11;
+        assert!(decode_lane_bytes(
+            &out_of_range,
+            3,
+            FieldType::Utf8,
+            false,
+            V3ValueLimits::HARD.max_block_bytes,
+        )
+        .is_err());
+
+        let decimal = AuraV3Column {
+            slot: 0,
+            validity: None,
+            values: AuraV3ColumnValues::DecimalText(variable(&[b"1", b"2", b"1"])),
+        };
+        let mut invalid_decimal = encode_dictionary_lane(&decimal, 3).unwrap().bytes;
+        invalid_decimal[dictionary_data_start] = b'x';
+        assert!(decode_lane_bytes(
+            &invalid_decimal,
+            3,
+            FieldType::DecimalText,
+            false,
+            V3ValueLimits::HARD.max_block_bytes,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cumulative_dictionary_inverse_budget_rejects_before_second_lane_output() {
+        let schema = SchemaBuilder::new("anonymous_dictionary_budget")
+            .v3()
+            .field("left", FieldType::Utf8, FieldRole::Value)
+            .field("right", FieldType::Utf8, FieldRole::Value)
+            .finish()
+            .unwrap();
+        let rows = 64usize;
+        let value = vec![b'x'; 128];
+        let parts = vec![value.as_slice(); rows];
+        let batch = AuraV3Batch {
+            schema_id: schema.schema_id,
+            row_count: rows as u32,
+            columns: vec![
+                AuraV3Column {
+                    slot: 0,
+                    validity: None,
+                    values: AuraV3ColumnValues::Utf8(variable(&parts)),
+                },
+                AuraV3Column {
+                    slot: 1,
+                    validity: None,
+                    values: AuraV3ColumnValues::Utf8(variable(&parts)),
+                },
+            ],
+        };
+        let mut plan = FlatAuraPlanV2::all_fixed(&schema).unwrap();
+        plan.registry_version = FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION;
+        plan.codecs
+            .fill(PlanV2PhysicalCodec::VariableByteDictionaryBitpacked);
+        plan.validate(&schema).unwrap();
+        let block = encode_block(&schema, &batch, &plan, V3ValueLimits::HARD).unwrap();
+        assert!(block.len() < 10_000);
+        let result = decode_block(
+            &schema,
+            &block,
+            &plan,
+            V3ValueLimits {
+                max_block_bytes: 10_000,
+                max_rows: rows,
+                ..V3ValueLimits::HARD
+            },
+        );
+        assert_eq!(
+            result,
+            Err(AuraError::InvalidValue(
+                "planned flat dictionary inverse length"
+            ))
+        );
+    }
+
+    #[test]
+    fn registry1_flat_plan_and_container_hashes_are_golden() {
+        let schema = SchemaBuilder::new("anonymous_registry1_golden")
+            .v3()
+            .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
+            .field("value", FieldType::I64, FieldRole::Value)
+            .finish()
+            .unwrap();
+        let batch = AuraV3Batch {
+            schema_id: schema.schema_id,
+            row_count: 3,
+            columns: vec![
+                AuraV3Column {
+                    slot: 0,
+                    validity: None,
+                    values: AuraV3ColumnValues::TimestampMs(vec![1, 2, 3]),
+                },
+                AuraV3Column {
+                    slot: 1,
+                    validity: None,
+                    values: AuraV3ColumnValues::I64(vec![-1, 0, 1]),
+                },
+            ],
+        };
+        let plan = FlatAuraPlanV2::all_fixed(&schema).unwrap();
+        let plan_bytes = plan.encode(&schema).unwrap();
+        let artifact = compile_plan(&schema, &[batch], V3FlatLimits::HARD, plan.clone()).unwrap();
+        assert_eq!(
+            hex(&Sha256::digest(&plan_bytes)),
+            "edb401d1a5e5bea099c3afa0084c751b26c84c9de837cb2b2d45cf39d22de9d8"
+        );
+        assert_eq!(
+            hex(&Sha256::digest(&artifact.bytes)),
+            "2394a5bf0ff8476df8dd5ce8bb0daca2aa9e1f7f14817b26f5d88bbd83361954"
+        );
+        assert_eq!(plan.registry_version, FLAT_PLAN_V2_REGISTRY_VERSION);
+        let header_len = AuraHeader::encoded_len(&artifact.bytes).unwrap();
+        assert_eq!(&artifact.bytes[header_len..header_len + 8], b"AUFPVB01");
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
 }

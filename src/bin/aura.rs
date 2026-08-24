@@ -19,16 +19,18 @@ use aura_codec::{
     V3FlatLimits, V3FlatWriteSummary, V3FlatWriterOptions, V3GroupedAura0Reader,
     V3GroupedAura0Writer, V3GroupedWriteSummary, V3GroupedWriterOptions, V3PlannedFlatArtifact,
     V3PlannedFlatSummary, V3ValueLimits, DEFAULT_V3_FLAT_IN_MEMORY_BODY_BYTES,
-    MAX_SCHEMA_JSON_BYTES, MAX_V3_EVENT_BLOCK_BYTES, MAX_V3_FLAT_FOOTER_BYTES,
-    MAX_V3_FLAT_SCHEMA_BYTES, MAX_V3_GROUPED_FOOTER_BYTES, MAX_V3_PLANNED_FLAT_FOOTER_BYTES,
-    MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND, SHADOW_ARTIFACT_KIND_V2,
-    SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL, SHADOW_PROTOCOL_V2, SHADOW_RESULT_SCHEMA,
-    SHADOW_RESULT_SCHEMA_V2, SHADOW_SCHEMA_FORMAT, SHADOW_VERIFY_RESULT_SCHEMA,
-    SHADOW_VERIFY_RESULT_SCHEMA_V2, V3_FLAT_BODY_ENCODING_EXACT_BLOCKS,
-    V3_FLAT_FOOTER_LAYOUT_VERSION, V3_GROUPED_BODY_ENCODING_EXACT_EVENTS,
-    V3_GROUPED_BODY_LAYOUT_VERSION, V3_GROUPED_EVENT_BLOCK_VERSION,
-    V3_GROUPED_FOOTER_LAYOUT_VERSION, V3_PLANNED_FLAT_BLOCK_VERSION, V3_PLANNED_FLAT_BODY_ENCODING,
-    V3_PLANNED_FLAT_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION,
+    FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION, MAX_SCHEMA_JSON_BYTES, MAX_V3_EVENT_BLOCK_BYTES,
+    MAX_V3_FLAT_FOOTER_BYTES, MAX_V3_FLAT_SCHEMA_BYTES, MAX_V3_GROUPED_FOOTER_BYTES,
+    MAX_V3_PLANNED_FLAT_FOOTER_BYTES, MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL,
+    SHADOW_ARTIFACT_KIND, SHADOW_ARTIFACT_KIND_V2, SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL,
+    SHADOW_PROTOCOL_V2, SHADOW_RESULT_SCHEMA, SHADOW_RESULT_SCHEMA_V2, SHADOW_SCHEMA_FORMAT,
+    SHADOW_VERIFY_RESULT_SCHEMA, SHADOW_VERIFY_RESULT_SCHEMA_V2,
+    V3_FLAT_BODY_ENCODING_EXACT_BLOCKS, V3_FLAT_FOOTER_LAYOUT_VERSION,
+    V3_GROUPED_BODY_ENCODING_EXACT_EVENTS, V3_GROUPED_BODY_LAYOUT_VERSION,
+    V3_GROUPED_EVENT_BLOCK_VERSION, V3_GROUPED_FOOTER_LAYOUT_VERSION,
+    V3_PLANNED_FLAT_BLOCK_VERSION, V3_PLANNED_FLAT_BODY_ENCODING,
+    V3_PLANNED_FLAT_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION,
+    V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -773,32 +775,45 @@ fn planned_flat_v3_seal_json(
         .inspection
         .codecs
         .iter()
-        .map(|codec| {
-            let selected_physical_codec = match codec.selected {
-                aura_codec::PlanV2PhysicalCodec::FixedWidth => "fixed_width",
-                aura_codec::PlanV2PhysicalCodec::UnsignedUleb128 => "unsigned_uleb128",
-                aura_codec::PlanV2PhysicalCodec::SignedZigZagUleb128 => "signed_zigzag_uleb128",
-            };
-            json!({
-                "slot": codec.slot,
-                "logical_field_type": codec.field_type.name(),
-                "fixed_bytes": codec.fixed_bytes,
-                "varint_bytes": codec.varint_bytes,
-                "selected_physical_codec": selected_physical_codec,
-            })
-        })
+        .map(planned_flat_codec_inspection_json)
+        .collect::<Vec<_>>();
+    let dictionary_candidate_codecs = artifact
+        .inspection
+        .dictionary_candidate_codecs
+        .iter()
+        .map(planned_flat_codec_inspection_json)
         .collect::<Vec<_>>();
     let plan_sha256 =
         (selection == PlannedFlatSelection::Planned).then(|| hex(&artifact.summary.plan_sha256));
-    let body_layout_version =
-        (selection == PlannedFlatSelection::Planned).then_some(V3_PLANNED_FLAT_BODY_LAYOUT_VERSION);
-    let block_version =
-        (selection == PlannedFlatSelection::Planned).then_some(V3_PLANNED_FLAT_BLOCK_VERSION);
+    let dictionary_selected = selected_candidate == "planned-flat-variable-dictionary";
+    let (body_layout_version, block_version) = if selection == PlannedFlatSelection::Exact {
+        (None, None)
+    } else if dictionary_selected {
+        (
+            Some(V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION),
+            Some(V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION),
+        )
+    } else {
+        (
+            Some(V3_PLANNED_FLAT_BODY_LAYOUT_VERSION),
+            Some(V3_PLANNED_FLAT_BLOCK_VERSION),
+        )
+    };
+    let container_target = if dictionary_selected {
+        "flat-aura0-v3-planned-v2"
+    } else {
+        selection.container_target()
+    };
+    let body_encoding = if dictionary_selected {
+        "planned_flat_codecs_v2"
+    } else {
+        selection.body_encoding_name()
+    };
     json!({
-        "result_schema": "aura-v3-flat-aura0-planned-request-seal-result-v1",
+        "result_schema": "aura-v3-flat-aura0-planned-request-seal-result-v2",
         "protocol": SHADOW_PROTOCOL,
         "complete_aura_file": true,
-        "container_target": selection.container_target(),
+        "container_target": container_target,
         "container_version": 3,
         "profile": "aura0",
         "requested_mode": "planned",
@@ -806,7 +821,8 @@ fn planned_flat_v3_seal_json(
         "selected_candidate": selected_candidate,
         "planner_candidates": candidates,
         "physical_codecs": codecs,
-        "body_encoding": selection.body_encoding_name(),
+        "dictionary_candidate_codecs": dictionary_candidate_codecs,
+        "body_encoding": body_encoding,
         "body_encoding_code": selection.body_encoding_code(),
         "body_layout_version": body_layout_version,
         "block_version": block_version,
@@ -824,9 +840,40 @@ fn planned_flat_v3_seal_json(
         "stale_temp_cleanup_required": stale_temp_cleanup_required,
         "development_only": true,
         "streaming": false,
-        "memory_model": "bounded_all_memory_exact_fixed_mixed_complete_candidates_v1",
-        "all_memory_limitation": "retains exact, fixed, and mixed complete candidate artifacts plus lane scratch during scoring",
+        "memory_model": "bounded_all_memory_exact_fixed_mixed_dictionary_complete_candidates_v1",
+        "all_memory_limitation": "retains exact, fixed, mixed, and dictionary complete candidate artifacts plus lane scratch during scoring",
         "build": build_json(provenance)
+    })
+}
+
+fn planned_flat_codec_inspection_json(
+    codec: &aura_codec::V3PlannedFlatCodecInspection,
+) -> serde_json::Value {
+    let selected_physical_codec = match codec.selected {
+        aura_codec::PlanV2PhysicalCodec::FixedWidth => "fixed_width",
+        aura_codec::PlanV2PhysicalCodec::UnsignedUleb128 => "unsigned_uleb128",
+        aura_codec::PlanV2PhysicalCodec::SignedZigZagUleb128 => "signed_zigzag_uleb128",
+        aura_codec::PlanV2PhysicalCodec::VariableByteDictionaryBitpacked => {
+            "variable_byte_dictionary_bitpacked"
+        }
+    };
+    json!({
+        "slot": codec.slot,
+        "logical_field_type": codec.field_type.name(),
+        "direct_bytes": codec.fixed_bytes,
+        "fixed_bytes": codec.fixed_bytes,
+        "varint_bytes": codec.varint_bytes,
+        "dictionary_bytes": codec.dictionary_bytes,
+        "present_count": codec.present_count,
+        "null_count": codec.null_count,
+        "present_empty_count": codec.present_empty_count,
+        "dictionary_entries": codec.dictionary_entries,
+        "max_chunk_dictionary_entries": codec.max_chunk_dictionary_entries,
+        "unique_data_bytes": codec.unique_data_bytes,
+        "dictionary_index_bytes": codec.dictionary_index_bytes,
+        "dictionary_selected": codec.dictionary_selected,
+        "dictionary_rejection": codec.dictionary_rejection,
+        "selected_physical_codec": selected_physical_codec,
     })
 }
 
@@ -917,17 +964,45 @@ fn verify_v3_planned_flat_value(mut file: File) -> Result<serde_json::Value, Cli
     }
     let artifact_sha256: [u8; 32] = Sha256::digest(&bytes).into();
     let provenance = build_provenance();
+    let dictionary_registry =
+        decoded.footer.plan.registry_version == FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION;
+    let (body_layout_version, block_version) = if dictionary_registry {
+        (
+            V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION,
+        )
+    } else {
+        (
+            V3_PLANNED_FLAT_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_BLOCK_VERSION,
+        )
+    };
+    let result_schema = if dictionary_registry {
+        "aura-v3-flat-aura0-planned-verify-result-v2"
+    } else {
+        "aura-v3-flat-aura0-planned-verify-result-v1"
+    };
+    let container_target = if dictionary_registry {
+        "flat-aura0-v3-planned-v2"
+    } else {
+        PlannedFlatSelection::Planned.container_target()
+    };
+    let body_encoding = if dictionary_registry {
+        "planned_flat_codecs_v2"
+    } else {
+        PlannedFlatSelection::Planned.body_encoding_name()
+    };
     Ok(json!({
-        "result_schema": "aura-v3-flat-aura0-planned-verify-result-v1",
+        "result_schema": result_schema,
         "protocol": SHADOW_PROTOCOL,
         "complete_aura_file": true,
-        "container_target": PlannedFlatSelection::Planned.container_target(),
+        "container_target": container_target,
         "container_version": 3,
         "profile": "aura0",
-        "body_encoding": PlannedFlatSelection::Planned.body_encoding_name(),
+        "body_encoding": body_encoding,
         "body_encoding_code": V3_PLANNED_FLAT_BODY_ENCODING,
-        "body_layout_version": V3_PLANNED_FLAT_BODY_LAYOUT_VERSION,
-        "block_version": V3_PLANNED_FLAT_BLOCK_VERSION,
+        "body_layout_version": body_layout_version,
+        "block_version": block_version,
         "footer_layout_version": V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION,
         "compression": "none",
         "verified": true,

@@ -828,6 +828,7 @@ fn validate_codec_type(codec: PlanV2PhysicalCodec, field_type: FieldType) -> Res
                 | FieldType::TimestampNs
                 | FieldType::TimestampMs
         ),
+        PlanV2PhysicalCodec::VariableByteDictionaryBitpacked => false,
     };
     if compatible {
         Ok(())

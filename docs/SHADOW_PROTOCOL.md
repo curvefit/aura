@@ -58,17 +58,27 @@ aura v3 aura0 seal \
   --json < logical.arrow-stream
 ```
 
-The planned-request seal schema reports all three candidates' applicability,
-rejection/cost attribution, selected physical codec rows, complete bytes, the
+The `aura-v3-flat-aura0-planned-request-seal-result-v2` schema reports all
+four candidates' applicability,
+rejection/cost attribution, selected physical codec rows, dictionary counts
+and byte attribution, complete bytes, the
 selected candidate, the actual footer/body tuple, and a plan hash only when a
 planned tuple wins. Exact fallback is intentional and is verified with the
-unchanged exact verify schema. A selected planned tuple uses footer layout 3,
-body encoding 4, the generic `planned_flat_codecs_v1` format label, and the
-distinct `aura-v3-flat-aura0-planned-verify-result-v1` schema. Both planned
+unchanged exact verify schema. A selected planned tuple uses footer layout 3
+and body encoding 4. Registry-1/layout-1 files retain container target
+`flat-aura0-v3-planned-v1`, format label `planned_flat_codecs_v1`, and verify
+schema `aura-v3-flat-aura0-planned-verify-result-v1`. Registry-2/layout-2
+files use the corresponding `planned-v2`, `planned_flat_codecs_v2`, and
+planned-verify-result-v2 identities. This preserves attempt-6 receipt meaning
+rather than silently broadening a v1 result schema. Both planned
 compilation and verification are conservatively bounded all-memory reference
-operations: compilation retains the exact, fixed, and mixed complete
-candidates plus lane scratch. This is not a seekable or streaming readiness
-claim. Planned mode is not accepted for grouped protocol v2.
+operations: compilation retains the exact, fixed, mixed, and dictionary
+complete candidates plus lane/dictionary scratch. Registry-2 dictionaries are
+chunk-local, lexicographically canonical, exact-byte Utf8/DecimalText codecs
+with present-only minimal bitpacked indices. They do not normalize DecimalText
+or use RLE, Huffman, general compression, or field identity. This is not a
+seekable or streaming readiness claim. Planned mode is not accepted for
+grouped protocol v2.
 
 Seal accepts canonical schema JSON only and publishes a new mode-0600 path via
 the same create-once, held-handle verification and directory-fsync state

@@ -5,9 +5,10 @@ This document describes the current implementation.
 Current production and default SDK writers still emit container V2. Aura also
 implements three complete, explicitly selected, uncompressed V3 Aura0
 flavors: flat event-scoped files whose body is a concatenation of exact-value
-`AURAV3VB` blocks; a development-only planned-flat file with plan-bound fixed
-or absolute-varint lanes; and grouped exact-event files whose body is a
-concatenation of `AURAV3EB` chunks. Exact-flat and grouped have seekable
+`AURAV3VB` blocks; a development-only planned-flat file with plan-bound fixed,
+absolute-varint, or exact-byte variable-dictionary lanes; and grouped
+exact-event files whose body is a concatenation of `AURAV3EB` chunks.
+Exact-flat and grouped have seekable
 writers/readers. Planned-flat compilation and verification are bounded
 all-memory reference paths. The explicit V3 CLI seal command covers all three
 and verify auto-dispatches from the held footer tuple. V3 is not
@@ -123,9 +124,10 @@ and 16,777,216-row format ceilings.
 Planned-flat is an additive group-free development format for the same logical
 flat schema subset. Its `AURP` route tuple is container version `3`, footer
 layout `3`, body encoding `4`, followed by three zero reserved bytes. The
-footer stamps body layout version `1`, block version `1`, the complete
-canonical schema descriptor, and an `AUF2` plan. A decoder never replans and
-needs no dataset, venue, symbol, filename, or sidecar.
+footer stamps body/block version `1` for registry 1 and version `2` for
+registry 2, plus the complete canonical schema descriptor and an `AUF2` plan.
+A decoder never replans and needs no dataset, venue, symbol, filename, or
+sidecar.
 
 Canonical `AUF2` plan version `2`, registry version `1`, starts with magic
 `AUF2`, total length, schema ID and fingerprint, field count, and reserved
@@ -135,6 +137,13 @@ all supported flat fields, unsigned canonical ULEB128 for unsigned integer
 fields, and signed canonical ZigZag ULEB128 for signed integers and timestamp
 fields. The plan decoder verifies its length, hash, schema binding, codec/type
 compatibility, and canonical re-encoding.
+
+Registry version `2` has a distinct plan-hash domain and adds physical codec
+code `3` for exact-byte dictionary plus minimal bitpacked indices. It is legal
+only for Utf8 and DecimalText and requires at least one such lane; the other
+codec bytes retain registry-1 meaning. One registry covers both types because
+the schema binds the logical type and the codec preserves already-validated
+bytes without DecimalText normalization.
 
 Each planned body chunk starts with `AUFPVB01`, block version `1`, zero flags,
 schema ID/fingerprint, row and field counts, zero reserved bytes, and the full
@@ -147,16 +156,30 @@ schema and plan. Its version-1 chunk table uses 104-byte descriptors carrying
 contiguous row/body ranges plus stored and logical SHA-256 values, followed by
 the footer hash and common trailer.
 
-The reference compiler scores three complete artifacts: legacy exact flat,
-planned all-fixed, and planned per-field fixed/varint. It charges header, body,
-plan, schema, footer, descriptors, hashes, footer length, and seal, and uses
-stable candidate order for complete-file ties. Therefore an explicit planned
-request may truthfully publish the byte-identical legacy exact fallback. The
-CLI receipt records the requested mode, every candidate's cost/applicability
-and rejection reason, the selected candidate, the actual route tuple, and
-per-slot codec costs when the mixed plan wins. This reference compiler retains
-up to three complete candidates plus lane scratch; it is not the streaming
-ingest writer or a readiness claim.
+Registry-2 chunks instead use `AUFPVB02`, body layout `2`, and block version
+`2`. Non-dictionary lanes keep the registry-1 payload. Each dictionary lane
+stores its normal validity bitmap followed by `u32 entry_count`, `u32 exact
+dictionary-data bytes`, minimal index bit width, three reserved zero bytes,
+`entry_count + 1` little-endian u32 offsets, lexicographically sorted unique
+entry bytes, and LSB-first packed indices for present rows only. Null rows have
+no index and reconstruct the required empty placeholder; a present empty value
+is a real dictionary entry. Width and packed length are minimal, unused high
+bits are zero, every entry is referenced, and offsets plus decoded output are
+checked against caller bounds before allocation.
+
+The reference compiler scores four complete artifacts: legacy exact flat,
+planned all-fixed, planned per-field fixed/varint, and one registry-2 candidate
+starting from the mixed plan and choosing a dictionary per eligible field only
+on a strict aggregate actual-lane byte win across chunks. It charges header,
+body, plan, schema, footer, descriptors, hashes, footer length, and seal, and
+uses stable candidate order for complete-file ties. Therefore an explicit
+planned request may truthfully publish the byte-identical legacy exact
+fallback. The CLI receipt records requested mode, every candidate's
+cost/applicability/rejection, selected candidate, actual route tuple, and
+bounded per-slot direct/dictionary/count/index attribution. This reference
+compiler retains up to four complete candidates plus lane/dictionary scratch;
+it is not the streaming ingest writer or a readiness claim. Registry 2 adds no
+RLE, Huffman, general compression, relationship math, or identity logic.
 
 ## Grouped Aura0 V3 container V1
 

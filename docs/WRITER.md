@@ -98,4 +98,6 @@ command. `aura v3 aura0 verify` routes exact-flat, planned-flat, and grouped
 files from their bounded footer tuple and verifies the embedded schema and
 exact held file. Explicit flat `--mode planned` is a bounded all-memory
 development path and may select the existing exact file; it is not a
-streaming-writer claim.
+streaming-writer claim. Its one registry-2 extension uses exact-byte,
+chunk-local dictionaries with minimal bitpacked present-only indices for
+Utf8/DecimalText; it performs no normalization or entropy compression.
