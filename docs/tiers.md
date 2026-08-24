@@ -49,3 +49,20 @@ file order, then slot order.
 
 `.aura1` should be bigger than `.aura0`, but it should be much easier to parse
 with predictable pointer arithmetic.
+
+## Explicit V3 Aura0 development surface
+
+The three-level description above is the V2 production/SDK compatibility
+model. V3 is separately dispatched and must not be inferred from a V2 profile
+byte or sent through the V2 conversion path. The current V3 surface is:
+
+- flat exact event-scoped Aura0 files (`AURAV3VB` blocks), with a seekable
+  writer/reader and CLI seal/verify route;
+- grouped exact-event Aura0 files (`AURAV3EB` chunks), with authoritative
+  event/child offsets and the protocol-v2 CLI seal/verify route; and
+- a planned-flat development-only complete-file route with bounded,
+  all-memory candidate scoring and tuple-specific verification receipts.
+
+These V3 routes are schema-authorized exact/reference surfaces. They do not
+add V2 ingest, V2 Aura1, or V2 conversion support, and they are not a
+production or Parquet replacement claim.

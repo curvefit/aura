@@ -13,10 +13,13 @@ Seal
 The established SDK writer and generic reader use container V2 by default.
 Container V3 is explicitly dispatched and has two complete uncompressed Aura0
 SDK profiles: flat event-scoped exact-value blocks and grouped exact-event
-chunks. Both are exposed by seekable writer/reader APIs. The `aura v3 aura0
-seal` developer command covers both protocol-specific profiles, and `aura v3
-aura0 verify` auto-dispatches them from the held footer tuple. Neither V3 profile is
-selected implicitly by the V2 SDK writer or promised as production/default.
+chunks. It also has a separate planned-flat development container whose
+candidate scoring and verification are bounded all-memory reference paths.
+Flat and grouped profiles are exposed by seekable writer/reader APIs. The
+`aura v3 aura0 seal` developer command covers all three routes, and
+`aura v3 aura0 verify` auto-dispatches exact, planned, and grouped files from
+the held footer tuple. No V3 route is selected implicitly by the V2 SDK writer
+or promised as production/default.
 
 ## V2 header
 

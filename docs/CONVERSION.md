@@ -1,6 +1,7 @@
 # Aura Conversion API
 
-Use `convert_aura(input, output, ConvertOptions::new(target_format))` for SDK-level format conversion.
+Use `convert_aura(input, output, ConvertOptions::new(target_format))` for the
+V2 SDK-level format conversion API.
 
 ```rust
 let summary = aura_codec::convert_aura(
@@ -12,7 +13,7 @@ println!("rows={}", summary.record_count);
 # Ok::<(), aura_codec::AuraError>(())
 ```
 
-Supported v1 conversions:
+Supported V2 conversions:
 
 - `.aura` to `.aura0`
 - `.aura` to `.aura1`
@@ -28,3 +29,9 @@ Supported v1 conversions:
 - verification by decoding the output and comparing rows with the input
 
 The conversion API builds and exposes the same schema-derived plan used by the writer and reader. Verification is off by default. Unsupported source formats, target formats, schemas, and byte-lane requests return `AuraError` instead of falling back silently.
+
+The explicit V3 flat, grouped, and planned Aura0 files are outside this V2
+conversion matrix. They carry their own V3 header/footer and schema contracts;
+the V2 converter rejects V3 schema/container inputs rather than relabeling or
+transcoding them. Use the V3 CLI/API seal and verify routes described in
+`docs/SHADOW_PROTOCOL.md` and `docs/FORMAT.md`.

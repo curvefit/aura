@@ -76,8 +76,10 @@ the 184-byte-prefix `AURP` footer with 152-byte chunk descriptors, then writes
 the footer, u32 footer length, and `sealed:)` trailer. `finish_and_sync` is the
 `File` specialization. A write, flush, sync, or second-pass error is a failed
 and uncommitted result; callers must discard it and must not publish it, even if
-the underlying bytes happen to end in a seal. The grouped SDK has no CLI
-complete-seal command yet.
+the underlying bytes happen to end in a seal. The developer CLI exposes this
+same grouped writer through `aura v3 aura0 seal --protocol
+aura-logical-arrow-ipc-v2`; the CLI supplies the strict Arrow stream and owns
+the complete-file publication state machine.
 
 `V3GroupedAura0Reader<R>` is a bounded seekable reader. It can locate chunks by
 global event or child, read one checked chunk, and run `verify_all`/`verify_with`

@@ -11,10 +11,11 @@ The current implementation has two deliberately separate surfaces:
   `.aura`, `.aura0`, and `.aura1` files.
 * V3 has two complete, explicitly bounded, uncompressed Aura0 SDK flavors:
   flat event-scoped values in `AURAV3VB` blocks and grouped exact events in
-  `AURAV3EB` chunks. Both have self-contained schema/footers, checksums,
-  hashes, and seekable writer/reader APIs. Both flavors have the explicit
-  developer CLI complete-seal and auto-dispatch verification path. Neither V3
-  flavor is production-ready or the default.
+  `AURAV3EB` chunks. It also has a separate planned-flat development route
+  whose complete artifacts are all-memory reference outputs. Flat and grouped
+  flavors have self-contained schema/footers, checksums, hashes, seekable
+  writer/reader APIs, and the developer CLI complete-seal/auto-dispatch path.
+  No V3 route is production-ready or the default.
 
 The public model is intentionally generic:
 

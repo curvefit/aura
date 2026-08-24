@@ -6,10 +6,13 @@ return an error instead of falling back silently.
 Current production and default SDK writers emit complete V2 containers. V3 has
 two complete, explicitly selected, uncompressed Aura0 SDK compatibility
 subsets: flat event-only `AURAV3VB` exact-value blocks, and grouped exact-event
-`AURAV3EB` chunks with the AURP V3 grouped footer. Both have public seekable
-writers/readers and bounded verification. Both flavors have explicit V3 CLI
-complete-seal support and held-file auto-dispatch verification. V3 adds no ingest/Aura1
-layout, stamping, or conversion path, and is not a production/default
+`AURAV3EB` chunks with the AURP V3 grouped footer. V3 also has a separate
+planned-flat development route with tuple-specific complete-file receipts;
+planned compilation/verification is an all-memory reference path, not a
+seekable SDK compatibility subset. Flat and grouped profiles have public
+seekable writers/readers and bounded verification, and all three have explicit
+V3 CLI seal/held-file auto-dispatch verification routes. V3 adds no ingest/Aura1
+layout, stamping, or V2 conversion path, and is not a production/default
 replacement. V2 footers still reject V3 schema tag 4. Both V3 front headers
 have a normative 16 MiB ceiling enforced before file-backed allocation.
 
