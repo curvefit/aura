@@ -3,9 +3,12 @@
 //! Registry version 1 stamps attempt-1 exact direct streams. Registry version 2
 //! adds plan-bound compact physical stream identities plus the
 //! schema-authorized split-domain direct candidate. Complete-cost selection
-//! retains registry-1 and compact registry-2 direct fallbacks. This registry
-//! specifies no compression and carries no Parquet, holdout, or production
-//! claim.
+//! retains registry-1 and compact registry-2 direct fallbacks. Registry version
+//! 3 adds whole-file exact physical integer codecs to Direct streams only:
+//! fixed width, unsigned canonical ULEB128, and signed ZigZag canonical
+//! ULEB128. It adds no delta, residual, split, Huffman, Zstandard, or null
+//! sparsity. These registries specify no compression claim and carry no
+//! Parquet, holdout, production, or campaign-size claim.
 
 use sha2::{Digest, Sha256};
 
@@ -17,6 +20,7 @@ pub const AURA_PLAN_V2_MAGIC: &[u8; 4] = b"AUP2";
 pub const AURA_PLAN_V2_VERSION: u16 = 2;
 pub const AURA_PLAN_V2_REGISTRY_VERSION: u16 = 1;
 pub const AURA_PLAN_V2_SPLIT_REGISTRY_VERSION: u16 = 2;
+pub const AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION: u16 = 3;
 pub const AURA_PLAN_V2_DIRECT_OP: u8 = 0;
 pub const AURA_PLAN_V2_SPLIT_DOMAIN_DIRECT_OP: u8 = 1;
 pub const AURA_PLAN_V2_AUTHORITATIVE_SOURCE_ORDER: u8 = 1;
@@ -30,6 +34,26 @@ const SPLIT_STREAM_PREFIX_BYTES: usize = 14;
 const HASH_BYTES: usize = 32;
 const PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v1\0";
 const SPLIT_PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v2\0";
+const INTEGER_CODEC_PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v3\0";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PlanV2PhysicalCodec {
+    FixedWidth = 0,
+    UnsignedUleb128 = 1,
+    SignedZigZagUleb128 = 2,
+}
+
+impl PlanV2PhysicalCodec {
+    fn from_code(code: u8) -> Result<Self> {
+        match code {
+            0 => Ok(Self::FixedWidth),
+            1 => Ok(Self::UnsignedUleb128),
+            2 => Ok(Self::SignedZigZagUleb128),
+            _ => Err(AuraError::InvalidValue("aura plan v2 physical codec")),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -74,6 +98,7 @@ pub struct AuraPlanV2 {
     pub source_order_selector_stream_id: Option<u16>,
     pub streams: Vec<PlanV2StreamDescriptor>,
     pub decode_order: Vec<u16>,
+    pub physical_stream_codecs: Vec<PlanV2PhysicalCodec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +159,22 @@ impl AuraPlanV2 {
             source_order_selector_stream_id: None,
             streams,
             decode_order,
+            physical_stream_codecs: Vec::new(),
         };
+        plan.validate(schema)?;
+        Ok(plan)
+    }
+
+    pub fn integer_codec_direct_for_schema(schema: &SchemaDescriptor) -> Result<Self> {
+        let mut plan = Self::candidate_for_schema(schema, PlanV2Selection::Direct)?;
+        plan.registry_version = AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION;
+        let codec_count = plan
+            .streams
+            .iter()
+            .flat_map(|stream| stream.physical_stream_ids.iter().copied())
+            .max()
+            .map_or(1usize, |id| usize::from(id) + 1);
+        plan.physical_stream_codecs = vec![PlanV2PhysicalCodec::FixedWidth; codec_count];
         plan.validate(schema)?;
         Ok(plan)
     }
@@ -179,7 +219,9 @@ impl AuraPlanV2 {
         if self.plan_version != AURA_PLAN_V2_VERSION
             || !matches!(
                 self.registry_version,
-                AURA_PLAN_V2_REGISTRY_VERSION | AURA_PLAN_V2_SPLIT_REGISTRY_VERSION
+                AURA_PLAN_V2_REGISTRY_VERSION
+                    | AURA_PLAN_V2_SPLIT_REGISTRY_VERSION
+                    | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
             )
             || self.schema_id != schema.schema_id
             || self.schema_fingerprint != canonical_v3_schema_fingerprint(schema)?
@@ -209,9 +251,11 @@ impl AuraPlanV2 {
         {
             return Err(AuraError::InvalidValue("aura plan v2 split authorization"));
         }
-        if self.registry_version == AURA_PLAN_V2_SPLIT_REGISTRY_VERSION
-            && (self.event_child_offsets_stream_id != Some(0)
-                || self.source_order_selector_stream_id.is_none())
+        if matches!(
+            self.registry_version,
+            AURA_PLAN_V2_SPLIT_REGISTRY_VERSION | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+        ) && (self.event_child_offsets_stream_id != Some(0)
+            || self.source_order_selector_stream_id.is_none())
         {
             return Err(AuraError::InvalidValue("aura plan v2 structural streams"));
         }
@@ -220,6 +264,16 @@ impl AuraPlanV2 {
                 || self.source_order_selector_stream_id.is_some())
         {
             return Err(AuraError::InvalidValue("aura plan v2 direct registry"));
+        }
+        if self.registry_version != AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+            && !self.physical_stream_codecs.is_empty()
+        {
+            return Err(AuraError::InvalidValue("aura plan v2 codec registry"));
+        }
+        if self.registry_version == AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+            && self.selection != PlanV2Selection::Direct
+        {
+            return Err(AuraError::InvalidValue("aura plan v2 codec selection"));
         }
 
         let mut seen = vec![false; schema.fields.len()];
@@ -293,6 +347,24 @@ impl AuraPlanV2 {
                         .ok_or(AuraError::InvalidValue("aura plan v2 physical stream id"))?;
                 }
             }
+            if self.registry_version == AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION {
+                if self.physical_stream_codecs.len() != usize::from(next_physical)
+                    || self.physical_stream_codecs.first() != Some(&PlanV2PhysicalCodec::FixedWidth)
+                {
+                    return Err(AuraError::InvalidValue("aura plan v2 codec count"));
+                }
+                for descriptor in &self.streams {
+                    for physical in &descriptor.physical_stream_ids {
+                        let codec = self.physical_stream_codecs[usize::from(*physical)];
+                        if descriptor.slot == self.discriminator_slot
+                            && codec != PlanV2PhysicalCodec::FixedWidth
+                        {
+                            return Err(AuraError::InvalidValue("aura plan v2 selector codec"));
+                        }
+                        validate_codec_type(codec, descriptor.field_type)?;
+                    }
+                }
+            }
         }
         for (index, slot) in self.decode_order.iter().copied().enumerate() {
             if usize::from(slot) != index {
@@ -329,6 +401,15 @@ impl AuraPlanV2 {
                 .checked_add(stream.physical_stream_ids.len())
                 .ok_or(AuraError::InvalidValue("aura plan v2 length"))
         })?;
+        let codec_table_len =
+            if self.registry_version == AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION {
+                self.physical_stream_codecs
+                    .len()
+                    .checked_add(2)
+                    .ok_or(AuraError::InvalidValue("aura plan v2 length"))?
+            } else {
+                0
+            };
         let stream_prefix = if self.registry_version == AURA_PLAN_V2_REGISTRY_VERSION {
             STREAM_PREFIX_BYTES
         } else {
@@ -343,6 +424,7 @@ impl AuraPlanV2 {
             )
             .and_then(|value| value.checked_add(dependency_count.checked_mul(2)?))
             .and_then(|value| value.checked_add(physical_count.checked_mul(2)?))
+            .and_then(|value| value.checked_add(codec_table_len))
             .and_then(|value| value.checked_add(self.decode_order.len().checked_mul(2)?))
             .and_then(|value| value.checked_add(HASH_BYTES))
             .filter(|value| *value <= MAX_AURA_PLAN_V2_BYTES)
@@ -387,7 +469,10 @@ impl AuraPlanV2 {
                 "aura plan v2 dependency count",
             )?;
             put_u32(&mut bytes, 0);
-            if self.registry_version == AURA_PLAN_V2_SPLIT_REGISTRY_VERSION {
+            if matches!(
+                self.registry_version,
+                AURA_PLAN_V2_SPLIT_REGISTRY_VERSION | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+            ) {
                 put_u16_len(
                     &mut bytes,
                     stream.physical_stream_ids.len(),
@@ -400,6 +485,14 @@ impl AuraPlanV2 {
             for physical in &stream.physical_stream_ids {
                 put_u16(&mut bytes, *physical);
             }
+        }
+        if self.registry_version == AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION {
+            put_u16_len(
+                &mut bytes,
+                self.physical_stream_codecs.len(),
+                "aura plan v2 codec count",
+            )?;
+            bytes.extend(self.physical_stream_codecs.iter().map(|codec| *codec as u8));
         }
         for slot in &self.decode_order {
             put_u16(&mut bytes, *slot);
@@ -431,7 +524,9 @@ impl AuraPlanV2 {
         if plan_version != AURA_PLAN_V2_VERSION
             || !matches!(
                 registry_version,
-                AURA_PLAN_V2_REGISTRY_VERSION | AURA_PLAN_V2_SPLIT_REGISTRY_VERSION
+                AURA_PLAN_V2_REGISTRY_VERSION
+                    | AURA_PLAN_V2_SPLIT_REGISTRY_VERSION
+                    | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
             )
         {
             return Err(AuraError::InvalidValue("aura plan v2 registry"));
@@ -483,7 +578,10 @@ impl AuraPlanV2 {
             if reader.u32()? != 0 {
                 return Err(AuraError::InvalidValue("aura plan v2 reserved"));
             }
-            let physical_count = if registry_version == AURA_PLAN_V2_SPLIT_REGISTRY_VERSION {
+            let physical_count = if matches!(
+                registry_version,
+                AURA_PLAN_V2_SPLIT_REGISTRY_VERSION | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+            ) {
                 reader.u16()? as usize
             } else {
                 0
@@ -526,6 +624,19 @@ impl AuraPlanV2 {
                 physical_stream_ids,
             });
         }
+        let mut physical_stream_codecs = Vec::new();
+        if registry_version == AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION {
+            let codec_count = reader.u16()? as usize;
+            if codec_count > MAX_AURA_PLAN_V2_STREAMS * 2 || codec_count > reader.remaining() {
+                return Err(AuraError::InvalidValue("aura plan v2 codec count"));
+            }
+            physical_stream_codecs
+                .try_reserve_exact(codec_count)
+                .map_err(|_| AuraError::InvalidValue("aura plan v2 allocation"))?;
+            for _ in 0..codec_count {
+                physical_stream_codecs.push(PlanV2PhysicalCodec::from_code(reader.u8()?)?);
+            }
+        }
         if decode_count > reader.remaining() / 2 {
             return Err(AuraError::UnexpectedEof);
         }
@@ -549,14 +660,19 @@ impl AuraPlanV2 {
             source_order,
             selection,
             authorized_relationship_bits,
-            event_child_offsets_stream_id: (registry_version
-                == AURA_PLAN_V2_SPLIT_REGISTRY_VERSION)
-                .then_some(offsets_stream_raw),
-            source_order_selector_stream_id: (registry_version
-                == AURA_PLAN_V2_SPLIT_REGISTRY_VERSION)
-                .then_some(selector_stream_raw),
+            event_child_offsets_stream_id: matches!(
+                registry_version,
+                AURA_PLAN_V2_SPLIT_REGISTRY_VERSION | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+            )
+            .then_some(offsets_stream_raw),
+            source_order_selector_stream_id: matches!(
+                registry_version,
+                AURA_PLAN_V2_SPLIT_REGISTRY_VERSION | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+            )
+            .then_some(selector_stream_raw),
             streams,
             decode_order,
+            physical_stream_codecs,
         };
         plan.validate(schema)?;
         if plan.encode(schema)? != bytes {
@@ -595,6 +711,30 @@ fn physical_stream_order(plan: &AuraPlanV2) -> Vec<usize> {
             }),
     );
     order
+}
+
+fn validate_codec_type(codec: PlanV2PhysicalCodec, field_type: FieldType) -> Result<()> {
+    let compatible = match codec {
+        PlanV2PhysicalCodec::FixedWidth => true,
+        PlanV2PhysicalCodec::UnsignedUleb128 => matches!(
+            field_type,
+            FieldType::U8 | FieldType::U16 | FieldType::U32 | FieldType::U64
+        ),
+        PlanV2PhysicalCodec::SignedZigZagUleb128 => matches!(
+            field_type,
+            FieldType::I8
+                | FieldType::I16
+                | FieldType::I32
+                | FieldType::I64
+                | FieldType::TimestampNs
+                | FieldType::TimestampMs
+        ),
+    };
+    if compatible {
+        Ok(())
+    } else {
+        Err(AuraError::InvalidValue("aura plan v2 codec type"))
+    }
 }
 
 fn validate_acyclic(streams: &[PlanV2StreamDescriptor], field_count: usize) -> Result<()> {
@@ -658,10 +798,10 @@ fn plan_hash_bytes(bytes: &[u8], registry_version: u16) -> Result<[u8; 32]> {
     let len =
         u64::try_from(bytes.len()).map_err(|_| AuraError::InvalidValue("aura plan v2 length"))?;
     let mut hasher = Sha256::new();
-    hasher.update(if registry_version == AURA_PLAN_V2_SPLIT_REGISTRY_VERSION {
-        SPLIT_PLAN_HASH_DOMAIN
-    } else {
-        PLAN_HASH_DOMAIN
+    hasher.update(match registry_version {
+        AURA_PLAN_V2_SPLIT_REGISTRY_VERSION => SPLIT_PLAN_HASH_DOMAIN,
+        AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION => INTEGER_CODEC_PLAN_HASH_DOMAIN,
+        _ => PLAN_HASH_DOMAIN,
     });
     hasher.update(len.to_le_bytes());
     hasher.update(bytes);

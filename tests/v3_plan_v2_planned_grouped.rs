@@ -3,18 +3,21 @@ use std::io::Cursor;
 use aura_codec::{
     canonical_v3_event_batch_sha256, compile_v3_planned_grouped,
     compile_v3_planned_grouped_attempt2, compile_v3_planned_grouped_attempt2_candidate,
-    decode_any_compiled_footer, decode_v3_planned_grouped, decode_v3_planned_grouped_footer,
-    encode_v3_planned_grouped_footer, AnyCompiledFooter, AuraHeader, AuraPlanV2, AuraV3Column,
-    AuraV3ColumnValues as Values, AuraV3EventBatch, AuraV3VariableColumn, FieldRole, FieldScope,
-    FieldType, PlanV2Selection, RelationshipPermissions, SchemaBuilder, V3EventLimits,
-    V3GroupedAura0Reader, V3GroupedAura0Writer, V3GroupedLimits, V3GroupedWriterOptions,
-    AURA_PLAN_V2_REGISTRY_VERSION, AURA_PLAN_V2_VERSION, MAX_AURA_PLAN_V2_BYTES,
-    V3_PLANNED_GROUPED_BODY_ENCODING, V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION,
-    V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION, V3_PLANNED_GROUPED_FOOTER_LAYOUT_VERSION,
+    compile_v3_planned_grouped_attempt3, decode_any_compiled_footer, decode_v3_planned_grouped,
+    decode_v3_planned_grouped_footer, encode_v3_planned_grouped_footer, AnyCompiledFooter,
+    AuraHeader, AuraPlanV2, AuraV3Column, AuraV3ColumnValues as Values, AuraV3EventBatch,
+    AuraV3VariableColumn, FieldRole, FieldScope, FieldType, PlanV2PhysicalCodec, PlanV2Selection,
+    RelationshipPermissions, SchemaBuilder, V3EventLimits, V3GroupedAura0Reader,
+    V3GroupedAura0Writer, V3GroupedLimits, V3GroupedWriterOptions,
+    AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION, AURA_PLAN_V2_REGISTRY_VERSION,
+    AURA_PLAN_V2_VERSION, MAX_AURA_PLAN_V2_BYTES, V3_PLANNED_GROUPED_BODY_ENCODING,
+    V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION, V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION,
+    V3_PLANNED_GROUPED_FOOTER_LAYOUT_VERSION,
 };
 use sha2::{Digest, Sha256};
 
 const PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v1\0";
+const PLAN_HASH_DOMAIN_V3: &[u8] = b"aura-plan-v2-registry-v3\0";
 const PLANNED_HEADER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-grouped-header-v1\0";
 const PLANNED_FOOTER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-grouped-footer-v1\0";
 const PLANNED_BODY_HASH_DOMAIN: &[u8] = b"aura-v3-planned-grouped-body-v1\0";
@@ -1130,6 +1133,597 @@ fn attempt2_physical_ids_follow_direct_and_split_order_when_side_is_not_first() 
     }
 }
 
+#[test]
+fn attempt3_selects_absolute_varints_by_complete_file_cost() {
+    let schema = small_schema();
+    let batches = vec![
+        small_batch(schema.schema_id, &[1], &[-1], &[0, 0], &[], &[]),
+        small_batch(
+            schema.schema_id,
+            &[2, 3],
+            &[0, 1],
+            &[0, 2, 4],
+            &[0, 1, 0, 1],
+            &[0, 1, -1, 2],
+        ),
+    ];
+    let artifact =
+        compile_v3_planned_grouped_attempt3(&schema, &batches, Default::default()).unwrap();
+    assert_eq!(artifact.summary.file_bytes, artifact.bytes.len() as u64);
+    assert_eq!(
+        artifact.summary.file_bytes,
+        artifact.summary.accounted_file_bytes
+    );
+    assert_eq!(artifact.inspection.candidates.len(), 4);
+    assert_eq!(
+        artifact
+            .inspection
+            .candidates
+            .iter()
+            .filter(|row| row.selected)
+            .count(),
+        1
+    );
+    assert_eq!(
+        artifact.inspection.candidates[3].candidate_id,
+        "registry3-compact-integer-codecs"
+    );
+    assert!(artifact.inspection.candidates[3].selected);
+    assert_eq!(
+        artifact.inspection.plan.registry_version,
+        AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+    );
+    assert!(!artifact.inspection.plan.relationships_attempted);
+    assert!(artifact.inspection.schema_relationships_authorized_only);
+    assert!(artifact.inspection.codecs.iter().any(|row| {
+        row.selected == PlanV2PhysicalCodec::SignedZigZagUleb128
+            && row
+                .varint_bytes
+                .is_some_and(|bytes| bytes < row.fixed_bytes)
+    }));
+    assert_eq!(
+        decode_v3_planned_grouped(&artifact.bytes, Default::default())
+            .unwrap()
+            .batches,
+        batches
+    );
+    let empty = compile_v3_planned_grouped_attempt3(&schema, &[], Default::default()).unwrap();
+    assert!(empty.inspection.candidates[0].selected);
+    assert_eq!(
+        empty.inspection.plan.registry_version,
+        AURA_PLAN_V2_REGISTRY_VERSION
+    );
+    assert!(empty.inspection.codecs.is_empty());
+    eprintln!(
+        "development attempt3 small integer complete bytes: r1={} r2={} r3_fixed={} r3_mixed={}",
+        artifact.inspection.candidates[0].complete_bytes.unwrap(),
+        artifact.inspection.candidates[1].complete_bytes.unwrap(),
+        artifact.inspection.candidates[2].complete_bytes.unwrap(),
+        artifact.inspection.candidates[3].complete_bytes.unwrap()
+    );
+}
+
+#[test]
+fn attempt3_extremes_nulls_and_fixed_only_types_round_trip() {
+    let schema = all_types_schema();
+    let batch = all_types_batch(schema.schema_id);
+    let artifact = compile_v3_planned_grouped_attempt3(
+        &schema,
+        std::slice::from_ref(&batch),
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        decode_v3_planned_grouped(&artifact.bytes, Default::default())
+            .unwrap()
+            .batches,
+        vec![batch]
+    );
+    for field_type in [
+        FieldType::I128,
+        FieldType::Opaque16,
+        FieldType::Utf8,
+        FieldType::DecimalText,
+    ] {
+        let row = artifact
+            .inspection
+            .codecs
+            .iter()
+            .find(|row| row.field_type == field_type)
+            .unwrap();
+        assert!(!row.eligible);
+        assert_eq!(row.selected, PlanV2PhysicalCodec::FixedWidth);
+        assert!(row.varint_bytes.is_none());
+    }
+    assert_eq!(
+        artifact
+            .inspection
+            .codecs
+            .iter()
+            .find(|row| row.field_type == FieldType::I64)
+            .unwrap()
+            .selected,
+        PlanV2PhysicalCodec::SignedZigZagUleb128
+    );
+    assert_eq!(
+        artifact
+            .inspection
+            .codecs
+            .iter()
+            .find(|row| row.field_type == FieldType::U64)
+            .unwrap()
+            .selected,
+        PlanV2PhysicalCodec::UnsignedUleb128
+    );
+    let extreme_schema = SchemaBuilder::new("integer_extremes")
+        .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
+        .field("signed", FieldType::I64, FieldRole::Sequence)
+        .repeated_field("side", FieldType::U8, FieldRole::Side)
+        .repeated_field("unsigned", FieldType::U64, FieldRole::Value)
+        .dual_domain_repeated_group(2, vec![2, 3], 2, permissions())
+        .finish()
+        .unwrap();
+    let groups = extreme_schema.groups.clone();
+    let extreme_schema = extreme_schema.with_v3_groups(groups).unwrap();
+    let extreme_batch = AuraV3EventBatch {
+        schema_id: extreme_schema.schema_id,
+        event_count: 2,
+        child_offsets: vec![0, 1, 3],
+        event_columns: vec![
+            AuraV3Column {
+                slot: 0,
+                validity: None,
+                values: Values::TimestampMs(vec![i64::MIN, i64::MAX]),
+            },
+            AuraV3Column {
+                slot: 1,
+                validity: None,
+                values: Values::I64(vec![i64::MIN, i64::MAX]),
+            },
+        ],
+        repeated_columns: vec![
+            AuraV3Column {
+                slot: 2,
+                validity: None,
+                values: Values::U8(vec![0, 1, 0]),
+            },
+            AuraV3Column {
+                slot: 3,
+                validity: None,
+                values: Values::U64(vec![u64::MAX, u64::MAX, u64::MAX]),
+            },
+        ],
+    };
+    let extremes = compile_v3_planned_grouped_attempt3(
+        &extreme_schema,
+        std::slice::from_ref(&extreme_batch),
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        decode_v3_planned_grouped(&extremes.bytes, Default::default())
+            .unwrap()
+            .batches,
+        vec![extreme_batch]
+    );
+    assert!(extremes
+        .inspection
+        .codecs
+        .iter()
+        .filter(|row| matches!(row.logical_slot, 0 | 1 | 3))
+        .all(|row| row.selected == PlanV2PhysicalCodec::FixedWidth));
+    eprintln!(
+        "development attempt3 all-types complete bytes: r1={} r2={} r3_fixed={} r3_mixed={}",
+        artifact.inspection.candidates[0].complete_bytes.unwrap(),
+        artifact.inspection.candidates[1].complete_bytes.unwrap(),
+        artifact.inspection.candidates[2].complete_bytes.unwrap(),
+        artifact.inspection.candidates[3].complete_bytes.unwrap()
+    );
+}
+
+#[test]
+fn attempt3_codec_plan_is_canonical_and_rechunking_stable() {
+    let schema = small_schema();
+    let whole = small_batch(
+        schema.schema_id,
+        &[1, 2, 3],
+        &[-1, 0, 1],
+        &[0, 0, 2, 4],
+        &[0, 1, 0, 1],
+        &[0, 1, -1, 2],
+    );
+    let split = vec![
+        small_batch(schema.schema_id, &[1], &[-1], &[0, 0], &[], &[]),
+        small_batch(
+            schema.schema_id,
+            &[2, 3],
+            &[0, 1],
+            &[0, 2, 4],
+            &[0, 1, 0, 1],
+            &[0, 1, -1, 2],
+        ),
+    ];
+    let one = compile_v3_planned_grouped_attempt3(
+        &schema,
+        std::slice::from_ref(&whole),
+        Default::default(),
+    )
+    .unwrap();
+    let many = compile_v3_planned_grouped_attempt3(&schema, &split, Default::default()).unwrap();
+    assert_eq!(one.summary.plan_sha256, many.summary.plan_sha256);
+    assert_eq!(
+        one.summary.global_logical_sha256,
+        many.summary.global_logical_sha256
+    );
+    assert_eq!(one.inspection.codecs, many.inspection.codecs);
+
+    let footer =
+        decode_v3_planned_grouped_footer(footer_bytes(&one.bytes), V3GroupedLimits::HARD).unwrap();
+    let encoded = footer.plan.encode(&schema).unwrap();
+    assert_eq!(AuraPlanV2::decode(&schema, &encoded).unwrap(), footer.plan);
+    let codec_count = footer.plan.physical_stream_codecs.len();
+    let codec_start = encoded.len() - 32 - footer.plan.decode_order.len() * 2 - codec_count;
+    let codec_count_offset = codec_start - 2;
+    assert_eq!(
+        u16::from_le_bytes(encoded[codec_count_offset..codec_start].try_into().unwrap()) as usize,
+        codec_count
+    );
+    assert_eq!(
+        codec_start + codec_count + footer.plan.decode_order.len() * 2,
+        encoded.len() - 32
+    );
+    let mut unknown = encoded.clone();
+    unknown[codec_start] = 99;
+    resign_plan_with_domain(&mut unknown, PLAN_HASH_DOMAIN_V3);
+    assert!(AuraPlanV2::decode(&schema, &unknown).is_err());
+    let mut bad_selector = encoded;
+    let selector = footer.plan.source_order_selector_stream_id.unwrap() as usize;
+    bad_selector[codec_start + selector] = PlanV2PhysicalCodec::UnsignedUleb128 as u8;
+    resign_plan_with_domain(&mut bad_selector, PLAN_HASH_DOMAIN_V3);
+    assert!(AuraPlanV2::decode(&schema, &bad_selector).is_err());
+    let mut bad_count = footer.plan.encode(&schema).unwrap();
+    bad_count[codec_count_offset..codec_start]
+        .copy_from_slice(&(codec_count as u16 + 1).to_le_bytes());
+    resign_plan_with_domain(&mut bad_count, PLAN_HASH_DOMAIN_V3);
+    assert!(AuraPlanV2::decode(&schema, &bad_count).is_err());
+}
+
+#[test]
+fn attempt3_fixed_width_wins_exact_codec_ties() {
+    let schema = SchemaBuilder::new("integer_codec_tie")
+        .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
+        .field("tiny", FieldType::U8, FieldRole::Value)
+        .repeated_field("side", FieldType::U8, FieldRole::Side)
+        .repeated_field("value", FieldType::I64, FieldRole::Value)
+        .dual_domain_repeated_group(1, vec![2, 3], 2, permissions())
+        .finish()
+        .unwrap();
+    let groups = schema.groups.clone();
+    let schema = schema.with_v3_groups(groups).unwrap();
+    let batch = AuraV3EventBatch {
+        schema_id: schema.schema_id,
+        event_count: 2,
+        child_offsets: vec![0, 0, 1],
+        event_columns: vec![
+            AuraV3Column {
+                slot: 0,
+                validity: None,
+                values: Values::TimestampMs(vec![0, 1]),
+            },
+            AuraV3Column {
+                slot: 1,
+                validity: None,
+                values: Values::U8(vec![1, 127]),
+            },
+        ],
+        repeated_columns: vec![
+            AuraV3Column {
+                slot: 2,
+                validity: None,
+                values: Values::U8(vec![0]),
+            },
+            AuraV3Column {
+                slot: 3,
+                validity: None,
+                values: Values::I64(vec![0]),
+            },
+        ],
+    };
+    let artifact =
+        compile_v3_planned_grouped_attempt3(&schema, &[batch], Default::default()).unwrap();
+    let tiny = artifact
+        .inspection
+        .codecs
+        .iter()
+        .find(|row| row.logical_slot == 1)
+        .unwrap();
+    assert_eq!(tiny.fixed_bytes, tiny.varint_bytes.unwrap());
+    assert_eq!(tiny.selected, PlanV2PhysicalCodec::FixedWidth);
+}
+
+#[test]
+fn attempt3_candidate_limit_failure_falls_back_to_smaller_valid_artifact() {
+    let schema = small_schema();
+    let batch = small_batch(
+        schema.schema_id,
+        &[1, 2, 3],
+        &[-1, 0, 1],
+        &[0, 0, 2, 4],
+        &[0, 1, 0, 1],
+        &[0, 1, -1, 2],
+    );
+    let compact = compile_v3_planned_grouped_attempt2_candidate(
+        &schema,
+        std::slice::from_ref(&batch),
+        V3GroupedLimits::default(),
+        PlanV2Selection::Direct,
+    )
+    .unwrap();
+    let registry1 = compile_v3_planned_grouped(
+        &schema,
+        std::slice::from_ref(&batch),
+        V3GroupedLimits::default(),
+    )
+    .unwrap();
+    assert!(registry1.summary.body_bytes > compact.summary.body_bytes);
+    let limits = V3GroupedLimits {
+        max_body_bytes: compact.summary.body_bytes,
+        ..Default::default()
+    };
+    let selected = compile_v3_planned_grouped_attempt3(&schema, &[batch], limits).unwrap();
+    assert!(!selected.inspection.candidates[0].applicable);
+    assert!(selected.inspection.candidates[0].complete_bytes.is_none());
+    assert!(selected.inspection.candidates[0]
+        .rejection
+        .as_deref()
+        .is_some_and(|reason| reason.contains("body length")));
+    assert!(selected.inspection.candidates[1..]
+        .iter()
+        .any(|candidate| candidate.selected));
+    assert_eq!(
+        selected.inspection.codecs.is_empty(),
+        selected.inspection.plan.registry_version != AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+    );
+    assert_eq!(selected.summary.file_bytes, selected.bytes.len() as u64);
+}
+
+#[test]
+fn attempt3_candidate_block_limit_uses_actual_physical_block_size() {
+    let schema = small_schema();
+    let batch = small_batch(
+        schema.schema_id,
+        &[1, 2, 3],
+        &[-1, 0, 1],
+        &[0, 0, 2, 4],
+        &[0, 1, 0, 1],
+        &[0, 1, -1, 2],
+    );
+    let registry1 =
+        compile_v3_planned_grouped(&schema, std::slice::from_ref(&batch), Default::default())
+            .unwrap();
+    let compact = compile_v3_planned_grouped_attempt2_candidate(
+        &schema,
+        std::slice::from_ref(&batch),
+        Default::default(),
+        PlanV2Selection::Direct,
+    )
+    .unwrap();
+    assert!(registry1.summary.body_bytes > compact.summary.body_bytes);
+    let defaults = V3GroupedLimits::default();
+    let limits = V3GroupedLimits {
+        event_limits: V3EventLimits {
+            max_block_bytes: compact.summary.body_bytes as usize,
+            ..defaults.event_limits
+        },
+        ..defaults
+    };
+    let selected = compile_v3_planned_grouped_attempt3(&schema, &[batch], limits).unwrap();
+    assert!(!selected.inspection.candidates[0].applicable);
+    assert!(selected.inspection.candidates[0]
+        .rejection
+        .as_deref()
+        .is_some_and(|reason| reason.contains("event block length")));
+    assert!(selected.inspection.candidates[1..]
+        .iter()
+        .any(|candidate| candidate.selected));
+    assert!(selected.summary.body_bytes <= compact.summary.body_bytes);
+}
+
+#[test]
+fn attempt3_footer_limit_keeps_registry1_when_larger_plans_are_inapplicable() {
+    let schema = all_types_schema();
+    let batch = all_types_batch(schema.schema_id);
+    let registry1 =
+        compile_v3_planned_grouped(&schema, std::slice::from_ref(&batch), Default::default())
+            .unwrap();
+    let compact = compile_v3_planned_grouped_attempt2_candidate(
+        &schema,
+        std::slice::from_ref(&batch),
+        Default::default(),
+        PlanV2Selection::Direct,
+    )
+    .unwrap();
+    assert!(compact.summary.footer_bytes > registry1.summary.footer_bytes);
+    let limits = V3GroupedLimits {
+        max_footer_bytes: registry1.summary.footer_bytes as usize,
+        ..Default::default()
+    };
+    let selected = compile_v3_planned_grouped_attempt3(&schema, &[batch], limits).unwrap();
+    assert!(selected.inspection.candidates[0].selected);
+    assert_eq!(selected.summary.file_bytes, registry1.summary.file_bytes);
+    for candidate in &selected.inspection.candidates[1..] {
+        assert!(!candidate.applicable);
+        assert!(candidate.complete_bytes.is_none());
+        assert!(candidate
+            .rejection
+            .as_deref()
+            .is_some_and(|reason| reason.contains("footer length")));
+    }
+    assert!(selected.inspection.codecs.is_empty());
+}
+
+#[test]
+fn attempt3_excludes_structurally_dominated_absolute_split_candidate() {
+    let small = small_schema();
+    let small_batch = small_batch(
+        small.schema_id,
+        &[1, 2],
+        &[-1, 0],
+        &[0, 3, 4],
+        &[0, 0, 0, 1],
+        &[0, 1, 2, 3],
+    );
+    let all = all_types_schema();
+    let all_batch = all_types_batch(all.schema_id);
+    for (schema, batches) in [
+        (&small, std::slice::from_ref(&small_batch)),
+        (&all, std::slice::from_ref(&all_batch)),
+    ] {
+        let direct = compile_v3_planned_grouped_attempt2_candidate(
+            schema,
+            batches,
+            Default::default(),
+            PlanV2Selection::Direct,
+        )
+        .unwrap();
+        let split = compile_v3_planned_grouped_attempt2_candidate(
+            schema,
+            batches,
+            Default::default(),
+            PlanV2Selection::SplitDomainDirect,
+        )
+        .unwrap();
+        // Absolute splitting conserves selector/value bytes, cannot reduce
+        // summed validity, adds variable-lane offsets, and stamps more plan
+        // metadata. It is therefore not an attempt-3 codec candidate.
+        assert!(split.summary.file_bytes >= direct.summary.file_bytes);
+        let attempt3 =
+            compile_v3_planned_grouped_attempt3(schema, batches, Default::default()).unwrap();
+        assert!(attempt3
+            .inspection
+            .candidates
+            .iter()
+            .all(|candidate| candidate.selection == PlanV2Selection::Direct));
+        assert!(attempt3
+            .inspection
+            .candidates
+            .iter()
+            .all(|candidate| !candidate.candidate_id.contains("split")));
+    }
+}
+
+#[test]
+fn attempt3_rejects_rehashed_noncanonical_and_overflow_varints() {
+    let schema = small_schema();
+    let batch = small_batch(schema.schema_id, &[0], &[0], &[0, 1], &[0], &[0]);
+    let artifact = compile_v3_planned_grouped_attempt3(
+        &schema,
+        std::slice::from_ref(&batch),
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        artifact.inspection.plan.registry_version,
+        AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+    );
+    let header_len = AuraHeader::encoded_len(&artifact.bytes).unwrap();
+    let body = &artifact.bytes[header_len..footer_start(&artifact.bytes)];
+    let first_event_value = 72 + (batch.event_count as usize + 1) * 4;
+    assert_eq!(body[first_event_value], 0);
+    let overlong = rebuild_with_replaced_body_range(
+        &artifact,
+        first_event_value..first_event_value + 1,
+        &[0x80, 0x00],
+    );
+    assert!(decode_v3_planned_grouped(&overlong, V3GroupedLimits::HARD).is_err());
+    let overflow = rebuild_with_replaced_body_range(
+        &artifact,
+        first_event_value..first_event_value + 1,
+        &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02],
+    );
+    assert!(decode_v3_planned_grouped(&overflow, V3GroupedLimits::HARD).is_err());
+    let truncated = rebuild_with_replaced_body_range(
+        &artifact,
+        first_event_value..first_event_value + 1,
+        &[0x80],
+    );
+    assert!(decode_v3_planned_grouped(&truncated, V3GroupedLimits::HARD).is_err());
+}
+
+#[test]
+fn attempt3_every_prefix_and_single_byte_mutation_fails_closed() {
+    let schema = small_schema();
+    let batch = small_batch(
+        schema.schema_id,
+        &[1, 2],
+        &[0, 1],
+        &[0, 1, 2],
+        &[0, 1],
+        &[1, 2],
+    );
+    let artifact =
+        compile_v3_planned_grouped_attempt3(&schema, &[batch], Default::default()).unwrap();
+    assert_eq!(
+        artifact.inspection.plan.registry_version,
+        AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+    );
+    for length in 0..artifact.bytes.len() {
+        let result = std::panic::catch_unwind(|| {
+            decode_v3_planned_grouped(&artifact.bytes[..length], V3GroupedLimits::HARD)
+        });
+        assert!(
+            result.is_ok_and(|decoded| decoded.is_err()),
+            "prefix {length}"
+        );
+    }
+    for index in 0..artifact.bytes.len() {
+        let mut corrupted = artifact.bytes.clone();
+        corrupted[index] ^= 1;
+        let result = std::panic::catch_unwind(|| {
+            decode_v3_planned_grouped(&corrupted, V3GroupedLimits::HARD)
+        });
+        assert!(result.is_ok_and(|decoded| decoded.is_err()), "byte {index}");
+    }
+}
+
+#[test]
+fn registry1_registry2_plan_and_container_hashes_are_golden() {
+    let schema = all_types_schema();
+    let batch = all_types_batch(schema.schema_id);
+    let registry1 =
+        compile_v3_planned_grouped(&schema, std::slice::from_ref(&batch), Default::default())
+            .unwrap();
+    let registry2 = compile_v3_planned_grouped_attempt2_candidate(
+        &schema,
+        std::slice::from_ref(&batch),
+        Default::default(),
+        PlanV2Selection::Direct,
+    )
+    .unwrap();
+    let footer1 =
+        decode_v3_planned_grouped_footer(footer_bytes(&registry1.bytes), V3GroupedLimits::HARD)
+            .unwrap();
+    let footer2 =
+        decode_v3_planned_grouped_footer(footer_bytes(&registry2.bytes), V3GroupedLimits::HARD)
+            .unwrap();
+    assert_eq!(
+        hex_bytes(&footer1.plan_sha256),
+        "ffc6f6b08a8a020d209d9731d6cdf4bac6d9503fccbe3d0f3f41f0fa8b67fc43"
+    );
+    assert_eq!(
+        hex_bytes(&<[u8; 32]>::from(Sha256::digest(&registry1.bytes))),
+        "1d245dfd95c7fedc710c34a9e2cdd6a23a093f65e1061dcf7246fbb1f2f353f0"
+    );
+    assert_eq!(
+        hex_bytes(&footer2.plan_sha256),
+        "d02ba9e0a52fb5ed937ad5666d68fc0fe6c098a1110cb8bba1d70c5eefef2646"
+    );
+    assert_eq!(
+        hex_bytes(&<[u8; 32]>::from(Sha256::digest(&registry2.bytes))),
+        "7abdc2934d74556a4469b41718ae436a693a85b19547bd8978379f0d3fa04b7d"
+    );
+}
+
 fn plan_hash(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(PLAN_HASH_DOMAIN);
@@ -1138,10 +1732,23 @@ fn plan_hash(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn resign_plan(bytes: &mut [u8]) {
     let hash_start = bytes.len() - 32;
     let hash = plan_hash(&bytes[..hash_start]);
     bytes[hash_start..].copy_from_slice(&hash);
+}
+
+fn resign_plan_with_domain(bytes: &mut [u8], domain: &[u8]) {
+    let hash_start = bytes.len() - 32;
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update((hash_start as u64).to_le_bytes());
+    hasher.update(&bytes[..hash_start]);
+    bytes[hash_start..].copy_from_slice(&<[u8; 32]>::from(hasher.finalize()));
 }
 
 fn domain_hash(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
@@ -1179,6 +1786,33 @@ fn resign_attempt2_body_mutation(
         decode_v3_planned_grouped_footer(footer_bytes(&artifact.bytes), V3GroupedLimits::HARD)
             .unwrap();
     footer.body_sha256 = domain_hash(PLANNED_BODY_HASH_DOMAIN, &body);
+    footer.chunks[0].stored_sha256 = Sha256::digest(&body).into();
+    let footer_bytes = encode_v3_planned_grouped_footer(&footer, V3GroupedLimits::HARD).unwrap();
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&artifact.bytes[..header_len]);
+    rebuilt.extend_from_slice(&body);
+    rebuilt.extend_from_slice(&footer_bytes);
+    rebuilt.extend_from_slice(&(footer_bytes.len() as u32).to_le_bytes());
+    rebuilt.extend_from_slice(b"sealed:)");
+    rebuilt
+}
+
+fn rebuild_with_replaced_body_range(
+    artifact: &aura_codec::V3PlannedGroupedArtifact,
+    range: std::ops::Range<usize>,
+    replacement: &[u8],
+) -> Vec<u8> {
+    let header_len = AuraHeader::encoded_len(&artifact.bytes).unwrap();
+    let mut body = artifact.bytes[header_len..footer_start(&artifact.bytes)].to_vec();
+    body.splice(range, replacement.iter().copied());
+    let body_len = body.len() as u64;
+    body[64..72].copy_from_slice(&body_len.to_le_bytes());
+    let mut footer =
+        decode_v3_planned_grouped_footer(footer_bytes(&artifact.bytes), V3GroupedLimits::HARD)
+            .unwrap();
+    footer.body_len = body_len;
+    footer.body_sha256 = domain_hash(PLANNED_BODY_HASH_DOMAIN, &body);
+    footer.chunks[0].stored_len = body_len;
     footer.chunks[0].stored_sha256 = Sha256::digest(&body).into();
     let footer_bytes = encode_v3_planned_grouped_footer(&footer, V3GroupedLimits::HARD).unwrap();
     let mut rebuilt = Vec::new();

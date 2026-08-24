@@ -3,8 +3,12 @@
 //! Attempt 1 stores exact direct `AURAV3EB` chunks. Attempt 2 adds a distinct
 //! plan-bound compact-stream block and scores registry-1 direct, compact
 //! registry-2 direct, and schema-authorized compact split-domain direct by
-//! actual complete-file bytes. Nothing here claims compression, Parquet
-//! comparison, holdout evidence, or production readiness.
+//! actual complete-file bytes. Attempt 3 adds a distinct Direct-only integer
+//! codec block and scores registry-1 Direct, registry-2 compact Direct,
+//! registry-3 all-fixed, and registry-3 per-stream fixed/absolute-varint files.
+//! It deliberately excludes relationship math and compression. Nothing here
+//! claims Parquet comparison, holdout evidence, production readiness, or the
+//! campaign size goal.
 
 use sha2::{Digest, Sha256};
 
@@ -15,10 +19,12 @@ use crate::schema::{
 };
 use crate::v3_events::{
     canonical_v3_event_batch_sha256, decode_v3_event_block, encode_v3_event_block,
-    validate_v3_event_batch, AuraV3EventBatch, CanonicalV3EventHasher,
+    validate_v3_event_batch, AuraV3EventBatch, CanonicalV3EventHasher, V3EventLimits,
+    MAX_V3_EVENT_BLOCK_BYTES,
 };
 use crate::v3_grouped_container::V3GroupedLimits;
 use crate::v3_plan_v2::{AuraPlanV2, PlanV2Inspection, PlanV2Selection, MAX_AURA_PLAN_V2_BYTES};
+use crate::v3_plan_v2::{PlanV2PhysicalCodec, AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION};
 use crate::v3_values::{
     canonical_v3_schema_fingerprint, decode_column, encode_column, AuraV3Column,
     AuraV3ColumnValues, AuraV3VariableColumn, V3ValueLimits,
@@ -31,6 +37,8 @@ pub const V3_PLANNED_GROUPED_BODY_LAYOUT_VERSION: u16 = 1;
 pub const V3_PLANNED_GROUPED_DIRECT_BLOCK_VERSION: u16 = crate::V3_EVENT_BLOCK_VERSION;
 pub const V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION: u16 = 2;
 pub const V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION: u16 = 2;
+pub const V3_PLANNED_GROUPED_INTEGER_CODEC_BODY_LAYOUT_VERSION: u16 = 3;
+pub const V3_PLANNED_GROUPED_INTEGER_CODEC_BLOCK_VERSION: u16 = 3;
 pub const V3_PLANNED_GROUPED_FOOTER_PREFIX_BYTES: usize = 216;
 pub const V3_PLANNED_GROUPED_CHUNK_DESCRIPTOR_BYTES: usize = 120;
 pub const MAX_V3_PLANNED_GROUPED_FOOTER_BYTES: usize = 64 * 1024 * 1024;
@@ -98,6 +106,7 @@ pub struct V3PlannedGroupedInspection {
     pub plan: PlanV2Inspection,
     pub schema_relationships_authorized_only: bool,
     pub candidates: Vec<V3PlannedGroupedCandidateInspection>,
+    pub codecs: Vec<V3PlannedGroupedCodecInspection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +118,18 @@ pub struct V3PlannedGroupedCandidateInspection {
     pub rejection: Option<String>,
     pub complete_bytes: Option<u64>,
     pub selected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V3PlannedGroupedCodecInspection {
+    pub physical_stream_id: u16,
+    pub logical_slot: u16,
+    pub field_type: crate::FieldType,
+    pub eligible: bool,
+    pub fixed_bytes: u64,
+    pub varint_bytes: Option<u64>,
+    pub selected: PlanV2PhysicalCodec,
+    pub rejection: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,13 +353,300 @@ pub fn compile_v3_planned_grouped_attempt2_candidate(
     compile_attempt2_candidate(schema, batches, limits, selection)
 }
 
+/// Size-attempt 3: select exact absolute integer codecs without relationship math.
+/// Compact SplitDomainDirect is deliberately not a candidate: for absolute
+/// fixed/varint lanes it preserves the same selector and value bytes, cannot
+/// reduce summed validity bytes, adds one variable offset at a domain split,
+/// and stamps extra dependency/physical-stream metadata. Its contribution is
+/// therefore structurally non-negative relative to compact Direct and belongs
+/// to the separately accounted relationship attempt.
+pub fn compile_v3_planned_grouped_attempt3(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    limits: V3GroupedLimits,
+) -> Result<V3PlannedGroupedArtifact> {
+    validate_attempt3_inputs(schema, batches, limits)?;
+    let fixed_plan = AuraPlanV2::integer_codec_direct_for_schema(schema);
+    let mixed_plan_and_rows = fixed_plan
+        .clone()
+        .and_then(|plan| select_integer_codecs(schema, batches, plan));
+    let mixed_rows = mixed_plan_and_rows
+        .as_ref()
+        .ok()
+        .map(|(_, rows)| rows.clone());
+    let mut fixed_rows = mixed_rows.clone().unwrap_or_default();
+    for row in &mut fixed_rows {
+        row.selected = PlanV2PhysicalCodec::FixedWidth;
+        row.rejection = Some("registry 3 all-fixed candidate".to_owned());
+    }
+    let candidates = vec![
+        compile_v3_planned_grouped(schema, batches, limits),
+        compile_attempt2_candidate(schema, batches, limits, PlanV2Selection::Direct),
+        fixed_plan
+            .and_then(|plan| compile_compact_candidate_with_plan(schema, batches, limits, plan)),
+        mixed_plan_and_rows.and_then(|(plan, _)| {
+            compile_compact_candidate_with_plan(schema, batches, limits, plan)
+        }),
+    ];
+    if let Some(error) = candidates
+        .iter()
+        .filter_map(|candidate| candidate.as_ref().err())
+        .find(|error| !is_expected_candidate_limit(error))
+    {
+        return Err(error.clone());
+    }
+    let sizes = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .as_ref()
+                .ok()
+                .map(|value| value.summary.file_bytes)
+        })
+        .collect::<Vec<_>>();
+    let selected_index = sizes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, bytes)| bytes.map(|bytes| (index, bytes)))
+        .min_by_key(|(index, bytes)| (*bytes, *index))
+        .map(|(index, _)| index)
+        .ok_or(AuraError::InvalidValue(
+            "v3 planned no applicable candidate",
+        ))?;
+    let ids = [
+        "registry1-direct",
+        "registry2-compact-direct",
+        "registry3-compact-fixed",
+        "registry3-compact-integer-codecs",
+    ];
+    let candidate_rows = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| V3PlannedGroupedCandidateInspection {
+            candidate_id: (*id).to_owned(),
+            selection: PlanV2Selection::Direct,
+            authorized: true,
+            applicable: candidates[index].is_ok(),
+            rejection: match &candidates[index] {
+                Err(error) => Some(sanitize_candidate_error(error)),
+                Ok(_) if index != selected_index => {
+                    Some("complete cost did not beat selected candidate".to_owned())
+                }
+                Ok(_) => None,
+            },
+            complete_bytes: sizes[index],
+            selected: index == selected_index,
+        })
+        .collect::<Vec<_>>();
+    let mut selected = candidates
+        .into_iter()
+        .nth(selected_index)
+        .ok_or(AuraError::InvalidValue("v3 planned candidate count"))??;
+    selected.inspection.candidates = candidate_rows;
+    selected.inspection.codecs = match selected_index {
+        2 => fixed_rows,
+        3 => mixed_rows.unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    Ok(selected)
+}
+
+fn validate_attempt3_inputs(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    limits: V3GroupedLimits,
+) -> Result<()> {
+    let limits = limits.effective();
+    crate::v3_events::validate_v3_grouped_exact_subset(schema)?;
+    if batches.len() > limits.max_chunks {
+        return Err(AuraError::InvalidValue("v3 planned grouped chunk count"));
+    }
+    let mut events = 0u64;
+    let mut children = 0u64;
+    for batch in batches {
+        validate_v3_event_batch(
+            schema,
+            batch,
+            planned_structural_limits(limits.event_limits),
+        )?;
+        if batch.event_count == 0 {
+            return Err(AuraError::InvalidValue("v3 planned grouped empty chunk"));
+        }
+        events = events
+            .checked_add(u64::from(batch.event_count))
+            .filter(|value| *value <= limits.max_events)
+            .ok_or(AuraError::InvalidValue("v3 planned grouped event count"))?;
+        children = children
+            .checked_add(u64::from(batch.child_count()))
+            .filter(|value| *value <= limits.max_children)
+            .ok_or(AuraError::InvalidValue("v3 planned grouped child count"))?;
+    }
+    Ok(())
+}
+
+/// Planned compact candidates use the caller's logical/value ceilings, while
+/// `max_block_bytes` applies to the actual candidate block rather than the
+/// larger canonical `AURAV3EB` reference representation used for structural
+/// validation and canonical hashing.
+const fn planned_structural_limits(limits: V3EventLimits) -> V3EventLimits {
+    V3EventLimits {
+        max_block_bytes: MAX_V3_EVENT_BLOCK_BYTES,
+        max_variable_value_bytes: limits.max_variable_value_bytes,
+        max_events: limits.max_events,
+        max_children: limits.max_children,
+        max_values: limits.max_values,
+    }
+}
+
+fn sanitize_candidate_error(error: &AuraError) -> String {
+    error
+        .to_string()
+        .chars()
+        .take(160)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn is_expected_candidate_limit(error: &AuraError) -> bool {
+    matches!(
+        error,
+        AuraError::InvalidValue(
+            "v3 event block length"
+                | "v3 planned block length"
+                | "v3 planned grouped body length"
+                | "v3 planned grouped footer length"
+        )
+    )
+}
+
+fn select_integer_codecs(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    mut plan: AuraPlanV2,
+) -> Result<(AuraPlanV2, Vec<V3PlannedGroupedCodecInspection>)> {
+    let mut rows = Vec::new();
+    for field in &schema.fields {
+        if field.index == plan.discriminator_slot {
+            continue;
+        }
+        let physical = plan.streams[usize::from(field.index)].physical_stream_ids[0];
+        let fixed_bytes = encoded_codec_bytes(
+            schema,
+            batches,
+            field.index,
+            PlanV2PhysicalCodec::FixedWidth,
+        )?;
+        let varint_codec = integer_varint_codec(field.field_type);
+        let varint_bytes = varint_codec
+            .map(|codec| encoded_codec_bytes(schema, batches, field.index, codec))
+            .transpose()?;
+        let selected_codec = match (varint_codec, varint_bytes) {
+            (Some(codec), Some(bytes)) if bytes < fixed_bytes => codec,
+            _ => PlanV2PhysicalCodec::FixedWidth,
+        };
+        plan.physical_stream_codecs[usize::from(physical)] = selected_codec;
+        rows.push(V3PlannedGroupedCodecInspection {
+            physical_stream_id: physical,
+            logical_slot: field.index,
+            field_type: field.field_type,
+            eligible: varint_codec.is_some(),
+            fixed_bytes: fixed_bytes as u64,
+            varint_bytes: varint_bytes.map(|value| value as u64),
+            selected: selected_codec,
+            rejection: match (varint_codec, varint_bytes) {
+                (None, _) => Some("type is fixed-only in registry 3".to_owned()),
+                (Some(_), Some(bytes)) if bytes >= fixed_bytes => {
+                    Some("varint did not beat fixed width".to_owned())
+                }
+                _ => None,
+            },
+        });
+    }
+    plan.validate(schema)?;
+    Ok((plan, rows))
+}
+
+fn encoded_codec_bytes(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    slot: u16,
+    codec: PlanV2PhysicalCodec,
+) -> Result<usize> {
+    let field = schema
+        .fields
+        .get(usize::from(slot))
+        .filter(|field| field.index == slot)
+        .ok_or(AuraError::InvalidValue("v3 planned codec slot"))?;
+    let scoped_position = schema
+        .fields
+        .iter()
+        .filter(|candidate| candidate.scope == field.scope)
+        .position(|candidate| candidate.index == slot)
+        .ok_or(AuraError::InvalidValue("v3 planned codec slot"))?;
+    let mut total = 0usize;
+    for batch in batches {
+        let (column, rows) = match field.scope {
+            FieldScope::Event => (
+                &batch.event_columns[scoped_position],
+                batch.event_count as usize,
+            ),
+            FieldScope::Repeated => (
+                &batch.repeated_columns[scoped_position],
+                batch.child_count() as usize,
+            ),
+        };
+        let mut encoded = Vec::new();
+        encode_codec_lane(column, rows, codec, &mut encoded)?;
+        total = total
+            .checked_add(encoded.len())
+            .ok_or(AuraError::InvalidValue("v3 planned codec length"))?;
+    }
+    Ok(total)
+}
+
+const fn integer_varint_codec(field_type: crate::FieldType) -> Option<PlanV2PhysicalCodec> {
+    match field_type {
+        crate::FieldType::U8
+        | crate::FieldType::U16
+        | crate::FieldType::U32
+        | crate::FieldType::U64 => Some(PlanV2PhysicalCodec::UnsignedUleb128),
+        crate::FieldType::I8
+        | crate::FieldType::I16
+        | crate::FieldType::I32
+        | crate::FieldType::I64
+        | crate::FieldType::TimestampNs
+        | crate::FieldType::TimestampMs => Some(PlanV2PhysicalCodec::SignedZigZagUleb128),
+        crate::FieldType::I128
+        | crate::FieldType::Opaque16
+        | crate::FieldType::Utf8
+        | crate::FieldType::DecimalText => None,
+    }
+}
+
 fn compile_attempt2_candidate(
     schema: &SchemaDescriptor,
     batches: &[AuraV3EventBatch],
     limits: V3GroupedLimits,
     selection: PlanV2Selection,
 ) -> Result<V3PlannedGroupedArtifact> {
+    let plan = AuraPlanV2::candidate_for_schema(schema, selection)?;
+    compile_compact_candidate_with_plan(schema, batches, limits, plan)
+}
+
+fn compile_compact_candidate_with_plan(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    limits: V3GroupedLimits,
+    plan: AuraPlanV2,
+) -> Result<V3PlannedGroupedArtifact> {
     let limits = limits.effective();
+    let structural_limits = planned_structural_limits(limits.event_limits);
     crate::v3_events::validate_v3_grouped_exact_subset(schema)?;
     if batches.len() > limits.max_chunks {
         return Err(AuraError::InvalidValue("v3 planned grouped chunk count"));
@@ -346,7 +654,7 @@ fn compile_attempt2_candidate(
     let mut event_count = 0u64;
     let mut child_count = 0u64;
     for batch in batches {
-        validate_v3_event_batch(schema, batch, limits.event_limits)?;
+        validate_v3_event_batch(schema, batch, structural_limits)?;
         if batch.event_count == 0 {
             return Err(AuraError::InvalidValue("v3 planned grouped empty chunk"));
         }
@@ -359,7 +667,6 @@ fn compile_attempt2_candidate(
             .filter(|value| *value <= limits.max_children)
             .ok_or(AuraError::InvalidValue("v3 planned grouped child count"))?;
     }
-    let plan = AuraPlanV2::candidate_for_schema(schema, selection)?;
     let plan_sha256 = plan.hash(schema)?;
     let header_bytes = canonical_header(schema)?.encode()?;
     let mut body = Vec::new();
@@ -375,7 +682,7 @@ fn compile_attempt2_candidate(
             .map_err(|_| AuraError::InvalidValue("v3 planned grouped event count"))?,
         u32::try_from(child_count)
             .map_err(|_| AuraError::InvalidValue("v3 planned grouped child count"))?,
-        limits.event_limits,
+        structural_limits,
     )?;
     for (index, batch) in batches.iter().enumerate() {
         let block = encode_attempt2_block(schema, batch, &plan, limits.event_limits)?;
@@ -399,7 +706,7 @@ fn compile_attempt2_candidate(
             chunk_logical_sha256: canonical_v3_event_batch_sha256(
                 schema,
                 batch,
-                limits.event_limits,
+                structural_limits,
             )?,
         });
         body.extend_from_slice(&block);
@@ -417,8 +724,17 @@ fn compile_attempt2_candidate(
         event_count,
         child_count,
         body_len: body.len() as u64,
-        body_layout_version: V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION,
-        block_version: V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION,
+        body_layout_version: if plan.registry_version == AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
+        {
+            V3_PLANNED_GROUPED_INTEGER_CODEC_BODY_LAYOUT_VERSION
+        } else {
+            V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION
+        },
+        block_version: if plan.registry_version == AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION {
+            V3_PLANNED_GROUPED_INTEGER_CODEC_BLOCK_VERSION
+        } else {
+            V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION
+        },
         schema: schema.clone(),
         plan,
         schema_fingerprint,
@@ -474,7 +790,7 @@ fn encode_attempt2_block(
     plan: &AuraPlanV2,
     limits: crate::V3EventLimits,
 ) -> Result<Vec<u8>> {
-    validate_v3_event_batch(schema, batch, limits)?;
+    validate_v3_event_batch(schema, batch, planned_structural_limits(limits))?;
     let repeated_fields = schema
         .fields
         .iter()
@@ -501,7 +817,12 @@ fn encode_attempt2_block(
     out.try_reserve_exact(ATTEMPT2_BLOCK_HEADER_BYTES)
         .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
     out.extend_from_slice(ATTEMPT2_BLOCK_MAGIC);
-    put_u16(&mut out, V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION);
+    let block_version = if plan.registry_version == AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION {
+        V3_PLANNED_GROUPED_INTEGER_CODEC_BLOCK_VERSION
+    } else {
+        V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION
+    };
+    put_u16(&mut out, block_version);
     out.push(plan.selection as u8);
     out.push(0);
     put_u32(&mut out, schema.schema_id);
@@ -530,7 +851,12 @@ fn encode_attempt2_block(
         put_u32(&mut out, *offset);
     }
     for column in &batch.event_columns {
-        encode_compact_lane(column, batch.event_count as usize, &mut out)?;
+        encode_codec_lane(
+            column,
+            batch.event_count as usize,
+            codec_for_column(plan, column.slot)?,
+            &mut out,
+        )?;
     }
     out.extend_from_slice(selector);
     for (field, column) in repeated_fields.iter().zip(&batch.repeated_columns) {
@@ -538,7 +864,12 @@ fn encode_attempt2_block(
             continue;
         }
         if plan.selection == PlanV2Selection::Direct {
-            encode_compact_lane(column, batch.child_count() as usize, &mut out)?;
+            encode_codec_lane(
+                column,
+                batch.child_count() as usize,
+                codec_for_column(plan, column.slot)?,
+                &mut out,
+            )?;
         } else {
             let zero = select_column(column, &domain[0])?;
             let one = select_column(column, &domain[1])?;
@@ -570,7 +901,12 @@ fn decode_attempt2_block(
     }
     let mut reader = ByteReader::new(bytes);
     if reader.read_exact(8)? != ATTEMPT2_BLOCK_MAGIC
-        || reader.read_u16_le()? != V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION
+        || reader.read_u16_le()?
+            != if plan.registry_version == AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION {
+                V3_PLANNED_GROUPED_INTEGER_CODEC_BLOCK_VERSION
+            } else {
+                V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION
+            }
         || reader.read_u8()? != plan.selection as u8
         || reader.read_u8()? != 0
         || reader.read_u32_le()? != schema.schema_id
@@ -601,7 +937,9 @@ fn decode_attempt2_block(
         || reader.read_u16_le()? as usize != repeated_fields.len()
         || reader.read_u16_le()? as usize != physical_count
         || reader.read_u16_le()? != 0
-        || reader.read_u64_le()? as usize != bytes.len()
+        || reader.read_u64_le()?
+            != u64::try_from(bytes.len())
+                .map_err(|_| AuraError::InvalidValue("v3 planned block length"))?
         || event_count as usize > limits.max_events
         || child_count as usize > limits.max_children
     {
@@ -630,11 +968,12 @@ fn decode_attempt2_block(
         .try_reserve_exact(event_fields.len())
         .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
     for field in event_fields {
-        event_columns.push(decode_compact_lane(
+        event_columns.push(decode_codec_lane(
             field.index,
             field.field_type,
             field.nullable,
             event_count as usize,
+            codec_for_column(plan, field.index)?,
             &mut reader,
             value_limits,
         )?);
@@ -659,11 +998,12 @@ fn decode_attempt2_block(
                 values: AuraV3ColumnValues::U8(selector.clone()),
             });
         } else if plan.selection == PlanV2Selection::Direct {
-            let column = decode_compact_lane(
+            let column = decode_codec_lane(
                 field.index,
                 field.field_type,
                 field.nullable,
                 child_count as usize,
+                codec_for_column(plan, field.index)?,
                 &mut reader,
                 value_limits,
             )?;
@@ -696,7 +1036,7 @@ fn decode_attempt2_block(
         event_columns,
         repeated_columns,
     };
-    validate_v3_event_batch(schema, &batch, limits)?;
+    validate_v3_event_batch(schema, &batch, planned_structural_limits(limits))?;
     Ok(batch)
 }
 
@@ -710,6 +1050,207 @@ fn encode_compact_lane(column: &AuraV3Column, rows: usize, out: &mut Vec<u8>) ->
         .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
     out.extend_from_slice(payload);
     Ok(())
+}
+
+fn codec_for_column(plan: &AuraPlanV2, slot: u16) -> Result<PlanV2PhysicalCodec> {
+    if plan.registry_version != AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION {
+        return Ok(PlanV2PhysicalCodec::FixedWidth);
+    }
+    let physical = plan
+        .streams
+        .get(usize::from(slot))
+        .filter(|stream| stream.slot == slot)
+        .and_then(|stream| stream.physical_stream_ids.first())
+        .copied()
+        .ok_or(AuraError::InvalidValue("v3 planned codec stream"))?;
+    plan.physical_stream_codecs
+        .get(usize::from(physical))
+        .copied()
+        .ok_or(AuraError::InvalidValue("v3 planned codec stream"))
+}
+
+fn encode_codec_lane(
+    column: &AuraV3Column,
+    rows: usize,
+    codec: PlanV2PhysicalCodec,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if codec == PlanV2PhysicalCodec::FixedWidth {
+        return encode_compact_lane(column, rows, out);
+    }
+    if let Some(validity) = &column.validity {
+        out.try_reserve_exact(validity.len())
+            .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
+        out.extend_from_slice(validity);
+    }
+    match (&column.values, codec) {
+        (AuraV3ColumnValues::U8(values), PlanV2PhysicalCodec::UnsignedUleb128) => {
+            for value in values {
+                crate::varint::encode_u64(u64::from(*value), out);
+            }
+        }
+        (AuraV3ColumnValues::U16(values), PlanV2PhysicalCodec::UnsignedUleb128) => {
+            for value in values {
+                crate::varint::encode_u64(u64::from(*value), out);
+            }
+        }
+        (AuraV3ColumnValues::U32(values), PlanV2PhysicalCodec::UnsignedUleb128) => {
+            for value in values {
+                crate::varint::encode_u64(u64::from(*value), out);
+            }
+        }
+        (AuraV3ColumnValues::U64(values), PlanV2PhysicalCodec::UnsignedUleb128) => {
+            for value in values {
+                crate::varint::encode_u64(*value, out);
+            }
+        }
+        (AuraV3ColumnValues::I8(values), PlanV2PhysicalCodec::SignedZigZagUleb128) => {
+            for value in values {
+                crate::varint::encode_i64(i64::from(*value), out);
+            }
+        }
+        (AuraV3ColumnValues::I16(values), PlanV2PhysicalCodec::SignedZigZagUleb128) => {
+            for value in values {
+                crate::varint::encode_i64(i64::from(*value), out);
+            }
+        }
+        (AuraV3ColumnValues::I32(values), PlanV2PhysicalCodec::SignedZigZagUleb128) => {
+            for value in values {
+                crate::varint::encode_i64(i64::from(*value), out);
+            }
+        }
+        (
+            AuraV3ColumnValues::I64(values)
+            | AuraV3ColumnValues::TimestampNs(values)
+            | AuraV3ColumnValues::TimestampMs(values),
+            PlanV2PhysicalCodec::SignedZigZagUleb128,
+        ) => {
+            for value in values {
+                crate::varint::encode_i64(*value, out);
+            }
+        }
+        _ => return Err(AuraError::InvalidValue("v3 planned codec type")),
+    }
+    Ok(())
+}
+
+fn decode_codec_lane(
+    slot: u16,
+    field_type: crate::FieldType,
+    nullable: bool,
+    rows: usize,
+    codec: PlanV2PhysicalCodec,
+    reader: &mut ByteReader<'_>,
+    limits: V3ValueLimits,
+) -> Result<AuraV3Column> {
+    if codec == PlanV2PhysicalCodec::FixedWidth {
+        return decode_compact_lane(slot, field_type, nullable, rows, reader, limits);
+    }
+    let validity = if nullable {
+        Some(reader.read_exact(rows.div_ceil(8))?.to_vec())
+    } else {
+        None
+    };
+    macro_rules! decode_unsigned {
+        ($variant:ident, $type:ty) => {{
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(rows)
+                .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
+            for _ in 0..rows {
+                values.push(
+                    <$type>::try_from(decode_canonical_uleb128(reader)?)
+                        .map_err(|_| AuraError::InvalidValue("v3 planned unsigned varint range"))?,
+                );
+            }
+            AuraV3ColumnValues::$variant(values)
+        }};
+    }
+    macro_rules! decode_signed {
+        ($variant:ident, $type:ty) => {{
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(rows)
+                .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
+            for _ in 0..rows {
+                values.push(
+                    <$type>::try_from(decode_canonical_zigzag(reader)?)
+                        .map_err(|_| AuraError::InvalidValue("v3 planned signed varint range"))?,
+                );
+            }
+            AuraV3ColumnValues::$variant(values)
+        }};
+    }
+    let values = match (field_type, codec) {
+        (crate::FieldType::U8, PlanV2PhysicalCodec::UnsignedUleb128) => {
+            decode_unsigned!(U8, u8)
+        }
+        (crate::FieldType::U16, PlanV2PhysicalCodec::UnsignedUleb128) => {
+            decode_unsigned!(U16, u16)
+        }
+        (crate::FieldType::U32, PlanV2PhysicalCodec::UnsignedUleb128) => {
+            decode_unsigned!(U32, u32)
+        }
+        (crate::FieldType::U64, PlanV2PhysicalCodec::UnsignedUleb128) => {
+            decode_unsigned!(U64, u64)
+        }
+        (crate::FieldType::I8, PlanV2PhysicalCodec::SignedZigZagUleb128) => {
+            decode_signed!(I8, i8)
+        }
+        (crate::FieldType::I16, PlanV2PhysicalCodec::SignedZigZagUleb128) => {
+            decode_signed!(I16, i16)
+        }
+        (crate::FieldType::I32, PlanV2PhysicalCodec::SignedZigZagUleb128) => {
+            decode_signed!(I32, i32)
+        }
+        (crate::FieldType::I64, PlanV2PhysicalCodec::SignedZigZagUleb128) => {
+            decode_signed!(I64, i64)
+        }
+        (crate::FieldType::TimestampNs, PlanV2PhysicalCodec::SignedZigZagUleb128) => {
+            decode_signed!(TimestampNs, i64)
+        }
+        (crate::FieldType::TimestampMs, PlanV2PhysicalCodec::SignedZigZagUleb128) => {
+            decode_signed!(TimestampMs, i64)
+        }
+        _ => return Err(AuraError::InvalidValue("v3 planned codec type")),
+    };
+    Ok(AuraV3Column {
+        slot,
+        validity,
+        values,
+    })
+}
+
+fn decode_canonical_uleb128(reader: &mut ByteReader<'_>) -> Result<u64> {
+    let mut value = 0u64;
+    for index in 0..10u32 {
+        let byte = reader.read_u8()?;
+        if index == 9 && (byte & 0xfe) != 0 {
+            return Err(AuraError::InvalidValue("v3 planned varint overflow"));
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            if usize::try_from(index + 1).unwrap() != uleb128_len(value) {
+                return Err(AuraError::InvalidValue("v3 planned varint noncanonical"));
+            }
+            return Ok(value);
+        }
+    }
+    Err(AuraError::InvalidValue("v3 planned varint overflow"))
+}
+
+fn decode_canonical_zigzag(reader: &mut ByteReader<'_>) -> Result<i64> {
+    let value = decode_canonical_uleb128(reader)?;
+    Ok(((value >> 1) as i64) ^ (-((value & 1) as i64)))
+}
+
+const fn uleb128_len(mut value: u64) -> usize {
+    let mut len = 1usize;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
 }
 
 fn decode_compact_lane(
@@ -1083,12 +1624,13 @@ pub fn decode_v3_planned_grouped(
         .map_err(|_| AuraError::InvalidValue("v3 planned grouped event count"))?;
     let total_children = u32::try_from(footer.child_count)
         .map_err(|_| AuraError::InvalidValue("v3 planned grouped child count"))?;
-    let mut global = CanonicalV3EventHasher::new(
-        &footer.schema,
-        total_events,
-        total_children,
-        limits.event_limits,
-    )?;
+    let logical_limits = if footer.block_version == V3_PLANNED_GROUPED_DIRECT_BLOCK_VERSION {
+        limits.event_limits
+    } else {
+        planned_structural_limits(limits.event_limits)
+    };
+    let mut global =
+        CanonicalV3EventHasher::new(&footer.schema, total_events, total_children, logical_limits)?;
     let mut batches = Vec::new();
     batches
         .try_reserve_exact(footer.chunks.len())
@@ -1115,7 +1657,7 @@ pub fn decode_v3_planned_grouped(
         };
         if batch.event_count != chunk.event_count
             || batch.child_count() != chunk.child_count
-            || canonical_v3_event_batch_sha256(&footer.schema, &batch, limits.event_limits)?
+            || canonical_v3_event_batch_sha256(&footer.schema, &batch, logical_limits)?
                 != chunk.chunk_logical_sha256
         {
             return Err(AuraError::InvalidValue("v3 planned grouped chunk identity"));
@@ -1284,6 +1826,9 @@ pub fn decode_v3_planned_grouped_footer(
         ) | (
             V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION,
             V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION
+        ) | (
+            V3_PLANNED_GROUPED_INTEGER_CODEC_BODY_LAYOUT_VERSION,
+            V3_PLANNED_GROUPED_INTEGER_CODEC_BLOCK_VERSION
         )
     ) {
         return Err(AuraError::InvalidValue("v3 planned grouped body layout"));
@@ -1390,6 +1935,10 @@ fn validate_footer(footer: &V3PlannedGroupedFooter, limits: V3GroupedLimits) -> 
             V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION,
             V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION,
             crate::AURA_PLAN_V2_SPLIT_REGISTRY_VERSION,
+        ) | (
+            V3_PLANNED_GROUPED_INTEGER_CODEC_BODY_LAYOUT_VERSION,
+            V3_PLANNED_GROUPED_INTEGER_CODEC_BLOCK_VERSION,
+            crate::AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION,
         )
     );
     if !version_contract
@@ -1574,6 +2123,7 @@ fn inspection(footer: &V3PlannedGroupedFooter) -> V3PlannedGroupedInspection {
         plan: footer.plan.inspection(),
         schema_relationships_authorized_only: !footer.plan.inspection().relationships_attempted,
         candidates: Vec::new(),
+        codecs: Vec::new(),
     }
 }
 
@@ -1651,5 +2201,30 @@ impl<'a> Reader<'a> {
 
     fn array32(&mut self) -> Result<[u8; 32]> {
         Ok(self.take(32)?.try_into().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod candidate_limit_tests {
+    use super::*;
+
+    #[test]
+    fn only_physical_length_limits_are_candidate_inapplicability() {
+        for name in [
+            "v3 event block length",
+            "v3 planned block length",
+            "v3 planned grouped body length",
+            "v3 planned grouped footer length",
+        ] {
+            assert!(is_expected_candidate_limit(&AuraError::InvalidValue(name)));
+        }
+        for error in [
+            AuraError::UnexpectedEof,
+            AuraError::InvalidValue("v3 planned grouped allocation"),
+            AuraError::InvalidValue("v3 planned split inverse"),
+            AuraError::InvalidValue("aura plan v2 codec type"),
+        ] {
+            assert!(!is_expected_candidate_limit(&error));
+        }
     }
 }
