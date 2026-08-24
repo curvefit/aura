@@ -31,6 +31,7 @@ pub mod schema;
 pub mod schema_json;
 pub mod scoped;
 pub mod shadow_protocol;
+pub mod shadow_protocol_v2;
 pub mod source;
 pub mod stats;
 pub mod types;
@@ -113,6 +114,14 @@ pub use shadow_protocol::{
     MAX_SHADOW_RECORD_BATCHES, SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND,
     SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL, SHADOW_RESULT_SCHEMA, SHADOW_SCHEMA_FORMAT,
     SHADOW_VERIFY_RESULT_SCHEMA,
+};
+pub use shadow_protocol_v2::{
+    compile_shadow_grouped_arrow_ipc, decode_shadow_grouped_arrow_ipc_batch,
+    encode_shadow_grouped_arrow_ipc, shadow_grouped_arrow_protocol, shadow_grouped_schema_format,
+    ShadowGroupedEncodeResult, ShadowGroupedProtocolLimits, DEFAULT_SHADOW_GROUPED_ARROW_IPC_BYTES,
+    DEFAULT_SHADOW_GROUPED_RECORD_BATCHES, MAX_SHADOW_GROUPED_ARROW_IPC_BYTES,
+    MAX_SHADOW_GROUPED_RECORD_BATCHES, SHADOW_ARTIFACT_KIND_V2, SHADOW_PROTOCOL_V2,
+    SHADOW_REPEATED_FIELD_V2, SHADOW_RESULT_SCHEMA_V2, SHADOW_VERIFY_RESULT_SCHEMA_V2,
 };
 pub use source::{
     AuraEventBatch, AuraEventSource, AuraEventSourceStats, AuraFileSource, AuraLiveFrameSource,

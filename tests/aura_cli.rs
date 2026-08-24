@@ -557,7 +557,10 @@ fn shadow_handshake_is_stable_json_and_has_no_side_effects() {
     );
     assert_eq!(value["handshake_schema"], "aura-shadow-handshake-v1");
     assert_eq!(value["package"], "aura-codec");
-    assert_eq!(value["protocols"][0], "aura-logical-arrow-ipc-v1");
+    assert_eq!(
+        value["protocols"],
+        serde_json::json!(["aura-logical-arrow-ipc-v1", "aura-logical-arrow-ipc-v2"])
+    );
     assert_eq!(
         value["operations"],
         serde_json::json!(["encode", "verify", "v3-aura0-seal", "v3-aura0-verify"])
@@ -571,7 +574,12 @@ fn shadow_handshake_is_stable_json_and_has_no_side_effects() {
     assert_eq!(value["cargo_lock_sha256"].as_str().unwrap().len(), 64);
     assert_json_keys(
         &value["hash_contracts"],
-        &["schema_fingerprint", "logical_values", "artifact"],
+        &[
+            "schema_fingerprint",
+            "logical_values",
+            "logical_events",
+            "artifact",
+        ],
     );
     assert_json_keys(&value["arrow"], &["rust_version", "protocol"]);
     assert_eq!(
@@ -580,7 +588,10 @@ fn shadow_handshake_is_stable_json_and_has_no_side_effects() {
     );
     assert_eq!(
         value["artifact_kinds"],
-        serde_json::json!(["standalone-aura-v3-value-block-v1"])
+        serde_json::json!([
+            "standalone-aura-v3-value-block-v1",
+            "standalone-aura-v3-event-block-v1"
+        ])
     );
     assert!(matches!(
         value["provenance_source"].as_str(),

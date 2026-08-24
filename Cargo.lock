@@ -183,6 +183,8 @@ dependencies = [
  "arrow-data",
  "arrow-schema",
  "flatbuffers",
+ "lz4_flex",
+ "zstd",
 ]
 
 [[package]]
@@ -285,6 +287,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "flatbuffers",
  "lz4_flex",
  "parquet",
  "serde",

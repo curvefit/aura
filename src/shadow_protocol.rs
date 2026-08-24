@@ -199,7 +199,7 @@ fn decode_ipc_batches(
     Ok(batch)
 }
 
-fn read_bounded(input: &mut impl Read, limit: usize) -> Result<Vec<u8>> {
+pub(crate) fn read_bounded(input: &mut impl Read, limit: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes
         .try_reserve(limit.min(64 * 1024))
@@ -380,7 +380,7 @@ fn validate_ipc_flatbuffer_schema(
     Ok(())
 }
 
-fn ipc_field_type_matches(field_type: FieldType, field: arrow::ipc::Field<'_>) -> bool {
+pub(crate) fn ipc_field_type_matches(field_type: FieldType, field: arrow::ipc::Field<'_>) -> bool {
     match field_type {
         FieldType::I8
         | FieldType::U8
@@ -517,7 +517,7 @@ fn preflight_record_batch(
     preflight_total_block(schema, *total_rows, variable_data, limits)
 }
 
-fn ipc_buffer<'a>(
+pub(crate) fn ipc_buffer<'a>(
     body: &'a [u8],
     buffer: &arrow::ipc::Buffer,
     previous_end: &mut usize,
@@ -540,14 +540,14 @@ fn ipc_buffer<'a>(
     Ok(value)
 }
 
-fn align_64(value: usize) -> Result<usize> {
+pub(crate) fn align_64(value: usize) -> Result<usize> {
     value
         .checked_add(63)
         .map(|value| value & !63)
         .ok_or(AuraError::InvalidValue("shadow ipc buffer alignment"))
 }
 
-fn validate_ipc_validity(validity: &[u8], rows: usize, null_count: usize) -> Result<()> {
+pub(crate) fn validate_ipc_validity(validity: &[u8], rows: usize, null_count: usize) -> Result<()> {
     let bitmap_len = rows
         .checked_add(7)
         .ok_or(AuraError::InvalidValue("shadow ipc validity length"))?
@@ -566,7 +566,12 @@ fn validate_ipc_validity(validity: &[u8], rows: usize, null_count: usize) -> Res
     Ok(())
 }
 
-fn validate_ipc_utf8(offsets: &[u8], data: &[u8], rows: usize, value_limit: usize) -> Result<()> {
+pub(crate) fn validate_ipc_utf8(
+    offsets: &[u8],
+    data: &[u8],
+    rows: usize,
+    value_limit: usize,
+) -> Result<()> {
     let expected_offsets = rows
         .checked_add(1)
         .and_then(|count| count.checked_mul(4))
@@ -642,7 +647,7 @@ fn preflight_total_block(
     Ok(())
 }
 
-fn take_i32(bytes: &[u8], position: &mut usize) -> Result<i32> {
+pub(crate) fn take_i32(bytes: &[u8], position: &mut usize) -> Result<i32> {
     let end = position.checked_add(4).ok_or(AuraError::UnexpectedEof)?;
     let raw: [u8; 4] = bytes
         .get(*position..end)
@@ -674,7 +679,7 @@ fn validate_arrow_field(expected: &FieldDescriptor, actual: &Field) -> Result<()
     Ok(())
 }
 
-fn arrow_type(field_type: FieldType) -> DataType {
+pub(crate) fn arrow_type(field_type: FieldType) -> DataType {
     match field_type {
         FieldType::I8 => DataType::Int8,
         FieldType::U8 => DataType::UInt8,
@@ -866,7 +871,7 @@ fn preflight_batch(
     Ok(())
 }
 
-fn reserve_column(
+pub(crate) fn reserve_column(
     column: &mut AuraV3Column,
     input: &dyn Array,
     rows: usize,
@@ -952,7 +957,7 @@ fn column_values_len(values: &AuraV3ColumnValues) -> usize {
     }
 }
 
-fn append_validity(bitmap: &mut Vec<u8>, row: usize, present: bool) -> Result<()> {
+pub(crate) fn append_validity(bitmap: &mut Vec<u8>, row: usize, present: bool) -> Result<()> {
     let byte = row / 8;
     if byte == bitmap.len() {
         bitmap.push(0);
@@ -965,7 +970,7 @@ fn append_validity(bitmap: &mut Vec<u8>, row: usize, present: bool) -> Result<()
     Ok(())
 }
 
-fn append_value(
+pub(crate) fn append_value(
     field: &FieldDescriptor,
     output: &mut AuraV3ColumnValues,
     input: &dyn Array,
@@ -1060,14 +1065,14 @@ fn append_value(
     }
 }
 
-fn downcast<T: Array + 'static>(array: &dyn Array) -> Result<&T> {
+pub(crate) fn downcast<T: Array + 'static>(array: &dyn Array) -> Result<&T> {
     array
         .as_any()
         .downcast_ref::<T>()
         .ok_or(AuraError::InvalidValue("shadow arrow array type"))
 }
 
-fn fixed_width(field_type: FieldType) -> usize {
+pub(crate) fn fixed_width(field_type: FieldType) -> usize {
     match field_type {
         FieldType::I8 | FieldType::U8 => 1,
         FieldType::I16 | FieldType::U16 => 2,

@@ -10,12 +10,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aura_codec::{
     arrow_rust_version, build_provenance, canonical_v3_batch_sha256,
-    canonical_v3_schema_fingerprint, cargo_lock_sha256, decode_shadow_arrow_ipc_batch,
+    canonical_v3_event_batch_sha256, canonical_v3_schema_fingerprint, cargo_lock_sha256,
+    compile_shadow_grouped_arrow_ipc, decode_shadow_arrow_ipc_batch, decode_v3_event_block,
     decode_v3_value_block, encode_shadow_arrow_ipc, parse_schema_json, SchemaEncodingVersion,
-    ShadowEncodeResult, ShadowProtocolLimits, V3FlatAura0Reader, V3FlatAura0Writer,
-    V3FlatWriteSummary, V3FlatWriterOptions, V3ValueLimits, MAX_SCHEMA_JSON_BYTES,
-    MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND, SHADOW_HANDSHAKE_SCHEMA,
-    SHADOW_PROTOCOL, SHADOW_RESULT_SCHEMA, SHADOW_SCHEMA_FORMAT, SHADOW_VERIFY_RESULT_SCHEMA,
+    ShadowEncodeResult, ShadowGroupedEncodeResult, ShadowGroupedProtocolLimits,
+    ShadowProtocolLimits, V3FlatAura0Reader, V3FlatAura0Writer, V3FlatWriteSummary,
+    V3FlatWriterOptions, V3ValueLimits, MAX_SCHEMA_JSON_BYTES, MAX_V3_EVENT_BLOCK_BYTES,
+    MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND, SHADOW_ARTIFACT_KIND_V2,
+    SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL, SHADOW_PROTOCOL_V2, SHADOW_RESULT_SCHEMA,
+    SHADOW_RESULT_SCHEMA_V2, SHADOW_SCHEMA_FORMAT, SHADOW_VERIFY_RESULT_SCHEMA,
+    SHADOW_VERIFY_RESULT_SCHEMA_V2,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -31,6 +35,10 @@ Usage:
     --artifact-kind standalone-aura-v3-value-block-v1 --output <path> --json
   aura shadow verify --protocol aura-logical-arrow-ipc-v1 --schema <path> \
     --input <existing.aurav3vb> --json
+  aura shadow encode --protocol aura-logical-arrow-ipc-v2 --schema <path> \
+    --artifact-kind standalone-aura-v3-event-block-v1 --output <path.aurav3eb> --json
+  aura shadow verify --protocol aura-logical-arrow-ipc-v2 --schema <path> \
+    --input <existing.aurav3eb> --json
   aura v3 aura0 seal --protocol aura-logical-arrow-ipc-v1 --schema <canonical.json> \
     --output <new.aura0> --json
   aura v3 aura0 verify --input <file.aura0> --json
@@ -38,6 +46,12 @@ Usage:
 ";
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShadowProtocolVersion {
+    V1,
+    V2,
+}
 
 #[derive(Debug)]
 struct CliError(String);
@@ -150,7 +164,7 @@ fn shadow_handshake_command(args: &[String]) -> Result<(), CliError> {
         }
         _ => Err(CliError("unknown shadow handshake option".to_owned())),
     })?;
-    require_protocol(protocol)?;
+    require_shadow_protocol(protocol)?;
     if !json_output {
         return Err(CliError("shadow handshake requires --json".to_owned()));
     }
@@ -162,14 +176,15 @@ fn shadow_handshake_command(args: &[String]) -> Result<(), CliError> {
         "git_commit": provenance.git_commit,
         "dirty": provenance.dirty,
         "provenance_source": provenance.source,
-        "protocols": [SHADOW_PROTOCOL],
+        "protocols": [SHADOW_PROTOCOL, SHADOW_PROTOCOL_V2],
         "schema_formats": [SHADOW_SCHEMA_FORMAT],
-        "artifact_kinds": [SHADOW_ARTIFACT_KIND],
+        "artifact_kinds": [SHADOW_ARTIFACT_KIND, SHADOW_ARTIFACT_KIND_V2],
         "operations": ["encode", "verify", "v3-aura0-seal", "v3-aura0-verify"],
         "complete_container_targets": ["flat-aura0-v3-v1"],
         "hash_contracts": {
             "schema_fingerprint": "sha256:aura-v3-schema-fingerprint-v1",
             "logical_values": "sha256:aura-v3-canonical-exact-values-v1",
+            "logical_events": "sha256:aura-v3-canonical-exact-events-v1",
             "artifact": "sha256"
         },
         "arrow": {
@@ -203,8 +218,12 @@ fn shadow_encode_command(args: &[String]) -> Result<(), CliError> {
         }
         _ => Err(CliError("unknown shadow encode option".to_owned())),
     })?;
-    require_protocol(protocol)?;
-    if artifact_kind.as_deref() != Some(SHADOW_ARTIFACT_KIND) {
+    let protocol = require_shadow_protocol(protocol)?;
+    let (expected_kind, expected_extension) = match protocol {
+        ShadowProtocolVersion::V1 => (SHADOW_ARTIFACT_KIND, "aurav3vb"),
+        ShadowProtocolVersion::V2 => (SHADOW_ARTIFACT_KIND_V2, "aurav3eb"),
+    };
+    if artifact_kind.as_deref() != Some(expected_kind) {
         return Err(CliError(
             "unsupported or missing --artifact-kind".to_owned(),
         ));
@@ -219,42 +238,72 @@ fn shadow_encode_command(args: &[String]) -> Result<(), CliError> {
             "shadow schema and output must be filesystem paths".to_owned(),
         ));
     }
-    if output.extension().and_then(|value| value.to_str()) != Some("aurav3vb") {
-        return Err(CliError(
-            "shadow output must use the .aurav3vb extension".to_owned(),
-        ));
+    if output.extension().and_then(|value| value.to_str()) != Some(expected_extension) {
+        return Err(CliError(format!(
+            "shadow output must use the .{expected_extension} extension"
+        )));
     }
     require_absent_output(&output)?;
     let schema_text = read_bounded_schema(&schema_path)?;
     let schema = parse_schema_json(&schema_text).map_err(|error| CliError(error.to_string()))?;
-    let result =
-        encode_shadow_arrow_ipc(&schema, io::stdin().lock(), ShadowProtocolLimits::default())
+    let (publication, value) = match protocol {
+        ShadowProtocolVersion::V1 => {
+            let result = encode_shadow_arrow_ipc(
+                &schema,
+                io::stdin().lock(),
+                ShadowProtocolLimits::default(),
+            )
             .map_err(|error| CliError(error.to_string()))?;
-    let publication = publish_verified_block(&output, &schema, &result)?;
-
-    let provenance = build_provenance();
-    let value = json!({
-        "result_schema": SHADOW_RESULT_SCHEMA,
-        "protocol": SHADOW_PROTOCOL,
-        "artifact_kind": SHADOW_ARTIFACT_KIND,
-        "complete_aura_file": false,
-        "reference_block_version": 1,
-        "package_version": env!("CARGO_PKG_VERSION"),
-        "schema_id": schema.schema_id,
-        "schema_fingerprint_sha256": hex(&result.schema_fingerprint),
-        "row_count": result.row_count,
-        "logical_sha256": hex(&result.logical_sha256),
-        "artifact_bytes": result.block.len(),
-        "artifact_sha256": hex(&result.block_sha256),
-        "stale_temp_cleanup_required": publication.stale_temp_cleanup_required,
-        "build": {
-            "git_commit": provenance.git_commit,
-            "dirty": provenance.dirty,
-            "provenance_source": provenance.source,
-            "arrow_crate_version": arrow_rust_version(),
-            "cargo_lock_sha256": hex(&cargo_lock_sha256())
+            let publication = publish_verified_block(&output, &schema, &result)?;
+            let provenance = build_provenance();
+            let value = json!({
+                "result_schema": SHADOW_RESULT_SCHEMA,
+                "protocol": SHADOW_PROTOCOL,
+                "artifact_kind": SHADOW_ARTIFACT_KIND,
+                "complete_aura_file": false,
+                "reference_block_version": 1,
+                "package_version": env!("CARGO_PKG_VERSION"),
+                "schema_id": schema.schema_id,
+                "schema_fingerprint_sha256": hex(&result.schema_fingerprint),
+                "row_count": result.row_count,
+                "logical_sha256": hex(&result.logical_sha256),
+                "artifact_bytes": result.block.len(),
+                "artifact_sha256": hex(&result.block_sha256),
+                "stale_temp_cleanup_required": publication.stale_temp_cleanup_required,
+                "build": build_json(provenance)
+            });
+            (publication, value)
         }
-    });
+        ShadowProtocolVersion::V2 => {
+            let result = compile_shadow_grouped_arrow_ipc(
+                &schema,
+                io::stdin().lock(),
+                ShadowGroupedProtocolLimits::default(),
+            )
+            .map_err(|error| CliError(error.to_string()))?;
+            let publication = publish_verified_grouped_block(&output, &schema, &result)?;
+            let provenance = build_provenance();
+            let value = json!({
+                "result_schema": SHADOW_RESULT_SCHEMA_V2,
+                "protocol": SHADOW_PROTOCOL_V2,
+                "artifact_kind": SHADOW_ARTIFACT_KIND_V2,
+                "complete_aura_file": false,
+                "reference_block_version": 1,
+                "package_version": env!("CARGO_PKG_VERSION"),
+                "schema_id": schema.schema_id,
+                "schema_fingerprint_sha256": hex(&result.schema_fingerprint),
+                "event_count": result.event_count,
+                "child_count": result.child_count,
+                "logical_sha256": hex(&result.logical_sha256),
+                "artifact_bytes": result.block.len(),
+                "artifact_sha256": hex(&result.block_sha256),
+                "stale_temp_cleanup_required": publication.stale_temp_cleanup_required,
+                "build": build_json(provenance)
+            });
+            (publication, value)
+        }
+    };
+    let _ = publication;
     write_json_stdout(&value)
         .map_err(|_| CliError("publication committed result unavailable".to_owned()))
 }
@@ -278,7 +327,7 @@ fn shadow_verify_command(args: &[String]) -> Result<(), CliError> {
         }
         _ => Err(CliError("unknown shadow verify option".to_owned())),
     })?;
-    require_protocol(protocol)?;
+    let protocol = require_shadow_protocol(protocol)?;
     if !json_output {
         return Err(CliError("shadow verify requires --json".to_owned()));
     }
@@ -289,44 +338,21 @@ fn shadow_verify_command(args: &[String]) -> Result<(), CliError> {
             "shadow schema and input must be filesystem paths".to_owned(),
         ));
     }
-    if input.extension().and_then(|value| value.to_str()) != Some("aurav3vb") {
-        return Err(CliError(
-            "shadow input must use the .aurav3vb extension".to_owned(),
-        ));
+    let expected_extension = match protocol {
+        ShadowProtocolVersion::V1 => "aurav3vb",
+        ShadowProtocolVersion::V2 => "aurav3eb",
+    };
+    if input.extension().and_then(|value| value.to_str()) != Some(expected_extension) {
+        return Err(CliError(format!(
+            "shadow input must use the .{expected_extension} extension"
+        )));
     }
     let schema_text = read_bounded_schema(&schema_path)?;
     let schema = parse_schema_json(&schema_text).map_err(|error| CliError(error.to_string()))?;
-    let verify_limits = ShadowProtocolLimits::default().values;
-    let bytes = read_bounded_reference_block(&input, verify_limits.max_block_bytes)?;
-    let decoded = decode_v3_value_block(&schema, &bytes, verify_limits)
-        .map_err(|_| CliError("invalid shadow reference block".to_owned()))?;
-    let schema_fingerprint = aura_codec::canonical_v3_schema_fingerprint(&schema)
-        .map_err(|_| CliError("invalid shadow schema fingerprint".to_owned()))?;
-    let logical_sha256 = canonical_v3_batch_sha256(&schema, &decoded, verify_limits)
-        .map_err(|_| CliError("invalid shadow reference block".to_owned()))?;
-    let artifact_sha256: [u8; 32] = Sha256::digest(&bytes).into();
-    let provenance = build_provenance();
-    let value = json!({
-        "result_schema": SHADOW_VERIFY_RESULT_SCHEMA,
-        "protocol": SHADOW_PROTOCOL,
-        "artifact_kind": SHADOW_ARTIFACT_KIND,
-        "complete_aura_file": false,
-        "reference_block_version": 1,
-        "package_version": env!("CARGO_PKG_VERSION"),
-        "schema_id": schema.schema_id,
-        "schema_fingerprint_sha256": hex(&schema_fingerprint),
-        "row_count": decoded.row_count,
-        "logical_sha256": hex(&logical_sha256),
-        "artifact_bytes": bytes.len(),
-        "artifact_sha256": hex(&artifact_sha256),
-        "build": {
-            "git_commit": provenance.git_commit,
-            "dirty": provenance.dirty,
-            "provenance_source": provenance.source,
-            "arrow_crate_version": arrow_rust_version(),
-            "cargo_lock_sha256": hex(&cargo_lock_sha256())
-        }
-    });
+    let value = match protocol {
+        ShadowProtocolVersion::V1 => verify_shadow_v1_value(&schema, &input)?,
+        ShadowProtocolVersion::V2 => verify_shadow_v2_value(&schema, &input)?,
+    };
     write_json_stdout(&value)
 }
 
@@ -485,6 +511,87 @@ fn require_protocol(protocol: Option<String>) -> Result<(), CliError> {
     } else {
         Err(CliError("unsupported or missing --protocol".to_owned()))
     }
+}
+
+fn require_shadow_protocol(protocol: Option<String>) -> Result<ShadowProtocolVersion, CliError> {
+    match protocol.as_deref() {
+        Some(SHADOW_PROTOCOL) => Ok(ShadowProtocolVersion::V1),
+        Some(SHADOW_PROTOCOL_V2) => Ok(ShadowProtocolVersion::V2),
+        _ => Err(CliError("unsupported or missing --protocol".to_owned())),
+    }
+}
+
+fn build_json(provenance: aura_codec::BuildProvenance) -> serde_json::Value {
+    json!({
+        "git_commit": provenance.git_commit,
+        "dirty": provenance.dirty,
+        "provenance_source": provenance.source,
+        "arrow_crate_version": arrow_rust_version(),
+        "cargo_lock_sha256": hex(&cargo_lock_sha256())
+    })
+}
+
+fn verify_shadow_v1_value(
+    schema: &aura_codec::SchemaDescriptor,
+    input: &Path,
+) -> Result<serde_json::Value, CliError> {
+    let verify_limits = ShadowProtocolLimits::default().values;
+    let bytes = read_bounded_reference_block(input, verify_limits.max_block_bytes)?;
+    let decoded = decode_v3_value_block(schema, &bytes, verify_limits)
+        .map_err(|_| CliError("invalid shadow reference block".to_owned()))?;
+    let schema_fingerprint = canonical_v3_schema_fingerprint(schema)
+        .map_err(|_| CliError("invalid shadow schema fingerprint".to_owned()))?;
+    let logical_sha256 = canonical_v3_batch_sha256(schema, &decoded, verify_limits)
+        .map_err(|_| CliError("invalid shadow reference block".to_owned()))?;
+    let artifact_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    let provenance = build_provenance();
+    Ok(json!({
+        "result_schema": SHADOW_VERIFY_RESULT_SCHEMA,
+        "protocol": SHADOW_PROTOCOL,
+        "artifact_kind": SHADOW_ARTIFACT_KIND,
+        "complete_aura_file": false,
+        "reference_block_version": 1,
+        "package_version": env!("CARGO_PKG_VERSION"),
+        "schema_id": schema.schema_id,
+        "schema_fingerprint_sha256": hex(&schema_fingerprint),
+        "row_count": decoded.row_count,
+        "logical_sha256": hex(&logical_sha256),
+        "artifact_bytes": bytes.len(),
+        "artifact_sha256": hex(&artifact_sha256),
+        "build": build_json(provenance)
+    }))
+}
+
+fn verify_shadow_v2_value(
+    schema: &aura_codec::SchemaDescriptor,
+    input: &Path,
+) -> Result<serde_json::Value, CliError> {
+    let limits = ShadowGroupedProtocolLimits::default();
+    let bytes = read_bounded_reference_block(input, limits.events.max_block_bytes)?;
+    let decoded = decode_v3_event_block(schema, &bytes, limits.events)
+        .map_err(|_| CliError("invalid shadow grouped reference block".to_owned()))?;
+    let schema_fingerprint = canonical_v3_schema_fingerprint(schema)
+        .map_err(|_| CliError("invalid shadow grouped schema fingerprint".to_owned()))?;
+    let logical_sha256 = canonical_v3_event_batch_sha256(schema, &decoded, limits.events)
+        .map_err(|_| CliError("invalid shadow grouped reference block".to_owned()))?;
+    let artifact_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    let provenance = build_provenance();
+    Ok(json!({
+        "result_schema": SHADOW_VERIFY_RESULT_SCHEMA_V2,
+        "protocol": SHADOW_PROTOCOL_V2,
+        "artifact_kind": SHADOW_ARTIFACT_KIND_V2,
+        "complete_aura_file": false,
+        "reference_block_version": 1,
+        "package_version": env!("CARGO_PKG_VERSION"),
+        "schema_id": schema.schema_id,
+        "schema_fingerprint_sha256": hex(&schema_fingerprint),
+        "event_count": decoded.event_count,
+        "child_count": decoded.child_count(),
+        "logical_sha256": hex(&logical_sha256),
+        "artifact_bytes": bytes.len(),
+        "artifact_sha256": hex(&artifact_sha256),
+        "build": build_json(provenance)
+    }))
 }
 
 fn write_json_stdout(value: &serde_json::Value) -> Result<(), CliError> {
@@ -1139,6 +1246,66 @@ fn open_v3_input(_path: &Path, _before: &fs::Metadata) -> Result<File, CliError>
     Err(CliError("v3 verify unsupported platform".to_owned()))
 }
 
+fn publish_verified_grouped_block(
+    output: &Path,
+    schema: &aura_codec::SchemaDescriptor,
+    result: &ShadowGroupedEncodeResult,
+) -> Result<PublicationOutcome, CliError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (output, schema, result);
+        return Err(CliError(
+            "trusted shadow publication is unsupported on this platform".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        publish_verified_grouped_block_with_ops(output, schema, result, &RealPublicationOps)
+    }
+}
+
+#[cfg(unix)]
+fn publish_verified_grouped_block_with_ops(
+    output: &Path,
+    schema: &aura_codec::SchemaDescriptor,
+    result: &ShadowGroupedEncodeResult,
+    ops: &impl PublicationOps,
+) -> Result<PublicationOutcome, CliError> {
+    publish_verified_shadow_bytes_with_ops(
+        output,
+        &result.block,
+        MAX_V3_EVENT_BLOCK_BYTES,
+        ops,
+        |bytes| verify_grouped_block_bytes(schema, result, bytes),
+    )
+}
+
+#[cfg(unix)]
+fn verify_grouped_block_bytes(
+    schema: &aura_codec::SchemaDescriptor,
+    expected: &ShadowGroupedEncodeResult,
+    bytes: &[u8],
+) -> Result<(), CliError> {
+    let artifact_hash: [u8; 32] = Sha256::digest(bytes).into();
+    if artifact_hash != expected.block_sha256 {
+        return Err(CliError("shadow temporary output hash mismatch".to_owned()));
+    }
+    let limits = ShadowGroupedProtocolLimits::default().events;
+    let decoded = decode_v3_event_block(schema, bytes, limits)
+        .map_err(|_| CliError("shadow temporary grouped output decode failed".to_owned()))?;
+    let logical = canonical_v3_event_batch_sha256(schema, &decoded, limits)
+        .map_err(|_| CliError("shadow temporary output logical verification failed".to_owned()))?;
+    if logical != expected.logical_sha256
+        || decoded.event_count != expected.event_count
+        || decoded.child_count() != expected.child_count
+    {
+        return Err(CliError(
+            "shadow temporary output logical hash mismatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn publish_verified_block_with_ops(
     output: &Path,
@@ -1146,6 +1313,27 @@ fn publish_verified_block_with_ops(
     result: &ShadowEncodeResult,
     ops: &impl PublicationOps,
 ) -> Result<PublicationOutcome, CliError> {
+    publish_verified_shadow_bytes_with_ops(
+        output,
+        &result.block,
+        MAX_V3_VALUE_BLOCK_BYTES,
+        ops,
+        |bytes| verify_block_bytes(schema, result, bytes),
+    )
+}
+
+#[cfg(unix)]
+fn publish_verified_shadow_bytes_with_ops(
+    output: &Path,
+    bytes: &[u8],
+    max_bytes: usize,
+    ops: &impl PublicationOps,
+    mut verify: impl FnMut(&[u8]) -> Result<(), CliError>,
+) -> Result<PublicationOutcome, CliError> {
+    if bytes.len() > max_bytes {
+        return Err(CliError("shadow artifact exceeds byte limit".to_owned()));
+    }
+    let expected_sha256: [u8; 32] = Sha256::digest(bytes).into();
     let parent = normalized_parent(output);
     let directory = ops
         .open_parent(parent)
@@ -1170,7 +1358,7 @@ fn publish_verified_block_with_ops(
             }
         };
         let write_result = temp
-            .write_all(&result.block)
+            .write_all(bytes)
             .and_then(|()| temp.flush())
             .and_then(|()| temp.sync_all());
         if write_result.is_err() {
@@ -1190,7 +1378,14 @@ fn publish_verified_block_with_ops(
             file_identity(&temp.metadata().map_err(|_| {
                 CliError("could not inspect held shadow temporary output".to_owned())
             })?);
-        if let Err(error) = verify_temp_block(&mut temp, held_identity, schema, result) {
+        if let Err(error) = verify_held_shadow_bytes(
+            &mut temp,
+            held_identity,
+            bytes.len(),
+            max_bytes,
+            expected_sha256,
+            &mut verify,
+        ) {
             return Err(prelink_failure(
                 &directory,
                 &temp_path,
@@ -1231,8 +1426,16 @@ fn publish_verified_block_with_ops(
         let identity_ok = ops.after_link(&temp_path, output).is_ok()
             && path_matches_identity(&temp_path, held_identity, ops)
             && path_matches_identity(output, held_identity, ops);
-        let final_verified =
-            identity_ok && verify_temp_block(&mut temp, held_identity, schema, result).is_ok();
+        let final_verified = identity_ok
+            && verify_held_shadow_bytes(
+                &mut temp,
+                held_identity,
+                bytes.len(),
+                max_bytes,
+                expected_sha256,
+                &mut verify,
+            )
+            .is_ok();
         if !final_verified {
             if rollback_uncommitted(&directory, &temp_path, output, held_identity, ops) {
                 return Err(CliError(
@@ -1261,6 +1464,42 @@ fn publish_verified_block_with_ops(
     Err(CliError(
         "could not create unique shadow temporary output".to_owned(),
     ))
+}
+
+#[cfg(unix)]
+fn verify_held_shadow_bytes(
+    temp: &mut File,
+    expected_identity: FileIdentity,
+    expected_len: usize,
+    max_bytes: usize,
+    expected_sha256: [u8; 32],
+    verify: &mut impl FnMut(&[u8]) -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    let metadata = temp
+        .metadata()
+        .map_err(|_| CliError("could not inspect shadow temporary output".to_owned()))?;
+    if !metadata.is_file()
+        || metadata.len() != expected_len as u64
+        || metadata.len() > max_bytes as u64
+        || file_identity(&metadata) != expected_identity
+    {
+        return Err(CliError(
+            "invalid shadow temporary output length".to_owned(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(expected_len)
+        .map_err(|_| CliError("could not allocate verification buffer".to_owned()))?;
+    temp.seek(SeekFrom::Start(0))
+        .map_err(|_| CliError("could not seek shadow temporary output".to_owned()))?;
+    temp.take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| CliError("could not verify shadow temporary output".to_owned()))?;
+    if bytes.len() != expected_len || Sha256::digest(&bytes).as_slice() != expected_sha256 {
+        return Err(CliError("shadow temporary output hash mismatch".to_owned()));
+    }
+    verify(&bytes)
 }
 
 #[cfg(unix)]
@@ -1367,38 +1606,16 @@ fn rollback_uncommitted(
 }
 
 #[cfg(unix)]
-fn verify_temp_block(
-    temp: &mut File,
-    expected_identity: FileIdentity,
+fn verify_block_bytes(
     schema: &aura_codec::SchemaDescriptor,
     expected: &ShadowEncodeResult,
+    bytes: &[u8],
 ) -> Result<(), CliError> {
-    let metadata = temp
-        .metadata()
-        .map_err(|_| CliError("could not inspect shadow temporary output".to_owned()))?;
-    if !metadata.is_file()
-        || metadata.len() != expected.block.len() as u64
-        || metadata.len() > MAX_V3_VALUE_BLOCK_BYTES as u64
-        || file_identity(&metadata) != expected_identity
-    {
-        return Err(CliError(
-            "invalid shadow temporary output length".to_owned(),
-        ));
-    }
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(expected.block.len())
-        .map_err(|_| CliError("could not allocate verification buffer".to_owned()))?;
-    temp.seek(SeekFrom::Start(0))
-        .map_err(|_| CliError("could not seek shadow temporary output".to_owned()))?;
-    temp.take((MAX_V3_VALUE_BLOCK_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| CliError("could not verify shadow temporary output".to_owned()))?;
-    let artifact_hash: [u8; 32] = Sha256::digest(&bytes).into();
+    let artifact_hash: [u8; 32] = Sha256::digest(bytes).into();
     if artifact_hash != expected.block_sha256 {
         return Err(CliError("shadow temporary output hash mismatch".to_owned()));
     }
-    let decoded = decode_v3_value_block(schema, &bytes, V3ValueLimits::default())
+    let decoded = decode_v3_value_block(schema, bytes, V3ValueLimits::default())
         .map_err(|_| CliError("shadow temporary output decode failed".to_owned()))?;
     let logical = canonical_v3_batch_sha256(schema, &decoded, V3ValueLimits::default())
         .map_err(|_| CliError("shadow temporary output logical verification failed".to_owned()))?;

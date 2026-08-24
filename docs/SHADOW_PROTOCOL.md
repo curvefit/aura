@@ -99,13 +99,61 @@ IPC input, Arrow batch storage, Aura columns, encoded block, and one bounded
 verification read. This is a reference boundary, not a streaming production
 compiler.
 
+## Grouped exact-event protocol v2
+
+`aura-logical-arrow-ipc-v2` is the grouped counterpart to the flat v1
+boundary. Its Arrow stream contains event-scoped fields in global slot order,
+followed by exactly one nonnullable reserved field named
+`__aura_repeated_v1`. That field is a nonnullable `List` of nonnullable
+`Struct` values whose children are every repeated field in global slot order,
+with their declared scalar types and nullability. Empty event batches and
+empty child lists are exact values; list offsets define event/child ownership.
+
+The stream contract remains Arrow 54 IPC stream metadata V5, little-endian,
+64-byte aligned, explicitly terminated, metadata-free, dictionary-free and
+uncompressed. Aura performs a bounded raw framing/node/buffer/offset preflight
+before Arrow decoding and then emits only
+`standalone-aura-v3-event-block-v1` (`AURAV3EB`):
+
+```bash
+aura shadow encode \
+  --protocol aura-logical-arrow-ipc-v2 \
+  --schema grouped-schema.json \
+  --artifact-kind standalone-aura-v3-event-block-v1 \
+  --output events.aurav3eb \
+  --json < grouped.arrow-stream
+
+aura shadow verify \
+  --protocol aura-logical-arrow-ipc-v2 \
+  --schema grouped-schema.json \
+  --input events.aurav3eb \
+  --json
+```
+
+This is a standalone grouped reference artifact, not a complete Aura0 file.
+The existing v1 flat protocol and artifact remain unchanged.
+
+Grouped v2 is also deliberately all-memory. Its conservative defaults cap the
+IPC input and `AURAV3EB` block at 256 MiB, record batches at 4,096, events at
+1,048,576, repeated children at 4,194,304, total logical scalar values at
+16,777,216, and each logical variable-width value at 16 MiB. Absolute hard
+ceilings are 1 GiB input/block, 65,536 batches, 4,194,304 events, 16,777,216
+children, 67,108,864 values, and 16 MiB per logical variable-width value.
+Callers may choose lower ceilings or explicitly opt toward the hard envelope;
+values above the hard ceilings are clamped. Raw IPC backing outside a sliced
+logical child range remains structurally validated and counts toward the
+input-byte cap, but it is not an Aura logical value and therefore does not
+count toward event-block size or logical value limits. Peak memory may include
+the bounded IPC bytes, Arrow views, accumulated Aura columns, the encoded event
+block, and one bounded verification read.
+
 ## Safe publication
 
 Trusted shadow publication is currently Unix-only and fails closed elsewhere.
-It requires a new `.aurav3vb` path and a real parent directory that is not group
-or world writable. Existing paths, parent symlinks, non-regular collisions, and
-extension mismatches are refused. This deliberately narrow scope avoids a
-weaker portable path-race fallback.
+It requires a new `.aurav3vb` or `.aurav3eb` path and a real parent directory
+that is not group or world writable. Existing paths, parent symlinks,
+non-regular collisions, and extension mismatches are refused. This deliberately
+narrow scope avoids a weaker portable path-race fallback.
 
 Aura opens and validates the directory before creating anything. It creates an
 exclusive destination-local mode-0600 temporary file for read/write and keeps
