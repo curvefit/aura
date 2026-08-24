@@ -11,11 +11,12 @@ Seal
 ```
 
 The established SDK writer and generic reader use container V2 by default.
-Container V3 is explicitly dispatched and currently has one complete profile:
-flat event-scoped Aura0 with exact-value blocks. The V3 profile is exposed by
-the seekable `V3FlatAura0Writer`/`V3FlatAura0Reader` API and by the `aura v3
-aura0 seal` and `aura v3 aura0 verify` developer commands. It is not selected
-implicitly by the V2 SDK writer.
+Container V3 is explicitly dispatched and has two complete uncompressed Aura0
+SDK profiles: flat event-scoped exact-value blocks and grouped exact-event
+chunks. Both are exposed by seekable writer/reader APIs. The `aura v3 aura0
+seal` and `aura v3 aura0 verify` developer commands cover the flat profile only;
+there is no grouped CLI complete-seal command yet. Neither V3 profile is
+selected implicitly by the V2 SDK writer or promised as production/default.
 
 ## V2 header
 
@@ -161,15 +162,19 @@ column subsets of one shared child row and exactly two domains. Unknown table
 versions, kinds, flags, permissions, overlapping children, mismatched byte 200,
 and expression cycles reject.
 
+The V3 header can carry a derived-expression section for dialect recognition,
+but both complete V3 Aura0 profiles require it to be empty; derived expressions
+are not executed by V3.
+
 The front V3 header authorizes relationships and groups. The full schema
 encoding tag 4 is authoritative for field names, exact types, roles, scales,
-nullability, and schema identity. For the complete flat Aura0 V3 profile, the
-canonical external schema JSON is the input declaration and the same validated
-schema is embedded in the footer. The V3 flat writer rejects groups, repeated
-fields, derived expressions, and byte `200`; those declarations remain
-available for a future profile whose event-to-child and inverse-transform
-contract is proven. Thus the presence of a V3 group header is not evidence that
-order-book body execution is supported.
+nullability, and schema identity. For both complete V3 Aura0 profiles, the
+validated schema is embedded in the footer. The flat writer rejects groups,
+repeated fields, derived expressions, and byte `200`. The grouped writer
+accepts only one exact repeated dual-domain group: all repeated child slots,
+the non-null U8 `side` discriminator marked by byte `200`, and no derived
+expressions. Group/Flag200 execution is exact logical event/child execution;
+it does not choose a physical relationship transform, compression, or Plan v2.
 
 The V2 SDK writer remains the production compatibility path. It rejects V3
 schemas and emits V2 containers; callers that need V3 must select the explicit
@@ -181,22 +186,26 @@ The body is profile-specific:
 
 ```text
 .aura   normalized generous ingest records
-.aura0  V2 compact compiled records, or V3 exact-value blocks
+.aura0  V2 compact compiled records, or V3 flat exact-value/grouped exact-event blocks
 .aura1  V2 replay compiled blocks
 ```
 
 V2 body/schema and layout decisions are file-level facts recorded in the V2
 footer. A V3 flat body is a concatenation of positive-row `AURAV3VB` version-1
 exact-value blocks; each block carries its own schema fingerprint and exact
-column/value planes. A zero-row V3 file has no body blocks. V3 does not perform
-compression or physical relationship planning in this profile.
+column/value planes. A grouped V3 body is a concatenation of positive-event
+`AURAV3EB` version-1 chunks. Grouped chunks carry authoritative child offsets,
+event/child counts, and exact scoped column planes. Both V3 bodies are
+uncompressed and do not perform physical relationship planning.
 
 The V2 SDK writer body path is lossless for its declared i64-compatible rows.
 Its typed boundary validates `i128` and `opaque16` but rejects them before V2
 sealing until the V2 body codecs can preserve those fields losslessly. The
 separate V3 exact-value block supports the V3 field types listed in
 [`SCHEMA.md`](SCHEMA.md), including exact `i128` and `opaque16` values, subject
-to the flat-profile limits.
+to the flat-profile limits. Grouped `AURAV3EB` chunks use the same exact value
+and null semantics for event and repeated child columns, subject to grouped
+event/child limits.
 
 ## Footer
 
@@ -215,8 +224,8 @@ generic Aura0 instruction plan
 chunk table
 ```
 
-A compiled `.aura0` or `.aura1` footer stores both compiled profile programs
-and replay metadata, not the ingest stats:
+A V2 compiled `.aura0` or `.aura1` footer stores both compiled profile
+programs and replay metadata, not the ingest stats:
 
 ```text
 magic AURP
@@ -283,11 +292,30 @@ range, body offset/length, stored-byte hash, logical-byte hash, and timestamp or
 sequence bounds when present.
 
 The V3 writer emits body blocks first, then performs a second pass over the
-sealed body to recompute hashes, statistics, and exact logical values before it
-writes the footer, footer length, and final seal. A reader opens the envelope
-and footer before trusting body-dependent claims; `verify_all` rechecks every
-block and global hash. The CLI publishes only a newly created, synced,
+body to recompute hashes, statistics, and exact logical values before it writes
+the footer, footer length, and final seal. A reader opens the envelope and
+footer before trusting body-dependent claims; `verify_all` rechecks every block
+and global hash. The flat CLI publishes only a newly created, synced,
 atomically renamed destination and never replaces an existing path.
+
+### V3 grouped Aura0 footer
+
+The V3 grouped footer also uses `AURP` version `3`, layout version `1`, and
+uncompressed body encoding `2`. Its fixed prefix is 184 bytes. It records event
+count, child count, body length, schema identity/fingerprint, primary timestamp
+and sequence slots, header/body/global logical SHA-256 values, then a stats
+table with 36-byte descriptors, a chunk table with 152-byte descriptors, and a
+footer self-hash. Each chunk descriptor records contiguous global event and
+child ranges, body offset/length, stored-byte hash, logical-event hash, and
+timestamp/sequence bounds when present.
+
+The grouped SDK writer streams `AURAV3EB` chunks and performs a bounded second
+pass before appending the grouped footer, u32 footer length, and final seal. The
+seekable grouped reader can locate chunks by global event or child, read an
+individual checked chunk, and run full verification with a second envelope/body
+check. It has no grouped CLI seal or production/default status. A failed write,
+flush, sync, or verification is a failed/uncommitted result that callers must
+discard and must not publish, even if bytes happen to end in a seal.
 
 ## Footer length and seal
 
@@ -312,12 +340,12 @@ body_start        = header_len
 body_end          = footer_start
 ```
 
-An incomplete or partially written file has no valid final seal and is rejected
+An incomplete or partially written file before its complete seal is rejected
 as incomplete. A truncated footer, invalid footer length, mismatched header or
 body hash, corrupted block, malformed value plane, unsupported version, or
 trailing bytes is rejected as an invalid file. Readers use checked lengths and
-bounded allocations; the V3 format ceilings are a 16 MiB front header, 64 MiB
-footer, 1 TiB body, 65,536 chunks, 16,777,216 rows, and 1 GiB per exact-value
-block. The default V3 API limits are lower; see [FORMAT.md](FORMAT.md) for the
-complete ceiling table and [COMPATIBILITY.md](COMPATIBILITY.md) for the
-promised compatibility boundary.
+bounded allocations. Flat and grouped profiles have separate hard/default
+ceilings; see [FORMAT.md](FORMAT.md) for the complete tables and
+[COMPATIBILITY.md](COMPATIBILITY.md) for the promised compatibility boundary.
+SDK writer/flush/sync errors are failed, uncommitted results rather than a
+recovery mechanism; callers must discard them even if a seal was written.

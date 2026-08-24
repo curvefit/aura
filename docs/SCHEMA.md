@@ -87,15 +87,17 @@ than the relationship byte. Every timestamp-role field must be event-scoped;
 text, opaque, boolean, and other non-timestamp physical types reject. This does
 not alter the V2 relationship-map dialect or bytes.
 
-Relationship flags authorize a bounded planner search; they do not select a
-codec or exact residual direction. The chosen complete inverse belongs in the
-compiled V2 footer when that planner path is used. The V3 flat Aura0 writer
-currently accepts only flat event schemas with no groups, repeated fields,
-derived expressions, or byte-200 discriminator. A schema author may declare
-those relationships for a future V3 profile, but the current complete writer
-rejects them rather than emitting a file whose child boundaries or inverse math
-would be ambiguous. V2 writers reject V3 schemas rather than emitting
-cross-wired files.
+Relationship flags are validated permissions; they do not select a codec or
+exact residual direction in either complete V3 profile. The V2 planner may use
+them when compiling a V2 footer, but V3 does not run a physical relationship
+planner, choose compression, or emit Plan v2. The V3 flat Aura0 writer accepts
+only flat event schemas with no groups, repeated fields, derived expressions,
+or byte-200 discriminator. The V3 grouped writer accepts exactly one repeated
+dual-domain group whose child slots cover all repeated fields, whose
+discriminator is the non-null U8 `side` field marked by byte `200`, and whose
+event/child values are encoded exactly. Both complete V3 writers reject
+non-empty derived-expression tables. V2 writers reject V3 schemas rather than
+emitting cross-wired files.
 
 ### V3 exact field types
 
@@ -125,11 +127,15 @@ are valid and preserved. Exponents, internal whitespace, Unicode digits,
 `NaN`/`Inf`, empty strings, and sign- or dot-only strings reject.
 
 The standalone exact-value block v1 is intentionally flat and event-scoped.
-Repeated fields and non-empty group declarations reject until a later block
-version defines event-to-child counts; child rows are never flattened under
-the event row count. This block is also the body block used by the complete V3
-flat Aura0 container, which adds the V3 header, footer, chunk table, second-pass
-statistics, hashes, and atomic seal/publication around it.
+Repeated fields and non-empty group declarations reject because its single row
+count cannot represent event-to-child boundaries; child rows are never
+flattened under the event row count. This block is the body block used by the
+complete V3 flat Aura0 container, which adds the V3 header, footer, chunk table,
+second-pass statistics, hashes, and final seal around it (the flat CLI adds
+atomic publication). The grouped
+Aura0 profile instead uses `AURAV3EB` event blocks with authoritative
+`event_count + 1` child offsets, scoped event/repeated columns, validity
+bitmaps, and source-order logical hashing.
 
 ## Canonical external schema JSON v1
 
@@ -210,11 +216,11 @@ cargo run --release --bin aura -- v3 aura0 verify \
 ```
 
 The schema author supplies the logical field declarations and relationship
-permissions. Aura's pinned implementation validates them and chooses any
-supported physical representation; the decoder does not infer a dataset,
-venue, or symbol from the input. For the currently complete flat V3 profile,
-the schema must have only event-scoped fields, no groups or derived
-expressions, and no byte-200 discriminator. The resulting file embeds the
-validated schema and complete decode metadata, so verification needs no schema
-sidecar. Future group/Flag200 and exact related-domain execution remain
-unsupported until a versioned body contract and inverse tests are accepted.
+permissions. Aura's pinned implementation validates them; the decoder does not
+infer a dataset, venue, or symbol from the input. For the complete flat V3
+profile, the schema must have only event-scoped fields, no groups or derived
+expressions, and no byte-200 discriminator. For the complete grouped profile,
+the schema must satisfy the exact one-group/two-domain/byte-200 subset above.
+Both resulting files embed the validated schema and complete decode metadata,
+so verification needs no schema sidecar. Grouped Flag200 execution is exact
+logical event/child behavior, not physical relationship planning or compression.

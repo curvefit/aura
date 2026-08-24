@@ -1,0 +1,19 @@
+{
+  "manifest_version": 1,
+  "compatibility_promise": "grouped Aura0 V3 exact-event v1 fixture bytes, routing tuple, schema identity, counts, and logical hash are frozen",
+  "fixture": {
+    "file": "three-event-two-chunk.aura0.hex",
+    "container_version": 3,
+    "footer_layout_version": 1,
+    "body_encoding": 2,
+    "body_layout_version": 1,
+    "event_block_version": 1,
+    "artifact_sha256": "8c011d581f96fa004b9d68b02f4748728cf9d0d17bf68503fdbf72b2534ec480",
+    "schema_id": 1847460365,
+    "schema_fingerprint_sha256": "0a829bebed5895a134715e41f8c75b8dd7aee6bcde76e14bcd821991602be929",
+    "global_logical_sha256": "5caf7d02d8059fd677a0c899b869dad1143faa9cf8b92efd2720e51e3039a6fc",
+    "event_count": 3,
+    "child_count": 4,
+    "chunk_count": 2
+  }
+}

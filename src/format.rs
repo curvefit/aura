@@ -9,7 +9,7 @@ pub const SEAL_MAGIC: &[u8; 8] = b"sealed:)";
 /// Aura container versions recognized by this implementation.
 ///
 /// Recognition and layout support are intentionally separate. V3 has an
-/// authoritative front header and a decode-first flat Aura0 container subset.
+/// authoritative front header and explicit flat/grouped Aura0 SDK containers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u16)]
 pub enum AuraContainerVersion {
@@ -42,7 +42,7 @@ impl AuraContainerVersion {
     }
 
     /// Confirms support in the established generic reader/writer container
-    /// paths. The decode-first V3 flat Aura0 API is intentionally separate.
+    /// paths. Explicit V3 flat/grouped Aura0 APIs are intentionally separate.
     pub fn require_supported_container_layout(self) -> Result<()> {
         match self {
             Self::V2 => Ok(()),
@@ -65,8 +65,8 @@ pub const AURA_CHUNK_DESCRIPTOR_SIZE: usize = 76;
 /// this ceiling are unsupported rather than eligible for an unsafe override.
 pub const MAX_AURA_CHUNK_COUNT: usize = 65_536;
 
-/// Compatibility alias for code that still needs the current emitted wire
-/// number. This remains pinned to V2 until a V3 layout is authoritative.
+/// Compatibility alias for code that needs the current default emitted wire
+/// number. It remains pinned to V2; explicit V3 APIs use `AURA_V3_WIRE_VERSION`.
 pub const FORMAT_VERSION: u16 = AURA_V2_WIRE_VERSION;
 
 pub fn profile_extension(profile: Profile) -> &'static str {

@@ -56,3 +56,38 @@ generic `finish` proves bytes and returns the stream plus `V3FlatWriteSummary`.
 
 The safe default limits are 256 MiB body/block, 4,194,304 rows, and 4,096
 chunks. `V3FlatLimits::HARD` is an explicit larger-envelope opt-in.
+
+## Grouped Aura0 V3 writer
+
+`V3GroupedAura0Writer<W>` writes the complete grouped, uncompressed V3 Aura0
+SDK profile to a new empty `Read + Write + Seek` stream. It accepts
+`AuraV3EventBatch` values with authoritative `event_count + 1` child offsets,
+event-scoped and repeated columns, nullable validity bitmaps, and the exact
+one-group/two-domain schema with the non-null U8 `side` discriminator marked by
+relationship byte `200`. Grouped `AURAV3EB` chunks preserve source order and
+global event/child ranges; their canonical logical hash includes both ranges,
+field slots/types, presence, and exact values, so the hash is stable across
+rechunking. Derived expressions are not supported.
+
+`finish` performs a bounded second pass over the emitted chunks. It validates
+every block and range again, recomputes stored/logical hashes, statistics,
+timestamp/sequence bounds, body hash, and the global logical hash, self-decodes
+the 184-byte-prefix `AURP` footer with 152-byte chunk descriptors, then writes
+the footer, u32 footer length, and `sealed:)` trailer. `finish_and_sync` is the
+`File` specialization. A write, flush, sync, or second-pass error is a failed
+and uncommitted result; callers must discard it and must not publish it, even if
+the underlying bytes happen to end in a seal. The grouped SDK has no CLI
+complete-seal command yet.
+
+`V3GroupedAura0Reader<R>` is a bounded seekable reader. It can locate chunks by
+global event or child, read one checked chunk, and run `verify_all`/`verify_with`
+for complete body, range, statistics, hash, and envelope verification. Opening
+checks the header/footer envelope; body-dependent claims remain provisional
+until verification succeeds. `V3GroupedLimits::default()` uses 256 MiB body,
+4,096 chunks, 1,048,576 events, and 4,194,304 children. The hard envelope is
+64 MiB footer, 1 TiB body, 65,536 chunks, 16,777,216 events, 67,108,864
+children, and 16 MiB schema. Per event-block defaults are 256 MiB,
+1,048,576 events, 4,194,304 children, and 16,777,216 values; hard limits are
+1 GiB, 4,194,304 events, 16,777,216 children, and 67,108,864 values.
+`V3GroupedLimits::HARD` is an explicit opt-in and all supplied limits are
+clamped to those ceilings.

@@ -176,6 +176,7 @@ pub type DecodedV3Aura0File = DecodedV3FlatAura0;
 pub enum AnyCompiledFooter {
     V2(CompiledFooter),
     V3Flat(V3FlatFooter),
+    V3Grouped(crate::v3_grouped_container::V3GroupedFooter),
 }
 
 impl AnyCompiledFooter {
@@ -188,7 +189,23 @@ impl AnyCompiledFooter {
         }
         match AuraContainerVersion::from_wire(u16::from_le_bytes([bytes[4], bytes[5]]))? {
             AuraContainerVersion::V2 => CompiledFooter::decode(bytes).map(Self::V2),
-            AuraContainerVersion::V3 => decode_v3_flat_footer(bytes).map(Self::V3Flat),
+            AuraContainerVersion::V3 => {
+                if bytes.len() < 9 {
+                    return Err(AuraError::UnexpectedEof);
+                }
+                let layout = u16::from_le_bytes([bytes[6], bytes[7]]);
+                match (layout, bytes[8]) {
+                    (V3_FLAT_FOOTER_LAYOUT_VERSION, V3_FLAT_BODY_ENCODING_EXACT_BLOCKS) => {
+                        decode_v3_flat_footer(bytes).map(Self::V3Flat)
+                    }
+                    (
+                        crate::v3_grouped_container::V3_GROUPED_FOOTER_LAYOUT_VERSION,
+                        crate::v3_grouped_container::V3_GROUPED_BODY_ENCODING_EXACT_EVENTS,
+                    ) => crate::v3_grouped_container::decode_v3_grouped_footer(bytes)
+                        .map(Self::V3Grouped),
+                    _ => Err(AuraError::InvalidValue("v3 compiled footer encoding")),
+                }
+            }
             AuraContainerVersion::LegacyV1 => Err(AuraError::UnsupportedVersion(1)),
         }
     }
@@ -197,6 +214,9 @@ impl AnyCompiledFooter {
         match self {
             Self::V2(footer) => footer.encode(),
             Self::V3Flat(footer) => encode_v3_flat_footer(footer),
+            Self::V3Grouped(footer) => {
+                crate::v3_grouped_container::encode_v3_grouped_footer(footer)
+            }
         }
     }
 }
@@ -684,60 +704,85 @@ pub(crate) fn primary_timestamp_slot(mapping: &[u8]) -> u16 {
 }
 
 fn validate_stats_metadata(footer: &V3FlatFooter, limits: V3FlatLimits) -> Result<()> {
-    if footer.stats.len() != footer.schema.fields.len() {
-        return Err(AuraError::InvalidValue("v3 flat stats count"));
+    validate_scoped_stats_metadata(
+        &footer.schema,
+        &footer.stats,
+        footer.record_count,
+        footer.record_count,
+        limits.value_limits.max_variable_value_bytes,
+        "v3 flat stats",
+        "v3 flat stats count",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_scoped_stats_metadata(
+    schema: &SchemaDescriptor,
+    stats: &[V3FlatColumnStats],
+    event_count: u64,
+    child_count: u64,
+    max_variable_value_bytes: usize,
+    stats_error: &'static str,
+    count_error: &'static str,
+) -> Result<()> {
+    if stats.len() != schema.fields.len() {
+        return Err(AuraError::InvalidValue(count_error));
     }
-    for (field, stat) in footer.schema.fields.iter().zip(&footer.stats) {
+    for (field, stat) in schema.fields.iter().zip(stats) {
+        let expected_count = match field.scope {
+            FieldScope::Event => event_count,
+            FieldScope::Repeated => child_count,
+        };
         let structurally_invalid = stat.slot != field.index
             || stat.field_type != field.field_type
             || stat.flags != stats_flags(field.field_type, field.nullable)
             || stat.flags & !STAT_KNOWN_FLAGS != 0
-            || stat.present_count.checked_add(stat.null_count) != Some(footer.record_count)
+            || stat.present_count.checked_add(stat.null_count) != Some(expected_count)
             || (!field.nullable && stat.null_count != 0)
             || (stat.present_count == 0
                 && (stat.logical_payload_bytes != 0 || stat.max_present_value_byte_len != 0));
         if structurally_invalid {
-            return Err(AuraError::InvalidValue("v3 flat stats"));
+            return Err(AuraError::InvalidValue(stats_error));
         }
         if let Some(width) = stats_fixed_width(field.field_type) {
             let expected_payload = stat
                 .present_count
                 .checked_mul(u64::from(width))
-                .ok_or(AuraError::InvalidValue("v3 flat stats"))?;
+                .ok_or(AuraError::InvalidValue(stats_error))?;
             let expected_max = if stat.present_count == 0 { 0 } else { width };
             if stat.logical_payload_bytes != expected_payload
                 || stat.max_present_value_byte_len != expected_max
             {
-                return Err(AuraError::InvalidValue("v3 flat stats"));
+                return Err(AuraError::InvalidValue(stats_error));
             }
         } else {
             let variable_limit = min_usize(
-                limits.value_limits.max_variable_value_bytes,
+                max_variable_value_bytes,
                 crate::v3_values::MAX_V3_VARIABLE_VALUE_BYTES,
             );
             let framed_payload = stat
                 .present_count
                 .checked_mul(4)
-                .ok_or(AuraError::InvalidValue("v3 flat stats"))?;
+                .ok_or(AuraError::InvalidValue(stats_error))?;
             let minimum_payload = if stat.present_count == 0 {
                 framed_payload
             } else {
                 framed_payload
                     .checked_add(u64::from(stat.max_present_value_byte_len))
-                    .ok_or(AuraError::InvalidValue("v3 flat stats"))?
+                    .ok_or(AuraError::InvalidValue(stats_error))?
             };
             let maximum_per_value = u64::from(stat.max_present_value_byte_len)
                 .checked_add(4)
-                .ok_or(AuraError::InvalidValue("v3 flat stats"))?;
+                .ok_or(AuraError::InvalidValue(stats_error))?;
             let maximum_payload = stat
                 .present_count
                 .checked_mul(maximum_per_value)
-                .ok_or(AuraError::InvalidValue("v3 flat stats"))?;
+                .ok_or(AuraError::InvalidValue(stats_error))?;
             if stat.max_present_value_byte_len as usize > variable_limit
                 || stat.logical_payload_bytes < minimum_payload
                 || stat.logical_payload_bytes > maximum_payload
             {
-                return Err(AuraError::InvalidValue("v3 flat stats"));
+                return Err(AuraError::InvalidValue(stats_error));
             }
         }
     }
@@ -897,36 +942,46 @@ pub(crate) fn zero_stats(schema: &SchemaDescriptor) -> Vec<V3FlatColumnStats> {
 
 pub(crate) fn accumulate_stats(stats: &mut [V3FlatColumnStats], batch: &AuraV3Batch) -> Result<()> {
     for (stat, column) in stats.iter_mut().zip(&batch.columns) {
-        for row in 0..batch.row_count as usize {
-            match column.value_ref(row)? {
-                None => {
-                    stat.null_count = stat
-                        .null_count
-                        .checked_add(1)
-                        .ok_or(AuraError::InvalidValue("v3 flat stats"))?;
-                }
-                Some(value) => {
-                    let len = value_payload_len(value)?;
-                    stat.present_count = stat
-                        .present_count
-                        .checked_add(1)
-                        .ok_or(AuraError::InvalidValue("v3 flat stats"))?;
-                    stat.logical_payload_bytes = stat
-                        .logical_payload_bytes
-                        .checked_add(u64::from(len))
-                        .and_then(|bytes| {
-                            if matches!(
-                                column.values,
-                                AuraV3ColumnValues::Utf8(_) | AuraV3ColumnValues::DecimalText(_)
-                            ) {
-                                bytes.checked_add(4)
-                            } else {
-                                Some(bytes)
-                            }
-                        })
-                        .ok_or(AuraError::InvalidValue("v3 flat stats"))?;
-                    stat.max_present_value_byte_len = stat.max_present_value_byte_len.max(len);
-                }
+        accumulate_column_stats(stat, column, batch.row_count as usize, "v3 flat stats")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn accumulate_column_stats(
+    stat: &mut V3FlatColumnStats,
+    column: &crate::AuraV3Column,
+    rows: usize,
+    error: &'static str,
+) -> Result<()> {
+    for row in 0..rows {
+        match column.value_ref(row)? {
+            None => {
+                stat.null_count = stat
+                    .null_count
+                    .checked_add(1)
+                    .ok_or(AuraError::InvalidValue(error))?;
+            }
+            Some(value) => {
+                let len = value_payload_len(value)?;
+                stat.present_count = stat
+                    .present_count
+                    .checked_add(1)
+                    .ok_or(AuraError::InvalidValue(error))?;
+                stat.logical_payload_bytes = stat
+                    .logical_payload_bytes
+                    .checked_add(u64::from(len))
+                    .and_then(|bytes| {
+                        if matches!(
+                            column.values,
+                            AuraV3ColumnValues::Utf8(_) | AuraV3ColumnValues::DecimalText(_)
+                        ) {
+                            bytes.checked_add(4)
+                        } else {
+                            Some(bytes)
+                        }
+                    })
+                    .ok_or(AuraError::InvalidValue(error))?;
+                stat.max_present_value_byte_len = stat.max_present_value_byte_len.max(len);
             }
         }
     }

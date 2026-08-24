@@ -3,12 +3,23 @@
 The current format version is checked during footer decode. Unsupported versions
 return an error instead of falling back silently.
 
-Current production writers emit complete V2 containers. V3 now has one
-complete decode-first compatibility subset: flat event-only, uncompressed
-Aura0 with concatenated exact-value blocks and the AURP V3 flat footer V1. It
-does not add a public streaming writer, CLI, ingest/Aura1 layout, stamping, or
-conversion path. V2 footers still reject V3 schema tag 4. The V3 front header
-has a normative 16 MiB ceiling enforced before file-backed allocation.
+Current production and default SDK writers emit complete V2 containers. V3 has
+two complete, explicitly selected, uncompressed Aura0 SDK compatibility
+subsets: flat event-only `AURAV3VB` exact-value blocks, and grouped exact-event
+`AURAV3EB` chunks with the AURP V3 grouped footer. Both have public seekable
+writers/readers and bounded verification. The flat flavor also has the V3 CLI;
+there is no grouped CLI complete-seal command yet. V3 adds no ingest/Aura1
+layout, stamping, or conversion path, and is not a production/default
+replacement. V2 footers still reject V3 schema tag 4. Both V3 front headers
+have a normative 16 MiB ceiling enforced before file-backed allocation.
+
+The grouped compatibility subset is exact logical execution of one repeated,
+two-domain group: byte-200 marks a non-null U8 `side` discriminator, all
+repeated child slots are covered, nullable event/repeated values retain validity
+bitmaps, and authoritative event-to-child offsets plus global event/child ranges
+are preserved in source order. Grouped encoding is uncompressed and does not
+run a physical relationship planner, compression, or Plan v2. Non-empty derived
+expression tables are rejected by both complete V3 writers.
 
 The `AURAV3VB` exact-value reference block is a separate, explicitly V3 API.
 Its 32-bit schema ID is only a routing hint; a SHA-256 fingerprint of the
@@ -32,9 +43,18 @@ U8 boolean, required UTF-8 (including empty and embedded NUL), and nullable
 decimal text with Unicode outer whitespace. Its manifest records exact sizes
 and SHA-256 values. Regeneration is an ignored maintenance test only.
 
+`tests/fixtures/v3-grouped-container/` freezes the grouped Aura0 V3 exact-event
+v1 fixture bytes, routing tuple, schema identity, event/child/chunk counts, and
+global logical hash. Its manifest records body encoding 2, body/footer layout
+versions, and the artifact SHA-256. These bytes and hashes are the grouped
+compatibility promise; normal tests regenerate the in-memory artifact and
+compare it with these checked-in bytes.
+
 `AnyCompiledFooter` provides version-aware AURP routing. It delegates V2 bytes
-to the unchanged `CompiledFooter` codec and routes only V3 flat-layout bytes to
-the new footer decoder. Checked-in V2 fixture routing and hashes are unchanged.
+to the unchanged `CompiledFooter` codec, routes V3 body encoding 1 to the flat
+footer decoder, and routes V3 body encoding 2 to the grouped footer decoder.
+Checked-in V2 fixture routing and hashes are unchanged; V3 layouts are never
+silently reinterpreted as one another.
 
 `CompiledAuraPlan` now exposes typed `container_version` and a numeric
 `format_version()` compatibility accessor. Direct field access through the old
@@ -48,9 +68,40 @@ the V3 SDK freeze.
 - `.aura0 -> .aura1`
 - `.aura1 -> .aura0`
 - `.aura1` fixed replay visitor
+- V3 flat Aura0 SDK writer/reader (`AURAV3VB`)
+- V3 grouped Aura0 SDK writer/reader (`AURAV3EB`)
 
 Current fast benchmark paths are i64-oriented. Typed wide values can round-trip
 through `.aura`, but compiled i64 paths reject schemas with wide fields.
+
+## V3 Limits and failure boundary
+
+Flat V3 hard ceilings are a 64 MiB footer, 1 TiB body, 65,536 chunks,
+16,777,216 rows, 1 GiB per exact-value block, 16 MiB per variable value, and
+16 MiB schema descriptor. Its default in-memory limits are 256 MiB body/block,
+4,194,304 rows, and 4,096 chunks. Grouped V3 hard ceilings are a 64 MiB
+footer, 1 TiB body, 65,536 chunks, 16,777,216 events, 67,108,864 children,
+and 16 MiB schema descriptor. Its defaults are 256 MiB body, 4,096 chunks,
+1,048,576 events, and 4,194,304 children. Grouped event-block defaults are
+256 MiB, 1,048,576 events, 4,194,304 children, and 16,777,216 values; hard
+limits are 1 GiB, 4,194,304 events, 16,777,216 children, and 67,108,864
+values. `V3FlatLimits::HARD` and `V3GroupedLimits::HARD` are explicit opt-ins;
+caller limits cannot raise the format ceilings.
+
+V3 readers require the complete header/body/footer/trailer envelope and reject
+truncated or invalid u32 footer lengths, missing seals, unsupported versions,
+schema/map disagreement, non-contiguous event/child/body ranges, malformed
+null/value planes, stored/logical/body/global hash mismatches, footer self-hash
+failures, and trailing bytes. The seekable grouped reader treats open-time
+metadata as provisional until `verify_all`/`verify_with` completes its bounded
+passes and envelope recheck. These checks detect corruption and observed
+mutation; they do not promise concurrent-mutation exclusion or recovery.
+
+For both V3 SDK writers, a write before the complete seal, or any writer,
+flush, sync, or second-pass error, is a failed/uncommitted result that callers
+must discard and must not publish even if bytes happen to end in a valid seal.
+The flat CLI uses a synced temporary file and atomic publication; grouped has
+no equivalent CLI seal or recovery workflow.
 
 ## Default Path Matrix
 
@@ -62,6 +113,7 @@ through `.aura`, but compiled i64 paths reject schemas with wide fields.
 | guard mode | `no_guard` | strict modes for verification only |
 | canonical hash | `none` | `verify` for correctness checks |
 | Aura0 profile | `hybrid` for speed + semantic fallback, `compact` for smallest archive | `fast` for byte-lane-only speed files |
+| V3 flat/grouped SDK | no production/default candidate; select the explicit API (flat also has the CLI) | `V3FlatLimits::HARD` / `V3GroupedLimits::HARD` for explicit hard-envelope tests |
 
 The default candidates are conservative. They are chosen from current test and
 benchmark evidence, not from an assertion that remaining materialization is

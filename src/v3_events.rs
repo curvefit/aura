@@ -19,7 +19,7 @@ use crate::v3_values::{
 use crate::{AuraError, Result};
 
 const MAGIC: &[u8; 8] = b"AURAV3EB";
-const VERSION: u16 = 1;
+pub const V3_EVENT_BLOCK_VERSION: u16 = 1;
 const HEADER_BYTES: usize = 76;
 const HASH_DOMAIN: &[u8] = b"aura-v3-canonical-exact-events-v1\0";
 const DUAL_DOMAIN_SCHEMA_MARKER: u8 = 200;
@@ -62,7 +62,7 @@ impl V3EventLimits {
         max_values: MAX_V3_EVENT_VALUES,
     };
 
-    const fn effective(self) -> Self {
+    pub(crate) const fn effective(self) -> Self {
         Self {
             max_block_bytes: min_usize(self.max_block_bytes, MAX_V3_EVENT_BLOCK_BYTES),
             max_variable_value_bytes: min_usize(
@@ -251,7 +251,7 @@ pub fn encode_v3_event_block(
     out.try_reserve_exact(total_len)
         .map_err(|_| AuraError::InvalidValue("v3 event allocation"))?;
     out.extend_from_slice(MAGIC);
-    put_u16(&mut out, VERSION);
+    put_u16(&mut out, V3_EVENT_BLOCK_VERSION);
     put_u16(&mut out, 0);
     put_u32(&mut out, batch.schema_id);
     out.extend_from_slice(&fingerprint);
@@ -300,7 +300,7 @@ pub fn decode_v3_event_block(
         });
     }
     let version = reader.read_u16_le()?;
-    if version != VERSION {
+    if version != V3_EVENT_BLOCK_VERSION {
         return Err(AuraError::UnsupportedVersion(version));
     }
     if reader.read_u16_le()? != 0 {
@@ -429,50 +429,187 @@ pub fn canonical_v3_event_batch_sha256(
     batch: &AuraV3EventBatch,
     limits: V3EventLimits,
 ) -> Result<[u8; 32]> {
-    validate_v3_event_batch(schema, batch, limits)?;
-    let fingerprint = canonical_v3_schema_fingerprint(schema)?;
-    let events = usize::try_from(batch.event_count)
-        .map_err(|_| AuraError::InvalidValue("v3 event count"))?;
-    let children = batch.child_count();
-    let mut hasher = Sha256::new();
-    hasher.update(HASH_DOMAIN);
-    hasher.update(schema.schema_id.to_le_bytes());
-    hasher.update(fingerprint);
-    hasher.update(batch.event_count.to_le_bytes());
-    hasher.update(children.to_le_bytes());
-    hasher.update(
-        u32::try_from(batch.event_columns.len())
-            .map_err(|_| AuraError::InvalidValue("v3 event column count"))?
-            .to_le_bytes(),
-    );
-    hasher.update(
-        u32::try_from(batch.repeated_columns.len())
-            .map_err(|_| AuraError::InvalidValue("v3 repeated column count"))?
-            .to_le_bytes(),
-    );
-    for event in 0..events {
-        let start = batch.child_offsets[event];
-        let end = batch.child_offsets[event + 1];
-        hasher.update(b"E");
+    let mut hasher =
+        CanonicalV3EventHasher::new(schema, batch.event_count, batch.child_count(), limits)?;
+    hasher.update_batch(schema, batch)?;
+    hasher.finalize()
+}
+
+/// Incremental form of the canonical grouped-event hash.
+///
+/// Total event and child counts are committed before any values. Batches are
+/// supplied in file order and local event/child indices are rebased into the
+/// global logical stream, making the final hash independent of chunking.
+#[derive(Clone)]
+pub struct CanonicalV3EventHasher {
+    hasher: Sha256,
+    schema_id: u32,
+    schema_fingerprint: [u8; 32],
+    event_column_count: usize,
+    repeated_column_count: usize,
+    total_events: u32,
+    total_children: u32,
+    hashed_events: u32,
+    hashed_children: u32,
+    limits: V3EventLimits,
+}
+
+impl core::fmt::Debug for CanonicalV3EventHasher {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("CanonicalV3EventHasher")
+            .field("schema_id", &self.schema_id)
+            .field("event_column_count", &self.event_column_count)
+            .field("repeated_column_count", &self.repeated_column_count)
+            .field("total_events", &self.total_events)
+            .field("total_children", &self.total_children)
+            .field("hashed_events", &self.hashed_events)
+            .field("hashed_children", &self.hashed_children)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CanonicalV3EventHasher {
+    pub fn new(
+        schema: &SchemaDescriptor,
+        total_events: u32,
+        total_children: u32,
+        limits: V3EventLimits,
+    ) -> Result<Self> {
+        validate_v3_grouped_exact_subset(schema)?;
+        let schema_fingerprint = canonical_v3_schema_fingerprint(schema)?;
+        let (event_fields, repeated_fields) = scoped_fields(schema);
+        let event_column_count = event_fields.len();
+        let repeated_column_count = repeated_fields.len();
+        let mut hasher = Sha256::new();
+        hasher.update(HASH_DOMAIN);
+        hasher.update(schema.schema_id.to_le_bytes());
+        hasher.update(schema_fingerprint);
+        hasher.update(total_events.to_le_bytes());
+        hasher.update(total_children.to_le_bytes());
         hasher.update(
-            u32::try_from(event)
-                .map_err(|_| AuraError::InvalidValue("v3 event count"))?
+            u32::try_from(event_column_count)
+                .map_err(|_| AuraError::InvalidValue("v3 event column count"))?
                 .to_le_bytes(),
         );
-        hasher.update(start.to_le_bytes());
-        hasher.update(end.to_le_bytes());
-        hash_columns_at(&mut hasher, &batch.event_columns, event)?;
-        for child in start..end {
-            hasher.update(b"C");
-            hasher.update(child.to_le_bytes());
-            hash_columns_at(
-                &mut hasher,
-                &batch.repeated_columns,
-                usize::try_from(child).map_err(|_| AuraError::InvalidValue("v3 child count"))?,
-            )?;
-        }
+        hasher.update(
+            u32::try_from(repeated_column_count)
+                .map_err(|_| AuraError::InvalidValue("v3 repeated column count"))?
+                .to_le_bytes(),
+        );
+        Ok(Self {
+            hasher,
+            schema_id: schema.schema_id,
+            schema_fingerprint,
+            event_column_count,
+            repeated_column_count,
+            total_events,
+            total_children,
+            hashed_events: 0,
+            hashed_children: 0,
+            limits,
+        })
     }
-    Ok(hasher.finalize().into())
+
+    pub const fn hashed_events(&self) -> u32 {
+        self.hashed_events
+    }
+
+    pub const fn hashed_children(&self) -> u32 {
+        self.hashed_children
+    }
+
+    pub fn update_batch(
+        &mut self,
+        schema: &SchemaDescriptor,
+        batch: &AuraV3EventBatch,
+    ) -> Result<()> {
+        validate_v3_event_batch(schema, batch, self.limits)?;
+        if schema.schema_id != self.schema_id
+            || canonical_v3_schema_fingerprint(schema)? != self.schema_fingerprint
+            || batch.event_columns.len() != self.event_column_count
+            || batch.repeated_columns.len() != self.repeated_column_count
+        {
+            return Err(AuraError::InvalidValue("v3 canonical event hash schema"));
+        }
+        let next_events = self
+            .hashed_events
+            .checked_add(batch.event_count)
+            .filter(|count| *count <= self.total_events)
+            .ok_or(AuraError::InvalidValue(
+                "v3 canonical event hash event count",
+            ))?;
+        let batch_children = batch.child_count();
+        let next_children = self
+            .hashed_children
+            .checked_add(batch_children)
+            .filter(|count| *count <= self.total_children)
+            .ok_or(AuraError::InvalidValue(
+                "v3 canonical event hash child count",
+            ))?;
+        let events = usize::try_from(batch.event_count)
+            .map_err(|_| AuraError::InvalidValue("v3 event count"))?;
+        for event in 0..events {
+            let event =
+                u32::try_from(event).map_err(|_| AuraError::InvalidValue("v3 event count"))?;
+            let global_event =
+                self.hashed_events
+                    .checked_add(event)
+                    .ok_or(AuraError::InvalidValue(
+                        "v3 canonical event hash event count",
+                    ))?;
+            let start = self
+                .hashed_children
+                .checked_add(batch.child_offsets[event as usize])
+                .ok_or(AuraError::InvalidValue(
+                    "v3 canonical event hash child count",
+                ))?;
+            let end = self
+                .hashed_children
+                .checked_add(batch.child_offsets[event as usize + 1])
+                .ok_or(AuraError::InvalidValue(
+                    "v3 canonical event hash child count",
+                ))?;
+            self.hasher.update(b"E");
+            self.hasher.update(global_event.to_le_bytes());
+            self.hasher.update(start.to_le_bytes());
+            self.hasher.update(end.to_le_bytes());
+            hash_columns_at(&mut self.hasher, &batch.event_columns, event as usize)?;
+            for child in start..end {
+                self.hasher.update(b"C");
+                self.hasher.update(child.to_le_bytes());
+                let local_child =
+                    child
+                        .checked_sub(self.hashed_children)
+                        .ok_or(AuraError::InvalidValue(
+                            "v3 canonical event hash child count",
+                        ))?;
+                hash_columns_at(
+                    &mut self.hasher,
+                    &batch.repeated_columns,
+                    usize::try_from(local_child)
+                        .map_err(|_| AuraError::InvalidValue("v3 child count"))?,
+                )?;
+            }
+        }
+        self.hashed_events = next_events;
+        self.hashed_children = next_children;
+        Ok(())
+    }
+
+    pub fn finalize(self) -> Result<[u8; 32]> {
+        if self.hashed_events != self.total_events {
+            return Err(AuraError::InvalidValue(
+                "v3 canonical event hash event count",
+            ));
+        }
+        if self.hashed_children != self.total_children {
+            return Err(AuraError::InvalidValue(
+                "v3 canonical event hash child count",
+            ));
+        }
+        Ok(self.hasher.finalize().into())
+    }
 }
 
 fn hash_columns_at(hasher: &mut Sha256, columns: &[AuraV3Column], row: usize) -> Result<()> {

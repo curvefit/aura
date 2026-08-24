@@ -2,11 +2,14 @@
 
 This document describes the current implementation.
 
-Current production writers still emit container V2. Aura also implements the
-first complete V3 subset: flat, event-only, uncompressed Aura0 files whose body
-is a concatenation of exact-value blocks. A seekable writer, bounded streaming
-verifier, and explicit V3 CLI seal/verify commands are available. A V3 schema
-cannot be embedded in a V2 container.
+Current production and default SDK writers still emit container V2. Aura also
+implements two complete, explicitly selected, uncompressed V3 Aura0 SDK
+flavors: flat event-scoped files whose body is a concatenation of exact-value
+`AURAV3VB` blocks, and grouped exact-event files whose body is a concatenation
+of `AURAV3EB` chunks. Both have seekable writers/readers and bounded
+verification. The explicit V3 CLI seal/verify commands cover the flat flavor
+only; there is no grouped CLI complete seal yet. V3 is not production-ready or
+the default, and a V3 schema cannot be embedded in a V2 container.
 
 ## Standalone V3 exact-value reference block
 
@@ -112,13 +115,56 @@ each exact-value block, 4,194,304 total rows, and 4,096 chunks;
 `V3FlatLimits::HARD` explicitly opts into the absolute 1 TiB body, 1 GiB block,
 and 16,777,216-row format ceilings.
 
+## Grouped Aura0 V3 container V1
+
+The complete grouped V3 SDK profile has the same V3 header/trailer envelope as
+the flat profile, but its body is a gapless sequence of positive-event
+`AURAV3EB` version-1 chunks. The `AURP` V3 grouped footer uses body encoding
+`2`, zero compression kind/level/flags, a 184-byte fixed prefix, 36-byte
+per-field statistics descriptors, and 152-byte chunk descriptors. The file
+ends with the common little-endian u32 footer length and `sealed:)` trailer.
+There is no physical compression in this profile.
+
+The grouped exact subset accepts a V3 tag-4 schema with exactly one repeated
+group, whose child slots are exactly all repeated fields and whose dual-domain
+descriptor has two domains. Its discriminator is the repeated, non-null `U8`
+field with role `side` and compact relationship-map byte `200`; group/Flag200
+execution is exact logical execution, not a physical transform. Event and
+repeated columns may be nullable and preserve their validity bitmaps. Each
+batch carries monotonic `event_count + 1` child offsets, and each chunk/footer
+descriptor carries contiguous global event and child ranges. The canonical
+logical hash commits event and child indices, boundaries, field slots, exact
+types, presence, and values in source/schema order, so rechunking preserves
+logical identity. Non-empty derived-expression tables are rejected.
+
+`V3GroupedAura0Writer<W>` streams validated batches to a seekable output. Its
+`finish` second pass reads every `AURAV3EB` chunk, rechecks decoding, ranges,
+stored/logical hashes and statistics, computes the body/global hashes, verifies
+the footer, then appends the footer, u32 length, and seal. `V3GroupedAura0Reader`
+opens the bounded envelope, supports event/child chunk lookup and individual
+chunk reads, and `verify_all` performs full body/hash/statistics verification
+with a second envelope/body check before marking the reader verified. A write
+that fails before the complete seal, or any writer/flush/sync or verification
+failure, is a failed/uncommitted result that callers must discard and must not
+publish, even if bytes happen to end in a seal. These SDK APIs do not provide a
+grouped CLI, physical relationship planner, compression, or Plan v2.
+
+The grouped hard ceilings are a 64 MiB footer, 1 TiB body, 65,536 chunks,
+16,777,216 events, 67,108,864 children, and 16 MiB schema descriptor. Default
+in-memory limits are 256 MiB body, 4,096 chunks, 1,048,576 events, and
+4,194,304 children. `V3GroupedLimits::HARD` is an explicit opt-in; supplied
+limits are clamped to the hard envelope. Grouped event-block limits are a 1 GiB
+hard/256 MiB default block, 4,194,304 hard/1,048,576 default events,
+16,777,216 hard/4,194,304 default children, and 67,108,864 hard/16,777,216
+default values; variable values retain the 16 MiB hard ceiling.
+
 ## Roles
 
 - `.aura`: ingest/preservation file. It stores logical i64 or typed rows plus
   the ingest footer (`AURF`).
 - `.aura0`: V2 compiled cold file with stream/delta/codec bodies plus the
-  compiled footer (`AURP`), or the explicit V3 flat file with exact-value
-  blocks and the V3 flat footer (`AURP`, version 3).
+  compiled footer (`AURP`), or an explicit V3 flat `AURAV3VB` file or grouped
+  `AURAV3EB` file with its V3 `AURP` footer (version 3).
 - `.aura1`: compiled fixed-width replay file. It stores fixed-width i64 rows
   plus the compiled footer (`AURP`).
 
@@ -138,10 +184,12 @@ footer length immediately before it, and locating the footer before that length.
 ## Header
 
 V2 and V3 use explicitly dispatched header layouts. Both contain the profile,
-stream and dictionary IDs, base timestamp, relationship map, derived expression
-table, and optional comment. V3 additionally carries canonical group
+stream and dictionary IDs, base timestamp, relationship map, derived-expression
+section, and optional comment. V3 additionally carries canonical group
 descriptors and uses slot-level byte 200 for the actual dual-domain
-discriminator. See `docs/container.md` for exact layouts.
+discriminator. The complete V3 flat and grouped profiles require an empty
+derived-expression section; V3 does not execute derived expressions. See
+`docs/container.md` for exact layouts.
 
 The V3 front header is authoritative for relationship and group permissions.
 The versioned full schema descriptor is authoritative for names, types, roles,
@@ -183,7 +231,8 @@ compiled plan slots
 chunk descriptors
 ```
 
-`.aura0` and `.aura1` use the compiled footer magic `AURP`. The current order is:
+V2 `.aura0` and `.aura1` use the compiled footer magic `AURP`. The current V2
+order is:
 
 ```text
 AURP
@@ -201,8 +250,9 @@ optional Aura1 byte-lane descriptor table (`AUBL`)
 ```
 
 Unsupported versions reject during footer decode. `AnyCompiledFooter` routes
-the unchanged V2 compiled footer to `CompiledFooter` and the V3 flat footer to
-its dedicated decoder.
+the unchanged V2 compiled footer to `CompiledFooter`, V3 flat encoding-1 bytes
+to the flat footer decoder, and V3 grouped encoding-2 bytes to the grouped
+footer decoder. It does not reinterpret one V3 layout as the other.
 
 ## Aura1 Body
 
@@ -234,13 +284,15 @@ a future format extension.
 
 ## Aura0 Body
 
-Aura0 uses the generic instruction plan when present. The body contains stream
-payloads referenced by that plan. Current stream operations include fixed-step,
-delta, varint, bitpack, RLE, dictionary, packed dictionary, block-local, and
-Huffman dictionary variants. The current direct paths preserve the footer plan
-and do not change binary layout.
+V2 Aura0 uses the generic instruction plan when present. Its body contains
+stream payloads referenced by that plan. Current V2 stream operations include
+fixed-step, delta, varint, bitpack, RLE, dictionary, packed dictionary,
+block-local, and Huffman dictionary variants. The current direct paths preserve
+the V2 footer plan and do not change binary layout. The V3 exact profiles above
+are uncompressed and do not use a physical relationship planner, compression,
+or Plan v2.
 
-Aura0 can now be written with three profiles:
+V2 Aura0 can be written with three profiles:
 
 - `compact`: semantic stream lane only. This is the smallest current profile
   and keeps the full semantic decode path.

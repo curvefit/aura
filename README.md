@@ -9,11 +9,12 @@ The current implementation has two deliberately separate surfaces:
 * V2 is the default production container used by the existing SDK writer,
   reader, and conversion paths. It remains the compatibility baseline for
   `.aura`, `.aura0`, and `.aura1` files.
-* V3 has one complete, explicitly bounded Aura0 subset: flat event-scoped
-  fields encoded as exact-value blocks, with a self-contained schema/footer,
-  checksums, hashes, a seekable writer/reader, and the developer CLI. V3 is
-  usable for the supported subset, but it is not a claim that every Aura
-  relationship or order-book layout is ready.
+* V3 has two complete, explicitly bounded, uncompressed Aura0 SDK flavors:
+  flat event-scoped values in `AURAV3VB` blocks and grouped exact events in
+  `AURAV3EB` chunks. Both have self-contained schema/footers, checksums,
+  hashes, and seekable writer/reader APIs. The flat flavor also has the
+  developer CLI; there is no grouped CLI complete-seal command yet. Neither
+  V3 flavor is production-ready or the default.
 
 The public model is intentionally generic:
 
@@ -23,7 +24,8 @@ The public model is intentionally generic:
   derived-expression references, repeated groups, timestamps, and opaque
   streams;
 - `.aura0` is a compact cold-storage profile. The established V2 writer uses
-  compiled instructions; the explicit V3 subset uses exact-value blocks;
+  compiled instructions; the explicit V3 APIs use exact-value or exact-event
+  blocks;
 - `.aura1` is the V2 replay-oriented fixed/block profile.
 
 ## Format Levels
@@ -31,13 +33,14 @@ The public model is intentionally generic:
 | File | Current container | Purpose |
 |---:|---|---|
 | `.aura` | V2 ingest | Normalized facts plus seal-time optimization stats when known. |
-| `.aura0` | V2 or explicit V3 | V2 compact instruction streams, or the supported V3 exact-value subset. |
+| `.aura0` | V2 or explicit V3 | V2 compact instruction streams, or the supported V3 flat/grouped exact subset. |
 | `.aura1` | V2 | Replay-oriented fixed/block encoding compiled from the V2 plan. |
 
 The V2 levels trade disk for parsing speed. The generic V2 writer emits V2
 containers even when its profile is `.aura0` or `.aura1`; V3 is selected only
-through the V3 API or CLI. A V3 flat Aura0 file is self-contained and is not
-converted by the V2 compiled-profile conversion path.
+through an explicit V3 API or the flat V3 CLI. V3 flat and grouped Aura0 files
+are self-contained and are not converted by the V2 compiled-profile conversion
+path.
 
 ## Repository Scope
 
@@ -52,9 +55,10 @@ Aura contains generic binary codec mechanics and research prototypes:
 
 It does not include venue-specific adapters, private source semantics, capture
 daemons, or production data. A caller or external schema author supplies the
-logical schema; Aura validates it and, where a planner is supported, selects
-physical instructions from the declared relationships and observed values.
-Dataset names and venue labels are not part of the V3 flat seal decision.
+logical schema; Aura validates it and the V2 planner, where applicable, selects
+physical instructions from declared relationships and observed values. The V3
+exact profiles do not run a physical relationship planner, compression, or
+Plan v2. Dataset names and venue labels are not part of a V3 seal decision.
 
 
 ## Docs
@@ -88,36 +92,51 @@ cargo run --release --bin aura -- v3 aura0 seal \
 cargo run --release --bin aura -- v3 aura0 verify \
   --input <new-file.aura0> --json
 cargo test --test v3_aura0_container
+cargo test --test v3_grouped_container --test v3_grouped_writer_reader
 cargo run --bin aura-size -- 10000 1 8
 cargo run --example roundtrip
 ```
 
-The V3 seal command reads one Arrow IPC stream from standard input and requires
+The flat V3 seal command reads one Arrow IPC stream from standard input and requires
 the schema file to already be Aura's canonical external schema JSON. It writes
 an absent `.aura0` destination through a temporary file, syncs it, and
 publishes it atomically. Verification reopens the complete file and checks the
 header, footer, schema fingerprint, per-chunk stored and logical hashes, body
-hash, statistics, global logical hash, and exact file length. A failed or
-interrupted seal is not a valid artifact; an existing destination is never
-silently replaced by this command.
+hash, statistics, global logical hash, and exact file length. A write that fails
+before the complete seal, or any writer/flush/sync error, is a failed and
+uncommitted result that must not be published even if bytes happen to end in a
+seal. The flat CLI syncs a temporary file before atomic publication and never
+silently replaces an existing destination. The grouped SDK writer takes a
+seekable stream and has no corresponding CLI complete-seal command yet.
 
 The supported V3 flat subset is intentionally narrow: event-scoped fields,
-exact fixed and variable values, optional validity bitmaps, no groups,
-repeated fields, derived expressions, or byte-200 dual-domain execution, and
-no V3 Aura1 conversion. The format ceilings are a 16 MiB front header, 64 MiB
-footer, 1 TiB body, 65,536 chunks, 16,777,216 rows, 1 GiB per exact-value
-block, and 16 MiB per variable value. Default API limits are lower (256 MiB
-body, 4,194,304 rows, 4,096 chunks, and 256 MiB per block); the hard limits
-are an explicit API choice and remain capped by the format ceilings. The
-reader treats files as untrusted input and rejects malformed lengths, hashes,
-types, offsets, UTF-8, decimal text, and trailing data before trusting the
-decoded result. These limits and checks are safety ceilings, not performance
-claims.
+exact fixed and variable values, and optional validity bitmaps. It rejects
+groups, repeated fields, derived expressions, byte-200 dual-domain execution,
+and V3 Aura1 conversion. The grouped subset accepts exactly one V3 repeated
+group with two domains: its byte-200 non-null U8 side field, all repeated child
+slots, authoritative event-to-child offsets, exact null validity, and stable
+source order are encoded and hashed. Grouped batches and chunks preserve event
+and child ranges; rechunking does not change the global logical hash.
 
-V3 schema headers can describe relationships and groups for future planning,
-but the complete flat Aura0 writer rejects those declarations until a later
-container/profile contract proves their exact event-to-child semantics. In
-particular, Flag 200 is a V3 discriminator declaration, not evidence that
-order-book body execution is supported today. Aura0 is therefore a usable
-shadow/fallback artifact for its flat subset, not yet a blanket replacement
-for Parquet in Grimoire.
+Flat hard ceilings are a 16 MiB front header, 64 MiB footer, 1 TiB body, 65,536
+chunks, 16,777,216 rows, 1 GiB per exact-value block, and 16 MiB per variable
+value. Flat defaults are 256 MiB body/block, 4,194,304 rows, and 4,096 chunks.
+Grouped hard ceilings are a 16 MiB front header, 64 MiB footer, 1 TiB body,
+65,536 chunks, 16,777,216 events, 67,108,864 children, and 16 MiB schema;
+grouped defaults are 256 MiB body, 4,096 chunks, 1,048,576 events, and
+4,194,304 children. Grouped event-block hard/default ceilings are 1 GiB /
+256 MiB block, 4,194,304 / 1,048,576 events, 16,777,216 / 4,194,304
+children, and 67,108,864 / 16,777,216 values. `V3FlatLimits::HARD` and
+`V3GroupedLimits::HARD` are explicit opt-ins;
+caller limits are clamped to these format ceilings. These limits and checks are
+safety ceilings, not performance claims.
+
+Both complete V3 writers reject non-empty derived-expression tables. Grouped
+Flag 200 is exact logical discriminator execution only; V3 does not select
+physical relationship transforms, compression, or Plan v2. Failed or
+interrupted SDK writes are discarded and re-written rather than recovered;
+writer/flush/sync failures must not be published even when bytes end in a seal.
+Readers reject bad trailer lengths, hashes, ranges, schema,
+null/value planes, and trailing bytes; they do not promise concurrent-mutation
+exclusion. Aura0 is therefore an explicit SDK/shadow surface, not a blanket
+replacement for Parquet in Grimoire.

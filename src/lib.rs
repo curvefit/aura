@@ -37,6 +37,9 @@ pub mod stats;
 pub mod types;
 pub mod v3_container;
 pub mod v3_events;
+pub mod v3_grouped_container;
+pub mod v3_grouped_reader;
+pub mod v3_grouped_writer;
 pub mod v3_reader;
 pub mod v3_values;
 pub mod v3_writer;
@@ -146,10 +149,33 @@ pub use v3_container::{
 };
 pub use v3_events::{
     canonical_v3_event_batch_sha256, decode_v3_event_block, encode_v3_event_block,
-    validate_v3_event_batch, validate_v3_grouped_exact_subset, AuraV3EventBatch, V3EventLimits,
-    DEFAULT_V3_EVENT_BLOCK_BYTES, DEFAULT_V3_EVENT_CHILDREN, DEFAULT_V3_EVENT_EVENTS,
-    DEFAULT_V3_EVENT_VALUES, MAX_V3_EVENT_BLOCK_BYTES, MAX_V3_EVENT_CHILDREN, MAX_V3_EVENT_EVENTS,
-    MAX_V3_EVENT_OFFSETS_BYTES, MAX_V3_EVENT_VALUES,
+    validate_v3_event_batch, validate_v3_grouped_exact_subset, AuraV3EventBatch,
+    CanonicalV3EventHasher, V3EventLimits, DEFAULT_V3_EVENT_BLOCK_BYTES, DEFAULT_V3_EVENT_CHILDREN,
+    DEFAULT_V3_EVENT_EVENTS, DEFAULT_V3_EVENT_VALUES, MAX_V3_EVENT_BLOCK_BYTES,
+    MAX_V3_EVENT_CHILDREN, MAX_V3_EVENT_EVENTS, MAX_V3_EVENT_OFFSETS_BYTES, MAX_V3_EVENT_VALUES,
+    V3_EVENT_BLOCK_VERSION,
+};
+pub use v3_grouped_container::{
+    decode_v3_grouped_aura0, decode_v3_grouped_aura0_with_limits, decode_v3_grouped_footer,
+    decode_v3_grouped_footer_with_limits, encode_v3_grouped_footer, v3_grouped_body_sha256,
+    v3_grouped_header_sha256, DecodedV3GroupedAura0, V3GroupedChunkDescriptor,
+    V3GroupedColumnStats, V3GroupedFooter, V3GroupedLimits,
+    DEFAULT_V3_GROUPED_IN_MEMORY_BODY_BYTES, DEFAULT_V3_GROUPED_IN_MEMORY_CHILDREN,
+    DEFAULT_V3_GROUPED_IN_MEMORY_CHUNKS, DEFAULT_V3_GROUPED_IN_MEMORY_EVENTS,
+    MAX_V3_GROUPED_BODY_BYTES, MAX_V3_GROUPED_CHILDREN, MAX_V3_GROUPED_CHUNKS,
+    MAX_V3_GROUPED_EVENTS, MAX_V3_GROUPED_FOOTER_BYTES, MAX_V3_GROUPED_SCHEMA_BYTES,
+    V3_GROUPED_BODY_ENCODING_EXACT_EVENTS, V3_GROUPED_BODY_LAYOUT_VERSION,
+    V3_GROUPED_CHUNK_DESCRIPTOR_BYTES, V3_GROUPED_EVENT_BLOCK_VERSION,
+    V3_GROUPED_FOOTER_LAYOUT_VERSION, V3_GROUPED_FOOTER_PREFIX_BYTES,
+    V3_GROUPED_STATS_DESCRIPTOR_BYTES,
+};
+pub use v3_grouped_reader::{
+    AuraV3GroupedReader, V3GroupedAura0Reader, V3GroupedChunkRead, V3GroupedReadAll,
+    V3GroupedReaderState, V3GroupedVerifySummary,
+};
+pub use v3_grouped_writer::{
+    AuraV3GroupedWriter, V3GroupedAura0Writer, V3GroupedWriteSummary, V3GroupedWriterOptions,
+    V3GroupedWriterState,
 };
 pub use v3_reader::{
     AuraV3FlatReader, V3FlatAura0Reader, V3FlatReadAll, V3FlatReaderState, V3FlatVerifySummary,
