@@ -1,20 +1,23 @@
 use std::io::Cursor;
 
 use aura_codec::{
-    canonical_v3_event_batch_sha256, compile_v3_planned_grouped, decode_any_compiled_footer,
-    decode_v3_planned_grouped, decode_v3_planned_grouped_footer, encode_v3_planned_grouped_footer,
-    AnyCompiledFooter, AuraHeader, AuraPlanV2, AuraV3Column, AuraV3ColumnValues as Values,
-    AuraV3EventBatch, AuraV3VariableColumn, FieldRole, FieldScope, FieldType, PlanV2Selection,
-    RelationshipPermissions, SchemaBuilder, V3EventLimits, V3GroupedAura0Reader,
-    V3GroupedAura0Writer, V3GroupedLimits, V3GroupedWriterOptions, AURA_PLAN_V2_REGISTRY_VERSION,
-    AURA_PLAN_V2_VERSION, MAX_AURA_PLAN_V2_BYTES, V3_PLANNED_GROUPED_BODY_ENCODING,
-    V3_PLANNED_GROUPED_FOOTER_LAYOUT_VERSION,
+    canonical_v3_event_batch_sha256, compile_v3_planned_grouped,
+    compile_v3_planned_grouped_attempt2, compile_v3_planned_grouped_attempt2_candidate,
+    decode_any_compiled_footer, decode_v3_planned_grouped, decode_v3_planned_grouped_footer,
+    encode_v3_planned_grouped_footer, AnyCompiledFooter, AuraHeader, AuraPlanV2, AuraV3Column,
+    AuraV3ColumnValues as Values, AuraV3EventBatch, AuraV3VariableColumn, FieldRole, FieldScope,
+    FieldType, PlanV2Selection, RelationshipPermissions, SchemaBuilder, V3EventLimits,
+    V3GroupedAura0Reader, V3GroupedAura0Writer, V3GroupedLimits, V3GroupedWriterOptions,
+    AURA_PLAN_V2_REGISTRY_VERSION, AURA_PLAN_V2_VERSION, MAX_AURA_PLAN_V2_BYTES,
+    V3_PLANNED_GROUPED_BODY_ENCODING, V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION,
+    V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION, V3_PLANNED_GROUPED_FOOTER_LAYOUT_VERSION,
 };
 use sha2::{Digest, Sha256};
 
 const PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v1\0";
 const PLANNED_HEADER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-grouped-header-v1\0";
 const PLANNED_FOOTER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-grouped-footer-v1\0";
+const PLANNED_BODY_HASH_DOMAIN: &[u8] = b"aura-v3-planned-grouped-body-v1\0";
 
 fn permissions() -> RelationshipPermissions {
     RelationshipPermissions::none()
@@ -254,6 +257,11 @@ fn aup2_rejects_duplicate_cycle_unauthorized_unknown_noncanonical_trailing_and_o
     resign_plan(&mut unknown);
     assert!(AuraPlanV2::decode(&schema, &unknown).is_err());
 
+    let mut registry1_split = encoded.clone();
+    registry1_split[57] = PlanV2Selection::SplitDomainDirect as u8;
+    resign_plan(&mut registry1_split);
+    assert!(AuraPlanV2::decode(&schema, &registry1_split).is_err());
+
     let mut noncanonical = plan.clone();
     noncanonical.streams.swap(0, 1);
     assert!(noncanonical.validate(&schema).is_err());
@@ -288,6 +296,7 @@ fn planned_direct_roundtrips_every_grouped_exact_type_and_complete_accounting() 
     )
     .unwrap();
     assert_eq!(artifact.summary.file_bytes, artifact.bytes.len() as u64);
+    assert_eq!(artifact.summary.file_bytes, 1964);
     assert_eq!(
         artifact.summary.file_bytes,
         artifact.summary.accounted_file_bytes
@@ -298,7 +307,29 @@ fn planned_direct_roundtrips_every_grouped_exact_type_and_complete_accounting() 
     assert!(artifact.inspection.schema_relationships_authorized_only);
     assert!(!artifact.inspection.plan.relationships_attempted);
     let decoded = decode_v3_planned_grouped(&artifact.bytes, V3GroupedLimits::default()).unwrap();
-    assert_eq!(decoded.batches, vec![batch]);
+    assert_eq!(decoded.batches, vec![batch.clone()]);
+    let split = compile_v3_planned_grouped_attempt2_candidate(
+        &schema,
+        std::slice::from_ref(&batch),
+        Default::default(),
+        PlanV2Selection::SplitDomainDirect,
+    )
+    .unwrap();
+    let split_repeat = compile_v3_planned_grouped_attempt2_candidate(
+        &schema,
+        std::slice::from_ref(&batch),
+        V3GroupedLimits::default(),
+        PlanV2Selection::SplitDomainDirect,
+    )
+    .unwrap();
+    assert_eq!(split.bytes, split_repeat.bytes);
+    assert_eq!(split.summary, split_repeat.summary);
+    assert_eq!(
+        decode_v3_planned_grouped(&split.bytes, Default::default())
+            .unwrap()
+            .batches,
+        vec![batch]
+    );
     assert_eq!(decoded.summary, artifact.summary);
     assert_eq!(decoded.footer.plan_sha256, artifact.summary.plan_sha256);
     eprintln!(
@@ -345,6 +376,8 @@ fn planned_direct_and_exact_body2_share_canonical_hash_across_legal_rechunking()
         planned_whole.summary.plan_sha256,
         planned_split.summary.plan_sha256
     );
+    assert_eq!(planned_whole.summary.file_bytes, 997);
+    assert_eq!(planned_split.summary.file_bytes, 1277);
     assert_ne!(planned_whole.bytes, planned_split.bytes);
 
     let mut exact_writer = V3GroupedAura0Writer::try_new(
@@ -688,6 +721,415 @@ fn planned_direct_preserves_nullable_event_scope_null_and_zero() {
     );
 }
 
+#[test]
+fn attempt2_scores_real_direct_and_split_files_and_preserves_exact_inverse() {
+    let schema = all_types_schema();
+    let batch = all_types_batch(schema.schema_id);
+    let direct = compile_v3_planned_grouped_attempt2_candidate(
+        &schema,
+        std::slice::from_ref(&batch),
+        V3GroupedLimits::default(),
+        PlanV2Selection::Direct,
+    )
+    .unwrap();
+    let split = compile_v3_planned_grouped_attempt2_candidate(
+        &schema,
+        std::slice::from_ref(&batch),
+        V3GroupedLimits::default(),
+        PlanV2Selection::SplitDomainDirect,
+    )
+    .unwrap();
+    for candidate in [&direct, &split] {
+        assert_eq!(candidate.summary.file_bytes, candidate.bytes.len() as u64);
+        assert_eq!(
+            candidate.summary.file_bytes,
+            candidate.summary.accounted_file_bytes
+        );
+        assert_eq!(candidate.inspection.body_layout_version, 2);
+        assert_eq!(candidate.inspection.direct_block_version, 2);
+        assert_eq!(
+            decode_v3_planned_grouped(&candidate.bytes, V3GroupedLimits::default())
+                .unwrap()
+                .batches,
+            vec![batch.clone()]
+        );
+        assert_eq!(
+            candidate.summary.global_logical_sha256,
+            canonical_v3_event_batch_sha256(&schema, &batch, Default::default()).unwrap()
+        );
+    }
+    assert_eq!(
+        split.inspection.plan.selected,
+        PlanV2Selection::SplitDomainDirect
+    );
+    assert!(split.inspection.plan.relationships_attempted);
+    assert!(!split.inspection.schema_relationships_authorized_only);
+    assert!(direct.inspection.schema_relationships_authorized_only);
+    assert!(
+        split.inspection.plan.authorized_relationship_bits & RelationshipPermissions::SPLIT != 0
+    );
+    let split_footer =
+        decode_v3_planned_grouped_footer(footer_bytes(&split.bytes), V3GroupedLimits::HARD)
+            .unwrap();
+    assert_eq!(
+        split_footer.plan.decode_order,
+        (0..schema.fields.len() as u16).collect::<Vec<_>>()
+    );
+    assert_eq!(split_footer.plan.event_child_offsets_stream_id, Some(0));
+    let discriminator = &split_footer.plan.streams[split_footer.plan.discriminator_slot as usize];
+    assert_eq!(
+        split_footer.plan.source_order_selector_stream_id,
+        discriminator.physical_stream_ids.first().copied()
+    );
+    assert!(split_footer.plan.streams.iter().all(|stream| {
+        !stream.physical_stream_ids.is_empty()
+            && (stream.scope == FieldScope::Event
+                || stream.slot == split_footer.plan.discriminator_slot
+                || stream.physical_stream_ids.len() == 2)
+    }));
+    assert!(split.bytes.windows(3).all(|window| window != b"bid"));
+    assert!(split.bytes.windows(3).all(|window| window != b"ask"));
+
+    let selected = compile_v3_planned_grouped_attempt2(
+        &schema,
+        std::slice::from_ref(&batch),
+        V3GroupedLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(selected.inspection.candidates.len(), 3);
+    assert!(selected.inspection.candidates[2].authorized);
+    assert!(selected.inspection.candidates[2].applicable);
+    assert_eq!(
+        selected.inspection.candidates[1].complete_bytes,
+        Some(direct.summary.file_bytes)
+    );
+    assert_eq!(
+        selected.inspection.candidates[2].complete_bytes,
+        Some(split.summary.file_bytes)
+    );
+    let registry1_bytes = selected.inspection.candidates[0].complete_bytes.unwrap();
+    assert_eq!(
+        selected.summary.file_bytes,
+        registry1_bytes
+            .min(direct.summary.file_bytes)
+            .min(split.summary.file_bytes)
+    );
+    assert_eq!(
+        selected
+            .inspection
+            .candidates
+            .iter()
+            .filter(|row| row.selected)
+            .count(),
+        1
+    );
+    assert_eq!(selected.inspection.plan.selected, PlanV2Selection::Direct);
+    assert!(selected.inspection.candidates[1].selected);
+    eprintln!(
+        "development attempt2 all-types complete bytes: registry1={} compact_direct={} compact_split={} selected={}",
+        registry1_bytes,
+        direct.summary.file_bytes,
+        split.summary.file_bytes,
+        selected.summary.file_bytes
+    );
+}
+
+#[test]
+fn attempt2_generic_and_okx_like_asymmetry_zero_child_and_cost_fallback() {
+    let generic = small_schema();
+    let generic_batches = vec![
+        small_batch(generic.schema_id, &[1], &[-1], &[0, 0], &[], &[]),
+        small_batch(
+            generic.schema_id,
+            &[2, 3],
+            &[-2, -3],
+            &[0, 3, 4],
+            &[0, 0, 0, 1],
+            &[0, 1, 2, 3],
+        ),
+    ];
+    let generic_direct = compile_v3_planned_grouped_attempt2_candidate(
+        &generic,
+        &generic_batches,
+        V3GroupedLimits::default(),
+        PlanV2Selection::Direct,
+    )
+    .unwrap();
+    let generic_split = compile_v3_planned_grouped_attempt2_candidate(
+        &generic,
+        &generic_batches,
+        V3GroupedLimits::default(),
+        PlanV2Selection::SplitDomainDirect,
+    )
+    .unwrap();
+    let selected =
+        compile_v3_planned_grouped_attempt2(&generic, &generic_batches, V3GroupedLimits::default())
+            .unwrap();
+    let empty_selected =
+        compile_v3_planned_grouped_attempt2(&generic, &[], V3GroupedLimits::default()).unwrap();
+    assert_eq!(
+        empty_selected.inspection.plan.selected,
+        PlanV2Selection::Direct
+    );
+    assert_eq!(
+        empty_selected.inspection.candidates[2].rejection.as_deref(),
+        Some("complete cost did not beat direct")
+    );
+    assert_eq!(
+        decode_v3_planned_grouped(&generic_split.bytes, Default::default())
+            .unwrap()
+            .batches,
+        generic_batches
+    );
+    let mut exact_writer = V3GroupedAura0Writer::try_new(
+        Cursor::new(Vec::new()),
+        generic.clone(),
+        V3GroupedWriterOptions::default(),
+    )
+    .unwrap();
+    for batch in &generic_batches {
+        exact_writer.write_batch(batch).unwrap();
+    }
+    let (_, exact_summary) = exact_writer.finish().unwrap();
+    assert_eq!(
+        exact_summary.global_logical_sha256,
+        generic_split.summary.global_logical_sha256
+    );
+
+    let mut okx = SchemaBuilder::new("generic_order_count_extension")
+        .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
+        .field("sequence", FieldType::I64, FieldRole::Sequence)
+        .repeated_field("side", FieldType::U8, FieldRole::Side)
+        .repeated_field("price", FieldType::I64, FieldRole::Price)
+        .repeated_field("quantity", FieldType::I64, FieldRole::Quantity)
+        .repeated_field("order_count", FieldType::U32, FieldRole::Count)
+        .dual_domain_repeated_group(8, vec![2, 3, 4, 5], 2, permissions())
+        .finish()
+        .unwrap();
+    okx.fields[5].nullable = true;
+    let groups = okx.groups.clone();
+    okx = okx.with_v3_groups(groups).unwrap();
+    let okx_batch = AuraV3EventBatch {
+        schema_id: okx.schema_id,
+        event_count: 2,
+        child_offsets: vec![0, 0, 3],
+        event_columns: vec![
+            AuraV3Column {
+                slot: 0,
+                validity: None,
+                values: Values::TimestampMs(vec![1, 2]),
+            },
+            AuraV3Column {
+                slot: 1,
+                validity: None,
+                values: Values::I64(vec![-1, -2]),
+            },
+        ],
+        repeated_columns: vec![
+            AuraV3Column {
+                slot: 2,
+                validity: None,
+                values: Values::U8(vec![1, 1, 0]),
+            },
+            AuraV3Column {
+                slot: 3,
+                validity: None,
+                values: Values::I64(vec![10, 11, 9]),
+            },
+            AuraV3Column {
+                slot: 4,
+                validity: None,
+                values: Values::I64(vec![0, 2, 3]),
+            },
+            AuraV3Column {
+                slot: 5,
+                validity: Some(vec![0b101]),
+                values: Values::U32(vec![0, 0, 7]),
+            },
+        ],
+    };
+    let okx_split = compile_v3_planned_grouped_attempt2_candidate(
+        &okx,
+        std::slice::from_ref(&okx_batch),
+        Default::default(),
+        PlanV2Selection::SplitDomainDirect,
+    )
+    .unwrap();
+    assert_eq!(
+        decode_v3_planned_grouped(&okx_split.bytes, Default::default())
+            .unwrap()
+            .batches,
+        vec![okx_batch]
+    );
+    eprintln!(
+        "development attempt2 generic complete bytes: registry1={} compact_direct={} compact_split={} selected={}; okx_split={}",
+        selected.inspection.candidates[0].complete_bytes.unwrap(),
+        generic_direct.summary.file_bytes,
+        generic_split.summary.file_bytes,
+        selected.summary.file_bytes,
+        okx_split.summary.file_bytes
+    );
+}
+
+#[test]
+fn attempt2_forbidden_split_invalid_selector_corruption_and_bounds_fail_closed() {
+    let schema = small_schema();
+    let batch = small_batch(schema.schema_id, &[1], &[-1], &[0, 1], &[0], &[1]);
+    let split = compile_v3_planned_grouped_attempt2_candidate(
+        &schema,
+        std::slice::from_ref(&batch),
+        Default::default(),
+        PlanV2Selection::SplitDomainDirect,
+    )
+    .unwrap();
+    for index in 0..split.bytes.len() {
+        let mut corrupted = split.bytes.clone();
+        corrupted[index] ^= 1;
+        assert!(decode_v3_planned_grouped(&corrupted, Default::default()).is_err());
+    }
+    let mut bad_mapping =
+        decode_v3_planned_grouped_footer(footer_bytes(&split.bytes), V3GroupedLimits::HARD)
+            .unwrap();
+    bad_mapping.plan.streams[0].physical_stream_ids[0] = u16::MAX;
+    assert!(encode_v3_planned_grouped_footer(&bad_mapping, V3GroupedLimits::HARD).is_err());
+    for block_offset in [60usize, 64] {
+        let resigned = resign_attempt2_body_mutation(&split, block_offset);
+        assert!(decode_v3_planned_grouped(&resigned, V3GroupedLimits::HARD).is_err());
+    }
+    let mut lower = V3GroupedLimits::default();
+    lower.event_limits.max_block_bytes = split.summary.body_bytes as usize - 1;
+    assert!(compile_v3_planned_grouped_attempt2_candidate(
+        &schema,
+        std::slice::from_ref(&batch),
+        lower,
+        PlanV2Selection::SplitDomainDirect
+    )
+    .is_err());
+
+    let forbidden = SchemaBuilder::new("split_forbidden")
+        .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
+        .field("sequence", FieldType::I64, FieldRole::Sequence)
+        .repeated_field("side", FieldType::U8, FieldRole::Side)
+        .repeated_field("value", FieldType::I64, FieldRole::Value)
+        .dual_domain_repeated_group(
+            1,
+            vec![2, 3],
+            2,
+            RelationshipPermissions::none().with_within_domain(),
+        )
+        .finish()
+        .unwrap();
+    let groups = forbidden.groups.clone();
+    let forbidden = forbidden.with_v3_groups(groups).unwrap();
+    let forbidden_batch = small_batch(forbidden.schema_id, &[1], &[-1], &[0, 1], &[0], &[1]);
+    assert!(compile_v3_planned_grouped_attempt2_candidate(
+        &forbidden,
+        std::slice::from_ref(&forbidden_batch),
+        Default::default(),
+        PlanV2Selection::SplitDomainDirect
+    )
+    .is_err());
+    let selected =
+        compile_v3_planned_grouped_attempt2(&forbidden, &[forbidden_batch], Default::default())
+            .unwrap();
+    assert_eq!(selected.inspection.plan.selected, PlanV2Selection::Direct);
+    assert!(!selected.inspection.candidates[2].authorized);
+
+    let mut invalid_side = batch;
+    invalid_side.repeated_columns[0].values = Values::U8(vec![2]);
+    assert!(
+        compile_v3_planned_grouped_attempt2(&schema, &[invalid_side], Default::default()).is_err()
+    );
+    assert_eq!(
+        split.inspection.body_layout_version,
+        V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION
+    );
+    assert_eq!(
+        split.inspection.direct_block_version,
+        V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION
+    );
+}
+
+#[test]
+fn attempt2_physical_ids_follow_direct_and_split_order_when_side_is_not_first() {
+    let schema = SchemaBuilder::new("discriminator_not_first")
+        .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
+        .repeated_field("value_before_side", FieldType::I64, FieldRole::Value)
+        .repeated_field("side", FieldType::U8, FieldRole::Side)
+        .repeated_field("value_after_side", FieldType::I64, FieldRole::Value)
+        .dual_domain_repeated_group(5, vec![1, 2, 3], 2, permissions())
+        .finish()
+        .unwrap();
+    let groups = schema.groups.clone();
+    let schema = schema.with_v3_groups(groups).unwrap();
+    let batch = AuraV3EventBatch {
+        schema_id: schema.schema_id,
+        event_count: 1,
+        child_offsets: vec![0, 3],
+        event_columns: vec![AuraV3Column {
+            slot: 0,
+            validity: None,
+            values: Values::TimestampMs(vec![1]),
+        }],
+        repeated_columns: vec![
+            AuraV3Column {
+                slot: 1,
+                validity: None,
+                values: Values::I64(vec![10, 20, 30]),
+            },
+            AuraV3Column {
+                slot: 2,
+                validity: None,
+                values: Values::U8(vec![1, 0, 1]),
+            },
+            AuraV3Column {
+                slot: 3,
+                validity: None,
+                values: Values::I64(vec![-1, -2, -3]),
+            },
+        ],
+    };
+    for selection in [PlanV2Selection::Direct, PlanV2Selection::SplitDomainDirect] {
+        let artifact = compile_v3_planned_grouped_attempt2_candidate(
+            &schema,
+            std::slice::from_ref(&batch),
+            Default::default(),
+            selection,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_v3_planned_grouped(&artifact.bytes, Default::default())
+                .unwrap()
+                .batches,
+            vec![batch.clone()]
+        );
+        let footer =
+            decode_v3_planned_grouped_footer(footer_bytes(&artifact.bytes), V3GroupedLimits::HARD)
+                .unwrap();
+        let physical_slots = footer
+            .plan
+            .streams
+            .iter()
+            .filter(|stream| !stream.physical_stream_ids.is_empty())
+            .flat_map(|stream| {
+                stream
+                    .physical_stream_ids
+                    .iter()
+                    .map(move |id| (*id, stream.slot))
+            })
+            .collect::<Vec<_>>();
+        if selection == PlanV2Selection::Direct {
+            assert!(physical_slots.contains(&(2, 2)));
+            assert!(physical_slots.contains(&(3, 1)));
+        } else {
+            assert!(physical_slots.contains(&(2, 2)));
+            assert!(physical_slots
+                .iter()
+                .any(|(id, slot)| *id > 2 && *slot == 1));
+        }
+    }
+}
+
 fn plan_hash(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(PLAN_HASH_DOMAIN);
@@ -724,6 +1166,28 @@ fn footer_start(file: &[u8]) -> usize {
             .unwrap(),
     ) as usize;
     footer_len_offset - footer_len
+}
+
+fn resign_attempt2_body_mutation(
+    artifact: &aura_codec::V3PlannedGroupedArtifact,
+    block_offset: usize,
+) -> Vec<u8> {
+    let header_len = AuraHeader::encoded_len(&artifact.bytes).unwrap();
+    let mut body = artifact.bytes[header_len..footer_start(&artifact.bytes)].to_vec();
+    body[block_offset] ^= 1;
+    let mut footer =
+        decode_v3_planned_grouped_footer(footer_bytes(&artifact.bytes), V3GroupedLimits::HARD)
+            .unwrap();
+    footer.body_sha256 = domain_hash(PLANNED_BODY_HASH_DOMAIN, &body);
+    footer.chunks[0].stored_sha256 = Sha256::digest(&body).into();
+    let footer_bytes = encode_v3_planned_grouped_footer(&footer, V3GroupedLimits::HARD).unwrap();
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&artifact.bytes[..header_len]);
+    rebuilt.extend_from_slice(&body);
+    rebuilt.extend_from_slice(&footer_bytes);
+    rebuilt.extend_from_slice(&(footer_bytes.len() as u32).to_le_bytes());
+    rebuilt.extend_from_slice(b"sealed:)");
+    rebuilt
 }
 
 fn footer_bytes(file: &[u8]) -> &[u8] {

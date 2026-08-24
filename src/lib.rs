@@ -182,15 +182,19 @@ pub use v3_grouped_writer::{
 pub use v3_plan_v2::{
     AuraPlanV2, PlanV2Inspection, PlanV2Selection, PlanV2StreamDescriptor,
     AURA_PLAN_V2_AUTHORITATIVE_SOURCE_ORDER, AURA_PLAN_V2_DIRECT_OP, AURA_PLAN_V2_MAGIC,
-    AURA_PLAN_V2_REGISTRY_VERSION, AURA_PLAN_V2_VERSION, MAX_AURA_PLAN_V2_BYTES,
+    AURA_PLAN_V2_REGISTRY_VERSION, AURA_PLAN_V2_SPLIT_DOMAIN_DIRECT_OP,
+    AURA_PLAN_V2_SPLIT_REGISTRY_VERSION, AURA_PLAN_V2_VERSION, MAX_AURA_PLAN_V2_BYTES,
     MAX_AURA_PLAN_V2_DEPENDENCIES, MAX_AURA_PLAN_V2_STREAMS,
 };
 pub use v3_planned_grouped::{
-    compile_v3_planned_grouped, decode_v3_planned_grouped, decode_v3_planned_grouped_footer,
-    encode_v3_planned_grouped_footer, DecodedV3PlannedGrouped, V3PlannedGroupedArtifact,
-    V3PlannedGroupedChunkDescriptor, V3PlannedGroupedFooter, V3PlannedGroupedInspection,
-    V3PlannedGroupedSummary, MAX_V3_PLANNED_GROUPED_FOOTER_BYTES, V3_PLANNED_GROUPED_BODY_ENCODING,
+    compile_v3_planned_grouped, compile_v3_planned_grouped_attempt2,
+    compile_v3_planned_grouped_attempt2_candidate, decode_v3_planned_grouped,
+    decode_v3_planned_grouped_footer, encode_v3_planned_grouped_footer, DecodedV3PlannedGrouped,
+    V3PlannedGroupedArtifact, V3PlannedGroupedCandidateInspection, V3PlannedGroupedChunkDescriptor,
+    V3PlannedGroupedFooter, V3PlannedGroupedInspection, V3PlannedGroupedSummary,
+    MAX_V3_PLANNED_GROUPED_FOOTER_BYTES, V3_PLANNED_GROUPED_BODY_ENCODING,
     V3_PLANNED_GROUPED_BODY_LAYOUT_VERSION, V3_PLANNED_GROUPED_CHUNK_DESCRIPTOR_BYTES,
+    V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION, V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION,
     V3_PLANNED_GROUPED_DIRECT_BLOCK_VERSION, V3_PLANNED_GROUPED_FOOTER_LAYOUT_VERSION,
     V3_PLANNED_GROUPED_FOOTER_PREFIX_BYTES,
 };
