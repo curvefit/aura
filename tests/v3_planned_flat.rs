@@ -51,6 +51,56 @@ fn schema() -> aura_codec::SchemaDescriptor {
     schema
 }
 
+fn relabeled_schema(seed: u64) -> aura_codec::SchemaDescriptor {
+    let label = format!("{seed:016x}");
+    SchemaBuilder::new(format!("schema-label-{label}"))
+        .v3()
+        .field(
+            format!("ts-label-{label}"),
+            FieldType::TimestampMs,
+            FieldRole::Timestamp,
+        )
+        .field(
+            format!("signed-label-{label}"),
+            FieldType::I64,
+            FieldRole::Value,
+        )
+        .field(
+            format!("unsigned-label-{label}"),
+            FieldType::U64,
+            FieldRole::Value,
+        )
+        .nullable_field(
+            format!("nullable-label-{label}"),
+            FieldType::I32,
+            FieldRole::Value,
+        )
+        .field(
+            format!("opaque-label-{label}"),
+            FieldType::Opaque16,
+            FieldRole::Value,
+        )
+        .field(
+            format!("text-label-{label}"),
+            FieldType::Utf8,
+            FieldRole::Value,
+        )
+        .field(
+            format!("decimal-label-{label}"),
+            FieldType::DecimalText,
+            FieldRole::Value,
+        )
+        .finish()
+        .unwrap()
+}
+
+fn without_schema_ids(mut batches: Vec<AuraV3Batch>) -> Vec<AuraV3Batch> {
+    for batch in &mut batches {
+        batch.schema_id = 0;
+    }
+    batches
+}
+
 fn batch(schema_id: u32, start: i64, rows: usize) -> AuraV3Batch {
     let timestamps = (0..rows).map(|i| start + i as i64).collect::<Vec<_>>();
     let signed = (0..rows)
@@ -305,6 +355,75 @@ fn public_json_oi_and_trade_shapes_are_generic_and_applicable() {
         assert!(FlatAuraPlanV2::all_fixed(&parsed).is_ok());
         assert!(compile_v3_planned_flat(&parsed, &[], Default::default()).is_ok());
         assert!(parsed.groups.is_empty());
+    }
+}
+
+#[test]
+fn planned_flat_candidate_costs_are_invariant_to_semantic_label_changes() {
+    // The planned compiler accepts a schema and batches, not separate dataset,
+    // venue, or symbol metadata. Varying those inert container labels is
+    // therefore outside this API; all schema and field labels are varied here.
+    let seeds = [
+        0x0102_0304_0506_0708,
+        0x1112_1314_1516_1718,
+        0xa1b2_c3d4_e5f6_0718,
+        0xfedc_ba98_7654_3210,
+    ];
+    let baseline_schema = relabeled_schema(seeds[0]);
+    let baseline_batches = vec![
+        batch(baseline_schema.schema_id, 1, 64),
+        batch(baseline_schema.schema_id, 65, 64),
+    ];
+    let baseline =
+        compile_v3_planned_flat(&baseline_schema, &baseline_batches, V3FlatLimits::HARD).unwrap();
+    let baseline_candidates = baseline
+        .inspection
+        .candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.candidate_id.clone(),
+                candidate.applicable,
+                candidate.complete_bytes,
+                candidate.selected,
+            )
+        })
+        .collect::<Vec<_>>();
+    let baseline_codecs = baseline.inspection.codecs.clone();
+    let expected_batches = without_schema_ids(baseline_batches);
+
+    for seed in seeds.into_iter().skip(1) {
+        let schema = relabeled_schema(seed);
+        let batches = vec![
+            batch(schema.schema_id, 1, 64),
+            batch(schema.schema_id, 65, 64),
+        ];
+        let artifact = compile_v3_planned_flat(&schema, &batches, V3FlatLimits::HARD).unwrap();
+        let candidates = artifact
+            .inspection
+            .candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.candidate_id.clone(),
+                    candidate.applicable,
+                    candidate.complete_bytes,
+                    candidate.selected,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(baseline_candidates, candidates, "seed={seed:016x}");
+        assert_eq!(
+            baseline_codecs, artifact.inspection.codecs,
+            "seed={seed:016x}"
+        );
+
+        let decoded = decode_v3_planned_flat(&artifact.bytes, V3FlatLimits::HARD).unwrap();
+        assert_eq!(
+            expected_batches,
+            without_schema_ids(decoded.batches),
+            "seed={seed:016x}"
+        );
     }
 }
 
