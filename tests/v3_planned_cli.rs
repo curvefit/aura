@@ -78,6 +78,15 @@ fn dictionary_only_schema() -> aura_codec::SchemaDescriptor {
         .unwrap()
 }
 
+fn prefix_suffix_schema() -> aura_codec::SchemaDescriptor {
+    SchemaBuilder::new("anonymous_prefix_suffix_cli")
+        .v3()
+        .field("ts", FieldType::TimestampNs, FieldRole::Timestamp)
+        .nullable_field("text", FieldType::Utf8, FieldRole::Value)
+        .finish()
+        .unwrap()
+}
+
 fn planned_arrow_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
@@ -104,6 +113,13 @@ fn value_only_arrow_schema() -> Arc<Schema> {
 
 fn dictionary_only_arrow_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]))
+}
+
+fn prefix_suffix_arrow_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new("text", DataType::Utf8, true),
+    ]))
 }
 
 fn planned_ipc(rows: usize) -> Vec<u8> {
@@ -143,6 +159,30 @@ fn planned_ipc(rows: usize) -> Vec<u8> {
         } else {
             vec![make_batch(0, midpoint), make_batch(midpoint, rows)]
         },
+    )
+}
+
+fn prefix_suffix_ipc(rows: usize) -> Vec<u8> {
+    let schema = prefix_suffix_arrow_schema();
+    let midpoint = rows / 2;
+    let make_batch = |start: usize, end: usize| {
+        let text = (start..end)
+            .map(|row| Some(format!("long-common-prefix-{row:05}-long-common-suffix")))
+            .collect::<Vec<_>>();
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(
+                    (start..end).map(|row| row as i64).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(text)),
+            ],
+        )
+        .unwrap()
+    };
+    ipc(
+        Arc::clone(&schema),
+        vec![make_batch(0, midpoint), make_batch(midpoint, rows)],
     )
 }
 
@@ -229,7 +269,7 @@ fn planned_v1_seal_selects_planned_tuple_and_auto_verifies() {
     let seal: serde_json::Value = serde_json::from_slice(&sealed.stdout).unwrap();
     assert_eq!(
         seal["result_schema"],
-        "aura-v3-flat-aura0-planned-request-seal-result-v4"
+        "aura-v3-flat-aura0-planned-request-seal-result-v5"
     );
     assert_eq!(seal["requested_mode"], "planned");
     assert_eq!(seal["planner_requested"], true);
@@ -251,7 +291,7 @@ fn planned_v1_seal_selects_planned_tuple_and_auto_verifies() {
     assert_eq!(seal["streaming"], false);
     assert_eq!(seal["plan_sha256"].as_str().unwrap().len(), 64);
     let candidates = seal["planner_candidates"].as_array().unwrap();
-    assert_eq!(candidates.len(), 6);
+    assert_eq!(candidates.len(), 7);
     assert_eq!(candidates[0]["candidate_id"], "exact-flat");
     assert_eq!(candidates[1]["candidate_id"], "planned-flat-fixed");
     assert_eq!(candidates[2]["candidate_id"], "planned-flat-integer-codecs");
@@ -264,12 +304,22 @@ fn planned_v1_seal_selects_planned_tuple_and_auto_verifies() {
         candidates[5]["candidate_id"],
         "planned-flat-temporal-zstd19-wrapper"
     );
-    assert!(candidates
+    assert_eq!(
+        candidates[6]["candidate_id"],
+        "planned-flat-prefix-suffix-zstd19-wrapper"
+    );
+    assert!(candidates[..6]
         .iter()
         .all(|candidate| candidate["applicable"] == true && candidate["complete_bytes"].is_u64()));
+    assert_eq!(candidates[6]["applicable"], false);
+    assert!(candidates[6]["complete_bytes"].is_null());
+    assert!(seal["prefix_suffix_candidate_codecs"].is_array());
+    assert!(seal["prefix_suffix_zstd_candidate"].is_null());
     assert!(candidates.iter().all(|candidate| {
         if candidate["selected"] == true {
             candidate["rejection"].is_null()
+        } else if candidate["applicable"] == false {
+            candidate["rejection"].is_string()
         } else {
             candidate["rejection"] == "complete cost did not win"
         }
@@ -371,6 +421,109 @@ fn planned_v1_seal_selects_planned_tuple_and_auto_verifies() {
     );
     assert_eq!(verify["artifact_sha256"], seal["artifact_sha256"]);
     assert_eq!(verify["plan_sha256"], seal["plan_sha256"]);
+}
+
+#[test]
+fn prefix_suffix_seal_and_verify_use_v5_without_changing_prior_receipt_identities() {
+    let dir = TestDir::new();
+    let schema_path = dir.path("prefix-schema.json");
+    let output = dir.path("prefix.aura0");
+    fs::write(
+        &schema_path,
+        prefix_suffix_schema().to_canonical_json().unwrap(),
+    )
+    .unwrap();
+    let sealed = run(
+        &[
+            "v3",
+            "aura0",
+            "seal",
+            "--protocol",
+            "aura-logical-arrow-ipc-v1",
+            "--mode",
+            "planned",
+            "--schema",
+            schema_path.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--json",
+        ],
+        Some(&prefix_suffix_ipc(512)),
+    );
+    assert!(
+        sealed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sealed.stderr)
+    );
+    let seal: serde_json::Value = serde_json::from_slice(&sealed.stdout).unwrap();
+    assert_eq!(
+        seal["result_schema"],
+        "aura-v3-flat-aura0-planned-request-seal-result-v5"
+    );
+    assert_eq!(
+        seal["selected_candidate"],
+        "planned-flat-prefix-suffix-zstd19-wrapper"
+    );
+    assert_eq!(seal["container_target"], "flat-aura0-v3-planned-v5");
+    assert_eq!(
+        seal["body_encoding"],
+        "planned_flat_prefix_suffix_zstd19_v5"
+    );
+    assert_eq!(seal["body_layout_version"], 7);
+    assert_eq!(seal["block_version"], 7);
+    assert_eq!(seal["wrapper_version"], 3);
+    assert_eq!(seal["planner_candidates"].as_array().unwrap().len(), 7);
+    assert_eq!(seal["planner_candidates"][6]["selected"], true);
+    assert_eq!(
+        seal["physical_codecs"][1]["selected_physical_codec"],
+        "previous_common_prefix_suffix_bytes"
+    );
+    assert_eq!(seal["physical_codecs"][1]["prefix_suffix_selected"], true);
+    assert_eq!(
+        seal["physical_codecs"][1]["prefix_suffix_validity_bytes"],
+        64
+    );
+    assert!(seal["physical_codecs"][1]["prefix_suffix_baseline_codec"].is_string());
+    assert!(seal["physical_codecs"][1]["prefix_suffix_baseline_bytes"].is_u64());
+    assert_eq!(
+        seal["prefix_suffix_zstd_candidate"]["inherited_complete_candidate_id"],
+        "planned-flat-temporal-zstd19-wrapper"
+    );
+    assert_eq!(
+        seal["prefix_suffix_zstd_candidate"]["inherited_complete_registry_version"],
+        3
+    );
+    assert_eq!(
+        seal["prefix_suffix_zstd_candidate"]["derived_raw_plan_id"],
+        "planned-flat-prefix-suffix-raw-registry4"
+    );
+    assert_eq!(
+        seal["prefix_suffix_zstd_candidate"]["derived_raw_plan_registry_version"],
+        4
+    );
+    assert_eq!(
+        seal["prefix_suffix_zstd_candidate"]["inner_body_layout_version"],
+        6
+    );
+
+    let verified = verify(&output);
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    let verify: serde_json::Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert_eq!(
+        verify["result_schema"],
+        "aura-v3-flat-aura0-planned-verify-result-v5"
+    );
+    assert_eq!(verify["body_layout_version"], 7);
+    assert_eq!(verify["inner_body_layout_version"], 6);
+    assert_eq!(verify["wrapper_version"], 3);
+    assert_eq!(verify["logical_sha256"], seal["logical_sha256"]);
+    assert_eq!(verify["artifact_sha256"], seal["artifact_sha256"]);
+    let decoded = decode_v3_planned_flat(&fs::read(output).unwrap(), V3FlatLimits::HARD).unwrap();
+    assert_eq!(decoded.footer.plan.registry_version, 4);
 }
 
 #[test]
@@ -544,16 +697,18 @@ fn planned_request_exact_fallback_is_auditable_and_verifies_as_exact() {
     let seal: serde_json::Value = serde_json::from_slice(&sealed.stdout).unwrap();
     assert_eq!(
         seal["result_schema"],
-        "aura-v3-flat-aura0-planned-request-seal-result-v4"
+        "aura-v3-flat-aura0-planned-request-seal-result-v5"
     );
     assert_eq!(seal["selected_candidate"], "exact-flat");
     assert_eq!(seal["container_target"], "flat-aura0-v3-v1");
     assert_eq!(seal["footer_layout_version"], 1);
     assert_eq!(seal["body_encoding_code"], 1);
     assert!(seal["plan_sha256"].is_null());
-    assert_eq!(seal["planner_candidates"].as_array().unwrap().len(), 6);
+    assert_eq!(seal["planner_candidates"].as_array().unwrap().len(), 7);
     assert!(seal["physical_codecs"].as_array().unwrap().is_empty());
     assert_eq!(seal["planner_candidates"][3]["applicable"], false);
+    assert!(seal["prefix_suffix_candidate_codecs"].is_array());
+    assert!(seal["prefix_suffix_zstd_candidate"].is_null());
 
     let verified = verify(&output);
     assert!(verified.status.success());
@@ -611,12 +766,14 @@ fn registry1_planned_file_preserves_v1_verify_receipt() {
     let seal: serde_json::Value = serde_json::from_slice(&sealed.stdout).unwrap();
     assert_eq!(
         seal["result_schema"],
-        "aura-v3-flat-aura0-planned-request-seal-result-v4"
+        "aura-v3-flat-aura0-planned-request-seal-result-v5"
     );
     assert_eq!(seal["selected_candidate"], "planned-flat-integer-codecs");
     assert_eq!(seal["container_target"], "flat-aura0-v3-planned-v1");
     assert_eq!(seal["body_encoding"], "planned_flat_codecs_v1");
     assert_eq!(seal["body_layout_version"], 1);
+    assert!(seal["prefix_suffix_candidate_codecs"].is_array());
+    assert!(seal["prefix_suffix_zstd_candidate"].is_null());
 
     let verified = verify(&output);
     assert!(verified.status.success());

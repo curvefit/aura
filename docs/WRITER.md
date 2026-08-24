@@ -108,5 +108,15 @@ complete candidate inherits that selected registry1/2 plan, replaces only a
 strictly smaller schema-authorized primary timestamp lane with checked
 per-chunk previous-delta (or explicitly authorized delta-of-delta), encodes an
 `AUFPVB03` inner block, and stores it in the distinct `AUFPZB02` wrapper-v2
-layout 5. The compiler retains all six complete artifacts while scoring; this
-is a bounded all-memory development limitation, not a measured-size claim.
+layout 5. A seventh complete candidate inherits that temporal plan when
+available (otherwise dictionary/mixed), replaces only strictly smaller
+Utf8/DecimalText lanes with canonical per-chunk previous-common-prefix/suffix
+code 6, writes `AUFPVB04` inner layout 6 only inside distinct `AUFPZB03`
+wrapper-v3 outer layout 7, and loses raw or complete ties to earlier choices.
+Its nullable bitmap, fixed 16-byte header, prefix/suffix/middle ULEBs, literal
+middle, null-no-update, present-empty-update, and per-chunk reset are bounded by
+effective caller block/output limits before allocation. Planned seal receipts
+are unconditionally v5 and always expose its rejection/inspection; verify
+receipts remain tuple-specific v1-v5. The compiler retains all seven complete
+artifacts while scoring; this is a bounded all-memory development limitation,
+not a measured-size, streaming, or production-readiness claim.

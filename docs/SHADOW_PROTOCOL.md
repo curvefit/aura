@@ -58,10 +58,12 @@ aura v3 aura0 seal \
   --json < logical.arrow-stream
 ```
 
-The `aura-v3-flat-aura0-planned-request-seal-result-v4` schema reports all
-six candidates' applicability, rejection/cost attribution, selected physical
-codec rows, dictionary and temporal byte attribution, wrapper/base/compressed
-bytes, complete bytes, the
+Every seven-candidate planned request uses the
+`aura-v3-flat-aura0-planned-request-seal-result-v5` seal schema, including
+exact or older-format fallback. It always reports prefix/suffix candidate rows
+and a null-or-object wrapper inspection in addition to all seven candidates'
+applicability, rejection/cost attribution, selected physical codecs,
+dictionary/temporal/prefix-suffix byte attribution, complete bytes, the
 selected candidate, the actual footer/body tuple, and a plan hash only when a
 planned tuple wins. Exact fallback is intentional and is verified with the
 unchanged exact verify schema. A selected planned tuple uses footer layout 3
@@ -74,11 +76,14 @@ planned-verify-result-v2 identities. Body-layout-3 wrapper files use
 Registry-3 temporal inner blocks use `AUFPVB03` layout/block 4 only inside
 `AUFPZB02` wrapper-v2 outer layout/block 5; they use `planned-v4`,
 `planned_flat_temporal_zstd19_v4`, and planned-verify-result-v4. This preserves
-all v1-v3 receipt meanings rather than silently broadening them. Both planned
+all v1-v4 verify meanings rather than silently broadening them. Registry-4
+code-6 inner blocks use `AUFPVB04` layout/block 6 only inside `AUFPZB03`
+wrapper-v3 outer layout/block 7; selected files use `planned-v5`,
+`planned_flat_prefix_suffix_zstd19_v5`, and planned-verify-result-v5. Both planned
 compilation and verification are conservatively bounded all-memory reference
 operations: compilation retains the exact, fixed, mixed, dictionary, zstd19,
-and temporal-zstd19 complete candidates plus lane/dictionary/temporal/
-compression scratch.
+and temporal-zstd19 and prefix-suffix-zstd19 complete candidates plus
+lane/dictionary/temporal/prefix-suffix/compression scratch.
 Registry-2 dictionaries are
 chunk-local, lexicographically canonical, exact-byte Utf8/DecimalText codecs
 with present-only minimal bitpacked indices. They do not normalize DecimalText
@@ -96,6 +101,15 @@ delta-of-delta only if `Delta2` is separately explicit. It never applies to an
 auxiliary byte-255 timestamp or infers a provider, field identity, or economic
 meaning. The v4 seal receipt reports direct/previous/delta-of-delta lane costs,
 authorization, selected transform, inner versions, and wrapper-v2 attribution.
+
+The registry-4 candidate is generic to Utf8/DecimalText. Its per-chunk lane
+stores nullable validity, a fixed 16-byte header, and canonical maximal
+non-overlapping prefix/suffix plus middle-length ULEBs and literal middle.
+Null does not update previous; present empty does; every chunk resets. Raw and
+complete ties retain earlier choices. The v5 seal inspection separates the
+inherited complete-candidate identity from the derived registry-4 raw plan and
+reports per-field baseline codec/bytes and validity bytes. Caller block/output
+bounds apply during analysis and actual encoding before allocation.
 
 Seal accepts canonical schema JSON only and publishes a new mode-0600 path via
 the same create-once, held-handle verification and directory-fsync state

@@ -127,10 +127,11 @@ Planned-flat is an additive group-free development format for the same logical
 flat schema subset. Its `AURP` route tuple is container version `3`, footer
 layout `3`, body encoding `4`, followed by three zero reserved bytes. The
 footer stamps body/block version `1` for registry 1, version `2` for registry
-2, outer wrapper version `3` for wrapper v1, or outer wrapper version `5` for
-the registry-3 temporal wrapper v2, plus the complete canonical schema
-descriptor and an `AUF2` plan. A decoder never replans and needs no dataset,
-venue, symbol, filename, or sidecar.
+2, outer version `3` for wrapper v1, outer version `5` for the registry-3
+temporal wrapper v2, or outer version `7` for the registry-4 prefix/suffix
+wrapper v3, plus the complete canonical schema descriptor and an `AUF2` plan.
+A decoder never replans and needs no dataset, venue, symbol, filename, or
+sidecar.
 
 Canonical `AUF2` plan version `2`, registry version `1`, starts with magic
 `AUF2`, total length, schema ID and fingerprint, field count, and reserved
@@ -161,6 +162,18 @@ delta-of-delta stores the first difference then checked differences of
 differences. Forward and inverse arithmetic use checked i128 intermediates and
 must fit i64 exactly. Auxiliary timestamp byte `255`, nullable timestamps, and
 arbitrary integer fields cannot use either codec.
+
+Registry version `4` has its own plan-hash domain, inherits legal registry-3
+codecs, and adds physical code `6` only for Utf8 and DecimalText. At least one
+code-6 lane is required. Every chunk stores the schema-required validity bitmap
+followed by a fixed 16-byte lane header: lane version 1, zero reserved flags,
+row count, present count, and record-stream byte length. Each present record is
+canonical ULEB128 `prefix_len`, `suffix_len`, and `middle_len`, then exactly the
+literal middle. Prefix and suffix are maximal bytewise matches against the
+previous present value and cannot overlap. Previous resets to empty per chunk;
+a null emits no record and does not update it, while a present empty value emits
+zero lengths and updates it to empty. Decode checks bounds and canonical
+re-encoding before accepting exact Utf8 or DecimalText bytes.
 
 Each planned body chunk starts with `AUFPVB01`, block version `1`, zero flags,
 schema ID/fingerprint, row and field counts, zero reserved bytes, and the full
@@ -203,27 +216,40 @@ inside the new `AUFPZB02` wrapper-v2 candidate. That wrapper retains the
 canonical 68-byte zstd19 profile but is stored as outer body layout `5` and
 block version `5`, so no wrapper-v1 artifact or receipt is reinterpreted.
 
-The reference compiler scores six complete artifacts: legacy exact flat,
+Registry-4 inner chunks use `AUFPVB04`, body layout/block version `6`, and are
+never emitted as a raw complete candidate. They exist only inside the distinct
+`AUFPZB03` wrapper version 3 stored as outer body layout/block version `7`.
+Wrapper v3 retains the canonical bounded 68-byte zstd19 framing without
+reinterpreting wrapper v1 or v2.
+
+The reference compiler scores seven complete artifacts: legacy exact flat,
 planned all-fixed, planned per-field fixed/varint, and one registry-2 candidate
 starting from the mixed plan and choosing a dictionary per eligible field only
 on a strict aggregate actual-lane byte win across chunks, followed by one
-zstd19 candidate and one registry-3 temporal-zstd19 candidate. The wrapper-v1
+zstd19 candidate, one registry-3 temporal-zstd19 candidate, and one registry-4
+prefix/suffix-zstd19 candidate. The wrapper-v1
 base is chosen before compression: registry2
 when applicable, otherwise registry1 mixed; both bases are never compressed
 and compared retrospectively. Registry 3 inherits that chosen base and changes
 only authorized primary timestamp lanes that strictly reduce aggregate raw
-lane bytes; its resulting inner plan is wrapped once. It charges header,
+lane bytes; its resulting inner plan is wrapped once. Registry 4 inherits that
+preselected temporal plan when available, otherwise the dictionary/mixed plan,
+and replaces only Utf8/DecimalText lanes that strictly reduce bounded aggregate
+raw bytes. Raw and complete-file ties retain the earlier codec/candidate. It
+charges header,
 body, plan, schema, footer, descriptors, hashes, footer length, and seal, and
 uses stable candidate order for complete-file ties. Therefore an explicit
 planned request may truthfully publish the byte-identical legacy exact
 fallback. The CLI receipt records requested mode, every candidate's
 cost/applicability/rejection, selected candidate, actual route tuple, and
-bounded per-slot direct/dictionary/count/index attribution plus wrapper base,
-inner, compressed, and overhead bytes. This reference compiler retains up to
-six complete candidates plus lane/dictionary/temporal/compression scratch; it
+bounded per-slot baseline/dictionary/prefix-suffix/count/index attribution,
+validity bytes, inherited complete-candidate identity, derived raw-plan
+identity, inner, compressed, and overhead bytes. This reference compiler
+retains up to seven complete candidates plus lane/dictionary/temporal/
+prefix-suffix/compression scratch; it
 is not the streaming ingest writer or a readiness claim. The additive
 registries use no RLE, Huffman, provider identity, or inferred economic
-semantics. Layouts 3 and 5 are distinct wrapper versions; neither is a
+semantics. Layouts 3, 5, and 7 are distinct wrapper versions; none is a
 streaming/readiness or measured-size claim.
 
 ## Grouped Aura0 V3 container V1

@@ -12,6 +12,7 @@ pub enum PlanV2PhysicalCodec {
     VariableByteDictionaryBitpacked = 3,
     TimestampPreviousDeltaZigZagUleb128 = 4,
     TimestampDeltaOfDeltaZigZagUleb128 = 5,
+    PreviousCommonPrefixSuffixBytes = 6,
 }
 
 impl PlanV2PhysicalCodec {
@@ -23,6 +24,7 @@ impl PlanV2PhysicalCodec {
             3 => Ok(Self::VariableByteDictionaryBitpacked),
             4 => Ok(Self::TimestampPreviousDeltaZigZagUleb128),
             5 => Ok(Self::TimestampDeltaOfDeltaZigZagUleb128),
+            6 => Ok(Self::PreviousCommonPrefixSuffixBytes),
             _ => Err(AuraError::InvalidValue("v3 physical codec")),
         }
     }

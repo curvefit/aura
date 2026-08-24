@@ -1,14 +1,14 @@
 //! Bounded all-memory reference planned-flat Aura0 V3 container.
 //!
 //! Exact, all-fixed, mixed-integer, variable-dictionary, the existing wrapped
-//! plan, and one primary-timestamp temporal wrapped artifact coexist during
-//! scoring. Peak memory is therefore roughly their summed bytes plus
-//! lane/dictionary/compression scratch. This is an honest replayable reference
-//! API, not a streaming writer claim. Registry 2 dictionaries retain exact
-//! Utf8 and DecimalText bytes. Registry 3 may use only schema-authorized
-//! previous-delta or explicitly authorized delta-of-delta for the non-null
-//! byte-100 primary timestamp, with a reset in every chunk. Neither wrapper
-//! uses RLE, provider identity, or inferred economic semantics.
+//! plan, one primary-timestamp temporal wrapped artifact, and one exact-byte
+//! previous-common-prefix/suffix wrapped artifact coexist during scoring. Peak
+//! memory is therefore roughly their summed bytes plus lane/dictionary/
+//! compression scratch. This is an honest replayable reference API, not a
+//! streaming writer claim. Registry 2 dictionaries retain exact Utf8 and
+//! DecimalText bytes. Registry 3 may use only schema-authorized temporal lanes.
+//! Registry 4 additively permits per-chunk prefix/suffix byte lanes for Utf8 and
+//! DecimalText. No candidate uses provider identity or inferred economics.
 
 use std::io::{self, Cursor, Read, Write};
 use std::{cell::Cell, rc::Rc};
@@ -26,7 +26,8 @@ use crate::v3_codecs::{
 };
 use crate::v3_flat_plan_v2::{
     temporal_field_authorized, FlatAuraPlanV2, FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION,
-    FLAT_PLAN_V2_REGISTRY_VERSION, FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION,
+    FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION, FLAT_PLAN_V2_REGISTRY_VERSION,
+    FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION,
 };
 use crate::v3_values::{
     decode_column, encode_column, is_present, validate_bitmap_padding, AuraV3VariableColumn,
@@ -56,6 +57,11 @@ pub const V3_PLANNED_FLAT_TEMPORAL_BLOCK_VERSION: u16 = 4;
 pub const V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION: u16 = 5;
 pub const V3_PLANNED_FLAT_TEMPORAL_ZSTD_BLOCK_VERSION: u16 = 5;
 pub const V3_PLANNED_FLAT_TEMPORAL_ZSTD_WRAPPER_VERSION: u16 = 2;
+pub const V3_PLANNED_FLAT_PREFIX_SUFFIX_BODY_LAYOUT_VERSION: u16 = 6;
+pub const V3_PLANNED_FLAT_PREFIX_SUFFIX_BLOCK_VERSION: u16 = 6;
+pub const V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BODY_LAYOUT_VERSION: u16 = 7;
+pub const V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BLOCK_VERSION: u16 = 7;
+pub const V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_WRAPPER_VERSION: u16 = 3;
 pub const V3_PLANNED_FLAT_FOOTER_PREFIX_BYTES: usize = 208;
 pub const V3_PLANNED_FLAT_CHUNK_DESCRIPTOR_BYTES: usize = 104;
 pub const MAX_V3_PLANNED_FLAT_FOOTER_BYTES: usize = 64 * 1024 * 1024;
@@ -63,16 +69,21 @@ pub const MAX_V3_PLANNED_FLAT_FOOTER_BYTES: usize = 64 * 1024 * 1024;
 const BLOCK_MAGIC_V1: &[u8; 8] = b"AUFPVB01";
 const BLOCK_MAGIC_V2: &[u8; 8] = b"AUFPVB02";
 const BLOCK_MAGIC_V3: &[u8; 8] = b"AUFPVB03";
+const BLOCK_MAGIC_V4: &[u8; 8] = b"AUFPVB04";
 const BLOCK_HEADER_BYTES: usize = 64;
 const DICTIONARY_LANE_PREFIX_BYTES: usize = 12;
+const PREFIX_SUFFIX_LANE_HEADER_BYTES: usize = 16;
+const PREFIX_SUFFIX_LANE_VERSION: u16 = 1;
 const ZSTD_WRAPPER_MAGIC: &[u8; 8] = b"AUFPZB01";
 const TEMPORAL_ZSTD_WRAPPER_MAGIC: &[u8; 8] = b"AUFPZB02";
+const PREFIX_SUFFIX_ZSTD_WRAPPER_MAGIC: &[u8; 8] = b"AUFPZB03";
 const ZSTD_WRAPPER_HEADER_BYTES: usize = 68;
 const ZSTD_CODEC_ID: u8 = 1;
 const ZSTD_WRAPPER_FLAGS: u8 = 0b0000_0011;
 const FOOTER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-flat-footer-v1\0";
 const HEADER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-flat-header-v1\0";
 const BODY_HASH_DOMAIN: &[u8] = b"aura-v3-planned-flat-body-v1\0";
+const PREFIX_SUFFIX_DERIVED_RAW_PLAN_ID: &str = "planned-flat-prefix-suffix-raw-registry4";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V3PlannedFlatChunkDescriptor {
@@ -147,6 +158,15 @@ pub struct V3PlannedFlatCodecInspection {
     pub delta_of_delta_authorized: bool,
     pub temporal_selected: bool,
     pub temporal_rejection: Option<String>,
+    pub prefix_suffix_bytes: Option<u64>,
+    pub prefix_suffix_frame_bytes: Option<u64>,
+    pub prefix_suffix_control_bytes: Option<u64>,
+    pub prefix_suffix_literal_bytes: Option<u64>,
+    pub prefix_suffix_validity_bytes: Option<u64>,
+    pub prefix_suffix_baseline_codec: Option<PlanV2PhysicalCodec>,
+    pub prefix_suffix_baseline_bytes: Option<u64>,
+    pub prefix_suffix_selected: bool,
+    pub prefix_suffix_rejection: Option<String>,
     pub selected: PlanV2PhysicalCodec,
 }
 
@@ -158,12 +178,28 @@ pub struct V3PlannedFlatInspection {
     pub zstd_candidate: Option<V3PlannedFlatZstdInspection>,
     pub temporal_zstd_candidate: Option<V3PlannedFlatZstdInspection>,
     pub temporal_candidate_codecs: Vec<V3PlannedFlatCodecInspection>,
+    pub prefix_suffix_zstd_candidate: Option<V3PlannedFlatPrefixSuffixZstdInspection>,
+    pub prefix_suffix_candidate_codecs: Vec<V3PlannedFlatCodecInspection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V3PlannedFlatZstdInspection {
     pub base_candidate_id: String,
     pub base_registry_version: u16,
+    pub inner_body_layout_version: u16,
+    pub inner_block_version: u16,
+    pub inner_body_bytes: u64,
+    pub compressed_payload_bytes: u64,
+    pub wrapper_overhead_bytes: u64,
+    pub stored_body_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V3PlannedFlatPrefixSuffixZstdInspection {
+    pub inherited_complete_candidate_id: String,
+    pub inherited_complete_registry_version: u16,
+    pub derived_raw_plan_id: String,
+    pub derived_raw_plan_registry_version: u16,
     pub inner_body_layout_version: u16,
     pub inner_block_version: u16,
     pub inner_body_bytes: u64,
@@ -198,6 +234,7 @@ pub fn compile_v3_planned_flat(
     batches: &[AuraV3Batch],
     limits: V3FlatLimits,
 ) -> Result<V3PlannedFlatArtifact> {
+    let limits = limits.effective();
     validate_inputs(schema, batches, limits)?;
     let exact = compile_exact(schema, batches, limits);
     let fixed_plan = FlatAuraPlanV2::all_fixed(schema);
@@ -282,7 +319,69 @@ pub fn compile_v3_planned_flat(
         .as_ref()
         .ok()
         .and_then(|artifact| artifact.inspection.temporal_zstd_candidate.clone());
-    let candidates = vec![exact, fixed, mixed, dictionary, zstd, temporal];
+    let prefix_suffix_base = match &temporal_plan_rows {
+        Ok((Some(plan), _)) => Ok((
+            plan.clone(),
+            temporal_rows.clone(),
+            "planned-flat-temporal-zstd19-wrapper",
+            FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION,
+        )),
+        Ok((None, _)) => match &base_plan_rows {
+            Ok((plan, rows, base_candidate_id)) => Ok((
+                plan.clone(),
+                rows.clone(),
+                *base_candidate_id,
+                plan.registry_version,
+            )),
+            Err(error) => Err(error.clone()),
+        },
+        Err(error) => Err(error.clone()),
+    };
+    let prefix_suffix_plan_rows = match &prefix_suffix_base {
+        Ok((plan, rows, _, _)) => select_prefix_suffix_codecs(
+            schema,
+            batches,
+            plan.clone(),
+            rows.clone(),
+            limits.value_limits.effective(),
+        ),
+        Err(error) => Err(error.clone()),
+    };
+    let prefix_suffix_rows = prefix_suffix_plan_rows
+        .as_ref()
+        .ok()
+        .map(|(_, rows)| rows.clone())
+        .unwrap_or_default();
+    let prefix_suffix = match (&prefix_suffix_plan_rows, &prefix_suffix_base) {
+        (Ok((Some(plan), _)), Ok((_, _, base_candidate_id, base_registry_version))) => {
+            compile_prefix_suffix_zstd_plan(
+                schema,
+                batches,
+                limits,
+                plan.clone(),
+                base_candidate_id,
+                *base_registry_version,
+            )
+        }
+        (Ok((None, _)), _) => Err(AuraError::InvalidValue(
+            "planned flat prefix suffix no lane win",
+        )),
+        (Err(error), _) => Err(error.clone()),
+        (_, Err(error)) => Err(error.clone()),
+    };
+    let prefix_suffix_zstd_inspection = prefix_suffix
+        .as_ref()
+        .ok()
+        .and_then(|artifact| artifact.inspection.prefix_suffix_zstd_candidate.clone());
+    let candidates = vec![
+        exact,
+        fixed,
+        mixed,
+        dictionary,
+        zstd,
+        temporal,
+        prefix_suffix,
+    ];
     if let Some(error) = candidates
         .iter()
         .filter_map(|candidate| candidate.as_ref().err())
@@ -299,15 +398,7 @@ pub fn compile_v3_planned_flat(
                 .map(|artifact| artifact.summary.file_bytes)
         })
         .collect::<Vec<_>>();
-    let selected_index = sizes
-        .iter()
-        .enumerate()
-        .filter_map(|(index, bytes)| bytes.map(|bytes| (index, bytes)))
-        .min_by_key(|(index, bytes)| (*bytes, *index))
-        .map(|(index, _)| index)
-        .ok_or(AuraError::InvalidValue(
-            "planned flat no applicable candidate",
-        ))?;
+    let selected_index = select_complete_candidate(&sizes)?;
     let ids = [
         "exact-flat",
         "planned-flat-fixed",
@@ -315,6 +406,7 @@ pub fn compile_v3_planned_flat(
         "planned-flat-variable-dictionary",
         "planned-flat-zstd19-wrapper",
         "planned-flat-temporal-zstd19-wrapper",
+        "planned-flat-prefix-suffix-zstd19-wrapper",
     ];
     let candidate_rows = ids
         .iter()
@@ -338,13 +430,28 @@ pub fn compile_v3_planned_flat(
         3 => dictionary_rows.clone(),
         4 => zstd_rows,
         5 => temporal_rows.clone(),
+        6 => prefix_suffix_rows.clone(),
         _ => Vec::new(),
     };
     selected.inspection.dictionary_candidate_codecs = dictionary_rows;
     selected.inspection.zstd_candidate = zstd_inspection;
     selected.inspection.temporal_candidate_codecs = temporal_rows;
     selected.inspection.temporal_zstd_candidate = temporal_zstd_inspection;
+    selected.inspection.prefix_suffix_candidate_codecs = prefix_suffix_rows;
+    selected.inspection.prefix_suffix_zstd_candidate = prefix_suffix_zstd_inspection;
     Ok(selected)
+}
+
+fn select_complete_candidate(sizes: &[Option<u64>]) -> Result<usize> {
+    sizes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, bytes)| bytes.map(|bytes| (index, bytes)))
+        .min_by_key(|(index, bytes)| (*bytes, *index))
+        .map(|(index, _)| index)
+        .ok_or(AuraError::InvalidValue(
+            "planned flat no applicable candidate",
+        ))
 }
 
 fn validate_inputs(
@@ -413,6 +520,8 @@ fn compile_exact(
             zstd_candidate: None,
             temporal_zstd_candidate: None,
             temporal_candidate_codecs: Vec::new(),
+            prefix_suffix_zstd_candidate: None,
+            prefix_suffix_candidate_codecs: Vec::new(),
         },
     })
 }
@@ -460,6 +569,15 @@ fn select_codecs(
             delta_of_delta_authorized: false,
             temporal_selected: false,
             temporal_rejection: None,
+            prefix_suffix_bytes: None,
+            prefix_suffix_frame_bytes: None,
+            prefix_suffix_control_bytes: None,
+            prefix_suffix_literal_bytes: None,
+            prefix_suffix_validity_bytes: None,
+            prefix_suffix_baseline_codec: None,
+            prefix_suffix_baseline_bytes: None,
+            prefix_suffix_selected: false,
+            prefix_suffix_rejection: None,
             selected,
         });
     }
@@ -605,6 +723,144 @@ fn select_temporal_codecs(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PrefixSuffixLaneTotals {
+    encoded_bytes: u64,
+    frame_bytes: u64,
+    control_bytes: u64,
+    literal_bytes: u64,
+    validity_bytes: u64,
+    present_count: u64,
+    null_count: u64,
+    present_empty_count: u64,
+}
+
+fn select_prefix_suffix_codecs(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3Batch],
+    mut plan: FlatAuraPlanV2,
+    mut rows: Vec<V3PlannedFlatCodecInspection>,
+    limits: V3ValueLimits,
+) -> Result<(Option<FlatAuraPlanV2>, Vec<V3PlannedFlatCodecInspection>)> {
+    if rows.len() != schema.fields.len()
+        || !matches!(
+            plan.registry_version,
+            FLAT_PLAN_V2_REGISTRY_VERSION
+                | FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION
+                | FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION
+        )
+    {
+        return Err(AuraError::InvalidValue(
+            "planned flat prefix suffix analysis",
+        ));
+    }
+    plan.registry_version = FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION;
+    let mut selected_any = false;
+    for (field, row) in schema.fields.iter().zip(&mut rows) {
+        if !matches!(
+            field.field_type,
+            crate::FieldType::Utf8 | crate::FieldType::DecimalText
+        ) {
+            row.prefix_suffix_rejection =
+                Some("logical type is not prefix-suffix-eligible".to_owned());
+            continue;
+        }
+        let direct = u64::try_from(lane_total(batches, usize::from(field.index), row.selected)?)
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix lane length"))?;
+        let totals = prefix_suffix_lane_totals(batches, usize::from(field.index), limits)?;
+        row.prefix_suffix_bytes = Some(totals.encoded_bytes);
+        row.prefix_suffix_frame_bytes = Some(totals.frame_bytes);
+        row.prefix_suffix_control_bytes = Some(totals.control_bytes);
+        row.prefix_suffix_literal_bytes = Some(totals.literal_bytes);
+        row.prefix_suffix_validity_bytes = Some(totals.validity_bytes);
+        row.prefix_suffix_baseline_codec = Some(row.selected);
+        row.prefix_suffix_baseline_bytes = Some(direct);
+        row.present_count = Some(totals.present_count);
+        row.null_count = Some(totals.null_count);
+        row.present_empty_count = Some(totals.present_empty_count);
+        if totals.encoded_bytes < direct {
+            row.prefix_suffix_selected = true;
+            row.prefix_suffix_rejection = None;
+            row.selected = PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes;
+            plan.codecs[usize::from(field.index)] = row.selected;
+            selected_any = true;
+        } else {
+            row.prefix_suffix_rejection = Some("prefix suffix lane bytes did not win".to_owned());
+        }
+    }
+    if selected_any {
+        plan.validate(schema)?;
+        Ok((Some(plan), rows))
+    } else {
+        Ok((None, rows))
+    }
+}
+
+fn prefix_suffix_lane_totals(
+    batches: &[AuraV3Batch],
+    slot: usize,
+    limits: V3ValueLimits,
+) -> Result<PrefixSuffixLaneTotals> {
+    let mut totals = PrefixSuffixLaneTotals::default();
+    for batch in batches {
+        let encoded = encode_prefix_suffix_lane(
+            batch
+                .columns
+                .get(slot)
+                .ok_or(AuraError::InvalidValue("planned flat prefix suffix slot"))?,
+            usize::try_from(batch.row_count)
+                .map_err(|_| AuraError::InvalidValue("planned flat row count"))?,
+            limits,
+        )?;
+        totals.encoded_bytes =
+            totals
+                .encoded_bytes
+                .checked_add(u64::try_from(encoded.bytes.len()).map_err(|_| {
+                    AuraError::InvalidValue("planned flat prefix suffix lane length")
+                })?)
+                .ok_or(AuraError::InvalidValue(
+                    "planned flat prefix suffix lane length",
+                ))?;
+        totals.frame_bytes = totals
+            .frame_bytes
+            .checked_add(PREFIX_SUFFIX_LANE_HEADER_BYTES as u64)
+            .ok_or(AuraError::InvalidValue(
+                "planned flat prefix suffix lane length",
+            ))?;
+        totals.control_bytes = totals
+            .control_bytes
+            .checked_add(encoded.control_bytes)
+            .ok_or(AuraError::InvalidValue(
+                "planned flat prefix suffix lane length",
+            ))?;
+        totals.literal_bytes = totals
+            .literal_bytes
+            .checked_add(encoded.literal_bytes)
+            .ok_or(AuraError::InvalidValue(
+                "planned flat prefix suffix lane length",
+            ))?;
+        totals.validity_bytes = totals
+            .validity_bytes
+            .checked_add(encoded.validity_bytes)
+            .ok_or(AuraError::InvalidValue(
+                "planned flat prefix suffix lane length",
+            ))?;
+        totals.present_count = totals
+            .present_count
+            .checked_add(encoded.present_count)
+            .ok_or(AuraError::InvalidValue("planned flat prefix suffix count"))?;
+        totals.null_count = totals
+            .null_count
+            .checked_add(encoded.null_count)
+            .ok_or(AuraError::InvalidValue("planned flat prefix suffix count"))?;
+        totals.present_empty_count = totals
+            .present_empty_count
+            .checked_add(encoded.present_empty_count)
+            .ok_or(AuraError::InvalidValue("planned flat prefix suffix count"))?;
+    }
+    Ok(totals)
+}
+
 fn temporal_lane_total(
     batches: &[AuraV3Batch],
     slot: usize,
@@ -695,6 +951,7 @@ fn lane_total(batches: &[AuraV3Batch], slot: usize, codec: PlanV2PhysicalCodec) 
             &batch.columns[slot],
             batch.row_count as usize,
             codec,
+            V3ValueLimits::HARD,
             &mut out,
         )?;
         total = total
@@ -749,6 +1006,26 @@ fn compile_temporal_zstd_plan(
     )
 }
 
+fn compile_prefix_suffix_zstd_plan(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3Batch],
+    limits: V3FlatLimits,
+    plan: FlatAuraPlanV2,
+    inherited_complete_candidate_id: &'static str,
+    inherited_complete_registry_version: u16,
+) -> Result<V3PlannedFlatArtifact> {
+    compile_plan_storage(
+        schema,
+        batches,
+        limits,
+        plan,
+        PlannedStorage::PrefixSuffixZstd19 {
+            inherited_complete_candidate_id,
+            inherited_complete_registry_version,
+        },
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlannedStorage {
     Direct,
@@ -758,6 +1035,10 @@ enum PlannedStorage {
     TemporalZstd19 {
         base_candidate_id: &'static str,
         base_registry_version: u16,
+    },
+    PrefixSuffixZstd19 {
+        inherited_complete_candidate_id: &'static str,
+        inherited_complete_registry_version: u16,
     },
 }
 
@@ -769,6 +1050,13 @@ fn compile_plan_storage(
     storage: PlannedStorage,
 ) -> Result<V3PlannedFlatArtifact> {
     let limits = limits.effective();
+    if storage == PlannedStorage::Direct
+        && plan.registry_version == FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION
+    {
+        return Err(AuraError::InvalidValue(
+            "planned flat prefix suffix raw storage",
+        ));
+    }
     let structural = V3ValueLimits {
         max_block_bytes: MAX_V3_VALUE_BLOCK_BYTES,
         ..limits.value_limits
@@ -788,6 +1076,10 @@ fn compile_plan_storage(
         PlannedStorage::TemporalZstd19 { .. } => (
             V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION,
             V3_PLANNED_FLAT_TEMPORAL_ZSTD_BLOCK_VERSION,
+        ),
+        PlannedStorage::PrefixSuffixZstd19 { .. } => (
+            V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BLOCK_VERSION,
         ),
     };
     let mut inner_body_bytes = 0u64;
@@ -809,21 +1101,29 @@ fn compile_plan_storage(
             ))?;
         let block = match storage {
             PlannedStorage::Direct => inner_block,
-            PlannedStorage::Zstd19 { .. } | PlannedStorage::TemporalZstd19 { .. } => {
-                let wrapper = if matches!(storage, PlannedStorage::TemporalZstd19 { .. }) {
-                    encode_temporal_zstd_wrapper(
+            PlannedStorage::Zstd19 { .. }
+            | PlannedStorage::TemporalZstd19 { .. }
+            | PlannedStorage::PrefixSuffixZstd19 { .. } => {
+                let wrapper = match storage {
+                    PlannedStorage::TemporalZstd19 { .. } => encode_temporal_zstd_wrapper(
                         &inner_block,
                         inner_body_layout_version,
                         inner_block_version,
                         limits.value_limits,
-                    )?
-                } else {
-                    encode_zstd_wrapper(
+                    )?,
+                    PlannedStorage::PrefixSuffixZstd19 { .. } => encode_prefix_suffix_zstd_wrapper(
                         &inner_block,
                         inner_body_layout_version,
                         inner_block_version,
                         limits.value_limits,
-                    )?
+                    )?,
+                    PlannedStorage::Zstd19 { .. } => encode_zstd_wrapper(
+                        &inner_block,
+                        inner_body_layout_version,
+                        inner_block_version,
+                        limits.value_limits,
+                    )?,
+                    PlannedStorage::Direct => unreachable!(),
                 };
                 compressed_payload_bytes = compressed_payload_bytes
                     .checked_add(
@@ -871,35 +1171,58 @@ fn compile_plan_storage(
         chunks,
     };
     let mut artifact = seal(header_bytes, body, footer, limits)?;
-    if let PlannedStorage::Zstd19 { base_candidate_id }
-    | PlannedStorage::TemporalZstd19 {
-        base_candidate_id, ..
-    } = storage
-    {
+    if storage != PlannedStorage::Direct {
         let wrapper_overhead_bytes = u64::try_from(batches.len())
             .ok()
             .and_then(|chunks| chunks.checked_mul(ZSTD_WRAPPER_HEADER_BYTES as u64))
             .ok_or(AuraError::InvalidValue("planned flat zstd wrapper length"))?;
-        let inspection = V3PlannedFlatZstdInspection {
-            base_candidate_id: base_candidate_id.to_owned(),
-            base_registry_version: match storage {
-                PlannedStorage::TemporalZstd19 {
+        match storage {
+            PlannedStorage::Zstd19 { base_candidate_id } => {
+                artifact.inspection.zstd_candidate = Some(V3PlannedFlatZstdInspection {
+                    base_candidate_id: base_candidate_id.to_owned(),
+                    base_registry_version: plan.registry_version,
+                    inner_body_layout_version,
+                    inner_block_version,
+                    inner_body_bytes,
+                    compressed_payload_bytes,
+                    wrapper_overhead_bytes,
+                    stored_body_bytes: artifact.summary.body_bytes,
+                });
+            }
+            PlannedStorage::TemporalZstd19 {
+                base_candidate_id,
+                base_registry_version,
+            } => {
+                artifact.inspection.temporal_zstd_candidate = Some(V3PlannedFlatZstdInspection {
+                    base_candidate_id: base_candidate_id.to_owned(),
                     base_registry_version,
-                    ..
-                } => base_registry_version,
-                _ => plan.registry_version,
-            },
-            inner_body_layout_version,
-            inner_block_version,
-            inner_body_bytes,
-            compressed_payload_bytes,
-            wrapper_overhead_bytes,
-            stored_body_bytes: artifact.summary.body_bytes,
-        };
-        if matches!(storage, PlannedStorage::TemporalZstd19 { .. }) {
-            artifact.inspection.temporal_zstd_candidate = Some(inspection);
-        } else {
-            artifact.inspection.zstd_candidate = Some(inspection);
+                    inner_body_layout_version,
+                    inner_block_version,
+                    inner_body_bytes,
+                    compressed_payload_bytes,
+                    wrapper_overhead_bytes,
+                    stored_body_bytes: artifact.summary.body_bytes,
+                });
+            }
+            PlannedStorage::PrefixSuffixZstd19 {
+                inherited_complete_candidate_id,
+                inherited_complete_registry_version,
+            } => {
+                artifact.inspection.prefix_suffix_zstd_candidate =
+                    Some(V3PlannedFlatPrefixSuffixZstdInspection {
+                        inherited_complete_candidate_id: inherited_complete_candidate_id.to_owned(),
+                        inherited_complete_registry_version,
+                        derived_raw_plan_id: PREFIX_SUFFIX_DERIVED_RAW_PLAN_ID.to_owned(),
+                        derived_raw_plan_registry_version: plan.registry_version,
+                        inner_body_layout_version,
+                        inner_block_version,
+                        inner_body_bytes,
+                        compressed_payload_bytes,
+                        wrapper_overhead_bytes,
+                        stored_body_bytes: artifact.summary.body_bytes,
+                    });
+            }
+            PlannedStorage::Direct => unreachable!(),
         }
     }
     Ok(artifact)
@@ -979,10 +1302,26 @@ fn encode_temporal_zstd_wrapper(
     )
 }
 
+fn encode_prefix_suffix_zstd_wrapper(
+    inner_block: &[u8],
+    inner_body_layout_version: u16,
+    inner_block_version: u16,
+    limits: V3ValueLimits,
+) -> Result<Vec<u8>> {
+    encode_zstd_wrapper_profile(
+        inner_block,
+        inner_body_layout_version,
+        inner_block_version,
+        limits,
+        ZstdWrapperKind::V3,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZstdWrapperKind {
     V1,
     V2,
+    V3,
 }
 
 impl ZstdWrapperKind {
@@ -990,6 +1329,7 @@ impl ZstdWrapperKind {
         match self {
             Self::V1 => ZSTD_WRAPPER_MAGIC,
             Self::V2 => TEMPORAL_ZSTD_WRAPPER_MAGIC,
+            Self::V3 => PREFIX_SUFFIX_ZSTD_WRAPPER_MAGIC,
         }
     }
 
@@ -997,6 +1337,7 @@ impl ZstdWrapperKind {
         match self {
             Self::V1 => V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION,
             Self::V2 => V3_PLANNED_FLAT_TEMPORAL_ZSTD_WRAPPER_VERSION,
+            Self::V3 => V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_WRAPPER_VERSION,
         }
     }
 }
@@ -1093,6 +1434,14 @@ fn decode_temporal_zstd_wrapper(
     decode_zstd_wrapper_profile(wrapper, plan, limits, ZstdWrapperKind::V2)
 }
 
+fn decode_prefix_suffix_zstd_wrapper(
+    wrapper: &[u8],
+    plan: &FlatAuraPlanV2,
+    limits: V3ValueLimits,
+) -> Result<Vec<u8>> {
+    decode_zstd_wrapper_profile(wrapper, plan, limits, ZstdWrapperKind::V3)
+}
+
 fn decode_zstd_wrapper_profile(
     wrapper: &[u8],
     plan: &FlatAuraPlanV2,
@@ -1187,6 +1536,245 @@ fn decode_zstd_wrapper_profile(
         return Err(AuraError::InvalidValue("planned flat zstd noncanonical"));
     }
     Ok(inner)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrefixSuffixLaneEncoding {
+    bytes: Vec<u8>,
+    control_bytes: u64,
+    literal_bytes: u64,
+    validity_bytes: u64,
+    present_count: u64,
+    null_count: u64,
+    present_empty_count: u64,
+}
+
+fn common_prefix_suffix_lengths(previous: &[u8], value: &[u8]) -> (usize, usize) {
+    let prefix = previous
+        .iter()
+        .zip(value)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let max_suffix = previous
+        .len()
+        .saturating_sub(prefix)
+        .min(value.len().saturating_sub(prefix));
+    let suffix = (0..max_suffix)
+        .take_while(|offset| {
+            previous[previous.len() - 1 - offset] == value[value.len() - 1 - offset]
+        })
+        .count();
+    (prefix, suffix)
+}
+
+const fn prefix_suffix_uleb_len(mut value: usize) -> usize {
+    let mut length = 1usize;
+    while value >= 0x80 {
+        value >>= 7;
+        length += 1;
+    }
+    length
+}
+
+fn encode_prefix_suffix_lane(
+    column: &AuraV3Column,
+    rows: usize,
+    limits: V3ValueLimits,
+) -> Result<PrefixSuffixLaneEncoding> {
+    let limits = limits.effective();
+    let variable = match &column.values {
+        AuraV3ColumnValues::Utf8(variable) | AuraV3ColumnValues::DecimalText(variable) => variable,
+        _ => return Err(AuraError::InvalidValue("planned flat prefix suffix type")),
+    };
+    if variable.offsets.len()
+        != rows.checked_add(1).ok_or(AuraError::InvalidValue(
+            "planned flat prefix suffix offsets",
+        ))?
+        || variable.offsets.first() != Some(&0)
+        || usize::try_from(*variable.offsets.last().unwrap_or(&0))
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix offsets"))?
+            != variable.data.len()
+    {
+        return Err(AuraError::InvalidValue(
+            "planned flat prefix suffix offsets",
+        ));
+    }
+    let validity = column.validity.as_deref();
+    if let Some(validity) = validity {
+        if validity.len() != checked_validity_len(rows)? {
+            return Err(AuraError::InvalidValue(
+                "planned flat prefix suffix validity length",
+            ));
+        }
+        validate_bitmap_padding(validity, rows)?;
+    }
+    let validity_len = validity.map_or(0, <[u8]>::len);
+    let logical_output_len = validity_len
+        .checked_add(
+            rows.checked_add(1)
+                .and_then(|count| count.checked_mul(4))
+                .ok_or(AuraError::InvalidValue(
+                    "planned flat prefix suffix lane length",
+                ))?,
+        )
+        .and_then(|length| length.checked_add(variable.data.len()))
+        .filter(|length| *length <= limits.max_block_bytes)
+        .ok_or(AuraError::InvalidValue(
+            "planned flat prefix suffix block length",
+        ))?;
+    let _ = logical_output_len;
+    let mut previous = None::<&[u8]>;
+    let mut present_count = 0u64;
+    let mut present_empty_count = 0u64;
+    let mut control_bytes = 0usize;
+    let mut literal_bytes = 0usize;
+    let mut records_len = 0usize;
+    for row in 0..rows {
+        if !is_present(validity, row) {
+            continue;
+        }
+        let start = usize::try_from(variable.offsets[row])
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix offsets"))?;
+        let end = usize::try_from(variable.offsets[row + 1])
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix offsets"))?;
+        let value = variable
+            .data
+            .get(start..end)
+            .ok_or(AuraError::InvalidValue(
+                "planned flat prefix suffix offsets",
+            ))?;
+        if value.len() > limits.max_variable_value_bytes {
+            return Err(AuraError::InvalidValue(
+                "planned flat prefix suffix value length",
+            ));
+        }
+        let previous_value = previous.unwrap_or(&[]);
+        let (prefix, suffix) = common_prefix_suffix_lengths(previous_value, value);
+        let middle_len = value
+            .len()
+            .checked_sub(prefix)
+            .and_then(|length| length.checked_sub(suffix))
+            .ok_or(AuraError::InvalidValue(
+                "planned flat prefix suffix lengths",
+            ))?;
+        let record_control_bytes = prefix_suffix_uleb_len(prefix)
+            .checked_add(prefix_suffix_uleb_len(suffix))
+            .and_then(|length| length.checked_add(prefix_suffix_uleb_len(middle_len)))
+            .ok_or(AuraError::InvalidValue(
+                "planned flat prefix suffix lane length",
+            ))?;
+        control_bytes =
+            control_bytes
+                .checked_add(record_control_bytes)
+                .ok_or(AuraError::InvalidValue(
+                    "planned flat prefix suffix lane length",
+                ))?;
+        literal_bytes = literal_bytes
+            .checked_add(middle_len)
+            .ok_or(AuraError::InvalidValue(
+                "planned flat prefix suffix lane length",
+            ))?;
+        records_len = records_len
+            .checked_add(record_control_bytes)
+            .and_then(|length| length.checked_add(middle_len))
+            .ok_or(AuraError::InvalidValue(
+                "planned flat prefix suffix lane length",
+            ))?;
+        present_count = present_count
+            .checked_add(1)
+            .ok_or(AuraError::InvalidValue("planned flat prefix suffix count"))?;
+        if value.is_empty() {
+            present_empty_count = present_empty_count
+                .checked_add(1)
+                .ok_or(AuraError::InvalidValue("planned flat prefix suffix count"))?;
+        }
+        previous = Some(value);
+    }
+    let total_len = validity_len
+        .checked_add(PREFIX_SUFFIX_LANE_HEADER_BYTES)
+        .and_then(|length| length.checked_add(records_len))
+        .filter(|length| *length <= limits.max_block_bytes && records_len <= u32::MAX as usize)
+        .ok_or(AuraError::InvalidValue(
+            "planned flat prefix suffix block length",
+        ))?;
+    let mut records = Vec::<u8>::new();
+    records
+        .try_reserve_exact(records_len)
+        .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix allocation"))?;
+    previous = None;
+    for row in 0..rows {
+        if !is_present(validity, row) {
+            continue;
+        }
+        let start = usize::try_from(variable.offsets[row])
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix offsets"))?;
+        let end = usize::try_from(variable.offsets[row + 1])
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix offsets"))?;
+        let value = &variable.data[start..end];
+        let previous_value = previous.unwrap_or(&[]);
+        let (prefix, suffix) = common_prefix_suffix_lengths(previous_value, value);
+        let middle_len = value.len() - prefix - suffix;
+        crate::varint::encode_u64(
+            u64::try_from(prefix)
+                .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix length"))?,
+            &mut records,
+        );
+        crate::varint::encode_u64(
+            u64::try_from(suffix)
+                .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix length"))?,
+            &mut records,
+        );
+        crate::varint::encode_u64(
+            u64::try_from(middle_len)
+                .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix length"))?,
+            &mut records,
+        );
+        records.extend_from_slice(&value[prefix..prefix + middle_len]);
+        previous = Some(value);
+    }
+    debug_assert_eq!(records.len(), records_len);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(total_len)
+        .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix allocation"))?;
+    if let Some(validity) = validity {
+        bytes.extend_from_slice(validity);
+    }
+    bytes.extend_from_slice(&PREFIX_SUFFIX_LANE_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(rows)
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix row count"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(
+        &u32::try_from(present_count)
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix count"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(
+        &u32::try_from(records_len)
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix block length"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(&records);
+    debug_assert_eq!(bytes.len(), total_len);
+    let row_count = u64::try_from(rows)
+        .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix row count"))?;
+    Ok(PrefixSuffixLaneEncoding {
+        bytes,
+        control_bytes: u64::try_from(control_bytes)
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix lane length"))?,
+        literal_bytes: u64::try_from(literal_bytes)
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix lane length"))?,
+        validity_bytes: u64::try_from(validity_len)
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix lane length"))?,
+        present_count,
+        null_count: row_count
+            .checked_sub(present_count)
+            .ok_or(AuraError::InvalidValue("planned flat prefix suffix count"))?,
+        present_empty_count,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1391,6 +1979,7 @@ fn encode_block(
             column,
             batch.row_count as usize,
             plan.codecs[column.slot as usize],
+            limits,
             &mut out,
         )?;
     }
@@ -1406,6 +1995,7 @@ fn encode_lane(
     column: &AuraV3Column,
     rows: usize,
     codec: PlanV2PhysicalCodec,
+    limits: V3ValueLimits,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     if matches!(
@@ -1414,6 +2004,10 @@ fn encode_lane(
             | PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128
     ) {
         return encode_temporal_lane(column, codec, out);
+    }
+    if codec == PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes {
+        out.extend_from_slice(&encode_prefix_suffix_lane(column, rows, limits)?.bytes);
+        return Ok(());
     }
     if codec == PlanV2PhysicalCodec::VariableByteDictionaryBitpacked {
         out.extend_from_slice(&encode_dictionary_lane(column, rows)?.bytes);
@@ -1528,6 +2122,11 @@ fn planned_body_versions(plan: &FlatAuraPlanV2) -> Result<(u16, u16, &'static [u
             V3_PLANNED_FLAT_TEMPORAL_BLOCK_VERSION,
             BLOCK_MAGIC_V3,
         )),
+        FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION => Ok((
+            V3_PLANNED_FLAT_PREFIX_SUFFIX_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_PREFIX_SUFFIX_BLOCK_VERSION,
+            BLOCK_MAGIC_V4,
+        )),
         _ => Err(AuraError::InvalidValue("planned flat plan registry")),
     }
 }
@@ -1538,13 +2137,21 @@ fn validate_stored_body_versions(
     block_version: u16,
 ) -> Result<()> {
     let (inner_body_layout_version, inner_block_version, _) = planned_body_versions(plan)?;
-    let valid = if plan.registry_version == FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION {
-        body_layout_version == V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION
-            && block_version == V3_PLANNED_FLAT_TEMPORAL_ZSTD_BLOCK_VERSION
-    } else {
-        (body_layout_version == inner_body_layout_version && block_version == inner_block_version)
-            || (body_layout_version == V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION
-                && block_version == V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION)
+    let valid = match plan.registry_version {
+        FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION => {
+            body_layout_version == V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION
+                && block_version == V3_PLANNED_FLAT_TEMPORAL_ZSTD_BLOCK_VERSION
+        }
+        FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION => {
+            body_layout_version == V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BODY_LAYOUT_VERSION
+                && block_version == V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BLOCK_VERSION
+        }
+        _ => {
+            (body_layout_version == inner_body_layout_version
+                && block_version == inner_block_version)
+                || (body_layout_version == V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION
+                    && block_version == V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION)
+        }
     };
     if valid {
         Ok(())
@@ -1650,9 +2257,7 @@ fn decode_block(
     if plan.registry_version != FLAT_PLAN_V2_REGISTRY_VERSION
         && encode_block(schema, &batch, plan, limits)? != bytes
     {
-        return Err(AuraError::InvalidValue(
-            "planned flat dictionary noncanonical",
-        ));
+        return Err(AuraError::InvalidValue("planned flat noncanonical"));
     }
     Ok(batch)
 }
@@ -1692,6 +2297,17 @@ fn decode_lane(
             rows,
             codec,
             reader,
+            logical_budget,
+        );
+    }
+    if codec == PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes {
+        return decode_prefix_suffix_lane(
+            slot,
+            field_type,
+            nullable,
+            rows,
+            reader,
+            limits,
             logical_budget,
         );
     }
@@ -1854,6 +2470,151 @@ fn decode_temporal_lane(
     Ok(AuraV3Column {
         slot,
         validity: None,
+        values,
+    })
+}
+
+fn decode_prefix_suffix_lane(
+    slot: u16,
+    field_type: crate::FieldType,
+    nullable: bool,
+    rows: usize,
+    reader: &mut ByteReader<'_>,
+    limits: V3ValueLimits,
+    logical_budget: usize,
+) -> Result<AuraV3Column> {
+    if !matches!(
+        field_type,
+        crate::FieldType::Utf8 | crate::FieldType::DecimalText
+    ) {
+        return Err(AuraError::InvalidValue("planned flat prefix suffix type"));
+    }
+    let validity = if nullable {
+        let length = checked_validity_len(rows)?;
+        let bytes = reader.read_exact(length)?.to_vec();
+        validate_bitmap_padding(&bytes, rows)?;
+        Some(bytes)
+    } else {
+        None
+    };
+    if reader.read_u16_le()? != PREFIX_SUFFIX_LANE_VERSION || reader.read_u16_le()? != 0 {
+        return Err(AuraError::InvalidValue("planned flat prefix suffix header"));
+    }
+    let declared_rows = usize::try_from(reader.read_u32_le()?)
+        .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix row count"))?;
+    let declared_present = usize::try_from(reader.read_u32_le()?)
+        .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix count"))?;
+    let records_len = usize::try_from(reader.read_u32_le()?)
+        .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix lane length"))?;
+    let expected_present = (0..rows)
+        .filter(|row| is_present(validity.as_deref(), *row))
+        .count();
+    if declared_rows != rows || declared_present != expected_present {
+        return Err(AuraError::InvalidValue("planned flat prefix suffix count"));
+    }
+    let record_bytes = reader.read_exact(records_len)?;
+    let mut records = ByteReader::new(record_bytes);
+    let logical_validity_len = if nullable {
+        checked_validity_len(rows)?
+    } else {
+        0
+    };
+    let logical_prefix_len = logical_validity_len
+        .checked_add(
+            rows.checked_add(1)
+                .and_then(|count| count.checked_mul(4))
+                .ok_or(AuraError::InvalidValue(
+                    "planned flat logical output length",
+                ))?,
+        )
+        .filter(|length| *length <= logical_budget)
+        .ok_or(AuraError::InvalidValue(
+            "planned flat logical output length",
+        ))?;
+    let max_data_len = logical_budget - logical_prefix_len;
+    let mut offsets = Vec::<u32>::new();
+    offsets
+        .try_reserve_exact(rows.checked_add(1).ok_or(AuraError::InvalidValue(
+            "planned flat prefix suffix offsets",
+        ))?)
+        .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix allocation"))?;
+    let mut data = Vec::<u8>::new();
+    let mut previous_range = None::<(usize, usize)>;
+    offsets.push(0);
+    for row in 0..rows {
+        if !is_present(validity.as_deref(), row) {
+            offsets.push(
+                u32::try_from(data.len())
+                    .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix offsets"))?,
+            );
+            continue;
+        }
+        let prefix = usize::try_from(decode_canonical_uleb128(&mut records)?)
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix length"))?;
+        let suffix = usize::try_from(decode_canonical_uleb128(&mut records)?)
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix length"))?;
+        let middle_len = usize::try_from(decode_canonical_uleb128(&mut records)?)
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix length"))?;
+        let previous = previous_range.map_or(&[][..], |(start, end)| &data[start..end]);
+        if prefix > previous.len() || suffix > previous.len().saturating_sub(prefix) {
+            return Err(AuraError::InvalidValue(
+                "planned flat prefix suffix lengths",
+            ));
+        }
+        let current_len = prefix
+            .checked_add(middle_len)
+            .and_then(|length| length.checked_add(suffix))
+            .filter(|length| *length <= limits.max_variable_value_bytes)
+            .ok_or(AuraError::InvalidValue(
+                "planned flat prefix suffix value length",
+            ))?;
+        let next_data_len = data
+            .len()
+            .checked_add(current_len)
+            .filter(|length| *length <= max_data_len && *length <= u32::MAX as usize)
+            .ok_or(AuraError::InvalidValue(
+                "planned flat logical output length",
+            ))?;
+        let middle = records.read_exact(middle_len)?;
+        let mut current = Vec::<u8>::new();
+        current
+            .try_reserve_exact(current_len)
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix allocation"))?;
+        current.extend_from_slice(&previous[..prefix]);
+        current.extend_from_slice(middle);
+        current.extend_from_slice(&previous[previous.len() - suffix..]);
+        let (canonical_prefix, canonical_suffix) = common_prefix_suffix_lengths(previous, &current);
+        if prefix != canonical_prefix || suffix != canonical_suffix {
+            return Err(AuraError::InvalidValue(
+                "planned flat prefix suffix noncanonical",
+            ));
+        }
+        let text = std::str::from_utf8(&current)
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix utf8"))?;
+        if field_type == crate::FieldType::DecimalText {
+            validate_decimal_text_v1(text)?;
+        }
+        let start = data.len();
+        data.try_reserve_exact(current_len)
+            .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix allocation"))?;
+        data.extend_from_slice(&current);
+        debug_assert_eq!(data.len(), next_data_len);
+        previous_range = Some((start, next_data_len));
+        offsets.push(
+            u32::try_from(next_data_len)
+                .map_err(|_| AuraError::InvalidValue("planned flat prefix suffix offsets"))?,
+        );
+    }
+    records.finish()?;
+    let variable = AuraV3VariableColumn { offsets, data };
+    let values = match field_type {
+        crate::FieldType::Utf8 => AuraV3ColumnValues::Utf8(variable),
+        crate::FieldType::DecimalText => AuraV3ColumnValues::DecimalText(variable),
+        _ => return Err(AuraError::InvalidValue("planned flat prefix suffix type")),
+    };
+    Ok(AuraV3Column {
+        slot,
+        validity,
         values,
     })
 }
@@ -2236,6 +2997,8 @@ fn seal(
             zstd_candidate: None,
             temporal_zstd_candidate: None,
             temporal_candidate_codecs: Vec::new(),
+            prefix_suffix_zstd_candidate: None,
+            prefix_suffix_candidate_codecs: Vec::new(),
         },
     })
 }
@@ -2487,8 +3250,12 @@ pub fn decode_v3_planned_flat(bytes: &[u8], limits: V3FlatLimits) -> Result<Deco
         }
         let inner_block;
         let block = if footer.body_layout_version
-            == V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION
+            == V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BODY_LAYOUT_VERSION
         {
+            inner_block =
+                decode_prefix_suffix_zstd_wrapper(stored, &footer.plan, limits.value_limits)?;
+            inner_block.as_slice()
+        } else if footer.body_layout_version == V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION {
             inner_block = decode_temporal_zstd_wrapper(stored, &footer.plan, limits.value_limits)?;
             inner_block.as_slice()
         } else if footer.body_layout_version == V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION {
@@ -2593,6 +3360,8 @@ fn candidate_inapplicable(error: &AuraError) -> bool {
                 | "planned flat zstd wrapper length"
                 | "planned flat zstd compressed length"
                 | "planned flat temporal no lane win"
+                | "planned flat prefix suffix no lane win"
+                | "planned flat prefix suffix block length"
         )
     )
 }
@@ -2668,6 +3437,230 @@ mod dictionary_tests {
         )?;
         reader.finish()?;
         Ok(decoded)
+    }
+
+    fn decode_prefix_lane_bytes(
+        bytes: &[u8],
+        rows: usize,
+        field_type: FieldType,
+        nullable: bool,
+        limits: V3ValueLimits,
+    ) -> Result<AuraV3Column> {
+        let mut reader = ByteReader::new(bytes);
+        let decoded = decode_prefix_suffix_lane(
+            0,
+            field_type,
+            nullable,
+            rows,
+            &mut reader,
+            limits,
+            limits.max_block_bytes,
+        )?;
+        reader.finish()?;
+        Ok(decoded)
+    }
+
+    fn prefix_lane_frame(
+        validity: Option<&[u8]>,
+        rows: u32,
+        present: u32,
+        records: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = validity.unwrap_or(&[]).to_vec();
+        bytes.extend_from_slice(&PREFIX_SUFFIX_LANE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&rows.to_le_bytes());
+        bytes.extend_from_slice(&present.to_le_bytes());
+        bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(records);
+        bytes
+    }
+
+    #[test]
+    fn prefix_suffix_lane_preserves_null_empty_and_all_present_validity_exactly() {
+        let parts = [
+            b"alpha-tail".as_slice(),
+            b"",
+            b"",
+            b"alpine-tail",
+            b"",
+            b"alpine-sail",
+        ];
+        let column = utf8_column(&parts, Some(vec![0b0010_1111]));
+        let encoded = encode_prefix_suffix_lane(&column, parts.len(), V3ValueLimits::HARD).unwrap();
+        assert_eq!(encoded.present_count, 5);
+        assert_eq!(encoded.null_count, 1);
+        assert_eq!(encoded.present_empty_count, 2);
+        assert_eq!(encoded.bytes[0], 0b0010_1111);
+        assert_eq!(
+            decode_prefix_lane_bytes(
+                &encoded.bytes,
+                parts.len(),
+                FieldType::Utf8,
+                true,
+                V3ValueLimits::HARD,
+            )
+            .unwrap(),
+            column
+        );
+
+        let all_present = utf8_column(&[b"first", b"second"], Some(vec![0b0000_0011]));
+        let encoded = encode_prefix_suffix_lane(&all_present, 2, V3ValueLimits::HARD).unwrap();
+        assert_eq!(
+            encoded.bytes.len(),
+            1 + PREFIX_SUFFIX_LANE_HEADER_BYTES + 17
+        );
+        assert_eq!(
+            decode_prefix_lane_bytes(
+                &encoded.bytes,
+                2,
+                FieldType::Utf8,
+                true,
+                V3ValueLimits::HARD,
+            )
+            .unwrap(),
+            all_present
+        );
+    }
+
+    #[test]
+    fn prefix_suffix_lane_malformed_and_noncanonical_forms_fail_closed() {
+        let valid = prefix_lane_frame(None, 1, 1, &[0, 0, 1, b'a']);
+        assert!(
+            decode_prefix_lane_bytes(&valid, 1, FieldType::Utf8, false, V3ValueLimits::HARD,)
+                .is_ok()
+        );
+
+        let malformed = [
+            prefix_lane_frame(None, 1, 1, &[0x80, 0, 0, 1, b'a']),
+            prefix_lane_frame(None, 1, 1, &[1, 0, 0]),
+            prefix_lane_frame(None, 1, 1, &[0, 0, 2, b'a']),
+            prefix_lane_frame(None, 1, 1, &[0, 0, 1, b'a', 0]),
+            prefix_lane_frame(None, 1, 1, &[0, 0, 1, 0xff]),
+            prefix_lane_frame(None, 2, 2, &[0, 0, 1, b'a', 0, 1, 0]),
+            prefix_lane_frame(None, 2, 2, &[0, 0, 1, b'a', 1, 1, 0]),
+        ];
+        for bytes in malformed {
+            let rows = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+            assert!(decode_prefix_lane_bytes(
+                &bytes,
+                rows,
+                FieldType::Utf8,
+                false,
+                V3ValueLimits::HARD,
+            )
+            .is_err());
+        }
+
+        let mut wrong_header = valid.clone();
+        wrong_header[0..2].copy_from_slice(&2u16.to_le_bytes());
+        assert!(decode_prefix_lane_bytes(
+            &wrong_header,
+            1,
+            FieldType::Utf8,
+            false,
+            V3ValueLimits::HARD,
+        )
+        .is_err());
+        for (range, value) in [
+            (2..4, 1u32),
+            (4..8, 2u32),
+            (8..12, 0u32),
+            (12..16, u32::MAX),
+        ] {
+            let mut malformed_header = valid.clone();
+            let width = range.end - range.start;
+            malformed_header[range].copy_from_slice(&value.to_le_bytes()[..width]);
+            assert!(decode_prefix_lane_bytes(
+                &malformed_header,
+                1,
+                FieldType::Utf8,
+                false,
+                V3ValueLimits::HARD,
+            )
+            .is_err());
+        }
+        let mut overflow = vec![0x80; 9];
+        overflow.push(0x02);
+        overflow.extend_from_slice(&[0, 0]);
+        assert!(decode_prefix_lane_bytes(
+            &prefix_lane_frame(None, 1, 1, &overflow),
+            1,
+            FieldType::Utf8,
+            false,
+            V3ValueLimits::HARD,
+        )
+        .is_err());
+        assert!(decode_prefix_lane_bytes(
+            &prefix_lane_frame(Some(&[0x81]), 1, 1, &[0, 0, 1, b'a']),
+            1,
+            FieldType::Utf8,
+            true,
+            V3ValueLimits::HARD,
+        )
+        .is_err());
+        assert!(decode_prefix_lane_bytes(
+            &valid,
+            1,
+            FieldType::DecimalText,
+            false,
+            V3ValueLimits::HARD,
+        )
+        .is_err());
+        assert!(decode_prefix_lane_bytes(
+            &valid,
+            1,
+            FieldType::Utf8,
+            false,
+            V3ValueLimits {
+                max_block_bytes: 7,
+                ..V3ValueLimits::HARD
+            },
+        )
+        .is_err());
+        assert!(decode_prefix_lane_bytes(
+            &valid,
+            1,
+            FieldType::Utf8,
+            false,
+            V3ValueLimits {
+                max_variable_value_bytes: 0,
+                ..V3ValueLimits::HARD
+            },
+        )
+        .is_err());
+        let bounded_column = utf8_column(&[b"caller-bounded-value"], None);
+        let caller_bound = V3ValueLimits {
+            max_block_bytes: 16,
+            ..V3ValueLimits::HARD
+        };
+        assert!(encode_prefix_suffix_lane(&bounded_column, 1, caller_bound).is_err());
+        let batch = AuraV3Batch {
+            schema_id: 0,
+            row_count: 1,
+            columns: vec![bounded_column],
+        };
+        assert!(prefix_suffix_lane_totals(&[batch], 0, caller_bound).is_err());
+    }
+
+    #[test]
+    fn appended_complete_candidate_loses_exact_ties_to_existing_candidates() {
+        assert_eq!(
+            select_complete_candidate(&[
+                Some(900),
+                Some(800),
+                Some(700),
+                Some(600),
+                Some(500),
+                Some(400),
+                Some(400),
+            ]),
+            Ok(5)
+        );
+        assert_eq!(
+            select_complete_candidate(&[None, None, None, None, None, None, Some(400)]),
+            Ok(6)
+        );
     }
 
     #[test]
@@ -3058,6 +4051,88 @@ mod dictionary_tests {
             let mut corrupted = first.clone();
             corrupted[offset] ^= 1;
             assert!(decode_temporal_zstd_wrapper(&corrupted, &plan, V3ValueLimits::HARD).is_err());
+        }
+    }
+
+    #[test]
+    fn prefix_suffix_wrapper_v3_is_distinct_and_raw_layout_is_rejected() {
+        let schema = SchemaBuilder::new("anonymous_prefix_suffix_wrapper")
+            .v3()
+            .field("clock", FieldType::TimestampMs, FieldRole::Timestamp)
+            .field("text", FieldType::Utf8, FieldRole::Value)
+            .finish()
+            .unwrap();
+        let owned = (0..128)
+            .map(|row| format!("common-prefix-{row:04}-common-suffix"))
+            .collect::<Vec<_>>();
+        let refs = owned
+            .iter()
+            .map(|value| value.as_bytes())
+            .collect::<Vec<_>>();
+        let batch = AuraV3Batch {
+            schema_id: schema.schema_id,
+            row_count: 128,
+            columns: vec![
+                AuraV3Column {
+                    slot: 0,
+                    validity: None,
+                    values: AuraV3ColumnValues::TimestampMs((0..128).collect()),
+                },
+                AuraV3Column {
+                    slot: 1,
+                    validity: None,
+                    values: AuraV3ColumnValues::Utf8(variable(&refs)),
+                },
+            ],
+        };
+        let mut plan = FlatAuraPlanV2::all_fixed(&schema).unwrap();
+        plan.registry_version = FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION;
+        plan.codecs[0] = PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128;
+        plan.codecs[1] = PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes;
+        plan.validate(&schema).unwrap();
+        assert!(compile_plan(
+            &schema,
+            std::slice::from_ref(&batch),
+            V3FlatLimits::HARD,
+            plan.clone()
+        )
+        .is_err());
+        assert!(validate_stored_body_versions(
+            &plan,
+            V3_PLANNED_FLAT_PREFIX_SUFFIX_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_PREFIX_SUFFIX_BLOCK_VERSION,
+        )
+        .is_err());
+        let inner = encode_block(&schema, &batch, &plan, V3ValueLimits::HARD).unwrap();
+        assert_eq!(&inner[..8], BLOCK_MAGIC_V4);
+        let first = encode_prefix_suffix_zstd_wrapper(
+            &inner,
+            V3_PLANNED_FLAT_PREFIX_SUFFIX_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_PREFIX_SUFFIX_BLOCK_VERSION,
+            V3ValueLimits::HARD,
+        )
+        .unwrap();
+        let second = encode_prefix_suffix_zstd_wrapper(
+            &inner,
+            V3_PLANNED_FLAT_PREFIX_SUFFIX_BODY_LAYOUT_VERSION,
+            V3_PLANNED_FLAT_PREFIX_SUFFIX_BLOCK_VERSION,
+            V3ValueLimits::HARD,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(&first[..8], PREFIX_SUFFIX_ZSTD_WRAPPER_MAGIC);
+        assert_eq!(
+            decode_prefix_suffix_zstd_wrapper(&first, &plan, V3ValueLimits::HARD).unwrap(),
+            inner
+        );
+        assert!(decode_zstd_wrapper(&first, &plan, V3ValueLimits::HARD).is_err());
+        assert!(decode_temporal_zstd_wrapper(&first, &plan, V3ValueLimits::HARD).is_err());
+        for offset in [0usize, 8, 10, 11, 12, 13, 14, 16, 18, 20, 28, 36] {
+            let mut corrupted = first.clone();
+            corrupted[offset] ^= 1;
+            assert!(
+                decode_prefix_suffix_zstd_wrapper(&corrupted, &plan, V3ValueLimits::HARD).is_err()
+            );
         }
     }
 

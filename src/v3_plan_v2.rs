@@ -830,7 +830,8 @@ fn validate_codec_type(codec: PlanV2PhysicalCodec, field_type: FieldType) -> Res
         ),
         PlanV2PhysicalCodec::VariableByteDictionaryBitpacked
         | PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128
-        | PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128 => false,
+        | PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128
+        | PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes => false,
     };
     if compatible {
         Ok(())

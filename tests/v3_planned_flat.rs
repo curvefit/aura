@@ -8,8 +8,11 @@ use aura_codec::{
     DecodedV3SelectedFlat, FieldRole, FieldTransform, FieldType, FlatAuraPlanV2,
     PlanV2PhysicalCodec, SchemaBuilder, TransformCandidates, V3FlatAura0Writer, V3FlatLimits,
     V3FlatWriterOptions, FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION,
-    FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION, V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION,
-    V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_TEMPORAL_BLOCK_VERSION,
+    FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION, FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION,
+    V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION, V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION,
+    V3_PLANNED_FLAT_PREFIX_SUFFIX_BLOCK_VERSION, V3_PLANNED_FLAT_PREFIX_SUFFIX_BODY_LAYOUT_VERSION,
+    V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BLOCK_VERSION,
+    V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_TEMPORAL_BLOCK_VERSION,
     V3_PLANNED_FLAT_TEMPORAL_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_TEMPORAL_ZSTD_BLOCK_VERSION,
     V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION,
 };
@@ -18,6 +21,7 @@ use sha2::{Digest, Sha256};
 const FLAT_PLAN_HASH_DOMAIN: &[u8] = b"aura-flat-plan-v2-registry-v1\0";
 const FLAT_DICTIONARY_PLAN_HASH_DOMAIN: &[u8] = b"aura-flat-plan-v2-registry-v2\0";
 const FLAT_TEMPORAL_PLAN_HASH_DOMAIN: &[u8] = b"aura-flat-plan-v2-registry-v3\0";
+const FLAT_PREFIX_SUFFIX_PLAN_HASH_DOMAIN: &[u8] = b"aura-flat-plan-v2-registry-v4\0";
 const FLAT_BODY_HASH_DOMAIN: &[u8] = b"aura-v3-planned-flat-body-v1\0";
 const FLAT_FOOTER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-flat-footer-v1\0";
 
@@ -202,8 +206,22 @@ fn auf2_and_planned_flat_roundtrip_complete_cost() {
         artifact.summary.file_bytes,
         artifact.summary.accounted_file_bytes
     );
-    assert_eq!(artifact.inspection.candidates.len(), 6);
+    assert_eq!(artifact.inspection.candidates.len(), 7);
     assert!(artifact.inspection.candidates[5].selected);
+    assert_eq!(
+        artifact.inspection.candidates[..6]
+            .iter()
+            .map(|candidate| candidate.complete_bytes)
+            .collect::<Vec<_>>(),
+        vec![
+            Some(8293),
+            Some(7812),
+            Some(4805),
+            Some(3681),
+            Some(1372),
+            Some(1206)
+        ]
+    );
     let zstd = artifact.inspection.zstd_candidate.as_ref().unwrap();
     assert_eq!(zstd.base_candidate_id, "planned-flat-variable-dictionary");
     assert_eq!(
@@ -229,6 +247,8 @@ fn auf2_and_planned_flat_roundtrip_complete_cost() {
         temporal_zstd.base_registry_version,
         FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION
     );
+    assert!(!artifact.inspection.candidates[6].applicable);
+    assert!(artifact.inspection.prefix_suffix_zstd_candidate.is_none());
     assert!(artifact
         .inspection
         .codecs
@@ -250,13 +270,14 @@ fn auf2_and_planned_flat_roundtrip_complete_cost() {
         DecodedV3SelectedFlat::Planned(decoded) if decoded.batches == batches
     ));
     eprintln!(
-        "development planned-flat bytes exact={} fixed={} mixed={} dictionary={} zstd19={} temporal_zstd19={}",
+        "development planned-flat bytes exact={} fixed={} mixed={} dictionary={} zstd19={} temporal_zstd19={} prefix_suffix_zstd19={:?}",
         artifact.inspection.candidates[0].complete_bytes.unwrap(),
         artifact.inspection.candidates[1].complete_bytes.unwrap(),
         artifact.inspection.candidates[2].complete_bytes.unwrap(),
         artifact.inspection.candidates[3].complete_bytes.unwrap(),
         artifact.inspection.candidates[4].complete_bytes.unwrap(),
-        artifact.inspection.candidates[5].complete_bytes.unwrap()
+        artifact.inspection.candidates[5].complete_bytes.unwrap(),
+        artifact.inspection.candidates[6].complete_bytes
     );
 }
 
@@ -354,6 +375,46 @@ fn temporal_registry_requires_primary_map_and_explicit_transform_authorization()
     nullable_plan.registry_version = FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION;
     nullable_plan.codecs[0] = PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128;
     assert!(nullable_plan.validate(&nullable).is_err());
+}
+
+#[test]
+fn prefix_suffix_registry_is_distinct_type_safe_and_retains_authorized_temporal_lanes() {
+    let schema = SchemaBuilder::new("anonymous_prefix_suffix_registry")
+        .v3()
+        .field("clock", FieldType::TimestampMs, FieldRole::Timestamp)
+        .field("text", FieldType::Utf8, FieldRole::Value)
+        .finish()
+        .unwrap();
+    let mut plan = FlatAuraPlanV2::all_fixed(&schema).unwrap();
+    plan.registry_version = FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION;
+    plan.codecs[0] = PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128;
+    plan.codecs[1] = PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes;
+    let encoded = plan.encode(&schema).unwrap();
+    assert_eq!(FlatAuraPlanV2::decode(&schema, &encoded).unwrap(), plan);
+    assert_eq!(
+        &encoded[encoded.len() - 32..],
+        domain_hash(
+            FLAT_PREFIX_SUFFIX_PLAN_HASH_DOMAIN,
+            &encoded[..encoded.len() - 32]
+        )
+    );
+
+    let mut missing = FlatAuraPlanV2::all_fixed(&schema).unwrap();
+    missing.registry_version = FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION;
+    assert!(missing.validate(&schema).is_err());
+
+    let mut wrong_type = plan.clone();
+    wrong_type.codecs[0] = PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes;
+    assert!(wrong_type.validate(&schema).is_err());
+
+    let mut old_registry = plan.clone();
+    old_registry.registry_version = FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION;
+    assert!(old_registry.validate(&schema).is_err());
+
+    let mut cross_accepted = encoded.clone();
+    cross_accepted[6..8].copy_from_slice(&FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION.to_le_bytes());
+    resign(&mut cross_accepted, FLAT_TEMPORAL_PLAN_HASH_DOMAIN);
+    assert!(FlatAuraPlanV2::decode(&schema, &cross_accepted).is_err());
 }
 
 #[test]
@@ -488,6 +549,158 @@ fn explicit_delta2_winner_roundtrips_through_registry3_container() {
         decoded.footer.plan.codecs[0],
         PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128
     );
+}
+
+#[test]
+fn prefix_suffix_candidate_roundtrips_nullable_all_present_with_multi_batch_resets() {
+    let schema = SchemaBuilder::new("anonymous_prefix_suffix_chunks")
+        .v3()
+        .field("clock", FieldType::TimestampMs, FieldRole::Timestamp)
+        .nullable_field("text", FieldType::Utf8, FieldRole::Value)
+        .finish()
+        .unwrap();
+    let batches = (0..2)
+        .map(|chunk| {
+            let owned = (0..64)
+                .map(|row| format!("long-common-prefix-{chunk}-{row:04}-long-common-suffix"))
+                .collect::<Vec<_>>();
+            let refs = owned
+                .iter()
+                .map(|value| value.as_bytes())
+                .collect::<Vec<_>>();
+            AuraV3Batch {
+                schema_id: schema.schema_id,
+                row_count: 64,
+                columns: vec![
+                    AuraV3Column {
+                        slot: 0,
+                        validity: None,
+                        values: Values::TimestampMs(
+                            (0..64).map(|row| chunk * 10_000 + row).collect(),
+                        ),
+                    },
+                    AuraV3Column {
+                        slot: 1,
+                        validity: Some(bitmap(64, &[])),
+                        values: Values::Utf8(variable(&refs)),
+                    },
+                ],
+            }
+        })
+        .collect::<Vec<_>>();
+    let artifact = compile_v3_planned_flat(&schema, &batches, V3FlatLimits::HARD).unwrap();
+    assert_eq!(artifact.inspection.candidates.len(), 7);
+    assert!(artifact.inspection.candidates[6].selected);
+    assert_eq!(
+        artifact.inspection.prefix_suffix_candidate_codecs[1].prefix_suffix_frame_bytes,
+        Some(32)
+    );
+    assert_eq!(
+        artifact.inspection.prefix_suffix_candidate_codecs[1].present_count,
+        Some(128)
+    );
+    let decoded = decode_v3_planned_flat(&artifact.bytes, V3FlatLimits::HARD).unwrap();
+    assert_eq!(decoded.batches, batches);
+    assert_eq!(
+        decoded.footer.plan.registry_version,
+        FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION
+    );
+    assert_eq!(
+        decoded.footer.plan.codecs,
+        vec![
+            PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128,
+            PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes,
+        ]
+    );
+    assert_eq!(
+        decoded.footer.body_layout_version,
+        V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BODY_LAYOUT_VERSION
+    );
+    assert_eq!(
+        decoded.footer.block_version,
+        V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BLOCK_VERSION
+    );
+    let wrapper = artifact
+        .inspection
+        .prefix_suffix_zstd_candidate
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        wrapper.inherited_complete_candidate_id,
+        "planned-flat-temporal-zstd19-wrapper"
+    );
+    assert_eq!(
+        wrapper.inherited_complete_registry_version,
+        FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION
+    );
+    assert_eq!(
+        wrapper.derived_raw_plan_id,
+        "planned-flat-prefix-suffix-raw-registry4"
+    );
+    assert_eq!(
+        wrapper.derived_raw_plan_registry_version,
+        FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION
+    );
+    assert_eq!(
+        wrapper.inner_body_layout_version,
+        V3_PLANNED_FLAT_PREFIX_SUFFIX_BODY_LAYOUT_VERSION
+    );
+    assert_eq!(
+        wrapper.inner_block_version,
+        V3_PLANNED_FLAT_PREFIX_SUFFIX_BLOCK_VERSION
+    );
+}
+
+#[test]
+fn prefix_suffix_no_raw_lane_win_is_inapplicable_and_keeps_existing_fallback() {
+    let schema = SchemaBuilder::new("anonymous_prefix_suffix_no_win")
+        .v3()
+        .field("text", FieldType::Utf8, FieldRole::Value)
+        .finish()
+        .unwrap();
+    let batch = AuraV3Batch {
+        schema_id: schema.schema_id,
+        row_count: 1,
+        columns: vec![AuraV3Column {
+            slot: 0,
+            validity: None,
+            values: Values::Utf8(variable(&[b"x"])),
+        }],
+    };
+    let artifact =
+        compile_v3_planned_flat(&schema, std::slice::from_ref(&batch), V3FlatLimits::HARD).unwrap();
+    assert_eq!(artifact.inspection.candidates.len(), 7);
+    assert!(!artifact.inspection.candidates[6].applicable);
+    assert_eq!(artifact.inspection.candidates[6].complete_bytes, None);
+    assert!(!artifact.inspection.candidates[6].selected);
+    match decode_v3_selected_flat(&artifact.bytes, V3FlatLimits::HARD).unwrap() {
+        DecodedV3SelectedFlat::Exact(decoded) => assert_eq!(decoded.batches, vec![batch]),
+        DecodedV3SelectedFlat::Planned(decoded) => assert_eq!(decoded.batches, vec![batch]),
+    }
+
+    let tie_schema = SchemaBuilder::new("anonymous_prefix_suffix_tie")
+        .v3()
+        .nullable_field("text", FieldType::Utf8, FieldRole::Value)
+        .finish()
+        .unwrap();
+    let tie = AuraV3Batch {
+        schema_id: tie_schema.schema_id,
+        row_count: 3,
+        columns: vec![AuraV3Column {
+            slot: 0,
+            validity: Some(vec![0]),
+            values: Values::Utf8(variable(&[b"", b"", b""])),
+        }],
+    };
+    let tied = compile_v3_planned_flat(&tie_schema, &[tie], V3FlatLimits::HARD).unwrap();
+    let inspection = &tied.inspection.prefix_suffix_candidate_codecs[0];
+    assert_eq!(inspection.prefix_suffix_bytes, Some(inspection.fixed_bytes));
+    assert!(!inspection.prefix_suffix_selected);
+    assert_eq!(
+        inspection.prefix_suffix_rejection.as_deref(),
+        Some("prefix suffix lane bytes did not win")
+    );
+    assert!(!tied.inspection.candidates[6].applicable);
 }
 
 #[test]
@@ -657,7 +870,7 @@ fn dictionary_candidate_mixes_eligible_lanes_and_high_cardinality_falls_back() {
     let artifact = compile_v3_planned_flat(&schema, &[input], V3FlatLimits::HARD).unwrap();
     assert!(artifact.inspection.candidates[3].applicable);
     assert!(artifact.inspection.candidates[4].applicable);
-    assert!(artifact.inspection.candidates[4].selected);
+    assert!(artifact.inspection.candidates[6].selected);
     let decoded = decode_v3_planned_flat(&artifact.bytes, V3FlatLimits::HARD).unwrap();
     assert_eq!(
         decoded.footer.plan.codecs[1],
@@ -665,8 +878,10 @@ fn dictionary_candidate_mixes_eligible_lanes_and_high_cardinality_falls_back() {
     );
     assert_eq!(
         decoded.footer.plan.codecs[2],
-        PlanV2PhysicalCodec::FixedWidth
+        PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes
     );
+    assert!(artifact.inspection.dictionary_candidate_codecs[1].dictionary_selected);
+    assert!(artifact.inspection.prefix_suffix_candidate_codecs[2].prefix_suffix_selected);
     assert_eq!(
         artifact.inspection.dictionary_candidate_codecs[2]
             .dictionary_rejection

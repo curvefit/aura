@@ -1,8 +1,9 @@
 //! Canonical group-free flat Aura Plan v2 (`AUF2`).
 //!
 //! Registry 1 is the frozen fixed/absolute-varint contract, registry 2 adds
-//! exact-byte variable dictionaries, and registry 3 additively authorizes
-//! per-chunk temporal lanes only for the schema-stamped primary timestamp.
+//! exact-byte variable dictionaries, registry 3 additively authorizes
+//! per-chunk temporal lanes only for the schema-stamped primary timestamp,
+//! and registry 4 adds exact-byte previous-common-prefix/suffix lanes.
 
 use sha2::{Digest, Sha256};
 
@@ -14,12 +15,14 @@ pub const FLAT_PLAN_V2_VERSION: u16 = 2;
 pub const FLAT_PLAN_V2_REGISTRY_VERSION: u16 = 1;
 pub const FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION: u16 = 2;
 pub const FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION: u16 = 3;
+pub const FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION: u16 = 4;
 pub const MAX_FLAT_PLAN_V2_BYTES: usize = 16 * 1024 * 1024;
 const HEADER_BYTES: usize = 52;
 const HASH_BYTES: usize = 32;
 const REGISTRY1_HASH_DOMAIN: &[u8] = b"aura-flat-plan-v2-registry-v1\0";
 const REGISTRY2_HASH_DOMAIN: &[u8] = b"aura-flat-plan-v2-registry-v2\0";
 const REGISTRY3_HASH_DOMAIN: &[u8] = b"aura-flat-plan-v2-registry-v3\0";
+const REGISTRY4_HASH_DOMAIN: &[u8] = b"aura-flat-plan-v2-registry-v4\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlatAuraPlanV2 {
@@ -80,7 +83,8 @@ impl FlatAuraPlanV2 {
                             )
                         }
                         PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128
-                        | PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128 => false,
+                        | PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128
+                        | PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes => false,
                     };
                     if !valid {
                         return Err(AuraError::InvalidValue("flat plan v2 codec type"));
@@ -115,6 +119,7 @@ impl FlatAuraPlanV2 {
                             has_temporal = true;
                             temporal_field_authorized(schema, field, crate::FieldTransform::Delta2)
                         }
+                        PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes => false,
                     };
                     if !valid {
                         return Err(AuraError::InvalidValue("flat plan v2 codec type"));
@@ -122,6 +127,47 @@ impl FlatAuraPlanV2 {
                 }
                 if !has_temporal {
                     return Err(AuraError::InvalidValue("flat plan v2 temporal registry"));
+                }
+            }
+            FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION => {
+                let mut has_prefix_suffix = false;
+                for (field, codec) in schema.fields.iter().zip(&self.codecs) {
+                    let valid = match codec {
+                        PlanV2PhysicalCodec::FixedWidth => true,
+                        PlanV2PhysicalCodec::UnsignedUleb128
+                        | PlanV2PhysicalCodec::SignedZigZagUleb128 => {
+                            integer_varint_codec(field.field_type) == Some(*codec)
+                        }
+                        PlanV2PhysicalCodec::VariableByteDictionaryBitpacked => matches!(
+                            field.field_type,
+                            crate::FieldType::Utf8 | crate::FieldType::DecimalText
+                        ),
+                        PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128 => {
+                            temporal_field_authorized(
+                                schema,
+                                field,
+                                crate::FieldTransform::DeltaPrevious,
+                            )
+                        }
+                        PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128 => {
+                            temporal_field_authorized(schema, field, crate::FieldTransform::Delta2)
+                        }
+                        PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes => {
+                            has_prefix_suffix = true;
+                            matches!(
+                                field.field_type,
+                                crate::FieldType::Utf8 | crate::FieldType::DecimalText
+                            )
+                        }
+                    };
+                    if !valid {
+                        return Err(AuraError::InvalidValue("flat plan v2 codec type"));
+                    }
+                }
+                if !has_prefix_suffix {
+                    return Err(AuraError::InvalidValue(
+                        "flat plan v2 prefix suffix registry",
+                    ));
                 }
             }
             _ => return Err(AuraError::InvalidValue("flat plan v2 registry")),
@@ -210,6 +256,7 @@ fn hash_bytes(registry_version: u16, bytes: &[u8]) -> Result<[u8; 32]> {
         FLAT_PLAN_V2_REGISTRY_VERSION => REGISTRY1_HASH_DOMAIN,
         FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION => REGISTRY2_HASH_DOMAIN,
         FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION => REGISTRY3_HASH_DOMAIN,
+        FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION => REGISTRY4_HASH_DOMAIN,
         _ => return Err(AuraError::InvalidValue("flat plan v2 registry")),
     };
     let mut hasher = Sha256::new();
