@@ -94,5 +94,8 @@ clamped to those ceilings. The developer CLI exposes this writer through
 `aura v3 aura0 seal --protocol aura-logical-arrow-ipc-v2`; it decodes the
 strict nested Arrow stream, seals empty input as an empty complete file, and
 uses the same create-once held-file publication state machine as the flat V3
-command. `aura v3 aura0 verify` routes flat/grouped files from their bounded
-footer tuple and verifies the embedded schema and exact held file.
+command. `aura v3 aura0 verify` routes exact-flat, planned-flat, and grouped
+files from their bounded footer tuple and verifies the embedded schema and
+exact held file. Explicit flat `--mode planned` is a bounded all-memory
+development path and may select the existing exact file; it is not a
+streaming-writer claim.

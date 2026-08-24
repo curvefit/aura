@@ -44,12 +44,38 @@ aura v3 aura0 seal \
 aura v3 aura0 verify --input events.aura0 --json
 ```
 
+The default and explicit `--mode exact` routes remain the existing exact flat
+writer and result schema. A separate development-only request can score the
+existing exact complete file against plan-bound fixed and absolute-varint
+complete files:
+
+```bash
+aura v3 aura0 seal \
+  --protocol aura-logical-arrow-ipc-v1 \
+  --mode planned \
+  --schema canonical-schema.json \
+  --output planned-events.aura0 \
+  --json < logical.arrow-stream
+```
+
+The planned-request seal schema reports all three candidates' applicability,
+rejection/cost attribution, selected physical codec rows, complete bytes, the
+selected candidate, the actual footer/body tuple, and a plan hash only when a
+planned tuple wins. Exact fallback is intentional and is verified with the
+unchanged exact verify schema. A selected planned tuple uses footer layout 3,
+body encoding 4, the generic `planned_flat_codecs_v1` format label, and the
+distinct `aura-v3-flat-aura0-planned-verify-result-v1` schema. Both planned
+compilation and verification are conservatively bounded all-memory reference
+operations: compilation retains the exact, fixed, and mixed complete
+candidates plus lane scratch. This is not a seekable or streaming readiness
+claim. Planned mode is not accepted for grouped protocol v2.
+
 Seal accepts canonical schema JSON only and publishes a new mode-0600 path via
 the same create-once, held-handle verification and directory-fsync state
 machine as the standalone shadow artifact. It never relabels an `AURAV3VB`
 reference block as a complete file.
 
-V3 seal and verify results identify container version 3, profile `aura0`, body
+Default exact V3 seal and verify results identify container version 3, profile `aura0`, body
 encoding `flat_exact_blocks_v1`, footer layout version 1, all publication-size
 fields, schema and logical identities, and the exact artifact SHA-256. Both
 carry build provenance. For backward compatibility, both complete V3 commands
@@ -85,9 +111,10 @@ do not claim a physical planner, compression, Aura1 support, or default
 production status.
 
 Complete-file verification holds one regular non-symlink file, boundedly reads
-its footer routing tuple, dispatches to the flat or grouped reader, performs
+its footer routing tuple, dispatches to the exact-flat, planned-flat, or grouped
+reader, performs
 the complete reader verification, and hashes exactly the verified held file.
-Both seal flavors use the same mode-0600 temporary-file, create-once hard-link,
+All seal routes use the same mode-0600 temporary-file, create-once hard-link,
 held-identity, pre/post-link verification, directory-sync, rollback/ambiguity,
 and committed-stdout-loss recovery state machine. Existing destinations,
 symlinks, and group/world-writable parent directories are rejected.

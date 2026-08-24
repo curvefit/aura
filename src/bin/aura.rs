@@ -11,20 +11,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use aura_codec::{
     arrow_rust_version, build_provenance, canonical_v3_batch_sha256,
     canonical_v3_event_batch_sha256, canonical_v3_schema_fingerprint, cargo_lock_sha256,
-    compile_shadow_grouped_arrow_ipc, decode_shadow_arrow_ipc_batch,
-    decode_shadow_grouped_arrow_ipc_batch, decode_v3_event_block, decode_v3_value_block,
-    encode_shadow_arrow_ipc, parse_schema_json, SchemaEncodingVersion, ShadowEncodeResult,
-    ShadowGroupedEncodeResult, ShadowGroupedProtocolLimits, ShadowProtocolLimits,
-    V3FlatAura0Reader, V3FlatAura0Writer, V3FlatWriteSummary, V3FlatWriterOptions,
-    V3GroupedAura0Reader, V3GroupedAura0Writer, V3GroupedWriteSummary, V3GroupedWriterOptions,
-    V3ValueLimits, MAX_SCHEMA_JSON_BYTES, MAX_V3_EVENT_BLOCK_BYTES, MAX_V3_FLAT_FOOTER_BYTES,
-    MAX_V3_GROUPED_FOOTER_BYTES, MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL,
-    SHADOW_ARTIFACT_KIND, SHADOW_ARTIFACT_KIND_V2, SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL,
-    SHADOW_PROTOCOL_V2, SHADOW_RESULT_SCHEMA, SHADOW_RESULT_SCHEMA_V2, SHADOW_SCHEMA_FORMAT,
-    SHADOW_VERIFY_RESULT_SCHEMA, SHADOW_VERIFY_RESULT_SCHEMA_V2,
-    V3_FLAT_BODY_ENCODING_EXACT_BLOCKS, V3_FLAT_FOOTER_LAYOUT_VERSION,
-    V3_GROUPED_BODY_ENCODING_EXACT_EVENTS, V3_GROUPED_BODY_LAYOUT_VERSION,
-    V3_GROUPED_EVENT_BLOCK_VERSION, V3_GROUPED_FOOTER_LAYOUT_VERSION,
+    compile_shadow_grouped_arrow_ipc, compile_v3_planned_flat, decode_shadow_arrow_ipc_batch,
+    decode_shadow_grouped_arrow_ipc_batch, decode_v3_event_block, decode_v3_planned_flat,
+    decode_v3_selected_flat, decode_v3_value_block, encode_shadow_arrow_ipc, parse_schema_json,
+    DecodedV3SelectedFlat, SchemaEncodingVersion, ShadowEncodeResult, ShadowGroupedEncodeResult,
+    ShadowGroupedProtocolLimits, ShadowProtocolLimits, V3FlatAura0Reader, V3FlatAura0Writer,
+    V3FlatLimits, V3FlatWriteSummary, V3FlatWriterOptions, V3GroupedAura0Reader,
+    V3GroupedAura0Writer, V3GroupedWriteSummary, V3GroupedWriterOptions, V3PlannedFlatArtifact,
+    V3PlannedFlatSummary, V3ValueLimits, DEFAULT_V3_FLAT_IN_MEMORY_BODY_BYTES,
+    MAX_SCHEMA_JSON_BYTES, MAX_V3_EVENT_BLOCK_BYTES, MAX_V3_FLAT_FOOTER_BYTES,
+    MAX_V3_FLAT_SCHEMA_BYTES, MAX_V3_GROUPED_FOOTER_BYTES, MAX_V3_PLANNED_FLAT_FOOTER_BYTES,
+    MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND, SHADOW_ARTIFACT_KIND_V2,
+    SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL, SHADOW_PROTOCOL_V2, SHADOW_RESULT_SCHEMA,
+    SHADOW_RESULT_SCHEMA_V2, SHADOW_SCHEMA_FORMAT, SHADOW_VERIFY_RESULT_SCHEMA,
+    SHADOW_VERIFY_RESULT_SCHEMA_V2, V3_FLAT_BODY_ENCODING_EXACT_BLOCKS,
+    V3_FLAT_FOOTER_LAYOUT_VERSION, V3_GROUPED_BODY_ENCODING_EXACT_EVENTS,
+    V3_GROUPED_BODY_LAYOUT_VERSION, V3_GROUPED_EVENT_BLOCK_VERSION,
+    V3_GROUPED_FOOTER_LAYOUT_VERSION, V3_PLANNED_FLAT_BLOCK_VERSION, V3_PLANNED_FLAT_BODY_ENCODING,
+    V3_PLANNED_FLAT_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -46,6 +50,8 @@ Usage:
     --input <existing.aurav3eb> --json
   aura v3 aura0 seal --protocol aura-logical-arrow-ipc-v1 --schema <canonical.json> \
     --output <new.aura0> --json
+  aura v3 aura0 seal --protocol aura-logical-arrow-ipc-v1 --mode planned \
+    --schema <canonical.json> --output <new.aura0> --json
   aura v3 aura0 seal --protocol aura-logical-arrow-ipc-v2 --schema <canonical.json> \
     --output <new.aura0> --json
   aura v3 aura0 verify --input <file.aura0> --json
@@ -58,6 +64,13 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 enum ShadowProtocolVersion {
     V1,
     V2,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum V3SealMode {
+    #[default]
+    Exact,
+    Planned,
 }
 
 #[derive(Debug)]
@@ -365,11 +378,13 @@ fn shadow_verify_command(args: &[String]) -> Result<(), CliError> {
 
 fn v3_aura0_seal_command(args: &[String]) -> Result<(), CliError> {
     let mut protocol = None;
+    let mut mode = None;
     let mut schema_path = None;
     let mut output = None;
     let mut json_output = false;
     parse_options(args, |name, value| match name {
         "--protocol" => set_string(&mut protocol, value, "--protocol"),
+        "--mode" => set_string(&mut mode, value, "--mode"),
         "--schema" => set_path(&mut schema_path, value, "--schema"),
         "--output" => set_path(&mut output, value, "--output"),
         "--json" if value.is_none() => {
@@ -379,6 +394,12 @@ fn v3_aura0_seal_command(args: &[String]) -> Result<(), CliError> {
         _ => Err(CliError("unknown v3 aura0 seal option".to_owned())),
     })?;
     let protocol = require_shadow_protocol(protocol)?;
+    let mode = require_v3_seal_mode(mode)?;
+    if protocol == ShadowProtocolVersion::V2 && mode == V3SealMode::Planned {
+        return Err(CliError(
+            "planned mode is unsupported for grouped protocol v2".to_owned(),
+        ));
+    }
     if !json_output {
         return Err(CliError("v3 aura0 seal requires --json".to_owned()));
     }
@@ -412,15 +433,42 @@ fn v3_aura0_seal_command(args: &[String]) -> Result<(), CliError> {
                 ShadowProtocolLimits::default(),
             )
             .map_err(|error| CliError(error.to_string()))?;
-            let (publication, summary, artifact_sha256) =
-                publish_verified_v3_flat(&output, &schema, &batch)?;
-            let value = flat_v3_seal_json(
-                &schema,
-                &summary,
-                artifact_sha256,
-                publication.stale_temp_cleanup_required,
-            );
-            (publication, value)
+            match mode {
+                V3SealMode::Exact => {
+                    let (publication, summary, artifact_sha256) =
+                        publish_verified_v3_flat(&output, &schema, &batch)?;
+                    let value = flat_v3_seal_json(
+                        &schema,
+                        &summary,
+                        artifact_sha256,
+                        publication.stale_temp_cleanup_required,
+                    );
+                    (publication, value)
+                }
+                V3SealMode::Planned => {
+                    let artifact = if batch.row_count == 0 {
+                        compile_v3_planned_flat(&schema, &[], planned_cli_limits())
+                    } else {
+                        compile_v3_planned_flat(
+                            &schema,
+                            std::slice::from_ref(&batch),
+                            planned_cli_limits(),
+                        )
+                    }
+                    .map_err(|_| CliError("could not compile planned v3 output".to_owned()))?;
+                    let selection = planned_flat_selection(&artifact)?;
+                    let (publication, artifact_sha256) =
+                        publish_verified_v3_planned(&output, &artifact, selection)?;
+                    let value = planned_flat_v3_seal_json(
+                        &schema,
+                        &artifact,
+                        selection,
+                        artifact_sha256,
+                        publication.stale_temp_cleanup_required,
+                    );
+                    (publication, value)
+                }
+            }
         }
         ShadowProtocolVersion::V2 => {
             let batch = decode_shadow_grouped_arrow_ipc_batch(
@@ -485,6 +533,7 @@ fn v3_aura0_verify_command(args: &[String]) -> Result<(), CliError> {
     let kind = inspect_v3_footer_kind(&mut file)?;
     let value = match kind {
         CompleteV3Kind::Flat => verify_v3_flat_value(file)?,
+        CompleteV3Kind::PlannedFlat => verify_v3_planned_flat_value(file)?,
         CompleteV3Kind::Grouped => verify_v3_grouped_value(file)?,
     };
     write_json_stdout(&value)
@@ -493,7 +542,113 @@ fn v3_aura0_verify_command(args: &[String]) -> Result<(), CliError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompleteV3Kind {
     Flat,
+    PlannedFlat,
     Grouped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannedFlatSelection {
+    Exact,
+    Planned,
+}
+
+impl PlannedFlatSelection {
+    const fn footer_layout_version(self) -> u16 {
+        match self {
+            Self::Exact => V3_FLAT_FOOTER_LAYOUT_VERSION,
+            Self::Planned => V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION,
+        }
+    }
+
+    const fn body_encoding_code(self) -> u8 {
+        match self {
+            Self::Exact => V3_FLAT_BODY_ENCODING_EXACT_BLOCKS,
+            Self::Planned => V3_PLANNED_FLAT_BODY_ENCODING,
+        }
+    }
+
+    const fn body_encoding_name(self) -> &'static str {
+        match self {
+            Self::Exact => "flat_exact_blocks_v1",
+            Self::Planned => "planned_flat_codecs_v1",
+        }
+    }
+
+    const fn container_target(self) -> &'static str {
+        match self {
+            Self::Exact => "flat-aura0-v3-v1",
+            Self::Planned => "flat-aura0-v3-planned-v1",
+        }
+    }
+}
+
+const MAX_PLANNED_CLI_FILE_BYTES: u64 = DEFAULT_V3_FLAT_IN_MEMORY_BODY_BYTES
+    + MAX_V3_PLANNED_FLAT_FOOTER_BYTES as u64
+    + MAX_V3_FLAT_SCHEMA_BYTES as u64
+    + 4096;
+
+fn planned_cli_limits() -> V3FlatLimits {
+    V3FlatLimits::DEFAULT_IN_MEMORY
+}
+
+fn planned_flat_selection(
+    artifact: &V3PlannedFlatArtifact,
+) -> Result<PlannedFlatSelection, CliError> {
+    let bytes = &artifact.bytes;
+    if bytes.len() < 21 || bytes.get(bytes.len() - 8..) != Some(b"sealed:)".as_slice()) {
+        return Err(CliError(
+            "planned v3 compiler returned invalid artifact".to_owned(),
+        ));
+    }
+    let trailer = bytes
+        .get(bytes.len() - 12..bytes.len() - 8)
+        .and_then(|value| <[u8; 4]>::try_from(value).ok())
+        .ok_or_else(|| CliError("planned v3 compiler returned invalid artifact".to_owned()))?;
+    let footer_len = usize::try_from(u32::from_le_bytes(trailer))
+        .map_err(|_| CliError("planned v3 compiler returned invalid artifact".to_owned()))?;
+    let footer_start = bytes
+        .len()
+        .checked_sub(12)
+        .and_then(|value| value.checked_sub(footer_len))
+        .ok_or_else(|| CliError("planned v3 compiler returned invalid artifact".to_owned()))?;
+    let footer = bytes
+        .get(footer_start..)
+        .ok_or_else(|| CliError("planned v3 compiler returned invalid artifact".to_owned()))?;
+    let tuple = footer
+        .get(..9)
+        .ok_or_else(|| CliError("planned v3 compiler returned invalid artifact".to_owned()))?;
+    if &tuple[..4] != b"AURP" || u16::from_le_bytes([tuple[4], tuple[5]]) != 3 {
+        return Err(CliError(
+            "planned v3 compiler returned invalid artifact".to_owned(),
+        ));
+    }
+    let selection = match (u16::from_le_bytes([tuple[6], tuple[7]]), tuple[8]) {
+        (V3_FLAT_FOOTER_LAYOUT_VERSION, V3_FLAT_BODY_ENCODING_EXACT_BLOCKS) => {
+            PlannedFlatSelection::Exact
+        }
+        (V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION, V3_PLANNED_FLAT_BODY_ENCODING) => {
+            PlannedFlatSelection::Planned
+        }
+        _ => {
+            return Err(CliError(
+                "planned v3 compiler returned invalid artifact".to_owned(),
+            ))
+        }
+    };
+    let selected_candidate = artifact
+        .inspection
+        .candidates
+        .iter()
+        .find(|candidate| candidate.selected)
+        .ok_or_else(|| CliError("planned v3 compiler omitted selection".to_owned()))?;
+    if (selection == PlannedFlatSelection::Exact)
+        != (selected_candidate.candidate_id == "exact-flat")
+    {
+        return Err(CliError(
+            "planned v3 compiler selection mismatch".to_owned(),
+        ));
+    }
+    Ok(selection)
 }
 
 fn inspect_v3_footer_kind(file: &mut File) -> Result<CompleteV3Kind, CliError> {
@@ -513,7 +668,9 @@ fn inspect_v3_footer_kind(file: &mut File) -> Result<CompleteV3Kind, CliError> {
         return Err(CliError("v3 invalid artifact".to_owned()));
     }
     let footer_len = u64::from(u32::from_le_bytes(trailer[..4].try_into().unwrap()));
-    let max_footer = MAX_V3_FLAT_FOOTER_BYTES.max(MAX_V3_GROUPED_FOOTER_BYTES) as u64;
+    let max_footer = MAX_V3_FLAT_FOOTER_BYTES
+        .max(MAX_V3_PLANNED_FLAT_FOOTER_BYTES)
+        .max(MAX_V3_GROUPED_FOOTER_BYTES) as u64;
     if !(12..=max_footer).contains(&footer_len) {
         return Err(CliError("v3 invalid artifact".to_owned()));
     }
@@ -536,6 +693,9 @@ fn inspect_v3_footer_kind(file: &mut File) -> Result<CompleteV3Kind, CliError> {
     match (layout, tuple[8]) {
         (V3_FLAT_FOOTER_LAYOUT_VERSION, V3_FLAT_BODY_ENCODING_EXACT_BLOCKS) => {
             Ok(CompleteV3Kind::Flat)
+        }
+        (V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION, V3_PLANNED_FLAT_BODY_ENCODING) => {
+            Ok(CompleteV3Kind::PlannedFlat)
         }
         (V3_GROUPED_FOOTER_LAYOUT_VERSION, V3_GROUPED_BODY_ENCODING_EXACT_EVENTS) => {
             Ok(CompleteV3Kind::Grouped)
@@ -577,6 +737,96 @@ fn flat_v3_seal_json(
             "arrow_crate_version": arrow_rust_version(),
             "cargo_lock_sha256": hex(&cargo_lock_sha256())
         }
+    })
+}
+
+fn planned_flat_v3_seal_json(
+    schema: &aura_codec::SchemaDescriptor,
+    artifact: &V3PlannedFlatArtifact,
+    selection: PlannedFlatSelection,
+    artifact_sha256: [u8; 32],
+    stale_temp_cleanup_required: bool,
+) -> serde_json::Value {
+    let provenance = build_provenance();
+    let selected_candidate = artifact
+        .inspection
+        .candidates
+        .iter()
+        .find(|candidate| candidate.selected)
+        .map(|candidate| candidate.candidate_id.as_str())
+        .unwrap_or("unavailable");
+    let candidates = artifact
+        .inspection
+        .candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "candidate_id": candidate.candidate_id,
+                "applicable": candidate.applicable,
+                "complete_bytes": candidate.complete_bytes,
+                "selected": candidate.selected,
+                "rejection": candidate.rejection,
+            })
+        })
+        .collect::<Vec<_>>();
+    let codecs = artifact
+        .inspection
+        .codecs
+        .iter()
+        .map(|codec| {
+            let selected_physical_codec = match codec.selected {
+                aura_codec::PlanV2PhysicalCodec::FixedWidth => "fixed_width",
+                aura_codec::PlanV2PhysicalCodec::UnsignedUleb128 => "unsigned_uleb128",
+                aura_codec::PlanV2PhysicalCodec::SignedZigZagUleb128 => "signed_zigzag_uleb128",
+            };
+            json!({
+                "slot": codec.slot,
+                "logical_field_type": codec.field_type.name(),
+                "fixed_bytes": codec.fixed_bytes,
+                "varint_bytes": codec.varint_bytes,
+                "selected_physical_codec": selected_physical_codec,
+            })
+        })
+        .collect::<Vec<_>>();
+    let plan_sha256 =
+        (selection == PlannedFlatSelection::Planned).then(|| hex(&artifact.summary.plan_sha256));
+    let body_layout_version =
+        (selection == PlannedFlatSelection::Planned).then_some(V3_PLANNED_FLAT_BODY_LAYOUT_VERSION);
+    let block_version =
+        (selection == PlannedFlatSelection::Planned).then_some(V3_PLANNED_FLAT_BLOCK_VERSION);
+    json!({
+        "result_schema": "aura-v3-flat-aura0-planned-request-seal-result-v1",
+        "protocol": SHADOW_PROTOCOL,
+        "complete_aura_file": true,
+        "container_target": selection.container_target(),
+        "container_version": 3,
+        "profile": "aura0",
+        "requested_mode": "planned",
+        "planner_requested": true,
+        "selected_candidate": selected_candidate,
+        "planner_candidates": candidates,
+        "physical_codecs": codecs,
+        "body_encoding": selection.body_encoding_name(),
+        "body_encoding_code": selection.body_encoding_code(),
+        "body_layout_version": body_layout_version,
+        "block_version": block_version,
+        "footer_layout_version": selection.footer_layout_version(),
+        "plan_sha256": plan_sha256,
+        "schema_id": schema.schema_id,
+        "schema_fingerprint_sha256": hex(&artifact.summary.schema_fingerprint),
+        "row_count": artifact.summary.row_count,
+        "chunk_count": artifact.summary.chunk_count,
+        "body_bytes": artifact.summary.body_bytes,
+        "footer_bytes": artifact.summary.footer_bytes,
+        "file_bytes": artifact.summary.file_bytes,
+        "logical_sha256": hex(&artifact.summary.global_logical_sha256),
+        "artifact_sha256": hex(&artifact_sha256),
+        "stale_temp_cleanup_required": stale_temp_cleanup_required,
+        "development_only": true,
+        "streaming": false,
+        "memory_model": "bounded_all_memory_exact_fixed_mixed_complete_candidates_v1",
+        "all_memory_limitation": "retains exact, fixed, and mixed complete candidate artifacts plus lane scratch during scoring",
+        "build": build_json(provenance)
     })
 }
 
@@ -655,6 +905,86 @@ fn verify_v3_flat_value(file: File) -> Result<serde_json::Value, CliError> {
     }))
 }
 
+fn verify_v3_planned_flat_value(mut file: File) -> Result<serde_json::Value, CliError> {
+    let bytes = read_bounded_planned_v3_file(&mut file)?;
+    let decoded = decode_v3_planned_flat(&bytes, planned_cli_limits())
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    if decoded.summary.file_bytes
+        != u64::try_from(bytes.len()).map_err(|_| CliError("v3 invalid artifact".to_owned()))?
+        || decoded.summary.accounted_file_bytes != decoded.summary.file_bytes
+    {
+        return Err(CliError("v3 invalid artifact".to_owned()));
+    }
+    let artifact_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    let provenance = build_provenance();
+    Ok(json!({
+        "result_schema": "aura-v3-flat-aura0-planned-verify-result-v1",
+        "protocol": SHADOW_PROTOCOL,
+        "complete_aura_file": true,
+        "container_target": PlannedFlatSelection::Planned.container_target(),
+        "container_version": 3,
+        "profile": "aura0",
+        "body_encoding": PlannedFlatSelection::Planned.body_encoding_name(),
+        "body_encoding_code": V3_PLANNED_FLAT_BODY_ENCODING,
+        "body_layout_version": V3_PLANNED_FLAT_BODY_LAYOUT_VERSION,
+        "block_version": V3_PLANNED_FLAT_BLOCK_VERSION,
+        "footer_layout_version": V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION,
+        "compression": "none",
+        "verified": true,
+        "schema_id": decoded.footer.schema.schema_id,
+        "schema_fingerprint_sha256": hex(&decoded.summary.schema_fingerprint),
+        "row_count": decoded.summary.row_count,
+        "chunk_count": decoded.summary.chunk_count,
+        "body_bytes": decoded.summary.body_bytes,
+        "footer_bytes": decoded.summary.footer_bytes,
+        "file_bytes": decoded.summary.file_bytes,
+        "plan_sha256": hex(&decoded.summary.plan_sha256),
+        "logical_sha256": hex(&decoded.summary.global_logical_sha256),
+        "artifact_sha256": hex(&artifact_sha256),
+        "development_only": true,
+        "streaming": false,
+        "memory_model": "bounded_all_memory_complete_file_decode_v1",
+        "build": build_json(provenance)
+    }))
+}
+
+fn read_bounded_planned_v3_file(file: &mut File) -> Result<Vec<u8>, CliError> {
+    let before = file
+        .metadata()
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    if !before.is_file() || before.len() > MAX_PLANNED_CLI_FILE_BYTES || before.len() < 24 {
+        return Err(CliError("v3 invalid artifact".to_owned()));
+    }
+    #[cfg(unix)]
+    let before_identity = file_identity(&before);
+    let capacity =
+        usize::try_from(before.len()).map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    let reserve = capacity
+        .checked_add(1)
+        .ok_or_else(|| CliError("v3 invalid artifact".to_owned()))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(reserve)
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    (&mut *file)
+        .take(before.len().saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    let after = file
+        .metadata()
+        .map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
+    if bytes.len() != capacity || after.len() != before.len() {
+        return Err(CliError("v3 invalid artifact".to_owned()));
+    }
+    #[cfg(unix)]
+    if file_identity(&after) != before_identity {
+        return Err(CliError("v3 input identity changed".to_owned()));
+    }
+    Ok(bytes)
+}
+
 fn verify_v3_grouped_value(file: File) -> Result<serde_json::Value, CliError> {
     let mut reader =
         V3GroupedAura0Reader::open(file).map_err(|_| CliError("v3 invalid artifact".to_owned()))?;
@@ -699,6 +1029,14 @@ fn require_shadow_protocol(protocol: Option<String>) -> Result<ShadowProtocolVer
         Some(SHADOW_PROTOCOL) => Ok(ShadowProtocolVersion::V1),
         Some(SHADOW_PROTOCOL_V2) => Ok(ShadowProtocolVersion::V2),
         _ => Err(CliError("unsupported or missing --protocol".to_owned())),
+    }
+}
+
+fn require_v3_seal_mode(mode: Option<String>) -> Result<V3SealMode, CliError> {
+    match mode.as_deref() {
+        None | Some("exact") => Ok(V3SealMode::Exact),
+        Some("planned") => Ok(V3SealMode::Planned),
+        Some(_) => Err(CliError("unsupported v3 seal mode".to_owned())),
     }
 }
 
@@ -1114,6 +1452,24 @@ fn publish_verified_v3_flat(
     }
 }
 
+fn publish_verified_v3_planned(
+    output: &Path,
+    artifact: &V3PlannedFlatArtifact,
+    selection: PlannedFlatSelection,
+) -> Result<(PublicationOutcome, [u8; 32]), CliError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (output, artifact, selection);
+        Err(CliError(
+            "trusted v3 publication is unsupported on this platform".to_owned(),
+        ))
+    }
+    #[cfg(unix)]
+    {
+        publish_verified_v3_planned_with_ops(output, artifact, selection, &RealPublicationOps)
+    }
+}
+
 fn publish_verified_v3_grouped(
     output: &Path,
     schema: &aura_codec::SchemaDescriptor,
@@ -1146,6 +1502,42 @@ fn publish_verified_v3_flat_with_ops(
         verify_temp_v3_flat,
         |summary| summary.file_bytes,
     )
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct V3PlannedPublicationExpected {
+    summary: V3PlannedFlatSummary,
+    selection: PlannedFlatSelection,
+    artifact_sha256: [u8; 32],
+}
+
+#[cfg(unix)]
+fn publish_verified_v3_planned_with_ops(
+    output: &Path,
+    artifact: &V3PlannedFlatArtifact,
+    selection: PlannedFlatSelection,
+    ops: &impl PublicationOps,
+) -> Result<(PublicationOutcome, [u8; 32]), CliError> {
+    let expected = V3PlannedPublicationExpected {
+        summary: artifact.summary.clone(),
+        selection,
+        artifact_sha256: Sha256::digest(&artifact.bytes).into(),
+    };
+    let (publication, _, artifact_sha256) = publish_verified_complete_v3_with_ops(
+        output,
+        ops,
+        |mut temp| {
+            temp.write_all(&artifact.bytes)
+                .map_err(|_| CliError("could not write planned v3 temporary output".to_owned()))?;
+            temp.sync_all()
+                .map_err(|_| CliError("could not sync planned v3 temporary output".to_owned()))?;
+            Ok((temp, expected.clone()))
+        },
+        verify_temp_v3_planned,
+        |expected| expected.summary.file_bytes,
+    )?;
+    Ok((publication, artifact_sha256))
 }
 
 #[cfg(unix)]
@@ -1403,6 +1795,57 @@ fn verify_temp_v3_flat(
         return Err(CliError("v3 temporary output summary mismatch".to_owned()));
     }
     hash_held_file(temp, expected.file_bytes)
+}
+
+#[cfg(unix)]
+fn verify_temp_v3_planned(
+    temp: &mut File,
+    expected_identity: FileIdentity,
+    expected: &V3PlannedPublicationExpected,
+) -> Result<[u8; 32], CliError> {
+    let metadata = temp
+        .metadata()
+        .map_err(|_| CliError("could not inspect planned v3 temporary output".to_owned()))?;
+    if !metadata.is_file()
+        || metadata.len() != expected.summary.file_bytes
+        || file_identity(&metadata) != expected_identity
+    {
+        return Err(CliError(
+            "invalid planned v3 temporary output length".to_owned(),
+        ));
+    }
+    let bytes = read_bounded_planned_v3_file(temp)
+        .map_err(|_| CliError("planned v3 temporary output read failed".to_owned()))?;
+    let decoded = decode_v3_selected_flat(&bytes, planned_cli_limits())
+        .map_err(|_| CliError("planned v3 temporary output decode failed".to_owned()))?;
+    let summary_matches = match (expected.selection, decoded) {
+        (PlannedFlatSelection::Exact, DecodedV3SelectedFlat::Exact(decoded)) => {
+            let header_bytes = aura_codec::AuraHeader::encoded_len(&bytes).ok();
+            let footer_bytes = bytes
+                .get(bytes.len().saturating_sub(12)..bytes.len().saturating_sub(8))
+                .and_then(|value| <[u8; 4]>::try_from(value).ok())
+                .map(u32::from_le_bytes);
+            decoded.footer.record_count == expected.summary.row_count
+                && decoded.footer.body_len == expected.summary.body_bytes
+                && decoded.footer.chunks.len() == expected.summary.chunk_count as usize
+                && decoded.footer.schema_fingerprint == expected.summary.schema_fingerprint
+                && decoded.footer.global_logical_sha256 == expected.summary.global_logical_sha256
+                && header_bytes == usize::try_from(expected.summary.header_bytes).ok()
+                && footer_bytes == Some(expected.summary.footer_bytes)
+                && expected.summary.plan_sha256 == [0; 32]
+        }
+        (PlannedFlatSelection::Planned, DecodedV3SelectedFlat::Planned(decoded)) => {
+            decoded.summary == expected.summary
+        }
+        _ => false,
+    };
+    let artifact_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    if !summary_matches || artifact_sha256 != expected.artifact_sha256 {
+        return Err(CliError(
+            "planned v3 temporary output summary mismatch".to_owned(),
+        ));
+    }
+    Ok(artifact_sha256)
 }
 
 #[cfg(unix)]
@@ -2517,6 +2960,28 @@ mod publication_tests {
         };
         assert!(
             publish_verified_v3_grouped_with_ops(&dir.output(), &schema, &batch, &ops).is_err()
+        );
+        assert!(!dir.output().exists());
+        let temps = dir.temp_paths();
+        assert_eq!(temps.len(), 1);
+        assert_eq!(fs::read(&temps[0]).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn planned_v3_uses_shared_publication_identity_guard() {
+        let dir = TestDirectory::new();
+        let (schema, batch) = v3_reference();
+        let artifact =
+            compile_v3_planned_flat(&schema, std::slice::from_ref(&batch), planned_cli_limits())
+                .unwrap();
+        let selection = planned_flat_selection(&artifact).unwrap();
+        let ops = FaultOps {
+            replace_temp_before_link: true,
+            ..Default::default()
+        };
+        assert!(
+            publish_verified_v3_planned_with_ops(&dir.output(), &artifact, selection, &ops)
+                .is_err()
         );
         assert!(!dir.output().exists());
         let temps = dir.temp_paths();

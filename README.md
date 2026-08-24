@@ -90,6 +90,10 @@ cargo run --release --bin aura -- v3 aura0 seal \
   --schema <canonical-schema.json> \
   --output <new-file.aura0> --json < <arrow-ipc-stream.bin>
 cargo run --release --bin aura -- v3 aura0 seal \
+  --protocol aura-logical-arrow-ipc-v1 --mode planned \
+  --schema <canonical-schema.json> \
+  --output <new-planned-file.aura0> --json < <arrow-ipc-stream.bin>
+cargo run --release --bin aura -- v3 aura0 seal \
   --protocol aura-logical-arrow-ipc-v2 \
   --schema <canonical-grouped-schema.json> \
   --output <new-grouped-file.aura0> --json < <grouped-arrow-ipc-stream.bin>
@@ -112,7 +116,13 @@ uncommitted result that must not be published even if bytes happen to end in a
 seal. The shared flat/grouped CLI publisher syncs a mode-0600 temporary file
 before create-once publication and never silently replaces an existing
 destination. Verification boundedly routes the held file from its footer tuple
-and verifies the exact embedded flat or grouped schema and complete file.
+and verifies the exact embedded flat, planned-flat, or grouped schema and
+complete file. The optional flat `--mode planned` route is development-only:
+it scores exact and plan-bound fixed/absolute-varint lane encodings as complete
+files using conservative bounds and publishes the smallest result (fixed ties,
+including an auditable exact fallback). Its receipt reports every candidate
+cost and the actual selected wire tuple. Compilation and planned verification
+are bounded all-memory reference paths, not seekable/streaming readiness.
 
 The supported V3 flat subset is intentionally narrow: event-scoped fields,
 exact fixed and variable values, and optional validity bitmaps. It rejects

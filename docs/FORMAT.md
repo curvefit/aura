@@ -3,13 +3,16 @@
 This document describes the current implementation.
 
 Current production and default SDK writers still emit container V2. Aura also
-implements two complete, explicitly selected, uncompressed V3 Aura0 SDK
+implements three complete, explicitly selected, uncompressed V3 Aura0
 flavors: flat event-scoped files whose body is a concatenation of exact-value
-`AURAV3VB` blocks, and grouped exact-event files whose body is a concatenation
-of `AURAV3EB` chunks. Both have seekable writers/readers and bounded
-verification. The explicit V3 CLI seal command covers both flavors and verify
-auto-dispatches from the held footer tuple. V3 is not production-ready or
-the default, and a V3 schema cannot be embedded in a V2 container.
+`AURAV3VB` blocks; a development-only planned-flat file with plan-bound fixed
+or absolute-varint lanes; and grouped exact-event files whose body is a
+concatenation of `AURAV3EB` chunks. Exact-flat and grouped have seekable
+writers/readers. Planned-flat compilation and verification are bounded
+all-memory reference paths. The explicit V3 CLI seal command covers all three
+and verify auto-dispatches from the held footer tuple. V3 is not
+production-ready or the default, and a V3 schema cannot be embedded in a V2
+container.
 
 ## Standalone V3 exact-value reference block
 
@@ -115,6 +118,46 @@ each exact-value block, 4,194,304 total rows, and 4,096 chunks;
 `V3FlatLimits::HARD` explicitly opts into the absolute 1 TiB body, 1 GiB block,
 and 16,777,216-row format ceilings.
 
+## Planned-flat Aura0 V3 development container
+
+Planned-flat is an additive group-free development format for the same logical
+flat schema subset. Its `AURP` route tuple is container version `3`, footer
+layout `3`, body encoding `4`, followed by three zero reserved bytes. The
+footer stamps body layout version `1`, block version `1`, the complete
+canonical schema descriptor, and an `AUF2` plan. A decoder never replans and
+needs no dataset, venue, symbol, filename, or sidecar.
+
+Canonical `AUF2` plan version `2`, registry version `1`, starts with magic
+`AUF2`, total length, schema ID and fingerprint, field count, and reserved
+zero bytes. One physical codec byte follows for every schema slot, then a
+domain-separated 32-byte plan hash. Registry 1 permits fixed-width lanes for
+all supported flat fields, unsigned canonical ULEB128 for unsigned integer
+fields, and signed canonical ZigZag ULEB128 for signed integers and timestamp
+fields. The plan decoder verifies its length, hash, schema binding, codec/type
+compatibility, and canonical re-encoding.
+
+Each planned body chunk starts with `AUFPVB01`, block version `1`, zero flags,
+schema ID/fingerprint, row and field counts, zero reserved bytes, and the full
+block length. Lanes then occur in schema-slot order. Fixed lanes reuse the
+exact-value plane payload without its 20-byte per-column header. Varint lanes
+store the exact validity bitmap when nullable followed by one canonical value
+per row. The footer's 208-byte prefix binds record/body totals, schema and
+plan lengths, schema/plan/header/body/global-logical hashes, then stores the
+schema and plan. Its version-1 chunk table uses 104-byte descriptors carrying
+contiguous row/body ranges plus stored and logical SHA-256 values, followed by
+the footer hash and common trailer.
+
+The reference compiler scores three complete artifacts: legacy exact flat,
+planned all-fixed, and planned per-field fixed/varint. It charges header, body,
+plan, schema, footer, descriptors, hashes, footer length, and seal, and uses
+stable candidate order for complete-file ties. Therefore an explicit planned
+request may truthfully publish the byte-identical legacy exact fallback. The
+CLI receipt records the requested mode, every candidate's cost/applicability
+and rejection reason, the selected candidate, the actual route tuple, and
+per-slot codec costs when the mixed plan wins. This reference compiler retains
+up to three complete candidates plus lane scratch; it is not the streaming
+ingest writer or a readiness claim.
+
 ## Grouped Aura0 V3 container V1
 
 The complete grouped V3 SDK profile has the same V3 header/trailer envelope as
@@ -166,8 +209,9 @@ default values; variable values retain the 16 MiB hard ceiling.
 - `.aura`: ingest/preservation file. It stores logical i64 or typed rows plus
   the ingest footer (`AURF`).
 - `.aura0`: V2 compiled cold file with stream/delta/codec bodies plus the
-  compiled footer (`AURP`), or an explicit V3 flat `AURAV3VB` file or grouped
-  `AURAV3EB` file with its V3 `AURP` footer (version 3).
+  compiled footer (`AURP`), or an explicit V3 exact-flat `AURAV3VB`,
+  planned-flat `AUFPVB01`, or grouped `AURAV3EB` file with its V3 `AURP`
+  footer (version 3).
 - `.aura1`: compiled fixed-width replay file. It stores fixed-width i64 rows
   plus the compiled footer (`AURP`).
 
@@ -253,9 +297,11 @@ optional Aura1 byte-lane descriptor table (`AUBL`)
 ```
 
 Unsupported versions reject during footer decode. `AnyCompiledFooter` routes
-the unchanged V2 compiled footer to `CompiledFooter`, V3 flat encoding-1 bytes
-to the flat footer decoder, and V3 grouped encoding-2 bytes to the grouped
-footer decoder. It does not reinterpret one V3 layout as the other.
+the unchanged V2 compiled footer to `CompiledFooter`, V3 exact-flat
+layout-1/encoding-1 bytes to the flat footer decoder, V3 grouped
+layout-1/encoding-2 bytes to the grouped footer decoder, and V3 planned-flat
+layout-3/encoding-4 bytes to the planned footer decoder. It does not
+reinterpret one V3 layout as another.
 
 ## Aura1 Body
 
@@ -293,7 +339,9 @@ fixed-step, delta, varint, bitpack, RLE, dictionary, packed dictionary,
 block-local, and Huffman dictionary variants. The current direct paths preserve
 the V2 footer plan and do not change binary layout. The V3 exact profiles above
 are uncompressed and do not use a physical relationship planner, compression,
-or Plan v2.
+or Plan v2. The additive planned-flat development profile uses the
+self-contained `AUF2` physical-codec plan described above; it currently
+performs no delta or related-domain math.
 
 V2 Aura0 can be written with three profiles:
 

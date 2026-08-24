@@ -215,6 +215,11 @@ cargo run --release --bin aura -- v3 aura0 verify \
   --input <new-file.aura0> --json
 ```
 
+Flat protocol v1 also accepts explicit development mode `--mode planned`.
+This does not change the schema contract or default exact command; it asks the
+bounded all-memory planner to score complete exact/fixed/mixed files and may
+still select the byte-identical exact fallback.
+
 The schema author supplies the logical field declarations and relationship
 permissions. Aura's pinned implementation validates them; the decoder does not
 infer a dataset, venue, or symbol from the input. For the complete flat V3
