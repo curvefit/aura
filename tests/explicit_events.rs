@@ -185,6 +185,71 @@ fn explicit_event_planner_selects_repeated_parent_residual_and_beats_direct() {
 }
 
 #[test]
+fn direct_aura0_event_seal_is_byte_identical_to_proven_two_step_compile() {
+    let cases = vec![
+        (
+            "campaign-shape",
+            generic_i64_parent_schema(
+                "explicit-direct-seal-campaign",
+                &[100, 0, 200, 205, 0, 0, 5, 0],
+            )
+            .unwrap(),
+            repeated_parent_events(),
+        ),
+        ("zero-child", book_schema().unwrap(), events()),
+    ];
+    for (case, schema, events) in cases {
+        let mut writer = AuraI64EventWriter::new(schema)
+            .with_stream(7, 11)
+            .with_header_comment("direct profile equality");
+        for event in events.clone() {
+            writer.push_event(event).unwrap();
+        }
+        let ingest = writer.clone().finish().unwrap();
+        for profile in [Profile::Ingest, Profile::Aura0, Profile::Aura1] {
+            let two_step = if profile == Profile::Ingest {
+                ingest.clone()
+            } else {
+                AuraI64EventWriter::compile_profile(&ingest, profile).unwrap()
+            };
+            let direct = writer.clone().finish_profile(profile).unwrap();
+            assert_eq!(direct, two_step, "{case} {profile:?}");
+            assert_eq!(
+                AuraI64EventReader::open(&direct).unwrap().events(),
+                events,
+                "{case} {profile:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn direct_aura0_event_seal_rejects_wide_schema_like_two_step_compile() {
+    let schema = SchemaBuilder::new("explicit-wide-rejection")
+        .field("ts", FieldType::TimestampNs, FieldRole::Timestamp)
+        .repeated_field("side", FieldType::U8, FieldRole::Side)
+        .repeated_field("wide", FieldType::I128, FieldRole::Value)
+        .finish()
+        .unwrap();
+    let mut writer = AuraI64EventWriter::new(schema);
+    writer
+        .push_event(I64Event {
+            event_values: vec![1],
+            children: vec![vec![0, 7]],
+        })
+        .unwrap();
+    let ingest = writer.clone().finish().unwrap();
+    assert_eq!(
+        AuraI64EventWriter::compile_profile(&ingest, Profile::Aura0).unwrap_err(),
+        aura_codec::AuraError::InvalidValue("i64 schema")
+    );
+    assert_eq!(
+        writer.finish_profile(Profile::Aura0).unwrap_err(),
+        aura_codec::AuraError::InvalidValue("i64 schema")
+    );
+}
+
+#[test]
 fn explicit_event_planner_keeps_small_losing_parent_relationship_direct() {
     let events = vec![I64Event {
         event_values: vec![1_000, 7],

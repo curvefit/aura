@@ -188,9 +188,9 @@ fn run_explicit_events(
     for event in events.iter().cloned() {
         writer.push_event(event)?;
     }
+    let aura0 = writer.clone().finish_profile(Profile::Aura0)?;
+    let aura1 = writer.clone().finish_profile(Profile::Aura1)?;
     let aura = writer.finish()?;
-    let aura0 = AuraI64EventWriter::compile_profile(&aura, Profile::Aura0)?;
-    let aura1 = AuraI64EventWriter::compile_profile(&aura, Profile::Aura1)?;
     for (bytes, profile) in [
         (&aura, Profile::Ingest),
         (&aura0, Profile::Aura0),

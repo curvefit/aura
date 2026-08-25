@@ -527,6 +527,123 @@ pub fn encode_ingest_i64_events_file(input: I64EventFileInput) -> Result<Vec<u8>
     encode_ingest_i64_events_file_inner(input)
 }
 
+/// Seal an explicit-event input directly into the requested production profile.
+///
+/// Aura0 reuses the already-planned compact event body and converts only the
+/// ingest footer into its compiled form. This is byte-identical to sealing an
+/// ingest file and compiling it through [`compile_i64_file`], but avoids the
+/// intermediate complete file, decode, event reconstruction, replanning, and
+/// second body encode.
+pub fn encode_i64_events_profile(
+    input: I64EventFileInput,
+    target_profile: Profile,
+) -> Result<Vec<u8>> {
+    match target_profile {
+        Profile::Ingest => encode_ingest_i64_events_file_inner(input),
+        Profile::Aura0 => {
+            let record_count = input.events.iter().try_fold(0u64, |count, event| {
+                count
+                    .checked_add(
+                        u64::try_from(event.children.len())
+                            .map_err(|_| AuraError::InvalidValue("record count"))?,
+                    )
+                    .ok_or(AuraError::InvalidValue("record count"))
+            })?;
+            validate_direct_i64_event_profile_limits(&input.schema, record_count, 0)?;
+            let prepared = prepare_i64_events(input)?;
+            validate_direct_i64_event_profile_limits(
+                &prepared.footer.schema,
+                record_count,
+                prepared.body.len(),
+            )?;
+            let record_count = usize::try_from(record_count)
+                .map_err(|_| AuraError::InvalidValue("record count"))?;
+            let compiled_footer =
+                compiled_footer_from_ingest_footer(&prepared.footer, record_count)?;
+            let _ = validate_compiled_i64_decode_limits(&compiled_footer, prepared.body.len())?;
+            encode_compiled_file(
+                Profile::Aura0,
+                prepared.stream_id,
+                prepared.dictionary_id,
+                prepared.base_time_ns,
+                &prepared.header_comment,
+                prepared.body,
+                compiled_footer,
+            )
+        }
+        Profile::Aura1 => {
+            let ingest = encode_ingest_i64_events_file_inner(input)?;
+            compile_i64_file_inner(&ingest, Profile::Aura1)
+        }
+    }
+}
+
+fn validate_direct_i64_event_profile_limits(
+    schema: &SchemaDescriptor,
+    record_count: u64,
+    body_len: usize,
+) -> Result<()> {
+    if schema_has_wide_fields(schema) {
+        return Err(AuraError::InvalidValue("i64 schema"));
+    }
+    let _ = validate_i64_decode_dimensions(record_count, schema.fields.len(), body_len)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod direct_i64_event_profile_limit_tests {
+    use super::*;
+    use crate::schema::{FieldRole, FieldType, SchemaBuilder};
+
+    fn schema(field_count: usize) -> SchemaDescriptor {
+        let mut builder = SchemaBuilder::new("direct-event-profile-limits").field(
+            "ts",
+            FieldType::TimestampNs,
+            FieldRole::Timestamp,
+        );
+        for index in 1..field_count {
+            builder =
+                builder.repeated_field(format!("value_{index}"), FieldType::I64, FieldRole::Value);
+        }
+        builder.finish().unwrap()
+    }
+
+    #[test]
+    fn direct_event_profile_enforces_reader_dimension_and_body_limits() {
+        assert_eq!(
+            validate_direct_i64_event_profile_limits(
+                &schema(2),
+                MAX_V2_I64_DECODE_ROWS as u64 + 1,
+                0,
+            )
+            .unwrap_err(),
+            AuraError::InvalidValue("i64 decode row limit")
+        );
+        assert_eq!(
+            validate_direct_i64_event_profile_limits(&schema(257), 1, 0).unwrap_err(),
+            AuraError::InvalidValue("i64 decode field limit")
+        );
+        assert_eq!(
+            validate_direct_i64_event_profile_limits(
+                &schema(17),
+                MAX_V2_I64_DECODE_ROWS as u64,
+                0,
+            )
+            .unwrap_err(),
+            AuraError::InvalidValue("i64 decode value limit")
+        );
+        assert_eq!(
+            validate_direct_i64_event_profile_limits(
+                &schema(2),
+                1,
+                MAX_V2_I64_DECODE_BODY_BYTES + 1,
+            )
+            .unwrap_err(),
+            AuraError::InvalidValue("i64 decode body limit")
+        );
+    }
+}
+
 pub fn encode_ingest_typed_file(input: TypedFileInput) -> Result<Vec<u8>> {
     crate::writer::encode_typed(input)
 }
@@ -603,7 +720,16 @@ pub(crate) fn encode_ingest_i64_file_inner(input: I64FileInput) -> Result<Vec<u8
     )
 }
 
-pub(crate) fn encode_ingest_i64_events_file_inner(input: I64EventFileInput) -> Result<Vec<u8>> {
+struct PreparedI64Events {
+    stream_id: u16,
+    dictionary_id: u16,
+    base_time_ns: i64,
+    header_comment: String,
+    body: Vec<u8>,
+    footer: AuraFooter,
+}
+
+fn prepare_i64_events(input: I64EventFileInput) -> Result<PreparedI64Events> {
     let event_values = input
         .events
         .iter()
@@ -709,14 +835,26 @@ pub(crate) fn encode_ingest_i64_events_file_inner(input: I64EventFileInput) -> R
     let base_time_ns = timestamp_event_index
         .and_then(|index| input.events.first()?.event_values.get(index).copied())
         .unwrap_or(0);
-    encode_file(
-        Profile::Ingest,
-        input.stream_id,
-        input.dictionary_id,
+    Ok(PreparedI64Events {
+        stream_id: input.stream_id,
+        dictionary_id: input.dictionary_id,
         base_time_ns,
-        input.header_comment.as_deref().unwrap_or(""),
+        header_comment: input.header_comment.unwrap_or_default(),
         body,
         footer,
+    })
+}
+
+pub(crate) fn encode_ingest_i64_events_file_inner(input: I64EventFileInput) -> Result<Vec<u8>> {
+    let prepared = prepare_i64_events(input)?;
+    encode_file(
+        Profile::Ingest,
+        prepared.stream_id,
+        prepared.dictionary_id,
+        prepared.base_time_ns,
+        &prepared.header_comment,
+        prepared.body,
+        prepared.footer,
     )
 }
 

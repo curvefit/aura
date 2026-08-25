@@ -337,11 +337,7 @@ impl AuraI64EventWriter {
     }
 
     pub fn finish_profile(self, target_profile: Profile) -> Result<Vec<u8>> {
-        let ingest = self.finish()?;
-        match target_profile {
-            Profile::Ingest => Ok(ingest),
-            Profile::Aura0 | Profile::Aura1 => compile_i64(&ingest, target_profile),
-        }
+        records::encode_i64_events_profile(self.into_input(), target_profile)
     }
 
     pub fn compile_profile(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
