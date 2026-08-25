@@ -142,7 +142,7 @@ pub fn encode_generic_i64_events(
             .flatten()
             .map(|row| row[repeated_index])
             .collect::<Vec<_>>();
-        let mut candidates = vec![direct_candidate(values.clone())?];
+        let mut candidates = Vec::new();
         let state_expression = schema.derived_expressions.iter().find(|expression| {
             expression.output_slot == output_slot
                 && matches!(
@@ -215,6 +215,11 @@ pub fn encode_generic_i64_events(
                 }
             }
         }
+
+        // Direct wins exact score ties, but it does not need to be built
+        // before schema-authorized candidates. Moving the original values into
+        // it last avoids cloning the complete repeated lane.
+        candidates.push(direct_candidate(values)?);
 
         match best_slot_candidate(candidates)? {
             SlotPlanCandidate::Direct {
@@ -323,12 +328,12 @@ fn add_explicit_event_stream(
         target_slot,
         op: op.unwrap_or(choose_i64_op(&values)?),
     };
-    let body =
-        encode_generic_stream_body(&instruction, &GenericStreamBodyValue::I64(values.clone()))?;
+    let value_count = values.len();
+    let body = encode_generic_stream_body(&instruction, &GenericStreamBodyValue::I64(values))?;
     instructions.push(instruction);
     streams.push(GenericEncodedStream {
         stream_id,
-        value_count: values.len(),
+        value_count,
         body,
     });
     Ok(stream_id)

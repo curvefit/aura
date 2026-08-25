@@ -730,40 +730,47 @@ struct PreparedI64Events {
 }
 
 fn prepare_i64_events(input: I64EventFileInput) -> Result<PreparedI64Events> {
-    let event_values = input
-        .events
-        .iter()
-        .map(|event| event.event_values.clone())
-        .collect::<Vec<_>>();
-    let children = input
-        .events
-        .iter()
-        .map(|event| event.children.clone())
-        .collect::<Vec<_>>();
-    let encoded = encode_generic_i64_events(&input.schema, &event_values, &children)?;
-    let rows = flatten_i64_events(&input.schema, &input.events)?;
-    let mut stats = IngestStats::new_for_schema(&input.schema)?;
-    let event_slots = input
-        .schema
+    let I64EventFileInput {
+        schema,
+        events,
+        stream_id,
+        dictionary_id,
+        header_comment,
+    } = input;
+    let mut event_values = Vec::new();
+    let mut children = Vec::new();
+    event_values
+        .try_reserve_exact(events.len())
+        .map_err(|_| AuraError::InvalidValue("event allocation"))?;
+    children
+        .try_reserve_exact(events.len())
+        .map_err(|_| AuraError::InvalidValue("event allocation"))?;
+    for event in events {
+        event_values.push(event.event_values);
+        children.push(event.children);
+    }
+    let encoded = encode_generic_i64_events(&schema, &event_values, &children)?;
+    let rows = flatten_i64_event_parts(&schema, &event_values, &children)?;
+    let mut stats = IngestStats::new_for_schema(&schema)?;
+    let event_slots = schema
         .fields
         .iter()
         .filter(|field| field.scope == FieldScope::Event)
         .map(|field| field.index)
         .collect::<Vec<_>>();
-    let repeated_slots = input
-        .schema
+    let repeated_slots = schema
         .fields
         .iter()
         .filter(|field| field.scope == FieldScope::Repeated)
         .map(|field| field.index)
         .collect::<Vec<_>>();
-    for event in &input.events {
-        for (slot, value) in event_slots.iter().copied().zip(&event.event_values) {
+    for (values, event_children) in event_values.iter().zip(&children) {
+        for (slot, value) in event_slots.iter().copied().zip(values) {
             stats.observe_i64(slot, *value)?;
         }
         for related in &mut stats.related_fields {
-            let field_scope = input.schema.fields[usize::from(related.field_index)].scope;
-            let parent_scope = input.schema.fields[usize::from(related.related_field_index)].scope;
+            let field_scope = schema.fields[usize::from(related.field_index)].scope;
+            let parent_scope = schema.fields[usize::from(related.related_field_index)].scope;
             if field_scope == FieldScope::Event && parent_scope == FieldScope::Event {
                 let field_position = event_slots
                     .iter()
@@ -773,27 +780,23 @@ fn prepare_i64_events(input: I64EventFileInput) -> Result<PreparedI64Events> {
                     .iter()
                     .position(|slot| *slot == related.related_field_index)
                     .ok_or(AuraError::InvalidValue("related field index"))?;
-                related.observe(
-                    event.event_values[field_position],
-                    event.event_values[parent_position],
-                );
+                related.observe(values[field_position], values[parent_position]);
             }
         }
-        for child in &event.children {
+        for child in event_children {
             stats.observe_record();
             for (slot, value) in repeated_slots.iter().copied().zip(child) {
                 stats.observe_i64(slot, *value)?;
             }
             for related in &mut stats.related_fields {
-                let field_scope = input.schema.fields[usize::from(related.field_index)].scope;
-                let parent_scope =
-                    input.schema.fields[usize::from(related.related_field_index)].scope;
+                let field_scope = schema.fields[usize::from(related.field_index)].scope;
+                let parent_scope = schema.fields[usize::from(related.related_field_index)].scope;
                 if field_scope == FieldScope::Event && parent_scope == FieldScope::Event {
                     continue;
                 }
                 let value_for = |slot: u16, scope: FieldScope| -> Result<i64> {
                     let (slots, values) = if scope == FieldScope::Event {
-                        (&event_slots, &event.event_values)
+                        (&event_slots, values)
                     } else {
                         (&repeated_slots, child)
                     };
@@ -813,33 +816,32 @@ fn prepare_i64_events(input: I64EventFileInput) -> Result<PreparedI64Events> {
             }
         }
     }
-    let timestamp_index = timestamp_field_index(&input.schema);
+    let timestamp_index = timestamp_field_index(&schema);
     if let Some(timestamp_index) = timestamp_index {
         observe_timestamp_runs(&mut stats, &rows, timestamp_index);
     }
-    let aura0_plan = Aura0Plan::from_schema_rows_stats(&input.schema, &stats, &rows)?;
+    let aura0_plan = Aura0Plan::from_schema_rows_stats(&schema, &stats, &rows)?;
     let aura1_plan = Aura1Plan::from_stats(&stats, 1);
-    let footer = AuraFooter::new(input.schema.clone(), stats)
+    let footer = AuraFooter::new(schema.clone(), stats)
         .with_aura0_plan(aura0_plan)
         .with_aura1_plan(aura1_plan)
         .with_generic_aura0_plan(encoded.plan.clone());
     let body = encode_generic_i64_rows_body(&encoded)?;
     let timestamp_event_index = timestamp_index.and_then(|slot| {
-        input
-            .schema
+        schema
             .fields
             .iter()
             .filter(|field| field.scope == FieldScope::Event)
             .position(|field| usize::from(field.index) == slot)
     });
     let base_time_ns = timestamp_event_index
-        .and_then(|index| input.events.first()?.event_values.get(index).copied())
+        .and_then(|index| event_values.first()?.get(index).copied())
         .unwrap_or(0);
     Ok(PreparedI64Events {
-        stream_id: input.stream_id,
-        dictionary_id: input.dictionary_id,
+        stream_id,
+        dictionary_id,
         base_time_ns,
-        header_comment: input.header_comment.unwrap_or_default(),
+        header_comment: header_comment.unwrap_or_default(),
         body,
         footer,
     })
@@ -884,6 +886,50 @@ fn flatten_i64_events(schema: &SchemaDescriptor, events: &[I64Event]) -> Result<
         for child in &event.children {
             let mut row = vec![0i64; schema.fields.len()];
             for (slot, value) in event_slots.iter().copied().zip(&event.event_values) {
+                row[slot] = *value;
+            }
+            for (slot, value) in repeated_slots.iter().copied().zip(child) {
+                row[slot] = *value;
+            }
+            rows.push(row);
+        }
+    }
+    validate_rows(schema, &rows)?;
+    Ok(rows)
+}
+
+fn flatten_i64_event_parts(
+    schema: &SchemaDescriptor,
+    event_values: &[Vec<i64>],
+    children: &[Vec<Vec<i64>>],
+) -> Result<Vec<Vec<i64>>> {
+    if event_values.len() != children.len() {
+        return Err(AuraError::InvalidValue("event count"));
+    }
+    let event_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Event)
+        .map(|field| usize::from(field.index))
+        .collect::<Vec<_>>();
+    let repeated_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Repeated)
+        .map(|field| usize::from(field.index))
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for (values, event_children) in event_values.iter().zip(children) {
+        if values.len() != event_slots.len()
+            || event_children
+                .iter()
+                .any(|child| child.len() != repeated_slots.len())
+        {
+            return Err(AuraError::InvalidValue("event field count"));
+        }
+        for child in event_children {
+            let mut row = vec![0i64; schema.fields.len()];
+            for (slot, value) in event_slots.iter().copied().zip(values) {
                 row[slot] = *value;
             }
             for (slot, value) in repeated_slots.iter().copied().zip(child) {
