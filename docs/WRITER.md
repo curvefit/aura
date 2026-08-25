@@ -103,6 +103,7 @@ development path and may select the existing exact file; it is not a
 streaming-writer claim. Its one registry-2 extension uses exact-byte,
 chunk-local dictionaries with minimal bitpacked present-only indices for
 Utf8/DecimalText; it performs no normalization or entropy compression.
+
 One additional body-layout-3 candidate wraps the preselected registry1/2 block
 independently per chunk with the canonical bounded zstd19 profile. This does
 not make the complete planned reader streaming or production-ready. A sixth
@@ -119,6 +120,38 @@ Its nullable bitmap, fixed 16-byte header, prefix/suffix/middle ULEBs, literal
 middle, null-no-update, present-empty-update, and per-chunk reset are bounded by
 effective caller block/output limits before allocation. Planned seal receipts
 are unconditionally v5 and always expose its rejection/inspection; verify
-receipts remain tuple-specific v1-v5. The compiler retains all seven complete
-artifacts while scoring; this is a bounded all-memory development limitation,
-not a measured-size, streaming, or production-readiness claim.
+receipts remain tuple-specific v1-v5. This planned-flat compiler retains all
+seven of its complete artifacts while scoring; that limitation does not apply
+to the sequential planned-grouped registry-1..5 scorer below.
+
+## Planned-grouped held ingest writer
+
+`V3PlannedGroupedIngestWriter<W>` is the explicit development writer for the
+registry-1..5 grouped planner. It writes the canonical V3 header once and then
+appends validated exact `AURAV3EB` ingest chunks. While open it retains only
+capped chunk identities/ranges and aggregate statistics, not logical batches;
+the scratch bytes have no footer or `sealed:)` trailer and therefore reject as
+an incomplete Aura artifact.
+
+At `finish`, the writer flushes and rereads every held chunk, checks stored and
+logical hashes plus recomputed statistics, and invokes the finite planner on
+the recovered bounded batches. Candidate artifacts are compiled sequentially:
+only the current complete-byte winner is retained, and Direct keeps ties. For
+the same batches and chunk contract, its selected artifact is byte-identical to
+`compile_v3_planned_grouped_attempt5`. Default scratch/output ceilings are 256
+MiB and both are hard-clamped below 4 GiB in addition to `V3GroupedLimits`.
+
+The `File` specialization rewrites and truncates the held scratch to the exact
+winner, flushes, syncs, rereads, and verifies it.
+`V3PlannedGroupedCreateOnceWriter` creates the held file beside the requested
+output through a held, no-symlink parent directory and publishes only the
+synced, verified mode-0600 inode using anchored `openat`/`linkat` create-once
+operations. Exact crash leftovers are adopted read-only; conflicting finals
+are never overwritten. Linked-not-durable and ambiguous outcomes carry a
+recovery-temporary identity, and `recover_exact` rechecks complete length/hash
+before directory sync. Trusted create-once publication is Linux-only; other
+platforms compile the API but return an explicit unsupported-platform error.
+A dropped, interrupted,
+truncated, or failed held file remains non-final. This API is CLI-capable but
+is not wired into the default V3 CLI mode and carries no live-run, compression,
+or production-readiness claim.

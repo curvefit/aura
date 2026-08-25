@@ -189,8 +189,12 @@ actual discriminator slot. The footer embeds the complete versioned Plan v2,
 codec table, schema and plan hashes, chunk ranges, and logical checksums; a
 reader never replans or needs an identity string or sidecar. Unknown layout,
 registry, selection, op, dependency, length, range, or checksum values reject.
-This route is an all-memory development compiler, not the streaming grouped
-writer and not a compression or production-readiness claim.
+The additive held-ingest development writer appends exact chunks incrementally,
+retains only capped identities/statistics while open, and rereads them at seal.
+Its planner still materializes bounded decoded batches, but complete candidate
+artifacts are scored sequentially and only the current winner is retained. The
+synced create-once file is byte-identical to the all-memory reference for the
+same chunk contract. This is not a compression or production-readiness claim.
 
 The V2 SDK writer remains the production compatibility path. It rejects V3
 schemas and emits V2 containers; callers that need V3 must select the explicit

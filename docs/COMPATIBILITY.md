@@ -24,14 +24,17 @@ are preserved in source order. Grouped encoding is uncompressed and does not
 run a physical relationship planner, compression, or Plan v2. Non-empty derived
 expression tables are rejected by both complete V3 writers.
 
-The planned-grouped all-memory reference compiler is an additive development
-route, not part of the grouped seekable-writer compatibility promise. Plan-v2
+The planned-grouped reference compiler and held-ingest writer are an additive
+development route, not part of the grouped seekable-writer compatibility promise. Plan-v2
 registries/body layouts 1-4 retain their existing dispatch. Registry/body
 version 5 adds only schema-authorized, checked cross-domain same-slot residuals
 with two serialized orientations and per-event ordinal pairing; unmatched
 tails are absolute. Complete schema/plan/footer metadata is charged before
 selection, Direct wins ties, and decoding uses only the embedded plan. This
 does not change the exact-event fixture, V2 bytes, default writers, or Aura1.
+The held writer's final bytes match the reference compiler for the same batch
+and chunk contract. Its open scratch has no footer/trailer and is never a
+decodable compatibility artifact; publication is synced and create-once.
 
 The `AURAV3VB` exact-value reference block is a separate, explicitly V3 API.
 Its 32-bit schema ID is only a routing hint; a SHA-256 fingerprint of the

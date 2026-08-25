@@ -99,8 +99,8 @@ event/child values are encoded exactly. Both complete V3 writers reject
 non-empty derived-expression tables. V2 writers reject V3 schemas rather than
 emitting cross-wired files.
 
-The separate all-memory planned-grouped development compiler does consume
-these permissions. Plan-v2 registry 5 may test both checked cross-domain
+The separate planned-grouped development compiler and held-ingest writer do
+consume these permissions. Plan-v2 registry 5 may test both checked cross-domain
 same-slot residual orientations for a non-null repeated signed integer stream.
 Within each event, values are paired by ordinal occurrence in discriminator
 domain 0 and domain 1. The selected target is stored relative to the same-slot

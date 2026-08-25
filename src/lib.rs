@@ -45,6 +45,7 @@ pub mod v3_grouped_writer;
 pub mod v3_plan_v2;
 pub mod v3_planned_flat;
 pub mod v3_planned_grouped;
+pub mod v3_planned_grouped_writer;
 pub mod v3_reader;
 pub mod v3_values;
 pub mod v3_writer;
@@ -238,6 +239,12 @@ pub use v3_planned_grouped::{
     V3_PLANNED_GROUPED_INTEGER_CODEC_BODY_LAYOUT_VERSION,
     V3_PLANNED_GROUPED_WITHIN_DOMAIN_BLOCK_VERSION,
     V3_PLANNED_GROUPED_WITHIN_DOMAIN_BODY_LAYOUT_VERSION,
+};
+pub use v3_planned_grouped_writer::{
+    V3PlannedGroupedCreateOnceWriter, V3PlannedGroupedIngestWriter,
+    V3PlannedGroupedPublicationOutcome, V3PlannedGroupedWriteReceipt,
+    V3PlannedGroupedWriterOptions, V3PlannedGroupedWriterState,
+    DEFAULT_V3_PLANNED_GROUPED_SCRATCH_BYTES, MAX_V3_PLANNED_GROUPED_SCRATCH_BYTES,
 };
 pub use v3_reader::{
     AuraV3FlatReader, V3FlatAura0Reader, V3FlatReadAll, V3FlatReaderState, V3FlatVerifySummary,

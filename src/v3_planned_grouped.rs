@@ -697,57 +697,75 @@ pub fn compile_v3_planned_grouped_attempt5(
         Err(AuraError::InvalidValue("v3 planned cross unauthorized"))
     };
     let cross_rows = r5_cross.as_ref().ok().map(|(_, rows)| rows.clone());
-    let candidates = vec![
+    // Compile and score one complete artifact at a time. The retained winner
+    // is the only whole candidate kept in memory; ties remain with the earlier
+    // Direct candidate by replacing only on a strict complete-byte win.
+    let mut outcomes = Vec::new();
+    outcomes
+        .try_reserve_exact(7)
+        .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
+    let mut winner = None;
+    consider_attempt5_candidate(
+        0,
+        true,
         compile_v3_planned_grouped(schema, batches, limits),
+        &mut outcomes,
+        &mut winner,
+    )?;
+    consider_attempt5_candidate(
+        1,
+        true,
         compile_attempt2_candidate(schema, batches, limits, PlanV2Selection::Direct),
+        &mut outcomes,
+        &mut winner,
+    )?;
+    consider_attempt5_candidate(
+        2,
+        true,
         r3_fixed_plan
             .and_then(|plan| compile_compact_candidate_with_plan(schema, batches, limits, plan)),
+        &mut outcomes,
+        &mut winner,
+    )?;
+    consider_attempt5_candidate(
+        3,
+        true,
         r3_mixed.and_then(|(plan, _)| {
             compile_compact_candidate_with_plan(schema, batches, limits, plan)
         }),
+        &mut outcomes,
+        &mut winner,
+    )?;
+    consider_attempt5_candidate(
+        4,
+        true,
         r4_absolute.clone().and_then(|(plan, _)| {
             compile_compact_candidate_with_plan(schema, batches, limits, plan)
         }),
+        &mut outcomes,
+        &mut winner,
+    )?;
+    consider_attempt5_candidate(
+        5,
+        within_authorized,
         r4_within.and_then(|(plan, _)| {
             compile_compact_candidate_with_plan(schema, batches, limits, plan)
         }),
+        &mut outcomes,
+        &mut winner,
+    )?;
+    consider_attempt5_candidate(
+        6,
+        cross_authorized,
         r5_cross.clone().and_then(|(plan, _)| {
             compile_compact_candidate_with_plan(schema, batches, limits, plan)
         }),
-    ];
-    if let Some(error) = candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| {
-            let authorized = match index {
-                5 => within_authorized,
-                6 => cross_authorized,
-                _ => true,
-            };
-            authorized.then(|| candidate.as_ref().err()).flatten()
-        })
-        .find(|error| !is_expected_candidate_limit(error))
-    {
-        return Err(error.clone());
-    }
-    let sizes = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .as_ref()
-                .ok()
-                .map(|value| value.summary.file_bytes)
-        })
-        .collect::<Vec<_>>();
-    let selected_index = sizes
-        .iter()
-        .enumerate()
-        .filter_map(|(index, bytes)| bytes.map(|bytes| (index, bytes)))
-        .min_by_key(|(index, bytes)| (*bytes, *index))
-        .map(|(index, _)| index)
-        .ok_or(AuraError::InvalidValue(
-            "v3 planned no applicable candidate",
-        ))?;
+        &mut outcomes,
+        &mut winner,
+    )?;
+    let (selected_index, mut selected) = winner.ok_or(AuraError::InvalidValue(
+        "v3 planned no applicable candidate",
+    ))?;
     let ids = [
         "registry1-direct",
         "registry2-compact-direct",
@@ -778,11 +796,11 @@ pub fn compile_v3_planned_grouped_attempt5(
                 candidate_id: (*id).to_owned(),
                 selection,
                 authorized,
-                applicable: authorized && candidates[index].is_ok(),
+                applicable: authorized && outcomes[index].is_ok(),
                 rejection: if !authorized {
                     Some(unauthorized_reason.to_owned())
                 } else {
-                    match &candidates[index] {
+                    match &outcomes[index] {
                         Err(error) => Some(sanitize_candidate_error(error)),
                         Ok(_) if index != selected_index => {
                             Some("complete cost did not beat selected candidate".to_owned())
@@ -790,12 +808,13 @@ pub fn compile_v3_planned_grouped_attempt5(
                         Ok(_) => None,
                     }
                 },
-                complete_bytes: authorized.then_some(sizes[index]).flatten(),
+                complete_bytes: authorized
+                    .then(|| outcomes[index].as_ref().ok().copied())
+                    .flatten(),
                 selected: index == selected_index,
             }
         })
         .collect::<Vec<_>>();
-    let mut selected = candidates.into_iter().nth(selected_index).unwrap()?;
     selected.inspection.candidates = candidate_rows;
     let mut rows = cross_rows.unwrap_or_default();
     if selected_index == 6 {
@@ -1119,6 +1138,39 @@ fn is_expected_candidate_limit(error: &AuraError) -> bool {
                 | "v3 planned grouped footer length"
         )
     )
+}
+
+fn consider_attempt5_candidate(
+    index: usize,
+    authorized: bool,
+    candidate: Result<V3PlannedGroupedArtifact>,
+    outcomes: &mut Vec<Result<u64>>,
+    winner: &mut Option<(usize, V3PlannedGroupedArtifact)>,
+) -> Result<()> {
+    if !authorized {
+        outcomes.push(Err(AuraError::InvalidValue(
+            "v3 planned candidate unauthorized",
+        )));
+        return Ok(());
+    }
+    match candidate {
+        Ok(artifact) => {
+            let bytes = artifact.summary.file_bytes;
+            let replace = winner
+                .as_ref()
+                .is_none_or(|(_, current)| bytes < current.summary.file_bytes);
+            if replace {
+                *winner = Some((index, artifact));
+            }
+            outcomes.push(Ok(bytes));
+            Ok(())
+        }
+        Err(error) if is_expected_candidate_limit(&error) => {
+            outcomes.push(Err(error));
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn select_integer_codecs(
