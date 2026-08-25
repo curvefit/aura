@@ -3,11 +3,13 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use aura_codec::records::{
-    compile_i64_file, decode_i64_file, encode_ingest_i64_file, I64FileInput,
+    compile_i64_file, decode_i64_events_file, decode_i64_file, encode_ingest_i64_file, I64FileInput,
 };
-use aura_codec::schema::{decode_schema_map, generic_i64_parent_schema, FieldRelation};
+use aura_codec::schema::{decode_schema_map, generic_i64_parent_schema, FieldRelation, FieldScope};
 use aura_codec::Profile;
-use aura_codec::{DerivedExpression, DerivedExpressionOp, DerivedExpressionSource};
+use aura_codec::{
+    AuraI64EventWriter, DerivedExpression, DerivedExpressionOp, DerivedExpressionSource, I64Event,
+};
 use serde_json::Value;
 
 const DEFAULT_TIMESTAMP_MULTIPLIER: i64 = 1_000_000;
@@ -22,6 +24,7 @@ struct Args {
     stream_id: u16,
     dictionary_id: u16,
     derived_expressions: Vec<DerivedExpression>,
+    explicit_events: bool,
 }
 
 fn main() -> Result<()> {
@@ -32,6 +35,9 @@ fn main() -> Result<()> {
     let mut schema = generic_i64_parent_schema("json_i64_rows_v1", &args.schema_header)?;
     if !args.derived_expressions.is_empty() {
         schema = schema.with_derived_expressions(args.derived_expressions.clone())?;
+    }
+    if args.explicit_events {
+        return run_explicit_events(args, schema, input_bytes);
     }
     let (rows, decimal_scales) = read_positional_rows(
         &args.input,
@@ -113,6 +119,7 @@ fn parse_args() -> Result<Args> {
     let mut stream_id = 0;
     let mut dictionary_id = 0;
     let mut derived_expressions = Vec::new();
+    let mut explicit_events = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -130,6 +137,7 @@ fn parse_args() -> Result<Args> {
             }
             "--stream-id" => stream_id = next_parse(&mut args, "--stream-id")?,
             "--dictionary-id" => dictionary_id = next_parse(&mut args, "--dictionary-id")?,
+            "--events" => explicit_events = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -161,7 +169,161 @@ fn parse_args() -> Result<Args> {
         stream_id,
         dictionary_id,
         derived_expressions,
+        explicit_events,
     })
+}
+
+fn run_explicit_events(
+    args: Args,
+    schema: aura_codec::SchemaDescriptor,
+    input_bytes: u64,
+) -> Result<()> {
+    let events = read_positional_events(
+        &args.input,
+        &args.schema_header,
+        args.decimal_scale,
+        args.timestamp_multiplier,
+    )?;
+    let mut writer = AuraI64EventWriter::new(schema);
+    for event in events.iter().cloned() {
+        writer.push_event(event)?;
+    }
+    let aura = writer.finish()?;
+    let aura0 = AuraI64EventWriter::compile_profile(&aura, Profile::Aura0)?;
+    let aura1 = AuraI64EventWriter::compile_profile(&aura, Profile::Aura1)?;
+    for (bytes, profile) in [
+        (&aura, Profile::Ingest),
+        (&aura0, Profile::Aura0),
+        (&aura1, Profile::Aura1),
+    ] {
+        let decoded = decode_i64_events_file(bytes)?;
+        if decoded.header.profile != profile
+            || decoded.header.schema_mapping != args.schema_header
+            || decoded.header.derived_expressions != args.derived_expressions
+            || decoded.events != events
+        {
+            bail!("decoded explicit events mismatch");
+        }
+    }
+
+    fs::write(&args.output, &aura).with_context(|| format!("write {}", args.output.display()))?;
+    let aura0_path = args.output.with_extension("aura0");
+    let aura1_path = args.output.with_extension("aura1");
+    fs::write(&aura0_path, &aura0).with_context(|| format!("write {}", aura0_path.display()))?;
+    fs::write(&aura1_path, &aura1).with_context(|| format!("write {}", aura1_path.display()))?;
+
+    let child_count = events
+        .iter()
+        .try_fold(0usize, |count, event| {
+            count.checked_add(event.children.len())
+        })
+        .context("explicit child count overflow")?;
+    println!("input={}", args.input.display());
+    println!("events={}", events.len());
+    println!("children={child_count}");
+    println!("schema_header={:?}", args.schema_header);
+    println!("derived_expressions={}", args.derived_expressions.len());
+    println!("timestamp_multiplier={}", args.timestamp_multiplier);
+    println!("input_bytes={input_bytes}");
+    println!("aura_bytes={}", aura.len());
+    println!("aura0_bytes={}", aura0.len());
+    println!("aura1_bytes={}", aura1.len());
+    println!("decoded_ingest_match=true");
+    println!("decoded_aura0_match=true");
+    println!("decoded_aura1_match=true");
+    println!("out={}", args.output.display());
+    println!("out_aura0={}", aura0_path.display());
+    println!("out_aura1={}", aura1_path.display());
+    Ok(())
+}
+
+fn read_positional_events(
+    path: &PathBuf,
+    schema_header: &[u8],
+    decimal_scale: Option<i64>,
+    timestamp_multiplier: i64,
+) -> Result<Vec<I64Event>> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let value: Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    let source_events = value.as_array().context("top-level JSON array")?;
+    let entries = decode_schema_map(schema_header)?;
+    let event_slots = entries
+        .iter()
+        .take_while(|entry| entry.scope == FieldScope::Event)
+        .count();
+    if entries[..event_slots]
+        .iter()
+        .any(|entry| entry.scope != FieldScope::Event)
+        || entries[event_slots..]
+            .iter()
+            .any(|entry| entry.scope != FieldScope::Repeated)
+        || event_slots == 0
+        || event_slots == entries.len()
+    {
+        bail!("--events requires event slots followed by repeated slots");
+    }
+    let repeated_slots = entries.len() - event_slots;
+    let timestamp_slots = timestamp_slots(schema_header)?;
+    let scale = decimal_scale.unwrap_or(1);
+    let mut events = Vec::with_capacity(source_events.len());
+    for (event_index, source_event) in source_events.iter().enumerate() {
+        let object = source_event
+            .as_object()
+            .with_context(|| format!("event {event_index} is not an object"))?;
+        if object.len() != 2 || !object.contains_key("event") || !object.contains_key("children") {
+            bail!("event {event_index} must contain only event and children");
+        }
+        let source_values = object["event"]
+            .as_array()
+            .with_context(|| format!("event {event_index} values are not an array"))?;
+        if source_values.len() != event_slots {
+            bail!("event {event_index} has wrong event slot count");
+        }
+        let mut event_values = Vec::with_capacity(event_slots);
+        for (slot, value) in source_values.iter().enumerate() {
+            event_values.push(value_to_i64(
+                value,
+                scale,
+                if timestamp_slots[slot] {
+                    timestamp_multiplier
+                } else {
+                    1
+                },
+            )?);
+        }
+        let source_children = object["children"]
+            .as_array()
+            .with_context(|| format!("event {event_index} children are not an array"))?;
+        let mut children = Vec::with_capacity(source_children.len());
+        for (child_index, source_child) in source_children.iter().enumerate() {
+            let source_values = source_child.as_array().with_context(|| {
+                format!("event {event_index} child {child_index} is not an array")
+            })?;
+            if source_values.len() != repeated_slots {
+                bail!("event {event_index} child {child_index} has wrong slot count");
+            }
+            let mut child = Vec::with_capacity(repeated_slots);
+            for (offset, value) in source_values.iter().enumerate() {
+                let slot = event_slots + offset;
+                child.push(value_to_i64(
+                    value,
+                    scale,
+                    if timestamp_slots[slot] {
+                        timestamp_multiplier
+                    } else {
+                        1
+                    },
+                )?);
+            }
+            children.push(child);
+        }
+        events.push(I64Event {
+            event_values,
+            children,
+        });
+    }
+    Ok(events)
 }
 
 fn read_positional_rows(
@@ -574,6 +736,6 @@ where
 
 fn print_usage() {
     println!(
-        "usage: aura-json-i64 --schema <bytes> --out <file.aura> [--derive <id:op:output:inputs[:literals][:internal]>] [--decimal-scale N] [--timestamp-multiplier N] [--stream-id N] [--dictionary-id N] <rows.json>"
+        "usage: aura-json-i64 --schema <bytes> --out <file.aura> [--events] [--derive <id:op:output:inputs[:literals][:internal]>] [--decimal-scale N] [--timestamp-multiplier N] [--stream-id N] [--dictionary-id N] <rows-or-events.json>"
     );
 }

@@ -2,13 +2,163 @@ use std::fs;
 use std::process::Command;
 
 use aura_codec::{
-    records, DerivedExpression, DerivedExpressionOp, DerivedOp, GenericGroupInstruction, Profile,
+    records, AuraI64EventReader, DerivedExpression, DerivedExpressionOp, DerivedOp,
+    GenericGroupInstruction, Profile,
 };
 
 const SCHEMA_HEADER: &str = "100,0,2,2,2,0,1,0,0,6,8";
 const SCHEMA_BYTES: &[u8] = &[100, 0, 2, 2, 2, 0, 1, 0, 0, 6, 8];
 const DERIVED_SCHEMA_HEADER: &str = "100,101,102,103,2,0,1,107,0,6,110";
 const DERIVED_SCHEMA_BYTES: &[u8] = &[100, 101, 102, 103, 2, 0, 1, 107, 0, 6, 110];
+
+#[test]
+fn json_explicit_events_retain_independent_order_count_slot() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-json-i64") else {
+        panic!("missing aura-json-i64 binary");
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "aura-json-i64-explicit-qty2-count-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("events.json");
+    let output = dir.join("count-related.aura");
+    fs::write(
+        &input,
+        r#"[
+            {"event":[1700000000000,42],"children":[
+                [0,"100.01","8.5","8.0",3],
+                [1,"100.02","7.0","7.0",9]
+            ]},
+            {"event":[1700000000100,43],"children":[
+                [0,"100.00","9.25","8.75",11]
+            ]}
+        ]"#,
+    )
+    .unwrap();
+
+    let result = Command::new(bin)
+        .arg("--events")
+        .arg("--schema")
+        .arg("100,0,200,205,0,0,5,0")
+        .arg("--decimal-scale")
+        .arg("100")
+        .arg("--timestamp-multiplier")
+        .arg("1")
+        .arg("--out")
+        .arg(&output)
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let bytes = fs::read(output.with_extension("aura0")).unwrap();
+    let reader = AuraI64EventReader::open(&bytes).unwrap();
+    assert_eq!(
+        reader.header().schema_mapping,
+        [100, 0, 200, 205, 0, 0, 5, 0]
+    );
+    assert_eq!(reader.events()[0].children[0], [0, 10_001, 850, 800, 3]);
+    assert_eq!(reader.events()[0].children[1][4], 9);
+    assert_eq!(reader.events()[1].children[0][4], 11);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn json_explicit_events_use_compact_operation200_parent_residual_schema() {
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aura-json-i64") else {
+        panic!("missing aura-json-i64 binary");
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "aura-json-i64-explicit-qty2-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("events.json");
+    let related_output = dir.join("related.aura");
+    let direct_output = dir.join("direct.aura");
+    let mut document = String::from("[");
+    for event in 0..256i64 {
+        if event != 0 {
+            document.push(',');
+        }
+        document.push_str(&format!(
+            "{{\"event\":[{},{}],\"children\":[",
+            1_000_000 + event * 100,
+            event
+        ));
+        for child in 0..64i64 {
+            if child != 0 {
+                document.push(',');
+            }
+            let side = child & 1;
+            let price = 50_000_000 + child * 10 + (event * 17).rem_euclid(31);
+            let mixed = i128::from(event * 64 + child) * 6_364_136_223_846_793_005i128;
+            let total =
+                1_000_000_000_000 + i64::try_from(mixed.rem_euclid(8_000_000_000_000i128)).unwrap();
+            let qty2 = total - (event + child).rem_euclid(5);
+            document.push_str(&format!("[{side},{price},{total},{qty2}]"));
+        }
+        document.push_str("]}");
+    }
+    document.push(']');
+    fs::write(&input, document).unwrap();
+
+    let run = |schema: &str, output: &std::path::Path| {
+        Command::new(bin)
+            .arg("--events")
+            .arg("--schema")
+            .arg(schema)
+            .arg("--timestamp-multiplier")
+            .arg("1")
+            .arg("--out")
+            .arg(output)
+            .arg(&input)
+            .output()
+            .unwrap()
+    };
+    let related = run("100,0,200,204,0,0,5", &related_output);
+    assert!(
+        related.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&related.stdout),
+        String::from_utf8_lossy(&related.stderr)
+    );
+    let direct = run("100,0,200,204,0,0,0", &direct_output);
+    assert!(direct.status.success());
+
+    let related_bytes = fs::read(related_output.with_extension("aura0")).unwrap();
+    let direct_bytes = fs::read(direct_output.with_extension("aura0")).unwrap();
+    assert!(related_bytes.len() * 100 < direct_bytes.len() * 75);
+    let decoded = records::decode_i64_events_file(&related_bytes).unwrap();
+    assert_eq!(decoded.events.len(), 256);
+    assert_eq!(
+        AuraI64EventReader::open(&related_bytes)
+            .unwrap()
+            .events()
+            .iter()
+            .map(|event| event.children.len())
+            .sum::<usize>(),
+        16_384
+    );
+    let plan = decoded.compiled_footer.unwrap().generic_aura0_plan.unwrap();
+    assert!(plan.groups.iter().any(|group| matches!(
+        group,
+        GenericGroupInstruction::DerivedStream {
+            output_slot: 5,
+            input_slots,
+            ..
+        } if input_slots == &[4]
+    )));
+    fs::remove_dir_all(&dir).unwrap();
+}
 
 #[test]
 fn json_positional_rows_support_structural_dual_domain_control() {
