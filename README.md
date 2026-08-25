@@ -72,6 +72,7 @@ Plan v2. Dataset names and venue labels are not part of a V3 seal decision.
   compatibility boundary, and current limits.
 - [Field programs](docs/field-programs.md) explains compact decode instructions.
 - [Schemas](docs/schemas.md) explains logical schema construction.
+- [Production explicit-event Aura0 repeated groups](docs/ORDER_BOOK_AURA0.md) documents the generic QTY1/QTY2 parent-child contract, exact decoding, and selection rules.
 - [Shadow Arrow protocol](docs/SHADOW_PROTOCOL.md) specifies the offline external-compiler boundary and safe reference-block publication.
 - [Chunked storage](docs/chunking.md) explains independent compression chunks.
 - [Compression policy](docs/compression.md) explains why chunks beat whole-file streams.
