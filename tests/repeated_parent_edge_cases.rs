@@ -17,7 +17,7 @@ const DIRECT_SCHEMA_MAP: &[u8] = &[100, 0, 200, 204, 0, 0, 0];
 fn edge_case_events() -> Vec<I64Event> {
     let mut events = vec![
         // Bid-only: includes a repeated price and a present zero residual
-        // (total == regular, so improvement is zero).
+        // (QTY1 == QTY2, so the residual is zero).
         I64Event {
             event_values: vec![1_700_000_000_000_000_000, 11],
             children: vec![
@@ -94,9 +94,9 @@ fn edge_case_events() -> Vec<I64Event> {
                 } else {
                     1_000_000_000_000 + ((event_index * 64 + child_index) % 10_000)
                 };
-                let improvement = (event_index + child_index).rem_euclid(5);
-                let regular = total - improvement;
-                vec![side, price, total, regular]
+                let residual = (event_index + child_index).rem_euclid(5);
+                let qty2 = total - residual;
+                vec![side, price, total, qty2]
             })
             .collect();
         events.push(I64Event {
