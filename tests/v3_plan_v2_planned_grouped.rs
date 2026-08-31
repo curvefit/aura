@@ -5,7 +5,8 @@ use aura_codec::{
     compile_v3_planned_grouped_attempt2, compile_v3_planned_grouped_attempt2_candidate,
     compile_v3_planned_grouped_attempt3, compile_v3_planned_grouped_attempt4,
     compile_v3_planned_grouped_attempt4_candidate, compile_v3_planned_grouped_attempt5,
-    compile_v3_planned_grouped_attempt5_candidate, decode_any_compiled_footer,
+    compile_v3_planned_grouped_attempt5_candidate, compile_v3_planned_grouped_attempt6,
+    compile_v3_planned_grouped_attempt6_candidate, decode_any_compiled_footer,
     decode_v3_planned_grouped, decode_v3_planned_grouped_footer, encode_v3_planned_grouped_footer,
     AnyCompiledFooter, AuraHeader, AuraPlanV2, AuraV3Column, AuraV3ColumnValues as Values,
     AuraV3EventBatch, AuraV3VariableColumn, FieldRole, FieldScope, FieldType, PlanV2PhysicalCodec,
@@ -13,8 +14,9 @@ use aura_codec::{
     V3GroupedAura0Writer, V3GroupedLimits, V3GroupedWriterOptions,
     AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION, AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP,
     AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP, AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION,
-    AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP, AURA_PLAN_V2_REGISTRY_VERSION, AURA_PLAN_V2_VERSION,
-    AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION, MAX_AURA_PLAN_V2_BYTES,
+    AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP, AURA_PLAN_V2_REGISTRY_VERSION,
+    AURA_PLAN_V2_SAME_CHILD_PARENT_OP, AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION,
+    AURA_PLAN_V2_VERSION, AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION, MAX_AURA_PLAN_V2_BYTES,
     V3_PLANNED_GROUPED_BODY_ENCODING, V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION,
     V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION, V3_PLANNED_GROUPED_FOOTER_LAYOUT_VERSION,
 };
@@ -25,6 +27,7 @@ const PLAN_HASH_DOMAIN_V2: &[u8] = b"aura-plan-v2-registry-v2\0";
 const PLAN_HASH_DOMAIN_V3: &[u8] = b"aura-plan-v2-registry-v3\0";
 const PLAN_HASH_DOMAIN_V4: &[u8] = b"aura-plan-v2-registry-v4\0";
 const PLAN_HASH_DOMAIN_V5: &[u8] = b"aura-plan-v2-registry-v5\0";
+const PLAN_HASH_DOMAIN_V6: &[u8] = b"aura-plan-v2-registry-v6\0";
 const PLANNED_HEADER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-grouped-header-v1\0";
 const PLANNED_FOOTER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-grouped-footer-v1\0";
 const PLANNED_BODY_HASH_DOMAIN: &[u8] = b"aura-v3-planned-grouped-body-v1\0";
@@ -2631,6 +2634,312 @@ fn attempt5_registry_plan_mutations_and_anonymous_label_bias_fail_closed() {
         original_footer.plan.physical_stream_codecs,
         renamed_footer.plan.physical_stream_codecs
     );
+}
+
+fn same_child_parent_schema(
+    nullable_parent: bool,
+    nullable_child: bool,
+) -> aura_codec::SchemaDescriptor {
+    let mut schema = SchemaBuilder::new("same_child_parent")
+        .field("event", FieldType::TimestampMs, FieldRole::Timestamp)
+        .repeated_field("domain", FieldType::U8, FieldRole::Side)
+        .repeated_field("base", FieldType::I64, FieldRole::Value)
+        .repeated_field_related_to("derived", FieldType::I64, FieldRole::Value, "base")
+        .dual_domain_repeated_group(17, vec![1, 2, 3], 1, permissions())
+        .finish()
+        .unwrap();
+    schema.fields[2].nullable = nullable_parent;
+    schema.fields[3].nullable = nullable_child;
+    let groups = schema.groups.clone();
+    schema.with_v3_groups(groups).unwrap()
+}
+
+fn same_child_parent_batch(
+    schema_id: u32,
+    offsets: Vec<u32>,
+    sides: Vec<u8>,
+    parents: Vec<i64>,
+    children: Vec<i64>,
+    parent_validity: Option<Vec<u8>>,
+    child_validity: Option<Vec<u8>>,
+) -> AuraV3EventBatch {
+    AuraV3EventBatch {
+        schema_id,
+        event_count: (offsets.len() - 1) as u32,
+        child_offsets: offsets,
+        event_columns: vec![AuraV3Column {
+            slot: 0,
+            validity: None,
+            values: Values::TimestampMs(vec![0, 1, 2]),
+        }],
+        repeated_columns: vec![
+            AuraV3Column {
+                slot: 1,
+                validity: None,
+                values: Values::U8(sides),
+            },
+            AuraV3Column {
+                slot: 2,
+                validity: parent_validity,
+                values: Values::I64(parents),
+            },
+            AuraV3Column {
+                slot: 3,
+                validity: child_validity,
+                values: Values::I64(children),
+            },
+        ],
+    }
+}
+
+#[test]
+fn attempt6_same_child_parent_wins_and_roundtrips_dual_domains_with_changing_cardinality() {
+    let schema = same_child_parent_schema(false, false);
+    let mut sides = Vec::new();
+    let mut parents = Vec::new();
+    let mut children = Vec::new();
+    for index in 0..192i64 {
+        sides.push((index & 1) as u8);
+        let parent = if index & 1 == 0 {
+            4_000_000_000_000 + index * 1_000_003
+        } else {
+            -4_000_000_000_000 - index * 999_983
+        };
+        parents.push(parent);
+        children.push(parent + (index % 3) - 1);
+    }
+    let batch = same_child_parent_batch(
+        schema.schema_id,
+        vec![0, 0, 64, 192],
+        sides,
+        parents,
+        children,
+        None,
+        None,
+    );
+    let artifact = compile_v3_planned_grouped_attempt6(
+        &schema,
+        std::slice::from_ref(&batch),
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(artifact.inspection.candidates.len(), 8);
+    assert!(artifact.inspection.candidates[7].selected);
+    assert_eq!(
+        artifact.inspection.plan.registry_version,
+        AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
+    );
+    let decoded = decode_v3_planned_grouped(&artifact.bytes, Default::default()).unwrap();
+    assert_eq!(decoded.batches, vec![batch.clone()]);
+    assert_eq!(
+        decoded.footer.plan.streams[3].op,
+        AURA_PLAN_V2_SAME_CHILD_PARENT_OP
+    );
+    assert_eq!(decoded.footer.plan.streams[3].dependencies, vec![2]);
+    let row = artifact.inspection.same_child_parent.first().unwrap();
+    assert!(row.authorized && row.eligible && row.applicable);
+    assert!(row.candidate_selected && row.selected);
+
+    let explicit = compile_v3_planned_grouped_attempt6_candidate(
+        &schema,
+        &[batch],
+        Default::default(),
+        &[3],
+        PlanV2PhysicalCodec::FixedWidth,
+    )
+    .unwrap();
+    assert_eq!(
+        decode_v3_planned_grouped(&explicit.bytes, Default::default())
+            .unwrap()
+            .footer
+            .plan
+            .streams[3]
+            .dependencies,
+        vec![2]
+    );
+}
+
+#[test]
+fn attempt6_overflow_nullable_mixed_presence_and_tie_remain_direct() {
+    let schema = same_child_parent_schema(false, false);
+    let overflow = same_child_parent_batch(
+        schema.schema_id,
+        vec![0, 0, 2, 2],
+        vec![0, 1],
+        vec![i64::MIN, 0],
+        vec![i64::MAX, 1],
+        None,
+        None,
+    );
+    let overflow_artifact =
+        compile_v3_planned_grouped_attempt6(&schema, &[overflow], Default::default()).unwrap();
+    let row = overflow_artifact
+        .inspection
+        .same_child_parent
+        .first()
+        .unwrap();
+    assert!(!row.applicable && !row.candidate_selected && !row.selected);
+    assert!(row
+        .rejection
+        .as_deref()
+        .is_some_and(|reason| reason.contains("overflow")));
+    let overflow_footer = decode_v3_planned_grouped_footer(
+        footer_bytes(&overflow_artifact.bytes),
+        V3GroupedLimits::HARD,
+    )
+    .unwrap();
+    assert_ne!(
+        overflow_footer.plan.streams[3].op,
+        AURA_PLAN_V2_SAME_CHILD_PARENT_OP
+    );
+
+    let nullable = same_child_parent_schema(false, true);
+    let nullable_batch = same_child_parent_batch(
+        nullable.schema_id,
+        vec![0, 0, 4, 4],
+        vec![0, 1, 0, 1],
+        vec![10, 20, 30, 40],
+        vec![11, 0, 31, 0],
+        None,
+        Some(vec![0b0000_0101]),
+    );
+    let nullable_artifact = compile_v3_planned_grouped_attempt6(
+        &nullable,
+        std::slice::from_ref(&nullable_batch),
+        Default::default(),
+    )
+    .unwrap();
+    let row = nullable_artifact
+        .inspection
+        .same_child_parent
+        .first()
+        .unwrap();
+    assert!(!row.eligible && !row.candidate_selected && !row.selected);
+    let nullable_footer = decode_v3_planned_grouped_footer(
+        footer_bytes(&nullable_artifact.bytes),
+        V3GroupedLimits::HARD,
+    )
+    .unwrap();
+    assert_ne!(
+        nullable_footer.plan.streams[3].op,
+        AURA_PLAN_V2_SAME_CHILD_PARENT_OP
+    );
+    assert_eq!(
+        decode_v3_planned_grouped(&nullable_artifact.bytes, Default::default())
+            .unwrap()
+            .batches,
+        vec![nullable_batch]
+    );
+
+    let nullable_parent = same_child_parent_schema(true, false);
+    let nullable_parent_batch = same_child_parent_batch(
+        nullable_parent.schema_id,
+        vec![0, 0, 4, 4],
+        vec![0, 1, 0, 1],
+        vec![10, 0, 30, 0],
+        vec![11, 21, 31, 41],
+        Some(vec![0b0000_0101]),
+        None,
+    );
+    let nullable_parent_artifact = compile_v3_planned_grouped_attempt6(
+        &nullable_parent,
+        std::slice::from_ref(&nullable_parent_batch),
+        Default::default(),
+    )
+    .unwrap();
+    let row = nullable_parent_artifact
+        .inspection
+        .same_child_parent
+        .first()
+        .unwrap();
+    assert!(!row.eligible && !row.candidate_selected && !row.selected);
+    let nullable_parent_decoded =
+        decode_v3_planned_grouped(&nullable_parent_artifact.bytes, Default::default()).unwrap();
+    assert_ne!(
+        nullable_parent_decoded.footer.plan.streams[3].op,
+        AURA_PLAN_V2_SAME_CHILD_PARENT_OP
+    );
+    assert_eq!(nullable_parent_decoded.batches, vec![nullable_parent_batch]);
+
+    let tie = same_child_parent_batch(
+        schema.schema_id,
+        vec![0, 0, 0, 0],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let tie_artifact =
+        compile_v3_planned_grouped_attempt6(&schema, &[tie], Default::default()).unwrap();
+    let row = tie_artifact.inspection.same_child_parent.first().unwrap();
+    assert!(row.applicable && !row.candidate_selected && !row.selected);
+    assert!(row
+        .rejection
+        .as_deref()
+        .is_some_and(|reason| reason.contains("did not beat")));
+}
+
+#[test]
+fn attempt6_footer_rejects_wrong_parent_dependency_or_version_contract() {
+    let schema = same_child_parent_schema(false, false);
+    let batch = same_child_parent_batch(
+        schema.schema_id,
+        vec![0, 0, 2, 2],
+        vec![0, 1],
+        vec![100, 200],
+        vec![101, 201],
+        None,
+        None,
+    );
+    let artifact = compile_v3_planned_grouped_attempt6_candidate(
+        &schema,
+        &[batch],
+        Default::default(),
+        &[3],
+        PlanV2PhysicalCodec::SignedZigZagUleb128,
+    )
+    .unwrap();
+    let footer =
+        decode_v3_planned_grouped_footer(footer_bytes(&artifact.bytes), V3GroupedLimits::HARD)
+            .unwrap();
+    let mut wrong_parent = footer.clone();
+    wrong_parent.plan.streams[3].dependencies = vec![1];
+    assert!(encode_v3_planned_grouped_footer(&wrong_parent, V3GroupedLimits::HARD).is_err());
+    let mut wrong_version = footer;
+    wrong_version.body_layout_version = V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION;
+    wrong_version.block_version = V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION;
+    assert!(encode_v3_planned_grouped_footer(&wrong_version, V3GroupedLimits::HARD).is_err());
+
+    // Re-sign both the embedded plan and outer footer so the raw mutation
+    // reaches canonical plan dependency validation rather than an integrity
+    // check. Slot 3 is declared DeltaFromField(2), never slot 1.
+    let mut raw_footer = footer_bytes(&artifact.bytes).to_vec();
+    let schema_len = u32::from_le_bytes(raw_footer[48..52].try_into().unwrap()) as usize;
+    let plan_len = u32::from_le_bytes(raw_footer[52..56].try_into().unwrap()) as usize;
+    let plan_start = 216 + schema_len;
+    let plan_end = plan_start + plan_len;
+    {
+        let plan = &mut raw_footer[plan_start..plan_end];
+        let mut stream_start = 64usize;
+        for _ in 0..3 {
+            let dependencies =
+                u16::from_le_bytes(plan[stream_start + 6..stream_start + 8].try_into().unwrap())
+                    as usize;
+            let physical = u16::from_le_bytes(
+                plan[stream_start + 12..stream_start + 14]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            stream_start += 14 + dependencies * 2 + physical * 2;
+        }
+        plan[stream_start + 14..stream_start + 16].copy_from_slice(&1u16.to_le_bytes());
+        resign_plan_with_domain(plan, PLAN_HASH_DOMAIN_V6);
+    }
+    let mutated_plan_sha: [u8; 32] = raw_footer[plan_end - 32..plan_end].try_into().unwrap();
+    raw_footer[88..120].copy_from_slice(&mutated_plan_sha);
+    resign_footer(&mut raw_footer);
+    assert!(decode_v3_planned_grouped_footer(&raw_footer, V3GroupedLimits::HARD).is_err());
 }
 
 fn plan_hash(bytes: &[u8]) -> [u8; 32] {

@@ -10,8 +10,10 @@
 //! with event/domain resets and checked inverse, against all accepted absolute
 //! fallbacks. Attempt 5 adds both schema-authorized cross-domain same-slot
 //! orientations, pairing ordinal occurrences per event and retaining unmatched
-//! tails as absolute values. Field roles such as price or quantity carry no
-//! economic meaning. Cross-event state remains excluded. Nothing here
+//! tails as absolute values. Attempt 6 adds only explicit same-child nonnullable `I64`
+//! `DeltaFromField(parent)` residuals, stored as checked `child - parent`.
+//! Field roles such as price or quantity carry no economic meaning. Cross-event
+//! state remains excluded. Nothing here
 //! claims compression, Parquet comparison, holdout evidence, production
 //! readiness, or the campaign size goal.
 
@@ -20,7 +22,7 @@ use sha2::{Digest, Sha256};
 use crate::bytes::ByteReader;
 use crate::format::{AuraContainerVersion, SEAL_MAGIC};
 use crate::schema::{
-    decode_schema_descriptor, encode_schema_descriptor, FieldScope, SchemaDescriptor,
+    decode_schema_descriptor, encode_schema_descriptor, FieldRelation, FieldScope, SchemaDescriptor,
 };
 use crate::v3_codecs::{
     decode_canonical_uleb128, decode_canonical_zigzag, fixed_width, integer_varint_codec,
@@ -36,7 +38,8 @@ use crate::v3_plan_v2::{AuraPlanV2, PlanV2Inspection, PlanV2Selection, MAX_AURA_
 use crate::v3_plan_v2::{
     AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION, AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP,
     AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP, AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION,
-    AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP, AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION,
+    AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP, AURA_PLAN_V2_SAME_CHILD_PARENT_OP,
+    AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION, AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION,
 };
 use crate::v3_values::{
     canonical_v3_schema_fingerprint, decode_column, encode_column, AuraV3Column,
@@ -56,6 +59,8 @@ pub const V3_PLANNED_GROUPED_WITHIN_DOMAIN_BODY_LAYOUT_VERSION: u16 = 4;
 pub const V3_PLANNED_GROUPED_WITHIN_DOMAIN_BLOCK_VERSION: u16 = 4;
 pub const V3_PLANNED_GROUPED_CROSS_DOMAIN_BODY_LAYOUT_VERSION: u16 = 5;
 pub const V3_PLANNED_GROUPED_CROSS_DOMAIN_BLOCK_VERSION: u16 = 5;
+pub const V3_PLANNED_GROUPED_SAME_CHILD_PARENT_BODY_LAYOUT_VERSION: u16 = 6;
+pub const V3_PLANNED_GROUPED_SAME_CHILD_PARENT_BLOCK_VERSION: u16 = 6;
 pub const V3_PLANNED_GROUPED_FOOTER_PREFIX_BYTES: usize = 216;
 pub const V3_PLANNED_GROUPED_CHUNK_DESCRIPTOR_BYTES: usize = 120;
 pub const MAX_V3_PLANNED_GROUPED_FOOTER_BYTES: usize = 64 * 1024 * 1024;
@@ -126,6 +131,23 @@ pub struct V3PlannedGroupedInspection {
     pub codecs: Vec<V3PlannedGroupedCodecInspection>,
     pub within_domain: Vec<V3PlannedGroupedWithinInspection>,
     pub cross_domain: Vec<V3PlannedGroupedCrossInspection>,
+    pub same_child_parent: Vec<V3PlannedGroupedParentInspection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V3PlannedGroupedParentInspection {
+    pub logical_slot: u16,
+    pub parent_slot: u16,
+    pub authorized: bool,
+    pub eligible: bool,
+    pub applicable: bool,
+    pub rejection: Option<String>,
+    pub absolute_bytes: u64,
+    pub residual_fixed_bytes: Option<u64>,
+    pub residual_varint_bytes: Option<u64>,
+    pub selected_codec: PlanV2PhysicalCodec,
+    pub candidate_selected: bool,
+    pub selected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -849,6 +871,208 @@ pub fn compile_v3_planned_grouped_attempt5_candidate(
     compile_compact_candidate_with_plan(schema, batches, limits, plan)
 }
 
+/// Size-attempt 6: add explicit same-child parent residuals to the complete
+/// v1-v5 candidate set. An eligible lane is exactly a repeated nonnullable
+/// `I64` field related to a repeated nonnullable `I64` parent. A transform is
+/// selected only when its encoded lane plus the two-byte plan dependency is
+/// strictly smaller than the best absolute lane; ties stay direct.
+pub fn compile_v3_planned_grouped_attempt6(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    limits: V3GroupedLimits,
+) -> Result<V3PlannedGroupedArtifact> {
+    validate_attempt3_inputs(schema, batches, limits)?;
+    let mut selected = compile_v3_planned_grouped_attempt5(schema, batches, limits)?;
+    let mut prior_candidates = selected.inspection.candidates.clone();
+    let authorized = schema.fields.iter().any(|field| {
+        field.scope == FieldScope::Repeated
+            && matches!(field.relation, FieldRelation::DeltaFromField(_))
+    });
+    let planned = AuraPlanV2::same_child_parent_direct_for_schema(schema)
+        .and_then(|plan| select_integer_codecs(schema, batches, plan))
+        .and_then(|(plan, _)| select_same_child_parent(schema, batches, plan));
+    let rows = planned.as_ref().ok().map(|(_, rows)| rows.clone());
+    let candidate = planned
+        .and_then(|(plan, _)| compile_compact_candidate_with_plan(schema, batches, limits, plan));
+    let (candidate_bytes, candidate_error, candidate_artifact) = match candidate {
+        Ok(artifact) => (Some(artifact.summary.file_bytes), None, Some(artifact)),
+        Err(error) if is_expected_candidate_limit(&error) => {
+            (None, Some(sanitize_candidate_error(&error)), None)
+        }
+        Err(error) => return Err(error),
+    };
+    let parent_wins =
+        authorized && candidate_bytes.is_some_and(|bytes| bytes < selected.summary.file_bytes);
+    if parent_wins {
+        for candidate in &mut prior_candidates {
+            candidate.selected = false;
+            if candidate.rejection.is_none() {
+                candidate.rejection =
+                    Some("complete cost did not beat selected candidate".to_owned());
+            }
+        }
+        selected =
+            candidate_artifact.ok_or(AuraError::InvalidValue("v3 planned selected candidate"))?;
+    }
+    let mut parent_rows = rows.unwrap_or_default();
+    if parent_wins {
+        for row in &mut parent_rows {
+            row.selected = row.candidate_selected;
+        }
+    }
+    let parent_row = V3PlannedGroupedCandidateInspection {
+        candidate_id: "registry6-same-child-parent".to_owned(),
+        selection: PlanV2Selection::SameChildParentMixed,
+        authorized,
+        applicable: authorized && candidate_bytes.is_some(),
+        rejection: if !authorized {
+            Some("schema has no repeated DeltaFromField relation".to_owned())
+        } else if parent_wins {
+            None
+        } else if let Some(error) = candidate_error {
+            Some(error)
+        } else {
+            Some("complete cost did not beat selected candidate".to_owned())
+        },
+        complete_bytes: authorized.then_some(candidate_bytes).flatten(),
+        selected: parent_wins,
+    };
+    if parent_wins {
+        // The registry-6 artifact starts with an empty inspection assembled
+        // from its footer; restore the complete v1-v5 comparison rows.
+        selected.inspection.candidates = prior_candidates;
+    }
+    selected.inspection.candidates.push(parent_row);
+    selected.inspection.same_child_parent = parent_rows;
+    Ok(selected)
+}
+
+/// Encode an explicit registry-6 candidate for inverse/footer auditing.
+pub fn compile_v3_planned_grouped_attempt6_candidate(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    limits: V3GroupedLimits,
+    slots: &[u16],
+    codec: PlanV2PhysicalCodec,
+) -> Result<V3PlannedGroupedArtifact> {
+    let mut plan = AuraPlanV2::same_child_parent_direct_for_schema(schema)?;
+    let mut relations = Vec::new();
+    relations
+        .try_reserve_exact(slots.len())
+        .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
+    for slot in slots {
+        let field = schema
+            .fields
+            .get(usize::from(*slot))
+            .filter(|field| field.index == *slot)
+            .ok_or(AuraError::InvalidValue("v3 planned parent slot"))?;
+        let FieldRelation::DeltaFromField(parent) = field.relation else {
+            return Err(AuraError::InvalidValue("v3 planned parent relation"));
+        };
+        relations.push((*slot, parent));
+        let physical = plan.streams[usize::from(*slot)].physical_stream_ids[0];
+        plan.physical_stream_codecs[usize::from(physical)] = codec;
+    }
+    plan.select_same_child_parent(&relations);
+    plan.validate(schema)?;
+    compile_compact_candidate_with_plan(schema, batches, limits, plan)
+}
+
+fn select_same_child_parent(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    mut plan: AuraPlanV2,
+) -> Result<(AuraPlanV2, Vec<V3PlannedGroupedParentInspection>)> {
+    let mut selected_relations = Vec::new();
+    let mut rows = Vec::new();
+    for field in &schema.fields {
+        let FieldRelation::DeltaFromField(parent_slot) = field.relation else {
+            continue;
+        };
+        if field.scope != FieldScope::Repeated {
+            continue;
+        }
+        let parent = schema
+            .fields
+            .get(usize::from(parent_slot))
+            .ok_or(AuraError::InvalidValue("v3 planned parent slot"))?;
+        let physical = plan.streams[usize::from(field.index)].physical_stream_ids[0];
+        let absolute_codec = plan.physical_stream_codecs[usize::from(physical)];
+        let absolute_bytes = encoded_codec_bytes(schema, batches, field.index, absolute_codec)?;
+        let eligible = !field.nullable
+            && field.field_type == crate::FieldType::I64
+            && parent.scope == FieldScope::Repeated
+            && !parent.nullable
+            && parent.field_type == crate::FieldType::I64;
+        let transformed = if eligible {
+            encoded_same_child_parent_bytes(schema, batches, field.index, parent_slot)
+        } else {
+            Err(AuraError::InvalidValue("v3 planned parent ineligible"))
+        };
+        let (fixed, varint, selected_codec, rejection, select) = match transformed {
+            Ok(columns) => {
+                let fixed = encoded_columns_bytes(&columns, PlanV2PhysicalCodec::FixedWidth)?;
+                let varint =
+                    encoded_columns_bytes(&columns, PlanV2PhysicalCodec::SignedZigZagUleb128)?;
+                let (body, codec) = if varint < fixed {
+                    (varint, PlanV2PhysicalCodec::SignedZigZagUleb128)
+                } else {
+                    (fixed, PlanV2PhysicalCodec::FixedWidth)
+                };
+                let select = body
+                    .checked_add(2)
+                    .is_some_and(|cost| cost < absolute_bytes);
+                (
+                    Some(fixed as u64),
+                    Some(varint as u64),
+                    if select { codec } else { absolute_codec },
+                    (!select).then(|| "relationship did not beat absolute codec".to_owned()),
+                    select,
+                )
+            }
+            Err(AuraError::InvalidValue("v3 planned parent overflow")) => (
+                None,
+                None,
+                absolute_codec,
+                Some("signed residual overflow".to_owned()),
+                false,
+            ),
+            Err(_) if !eligible => (
+                None,
+                None,
+                absolute_codec,
+                Some(
+                    "nullable, non-I64, or non-repeated parent relation remains absolute"
+                        .to_owned(),
+                ),
+                false,
+            ),
+            Err(error) => return Err(error),
+        };
+        if select {
+            selected_relations.push((field.index, parent_slot));
+            plan.physical_stream_codecs[usize::from(physical)] = selected_codec;
+        }
+        rows.push(V3PlannedGroupedParentInspection {
+            logical_slot: field.index,
+            parent_slot,
+            authorized: true,
+            eligible,
+            applicable: fixed.is_some(),
+            rejection,
+            absolute_bytes: absolute_bytes as u64,
+            residual_fixed_bytes: fixed,
+            residual_varint_bytes: varint,
+            selected_codec,
+            candidate_selected: select,
+            selected: false,
+        });
+    }
+    plan.select_same_child_parent(&selected_relations);
+    plan.validate(schema)?;
+    Ok((plan, rows))
+}
+
 fn select_cross_domain_same_field(
     schema: &SchemaDescriptor,
     batches: &[AuraV3EventBatch],
@@ -1331,6 +1555,41 @@ fn encoded_cross_domain_bytes(
     Ok(columns)
 }
 
+fn encoded_same_child_parent_bytes(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    slot: u16,
+    parent_slot: u16,
+) -> Result<Vec<(AuraV3Column, usize)>> {
+    let repeated = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Repeated)
+        .collect::<Vec<_>>();
+    let position = repeated
+        .iter()
+        .position(|field| field.index == slot)
+        .ok_or(AuraError::InvalidValue("v3 planned parent slot"))?;
+    let parent_position = repeated
+        .iter()
+        .position(|field| field.index == parent_slot)
+        .ok_or(AuraError::InvalidValue("v3 planned parent slot"))?;
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(batches.len())
+        .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
+    for batch in batches {
+        columns.push((
+            same_child_parent_values(
+                &batch.repeated_columns[position],
+                &batch.repeated_columns[parent_position],
+            )?,
+            batch.child_count() as usize,
+        ));
+    }
+    Ok(columns)
+}
+
 fn encoded_columns_bytes(
     columns: &[(AuraV3Column, usize)],
     codec: PlanV2PhysicalCodec,
@@ -1472,6 +1731,10 @@ fn compile_compact_candidate_with_plan(
 
 const fn body_versions(plan: &AuraPlanV2) -> (u16, u16) {
     match plan.registry_version {
+        AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION => (
+            V3_PLANNED_GROUPED_SAME_CHILD_PARENT_BODY_LAYOUT_VERSION,
+            V3_PLANNED_GROUPED_SAME_CHILD_PARENT_BLOCK_VERSION,
+        ),
         AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION => (
             V3_PLANNED_GROUPED_CROSS_DOMAIN_BODY_LAYOUT_VERSION,
             V3_PLANNED_GROUPED_CROSS_DOMAIN_BLOCK_VERSION,
@@ -1614,6 +1877,24 @@ fn encode_attempt2_block(
         ) {
             let transformed =
                 cross_domain_same_field_values(batch, column, selector, descriptor.op)?;
+            encode_codec_lane(
+                &transformed,
+                batch.child_count() as usize,
+                codec_for_column(plan, column.slot)?,
+                &mut out,
+            )?;
+        } else if descriptor.op == AURA_PLAN_V2_SAME_CHILD_PARENT_OP {
+            let parent_slot = descriptor
+                .dependencies
+                .first()
+                .copied()
+                .ok_or(AuraError::InvalidValue("v3 planned parent dependency"))?;
+            let parent_position = repeated_fields
+                .iter()
+                .position(|candidate| candidate.index == parent_slot)
+                .ok_or(AuraError::InvalidValue("v3 planned parent dependency"))?;
+            let transformed =
+                same_child_parent_values(column, &batch.repeated_columns[parent_position])?;
             encode_codec_lane(
                 &transformed,
                 batch.child_count() as usize,
@@ -1788,6 +2069,27 @@ fn decode_attempt2_block(
                 &selector,
                 op,
             )?);
+        } else if plan.streams[usize::from(field.index)].op == AURA_PLAN_V2_SAME_CHILD_PARENT_OP {
+            let descriptor = &plan.streams[usize::from(field.index)];
+            let parent_slot = descriptor
+                .dependencies
+                .first()
+                .copied()
+                .ok_or(AuraError::InvalidValue("v3 planned parent dependency"))?;
+            let parent = repeated_columns
+                .iter()
+                .find(|column| column.slot == parent_slot)
+                .ok_or(AuraError::InvalidValue("v3 planned parent decode order"))?;
+            let physical = decode_codec_lane(
+                field.index,
+                crate::FieldType::I64,
+                false,
+                child_count as usize,
+                codec_for_column(plan, field.index)?,
+                &mut reader,
+                value_limits,
+            )?;
+            repeated_columns.push(inverse_same_child_parent(field, &physical, parent)?);
         } else if plan.selection != PlanV2Selection::SplitDomainDirect {
             let column = decode_codec_lane(
                 field.index,
@@ -1917,6 +2219,70 @@ fn cross_domain_same_field_values(
         slot: column.slot,
         validity: None,
         values: AuraV3ColumnValues::I64(transformed),
+    })
+}
+
+fn same_child_parent_values(column: &AuraV3Column, parent: &AuraV3Column) -> Result<AuraV3Column> {
+    let AuraV3ColumnValues::I64(values) = &column.values else {
+        return Err(AuraError::InvalidValue("v3 planned parent logical type"));
+    };
+    let AuraV3ColumnValues::I64(parent_values) = &parent.values else {
+        return Err(AuraError::InvalidValue("v3 planned parent logical type"));
+    };
+    if column.validity.is_some() || parent.validity.is_some() || values.len() != parent_values.len()
+    {
+        return Err(AuraError::InvalidValue("v3 planned parent presence"));
+    }
+    let mut residuals = Vec::new();
+    residuals
+        .try_reserve_exact(values.len())
+        .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
+    for (value, parent) in values.iter().copied().zip(parent_values.iter().copied()) {
+        residuals.push(
+            value
+                .checked_sub(parent)
+                .ok_or(AuraError::InvalidValue("v3 planned parent overflow"))?,
+        );
+    }
+    Ok(AuraV3Column {
+        slot: column.slot,
+        validity: None,
+        values: AuraV3ColumnValues::I64(residuals),
+    })
+}
+
+fn inverse_same_child_parent(
+    field: &crate::FieldDescriptor,
+    physical: &AuraV3Column,
+    parent: &AuraV3Column,
+) -> Result<AuraV3Column> {
+    let AuraV3ColumnValues::I64(residuals) = &physical.values else {
+        return Err(AuraError::InvalidValue("v3 planned parent physical type"));
+    };
+    let AuraV3ColumnValues::I64(parent_values) = &parent.values else {
+        return Err(AuraError::InvalidValue("v3 planned parent physical type"));
+    };
+    if physical.validity.is_some()
+        || parent.validity.is_some()
+        || residuals.len() != parent_values.len()
+    {
+        return Err(AuraError::InvalidValue("v3 planned parent presence"));
+    }
+    let mut logical = Vec::new();
+    logical
+        .try_reserve_exact(residuals.len())
+        .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
+    for (residual, parent) in residuals.iter().copied().zip(parent_values.iter().copied()) {
+        logical.push(
+            parent
+                .checked_add(residual)
+                .ok_or(AuraError::InvalidValue("v3 planned parent inverse"))?,
+        );
+    }
+    Ok(AuraV3Column {
+        slot: field.index,
+        validity: None,
+        values: AuraV3ColumnValues::I64(logical),
     })
 }
 
@@ -2054,6 +2420,7 @@ fn codec_for_column(plan: &AuraPlanV2, slot: u16) -> Result<PlanV2PhysicalCodec>
         AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
             | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
             | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
+            | AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
     ) {
         return Ok(PlanV2PhysicalCodec::FixedWidth);
     }
@@ -2790,6 +3157,9 @@ pub fn decode_v3_planned_grouped_footer(
         ) | (
             V3_PLANNED_GROUPED_CROSS_DOMAIN_BODY_LAYOUT_VERSION,
             V3_PLANNED_GROUPED_CROSS_DOMAIN_BLOCK_VERSION
+        ) | (
+            V3_PLANNED_GROUPED_SAME_CHILD_PARENT_BODY_LAYOUT_VERSION,
+            V3_PLANNED_GROUPED_SAME_CHILD_PARENT_BLOCK_VERSION
         )
     ) {
         return Err(AuraError::InvalidValue("v3 planned grouped body layout"));
@@ -2908,6 +3278,10 @@ fn validate_footer(footer: &V3PlannedGroupedFooter, limits: V3GroupedLimits) -> 
             V3_PLANNED_GROUPED_CROSS_DOMAIN_BODY_LAYOUT_VERSION,
             V3_PLANNED_GROUPED_CROSS_DOMAIN_BLOCK_VERSION,
             crate::AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION,
+        ) | (
+            V3_PLANNED_GROUPED_SAME_CHILD_PARENT_BODY_LAYOUT_VERSION,
+            V3_PLANNED_GROUPED_SAME_CHILD_PARENT_BLOCK_VERSION,
+            AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION,
         )
     );
     if !version_contract
@@ -3095,6 +3469,7 @@ fn inspection(footer: &V3PlannedGroupedFooter) -> V3PlannedGroupedInspection {
         codecs: Vec::new(),
         within_domain: Vec::new(),
         cross_domain: Vec::new(),
+        same_child_parent: Vec::new(),
     }
 }
 

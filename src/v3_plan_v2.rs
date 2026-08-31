@@ -12,13 +12,16 @@
 //! no cross-event state, Huffman, Zstandard, null sparsity, or provider meaning.
 //! Registry version 5 adds the two checked cross-domain same-slot residual
 //! orientations authorized by the schema. Pairing is by ordinal occurrence
-//! inside each event; unmatched tails stay absolute. These registries specify no
-//! compression claim and carry
-//! no Parquet, holdout, production, or campaign-size claim.
+//! inside each event; unmatched tails stay absolute.
+//! Registry version 6 adds checked same-child `I64` residuals for an explicit
+//! `DeltaFromField(parent)` relation. Both fields are repeated, nonnullable
+//! `I64` lanes and the stored value is exactly `child - parent` at the same
+//! authoritative child position. These registries specify no compression claim
+//! and carry no Parquet, holdout, production, or campaign-size claim.
 
 use sha2::{Digest, Sha256};
 
-use crate::schema::{FieldScope, FieldType, SchemaDescriptor};
+use crate::schema::{FieldRelation, FieldScope, FieldType, SchemaDescriptor};
 pub use crate::v3_codecs::PlanV2PhysicalCodec;
 use crate::v3_values::canonical_v3_schema_fingerprint;
 use crate::{AuraError, Result};
@@ -30,6 +33,7 @@ pub const AURA_PLAN_V2_SPLIT_REGISTRY_VERSION: u16 = 2;
 pub const AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION: u16 = 3;
 pub const AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION: u16 = 4;
 pub const AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION: u16 = 5;
+pub const AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION: u16 = 6;
 pub const AURA_PLAN_V2_DIRECT_OP: u8 = 0;
 pub const AURA_PLAN_V2_SPLIT_DOMAIN_DIRECT_OP: u8 = 1;
 /// Registry-4 per-event/domain reset transform. The physical lane is normative
@@ -43,6 +47,9 @@ pub const AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP: u8 = 2;
 pub const AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP: u8 = 3;
 /// Registry-5 inverse orientation of [`AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP`].
 pub const AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP: u8 = 4;
+/// Registry-6 checked same-child residual. The single dependency is the exact
+/// repeated nonnullable `I64` parent named by `FieldRelation::DeltaFromField`.
+pub const AURA_PLAN_V2_SAME_CHILD_PARENT_OP: u8 = 5;
 pub const AURA_PLAN_V2_AUTHORITATIVE_SOURCE_ORDER: u8 = 1;
 pub const MAX_AURA_PLAN_V2_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_AURA_PLAN_V2_STREAMS: usize = 4_096;
@@ -57,6 +64,7 @@ const SPLIT_PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v2\0";
 const INTEGER_CODEC_PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v3\0";
 const WITHIN_DOMAIN_PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v4\0";
 const CROSS_DOMAIN_PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v5\0";
+const SAME_CHILD_PARENT_PLAN_HASH_DOMAIN: &[u8] = b"aura-plan-v2-registry-v6\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -65,6 +73,7 @@ pub enum PlanV2Selection {
     SplitDomainDirect = 1,
     PreviousWithinDomainMixed = 2,
     CrossDomainSameFieldMixed = 3,
+    SameChildParentMixed = 4,
 }
 
 impl PlanV2Selection {
@@ -74,6 +83,7 @@ impl PlanV2Selection {
             1 => Ok(Self::SplitDomainDirect),
             2 => Ok(Self::PreviousWithinDomainMixed),
             3 => Ok(Self::CrossDomainSameFieldMixed),
+            4 => Ok(Self::SameChildParentMixed),
             _ => Err(AuraError::InvalidValue("aura plan v2 selection")),
         }
     }
@@ -200,6 +210,13 @@ impl AuraPlanV2 {
         Ok(plan)
     }
 
+    pub fn same_child_parent_direct_for_schema(schema: &SchemaDescriptor) -> Result<Self> {
+        let mut plan = Self::integer_codec_direct_for_schema(schema)?;
+        plan.registry_version = AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION;
+        plan.validate(schema)?;
+        Ok(plan)
+    }
+
     pub fn select_previous_within_domain(&mut self, slots: &[u16]) {
         self.registry_version = AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION;
         self.selection = if slots.is_empty() {
@@ -229,6 +246,24 @@ impl AuraPlanV2 {
             if let Some((_, op)) = ops.iter().find(|(slot, _)| *slot == stream.slot) {
                 stream.op = *op;
                 stream.dependencies = vec![self.discriminator_slot];
+            } else {
+                stream.op = AURA_PLAN_V2_DIRECT_OP;
+                stream.dependencies.clear();
+            }
+        }
+    }
+
+    pub fn select_same_child_parent(&mut self, relations: &[(u16, u16)]) {
+        self.registry_version = AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION;
+        self.selection = if relations.is_empty() {
+            PlanV2Selection::Direct
+        } else {
+            PlanV2Selection::SameChildParentMixed
+        };
+        for stream in &mut self.streams {
+            if let Some((_, parent)) = relations.iter().find(|(slot, _)| *slot == stream.slot) {
+                stream.op = AURA_PLAN_V2_SAME_CHILD_PARENT_OP;
+                stream.dependencies = vec![*parent];
             } else {
                 stream.op = AURA_PLAN_V2_DIRECT_OP;
                 stream.dependencies.clear();
@@ -281,6 +316,7 @@ impl AuraPlanV2 {
                     | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
                     | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
                     | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
+                    | AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
             )
             || self.schema_id != schema.schema_id
             || self.schema_fingerprint != canonical_v3_schema_fingerprint(schema)?
@@ -330,6 +366,7 @@ impl AuraPlanV2 {
                 | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
                 | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
                 | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
+                | AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
         ) && (self.event_child_offsets_stream_id != Some(0)
             || self.source_order_selector_stream_id.is_none())
         {
@@ -346,6 +383,7 @@ impl AuraPlanV2 {
             AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
                 | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
                 | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
+                | AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
         ) && !self.physical_stream_codecs.is_empty()
         {
             return Err(AuraError::InvalidValue("aura plan v2 codec registry"));
@@ -378,6 +416,14 @@ impl AuraPlanV2 {
             )
         {
             return Err(AuraError::InvalidValue("aura plan v2 cross selection"));
+        }
+        if self.registry_version == AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
+            && !matches!(
+                self.selection,
+                PlanV2Selection::Direct | PlanV2Selection::SameChildParentMixed
+            )
+        {
+            return Err(AuraError::InvalidValue("aura plan v2 parent selection"));
         }
 
         let mut seen = vec![false; schema.fields.len()];
@@ -426,6 +472,9 @@ impl AuraPlanV2 {
                         descriptor.op,
                         AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP | AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP
                     );
+                let parent = self.registry_version
+                    == AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
+                    && descriptor.op == AURA_PLAN_V2_SAME_CHILD_PARENT_OP;
                 if within
                     && (descriptor.scope != FieldScope::Repeated
                         || descriptor.nullable
@@ -442,16 +491,43 @@ impl AuraPlanV2 {
                 {
                     return Err(AuraError::InvalidValue("aura plan v2 cross stream"));
                 }
+                if parent {
+                    let parent_slot = descriptor
+                        .dependencies
+                        .first()
+                        .copied()
+                        .ok_or(AuraError::InvalidValue("aura plan v2 parent stream"))?;
+                    let parent_field = schema
+                        .fields
+                        .get(usize::from(parent_slot))
+                        .ok_or(AuraError::InvalidValue("aura plan v2 parent stream"))?;
+                    if descriptor.dependencies.len() != 1
+                        || descriptor.scope != FieldScope::Repeated
+                        || descriptor.nullable
+                        || descriptor.field_type != FieldType::I64
+                        || parent_field.scope != FieldScope::Repeated
+                        || parent_field.nullable
+                        || parent_field.field_type != FieldType::I64
+                        || schema.fields[usize::from(descriptor.slot)].relation
+                            != FieldRelation::DeltaFromField(parent_slot)
+                    {
+                        return Err(AuraError::InvalidValue("aura plan v2 parent stream"));
+                    }
+                }
                 let expected_op = if split {
                     AURA_PLAN_V2_SPLIT_DOMAIN_DIRECT_OP
                 } else if within {
                     AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP
                 } else if cross {
                     descriptor.op
+                } else if parent {
+                    AURA_PLAN_V2_SAME_CHILD_PARENT_OP
                 } else {
                     AURA_PLAN_V2_DIRECT_OP
                 };
-                let expected_dependencies = if split || within || cross {
+                let expected_dependencies = if parent {
+                    descriptor.dependencies.as_slice()
+                } else if split || within || cross {
                     &[self.discriminator_slot][..]
                 } else {
                     &[][..]
@@ -483,6 +559,7 @@ impl AuraPlanV2 {
                 AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
                     | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
                     | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
+                    | AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
             ) {
                 if self.physical_stream_codecs.len() != usize::from(next_physical)
                     || self.physical_stream_codecs.first() != Some(&PlanV2PhysicalCodec::FixedWidth)
@@ -527,6 +604,16 @@ impl AuraPlanV2 {
                 return Err(AuraError::InvalidValue("aura plan v2 cross selection"));
             }
         }
+        if self.registry_version == AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION {
+            let count = self
+                .streams
+                .iter()
+                .filter(|stream| stream.op == AURA_PLAN_V2_SAME_CHILD_PARENT_OP)
+                .count();
+            if (count == 0) != (self.selection == PlanV2Selection::Direct) {
+                return Err(AuraError::InvalidValue("aura plan v2 parent selection"));
+            }
+        }
         for (index, slot) in self.decode_order.iter().copied().enumerate() {
             if usize::from(slot) != index {
                 return Err(AuraError::InvalidValue("aura plan v2 decode order"));
@@ -551,6 +638,7 @@ impl AuraPlanV2 {
                 PlanV2Selection::SplitDomainDirect
                     | PlanV2Selection::PreviousWithinDomainMixed
                     | PlanV2Selection::CrossDomainSameFieldMixed
+                    | PlanV2Selection::SameChildParentMixed
             ),
         }
     }
@@ -572,6 +660,7 @@ impl AuraPlanV2 {
             AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
                 | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
                 | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
+                | AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
         ) {
             self.physical_stream_codecs
                 .len()
@@ -645,6 +734,7 @@ impl AuraPlanV2 {
                     | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
                     | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
                     | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
+                    | AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
             ) {
                 put_u16_len(
                     &mut bytes,
@@ -664,6 +754,7 @@ impl AuraPlanV2 {
             AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
                 | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
                 | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
+                | AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
         ) {
             put_u16_len(
                 &mut bytes,
@@ -707,6 +798,7 @@ impl AuraPlanV2 {
                     | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
                     | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
                     | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
+                    | AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
             )
         {
             return Err(AuraError::InvalidValue("aura plan v2 registry"));
@@ -764,6 +856,7 @@ impl AuraPlanV2 {
                     | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
                     | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
                     | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
+                    | AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
             ) {
                 reader.u16()? as usize
             } else {
@@ -813,6 +906,7 @@ impl AuraPlanV2 {
             AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
                 | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
                 | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
+                | AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
         ) {
             let codec_count = reader.u16()? as usize;
             if codec_count > MAX_AURA_PLAN_V2_STREAMS * 2 || codec_count > reader.remaining() {
@@ -854,6 +948,7 @@ impl AuraPlanV2 {
                     | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
                     | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
                     | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
+                    | AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
             )
             .then_some(offsets_stream_raw),
             source_order_selector_stream_id: matches!(
@@ -862,6 +957,7 @@ impl AuraPlanV2 {
                     | AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
                     | AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION
                     | AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION
+                    | AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION
             )
             .then_some(selector_stream_raw),
             streams,
@@ -1008,6 +1104,7 @@ fn plan_hash_bytes(bytes: &[u8], registry_version: u16) -> Result<[u8; 32]> {
         AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION => INTEGER_CODEC_PLAN_HASH_DOMAIN,
         AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION => WITHIN_DOMAIN_PLAN_HASH_DOMAIN,
         AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION => CROSS_DOMAIN_PLAN_HASH_DOMAIN,
+        AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION => SAME_CHILD_PARENT_PLAN_HASH_DOMAIN,
         _ => PLAN_HASH_DOMAIN,
     });
     hasher.update(len.to_le_bytes());
