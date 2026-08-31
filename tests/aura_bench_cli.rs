@@ -1259,8 +1259,8 @@ fn aura_bench_runs_sdk_generic_fixture_smoke_matrix() {
     let Some(fixture_bin) = option_env!("CARGO_BIN_EXE_aura-fixture-gen") else {
         panic!("missing aura-fixture-gen binary");
     };
-    let Some(sdk_bench_bin) = option_env!("CARGO_BIN_EXE_aura_sdk_bench") else {
-        panic!("missing aura_sdk_bench binary");
+    let Some(sdk_bench_bin) = option_env!("CARGO_BIN_EXE_aura-sdk-bench") else {
+        panic!("missing aura-sdk-bench binary");
     };
     let dir = std::env::temp_dir().join(format!(
         "aura-sdk-generic-bench-smoke-{}",

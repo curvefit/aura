@@ -19,6 +19,10 @@ name = "aura-bench"
 path = "src/bin/aura_bench.rs"
 
 [[bin]]
+name = "aura-sdk-bench"
+path = "src/bin/aura_sdk_bench.rs"
+
+[[bin]]
 name = "aura-fixture-gen"
 path = "src/bin/aura_fixture_gen.rs"
 
