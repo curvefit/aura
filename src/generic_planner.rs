@@ -556,6 +556,16 @@ pub(crate) fn validate_generic_plan_schema_authorization(
         else {
             continue;
         };
+        if matches!(op, DerivedOp::AddResidual | DerivedOp::SubtractResidual) {
+            validate_related_residual_authorization(
+                schema,
+                plan,
+                *parent_group_id,
+                *output_slot,
+                *op,
+                input_slots,
+            )?;
+        }
         if !is_previous_same_key_op(*op) {
             continue;
         }
@@ -598,6 +608,52 @@ pub(crate) fn validate_generic_plan_schema_authorization(
         if !exact_parent {
             return Err(AuraError::InvalidValue("previous same-key group contract"));
         }
+    }
+    Ok(())
+}
+
+fn validate_related_residual_authorization(
+    schema: &SchemaDescriptor,
+    plan: &GenericInstructionPlan,
+    parent_group_id: Option<u16>,
+    output_slot: u16,
+    op: DerivedOp,
+    input_slots: &[u16],
+) -> Result<()> {
+    let [input_slot] = input_slots else {
+        return Err(AuraError::InvalidValue("undeclared related residual"));
+    };
+    let output_field = schema
+        .fields
+        .get(usize::from(output_slot))
+        .filter(|field| field.index == output_slot)
+        .ok_or(AuraError::InvalidValue("undeclared related residual"))?;
+    let _input_field = schema
+        .fields
+        .get(usize::from(*input_slot))
+        .filter(|field| field.index == *input_slot)
+        .ok_or(AuraError::InvalidValue("undeclared related residual"))?;
+    let relation_authorized = output_field.relation == FieldRelation::DeltaFromField(*input_slot);
+    let expression_op = match op {
+        DerivedOp::AddResidual => DerivedExpressionOp::AddResidual,
+        DerivedOp::SubtractResidual => DerivedExpressionOp::SubtractResidual,
+        _ => return Err(AuraError::InvalidValue("undeclared related residual")),
+    };
+    let expression_authorized = schema.derived_expressions.iter().any(|expression| {
+        expression.output_slot == output_slot
+            && expression.op == expression_op
+            && expression.input_slots.as_slice() == input_slots
+    });
+    // Ordinary related residuals are row-cardinality transforms. Stateful
+    // parent groups have different reset/cardinality semantics and require one
+    // of the separately declared previous-same-key operations. In an explicit
+    // event plan, only repeated outputs have one residual per flattened child;
+    // event-scoped inputs are still legal because GroupValueStream broadcasts
+    // them over the authoritative child-count ranges.
+    let cardinality_matches = parent_group_id.is_none()
+        && explicit_event_group(plan).is_none_or(|_| output_field.scope == FieldScope::Repeated);
+    if (!relation_authorized && !expression_authorized) || !cardinality_matches {
+        return Err(AuraError::InvalidValue("undeclared related residual"));
     }
     Ok(())
 }

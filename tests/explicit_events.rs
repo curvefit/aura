@@ -1,14 +1,16 @@
+use aura_codec::format::SEAL_MAGIC;
+use aura_codec::program::CompiledFooter;
 use aura_codec::records::{
     aura1_fixed_layout_info, compile_i64_file_with_aura0_profile, decode_i64_events_file,
     visit_i64_rows_file_range, Aura0FileProfile,
 };
 use aura_codec::Aura0ByteLaneCodec;
 use aura_codec::{
-    decode_generic_i64_rows, generic_i64_parent_schema, AuraI64EventReader, AuraI64EventWriter,
-    AuraI64Reader, AuraI64Writer, AuraReader, DerivedExpression, DerivedExpressionOp, DerivedOp,
-    FieldRole, FieldType, GenericEncodedI64Rows, GenericEncodedStream, GenericGroupInstruction,
-    GenericInstructionPlan, GenericStreamInstruction, GenericStreamOp, I64Event, Profile,
-    SchemaBuilder,
+    decode_generic_i64_rows, generic_i64_parent_schema, AuraError, AuraI64EventReader,
+    AuraI64EventWriter, AuraI64Reader, AuraI64Writer, AuraReader, DerivedExpression,
+    DerivedExpressionOp, DerivedOp, FieldRole, FieldType, GenericEncodedI64Rows,
+    GenericEncodedStream, GenericGroupInstruction, GenericInstructionPlan,
+    GenericStreamInstruction, GenericStreamOp, I64Event, Profile, SchemaBuilder,
 };
 
 fn book_schema() -> aura_codec::Result<aura_codec::SchemaDescriptor> {
@@ -181,6 +183,87 @@ fn explicit_event_planner_selects_repeated_parent_residual_and_beats_direct() {
     assert_eq!(
         AuraI64EventReader::open(&aura0_again).unwrap().events(),
         events
+    );
+}
+
+#[test]
+fn complete_footer_rejects_undeclared_or_wrong_related_residual_parent() {
+    let events = repeated_parent_events().into_iter().take(16);
+    let schema = generic_i64_parent_schema(
+        "explicit-related-footer-auth",
+        &[100, 0, 200, 205, 0, 0, 5, 0],
+    )
+    .unwrap();
+    let mut writer = AuraI64EventWriter::new(schema);
+    for event in events {
+        writer.push_event(event).unwrap();
+    }
+    let aura0 = writer.finish_profile(Profile::Aura0).unwrap();
+    let original_footer = decode_i64_events_file(&aura0)
+        .unwrap()
+        .compiled_footer
+        .unwrap();
+    assert!(original_footer
+        .generic_aura0_plan
+        .as_ref()
+        .unwrap()
+        .groups
+        .iter()
+        .any(|group| matches!(
+            group,
+            GenericGroupInstruction::DerivedStream {
+                output_slot: 5,
+                op: DerivedOp::AddResidual | DerivedOp::SubtractResidual,
+                input_slots,
+                ..
+            } if input_slots == &[4]
+        )));
+
+    let rebuild = |footer: CompiledFooter| {
+        let footer_bytes = footer.encode().unwrap();
+        let footer_len_offset = aura0.len() - SEAL_MAGIC.len() - 4;
+        let original_footer_len = u32::from_le_bytes(
+            aura0[footer_len_offset..footer_len_offset + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let footer_start = footer_len_offset - original_footer_len;
+        let mut malformed = aura0[..footer_start].to_vec();
+        malformed.extend_from_slice(&footer_bytes);
+        malformed.extend_from_slice(&(footer_bytes.len() as u32).to_le_bytes());
+        malformed.extend_from_slice(SEAL_MAGIC);
+        malformed
+    };
+
+    let mut wrong_parent = original_footer.clone();
+    let wrong_parent_plan = wrong_parent.generic_aura0_plan.as_mut().unwrap();
+    let input_slots = wrong_parent_plan
+        .groups
+        .iter_mut()
+        .find_map(|group| match group {
+            GenericGroupInstruction::DerivedStream {
+                output_slot: 5,
+                input_slots,
+                ..
+            } => Some(input_slots),
+            _ => None,
+        })
+        .unwrap();
+    *input_slots = vec![3];
+    assert_eq!(
+        decode_i64_events_file(&rebuild(wrong_parent)).unwrap_err(),
+        AuraError::InvalidValue("undeclared related residual")
+    );
+
+    let mut undeclared = original_footer;
+    undeclared.schema = generic_i64_parent_schema(
+        "explicit-related-footer-auth",
+        &[100, 0, 200, 205, 0, 0, 0, 0],
+    )
+    .unwrap();
+    assert_eq!(
+        decode_i64_events_file(&rebuild(undeclared)).unwrap_err(),
+        AuraError::InvalidValue("undeclared related residual")
     );
 }
 
