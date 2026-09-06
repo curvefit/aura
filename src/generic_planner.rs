@@ -9971,15 +9971,10 @@ fn encoded_i64_len(values: &[i64]) -> Result<usize> {
 }
 
 fn encoded_i64_len_with_op(op: &GenericStreamOp, values: &[i64]) -> Result<usize> {
-    let instruction = GenericStreamInstruction {
-        stream_id: 0,
-        target_slot: Some(0),
-        op: op.clone(),
-    };
-    Ok(
-        encode_generic_stream_body(&instruction, &GenericStreamBodyValue::I64(values.to_vec()))?
-            .len(),
-    )
+    // Reuse the exact length calculation used by local-mode planning. It
+    // validates the same values, avoids cloning the input solely for scoring,
+    // and retains actual encoding as the fallback for other codecs.
+    crate::body::encoded_i64_op_len(op, values)
 }
 
 fn encoded_i64_score_with_op(op: &GenericStreamOp, values: &[i64]) -> Result<usize> {

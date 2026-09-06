@@ -1788,7 +1788,7 @@ where
     Ok(out)
 }
 
-fn encoded_i64_op_len(op: &GenericStreamOp, values: &[i64]) -> Result<usize> {
+pub(crate) fn encoded_i64_op_len(op: &GenericStreamOp, values: &[i64]) -> Result<usize> {
     match *op {
         GenericStreamOp::FixedStep { base, step } => {
             for (index, value) in values.iter().enumerate() {
@@ -1881,8 +1881,122 @@ fn encoded_i64_op_len(op: &GenericStreamOp, values: &[i64]) -> Result<usize> {
                 .sum::<usize>();
             Ok(run_value_bytes + run_length_bytes)
         }
+        GenericStreamOp::Dictionary {
+            unit,
+            entry_count,
+            code_width,
+        } => {
+            let mut entries = values
+                .iter()
+                .map(|value| scaled_signed_value(*value, unit))
+                .collect::<Result<Vec<_>>>()?;
+            entries.sort_unstable();
+            entries.dedup();
+            if entries.len() != entry_count as usize {
+                return Err(AuraError::InvalidValue("dictionary entry count"));
+            }
+            let entry_bytes = entries.iter().try_fold(0usize, |size, entry| {
+                size.checked_add(varint_u64_len(varint::zigzag_encode(*entry)))
+                    .ok_or(AuraError::InvalidValue("dictionary size"))
+            })?;
+            entry_bytes
+                .checked_add(dictionary_code_bytes(
+                    entries.len(),
+                    values.len(),
+                    code_width,
+                )?)
+                .ok_or(AuraError::InvalidValue("dictionary size"))
+        }
+        GenericStreamOp::PackedDictionary {
+            base,
+            unit,
+            entry_count,
+            entry_width,
+            code_width,
+        } => {
+            let mut entries = values
+                .iter()
+                .map(|value| scaled_unsigned_offset(*value, base, unit))
+                .collect::<Result<Vec<_>>>()?;
+            entries.sort_unstable();
+            entries.dedup();
+            if entries.len() != entry_count as usize {
+                return Err(AuraError::InvalidValue("dictionary entry count"));
+            }
+            for entry in &entries {
+                ensure_unsigned_width(*entry, entry_width, "dictionary entry")?;
+            }
+            bitpacked_len(entries.len(), entry_width)?
+                .checked_add(dictionary_code_bytes(
+                    entries.len(),
+                    values.len(),
+                    code_width,
+                )?)
+                .ok_or(AuraError::InvalidValue("dictionary size"))
+        }
+        GenericStreamOp::HuffmanDictionary {
+            base,
+            unit,
+            entry_count,
+            entry_width,
+            ref code_lengths,
+        } => {
+            // Encoded length depends on symbol frequencies, not source order.
+            // Sorting once avoids rebuilding the code lookup and emitting
+            // every Huffman bit merely to score this candidate.
+            let mut scaled = values
+                .iter()
+                .map(|value| scaled_unsigned_offset(*value, base, unit))
+                .collect::<Result<Vec<_>>>()?;
+            scaled.sort_unstable();
+            let frequencies = runs_for(&scaled);
+            if frequencies.len() != entry_count as usize || code_lengths.len() != frequencies.len()
+            {
+                return Err(AuraError::InvalidValue("dictionary entry count"));
+            }
+            for (entry, _) in &frequencies {
+                ensure_unsigned_width(*entry, entry_width, "dictionary entry")?;
+            }
+            let codes = canonical_huffman_codes(code_lengths)?;
+            let mut bits = 0usize;
+            for (index, (_, count)) in frequencies.iter().enumerate() {
+                let code = codes
+                    .get(index)
+                    .and_then(|code| *code)
+                    .ok_or(AuraError::InvalidValue("huffman code"))?;
+                bits = count
+                    .checked_mul(usize::from(code.bit_len))
+                    .and_then(|n| bits.checked_add(n))
+                    .ok_or(AuraError::InvalidValue("dictionary size"))?;
+            }
+            bitpacked_len(frequencies.len(), entry_width)?
+                .checked_add(bits.div_ceil(8))
+                .ok_or(AuraError::InvalidValue("dictionary size"))
+        }
+        GenericStreamOp::FixedStrideDelta {
+            stride,
+            ref residual_op,
+        } => encoded_i64_op_len(
+            residual_op,
+            &fixed_stride_residuals(values, usize::from(stride))?,
+        ),
+        GenericStreamOp::DeltaOfDelta { ref residual_op } => {
+            encoded_i64_op_len(residual_op, &delta_of_delta_residuals(values)?)
+        }
+        GenericStreamOp::PreviousValueDelta { ref residual_op } => {
+            encoded_i64_op_len(residual_op, &previous_value_residuals(values)?)
+        }
         _ => Ok(encode_i64_op(op, values)?.len()),
     }
+}
+
+fn dictionary_code_bytes(entry_count: usize, value_count: usize, code_width: u8) -> Result<usize> {
+    // Every sorted dictionary entry occurs in the input, so its highest code
+    // must fit. Empty inputs retain the encoder's empty-body behavior.
+    if entry_count != 0 {
+        ensure_unsigned_width((entry_count - 1) as u64, code_width, "dictionary code")?;
+    }
+    bitpacked_len(value_count, code_width)
 }
 
 fn decode_i64_op(
@@ -4234,6 +4348,145 @@ mod tests {
                 encode_i64_op(&op, &values).unwrap().len(),
                 encoded_i64_op_len(&op, &values).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn planner_cost_length_matches_encoded_extremes_and_invalid_values() {
+        let mut state = 0x2a53_74dc_165f_981bu64;
+        for count in [0, 1, 2, 3, 7, 64, 257] {
+            for shape in 0..4 {
+                let values = (0..count)
+                    .map(|index| {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        match shape {
+                            0 => i64::MIN,
+                            1 => {
+                                if index % 2 == 0 {
+                                    i64::MIN
+                                } else {
+                                    i64::MAX
+                                }
+                            }
+                            2 => index as i64 - 100,
+                            _ => state as i64,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let base = values.iter().copied().min().unwrap_or(0);
+                let first = values.first().copied().unwrap_or(0);
+                let runs = if values.is_empty() {
+                    0
+                } else {
+                    1 + values.windows(2).filter(|pair| pair[0] != pair[1]).count()
+                };
+                let exceptions = values.iter().filter(|value| **value != base).count();
+                let entries = values
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                let huffman_width = unsigned_bitpack_width(entries.saturating_sub(1) as u64).max(1);
+                for unit in [0, 1, 2, i64::MAX] {
+                    for width in [0, 1, 8, 63, 64, 65] {
+                        for op in [
+                            GenericStreamOp::FixedStep {
+                                base: first,
+                                step: 0,
+                            },
+                            GenericStreamOp::BaseBitpack {
+                                base,
+                                unit,
+                                bit_width: width,
+                            },
+                            GenericStreamOp::PrevDelta {
+                                base: first,
+                                unit,
+                                bit_width: width,
+                            },
+                            GenericStreamOp::PatchedBitpack {
+                                base,
+                                unit,
+                                low_width: 0,
+                                high_width: width,
+                                exception_count: exceptions as u32,
+                            },
+                            GenericStreamOp::Rle {
+                                base,
+                                unit,
+                                bit_width: width,
+                                run_count: runs as u32,
+                            },
+                            GenericStreamOp::Dictionary {
+                                unit,
+                                entry_count: entries as u32,
+                                code_width: width,
+                            },
+                            GenericStreamOp::PackedDictionary {
+                                base,
+                                unit,
+                                entry_count: entries as u32,
+                                entry_width: width,
+                                code_width: width,
+                            },
+                            GenericStreamOp::HuffmanDictionary {
+                                base,
+                                unit,
+                                entry_count: entries as u32,
+                                entry_width: width,
+                                code_lengths: vec![huffman_width; entries],
+                            },
+                        ] {
+                            let expected = encode_i64_op(&op, &values).map(|body| body.len());
+                            let actual = encoded_i64_op_len(&op, &values);
+                            match (actual, expected) {
+                                (Ok(actual), Ok(expected)) => {
+                                    assert_eq!(actual, expected, "{op:?}")
+                                }
+                                (Err(_), Err(_)) => {}
+                                (actual, expected) => panic!("{op:?}: {actual:?} != {expected:?}"),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dictionary_cost_handles_nested_deltas_and_malformed_codes() {
+        let values = [3, 3, 4, 4, 5, 5, 3];
+        let child = GenericStreamOp::BaseBitpack {
+            base: -100,
+            unit: 1,
+            bit_width: 8,
+        };
+        for op in [
+            GenericStreamOp::PreviousValueDelta {
+                residual_op: Box::new(child.clone()),
+            },
+            GenericStreamOp::DeltaOfDelta {
+                residual_op: Box::new(child.clone()),
+            },
+            GenericStreamOp::FixedStrideDelta {
+                stride: 2,
+                residual_op: Box::new(child),
+            },
+        ] {
+            assert_eq!(
+                encoded_i64_op_len(&op, &values).unwrap(),
+                encode_i64_op(&op, &values).unwrap().len()
+            );
+        }
+        for code_lengths in [vec![1, 1, 1], vec![0, 0, 0], vec![65, 65, 65], vec![1, 2]] {
+            let op = GenericStreamOp::HuffmanDictionary {
+                base: 0,
+                unit: 1,
+                entry_count: 3,
+                entry_width: 3,
+                code_lengths,
+            };
+            assert!(encode_i64_op(&op, &values).is_err());
+            assert!(encoded_i64_op_len(&op, &values).is_err());
         }
     }
 
