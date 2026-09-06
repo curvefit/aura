@@ -113,6 +113,26 @@ restricted-search files: the aggregate Aura increase was about 0.05%, while the
 small Binance snapshot increased 1.98%. Measure complete, verified conversion
 and required restoration metadata on the caller's own data before selecting it.
 
+`I64SearchEffort::Fast` additionally omits bitplane-RLE and delta-of-delta
+candidate trials. It retains previous-value deltas, shared dictionary analysis,
+Zstandard candidates, schema-authorized parent relationships, and exact fallback
+encodings. This avoids complete candidate scans; it does not sample or round
+source values. Full and Bounded keep their previous selection rules, and every
+historical codec remains readable. Fast has no universal percentage size bound;
+compare complete verified archives, including required restoration metadata,
+on representative inputs before choosing this CPU/size tradeoff.
+
+On the four preserved Grimoire venue samples, two order-balanced repetitions
+of complete conversion (including decoding, Parquet restoration/parity and
+required receipt publication) used 29.6% less CPU with Fast. Per-venue archival
+growth was 0.0113% Binance, 0.0001% Bybit, 0% Bitget and 0.0113% OKX. Four-worker
+matched rounds improved 5.10 to 6.60 source GiB/hour (+29.2%), used 24.6% less
+CPU and peaked at 1.9 GiB in the benchmark cgroup. All 64 four-worker conversions
+passed and reproduced their mode's deterministic Aura bytes. These are sample
+measurements, not a bound for other streams or a mixed-workload forecast.
+A separate retained peer window passed full reconstruction for 306,027 events;
+its per-venue CPU reduction was 24.9–35.0% and maximum archival growth 0.0277%.
+
 Bounded preparation also avoids constructing a second flattened copy solely
 for a legacy residual search. It retains the valid stats-derived legacy
 program, the authoritative generic event plan and identical timestamp-run
