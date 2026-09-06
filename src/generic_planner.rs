@@ -39,6 +39,16 @@ pub struct GenericDecodedI64Events {
     pub children: Vec<Vec<Vec<i64>>>,
 }
 
+/// Writer-side search budget. Both choices emit the same self-describing format.
+/// Bounded omits expensive BlockLocal candidate trials; it never omits values,
+/// declared parent relations, direct fallbacks, or decoder validation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum I64SearchEffort {
+    #[default]
+    Full,
+    Bounded,
+}
+
 /// Encode a source-event stream without flattening its boundaries into the
 /// schema. `event_values` use event-scope field order and each child row uses
 /// repeated-scope field order.
@@ -46,6 +56,15 @@ pub fn encode_generic_i64_events(
     schema: &SchemaDescriptor,
     event_values: &[Vec<i64>],
     children: &[Vec<Vec<i64>>],
+) -> Result<GenericEncodedI64Rows> {
+    encode_generic_i64_events_with_search(schema, event_values, children, I64SearchEffort::Full)
+}
+
+pub fn encode_generic_i64_events_with_search(
+    schema: &SchemaDescriptor,
+    event_values: &[Vec<i64>],
+    children: &[Vec<Vec<i64>>],
+    effort: I64SearchEffort,
 ) -> Result<GenericEncodedI64Rows> {
     if event_values.len() != children.len() {
         return Err(AuraError::InvalidValue("event count"));
@@ -97,6 +116,7 @@ pub fn encode_generic_i64_events(
         None,
         child_counts,
         None,
+        effort,
     )?;
     let root_group_id = 0;
     let explicit_group_id = 1;
@@ -125,6 +145,7 @@ pub fn encode_generic_i64_events(
             None,
             values,
             None,
+            effort,
         )?;
         groups.push(GenericGroupInstruction::GroupValueStream {
             group_id: next_group_id,
@@ -168,11 +189,12 @@ pub fn encode_generic_i64_events(
                 &event_slots,
                 &repeated_slots,
             ) {
-                candidates.push(derived_candidate(
+                candidates.push(derived_candidate_with_search(
                     output_slot,
                     op,
                     expression.input_slots.clone(),
                     residuals,
+                    effort,
                 )?);
             }
         }
@@ -193,11 +215,12 @@ pub fn encode_generic_i64_events(
                     .map(|(value, parent)| checked_delta(*value, *parent))
                     .collect::<Result<Vec<_>>>()
                 {
-                    candidates.push(derived_candidate(
+                    candidates.push(derived_candidate_with_search(
                         output_slot,
                         DerivedOp::AddResidual,
                         vec![parent_slot],
                         residuals,
+                        effort,
                     )?);
                 }
                 if let Ok(residuals) = values
@@ -206,11 +229,12 @@ pub fn encode_generic_i64_events(
                     .map(|(value, parent)| checked_delta(*parent, *value))
                     .collect::<Result<Vec<_>>>()
                 {
-                    candidates.push(derived_candidate(
+                    candidates.push(derived_candidate_with_search(
                         output_slot,
                         DerivedOp::SubtractResidual,
                         vec![parent_slot],
                         residuals,
+                        effort,
                     )?);
                 }
             }
@@ -219,7 +243,7 @@ pub fn encode_generic_i64_events(
         // Direct wins exact score ties, but it does not need to be built
         // before schema-authorized candidates. Moving the original values into
         // it last avoids cloning the complete repeated lane.
-        candidates.push(direct_candidate(values)?);
+        candidates.push(direct_candidate_with_search(values, effort)?);
 
         match best_slot_candidate(candidates)? {
             SlotPlanCandidate::Direct {
@@ -232,6 +256,7 @@ pub fn encode_generic_i64_events(
                     Some(output_slot),
                     values,
                     Some(stream_op),
+                    effort,
                 )?;
             }
             SlotPlanCandidate::Derived {
@@ -248,6 +273,7 @@ pub fn encode_generic_i64_events(
                     None,
                     values,
                     Some(stream_op),
+                    effort,
                 )?;
                 groups.push(GenericGroupInstruction::DerivedStream {
                     group_id: next_group_id,
@@ -318,6 +344,7 @@ fn add_explicit_event_stream(
     target_slot: Option<u16>,
     values: Vec<i64>,
     op: Option<GenericStreamOp>,
+    effort: I64SearchEffort,
 ) -> Result<u16> {
     let stream_id = *next_stream_id;
     *next_stream_id = next_stream_id
@@ -328,7 +355,7 @@ fn add_explicit_event_stream(
         target_slot,
         op: match op {
             Some(op) => op,
-            None => choose_i64_op(&values)?,
+            None => choose_i64_op_inner(&values, true, effort)?,
         },
     };
     let value_count = values.len();
@@ -8880,7 +8907,14 @@ fn best_declared_expression_candidate(
 }
 
 fn direct_candidate(values: Vec<i64>) -> Result<SlotPlanCandidate> {
-    let stream_op = choose_i64_op(&values)?;
+    direct_candidate_with_search(values, I64SearchEffort::Full)
+}
+
+fn direct_candidate_with_search(
+    values: Vec<i64>,
+    effort: I64SearchEffort,
+) -> Result<SlotPlanCandidate> {
+    let stream_op = choose_i64_op_inner(&values, true, effort)?;
     Ok(SlotPlanCandidate::Direct {
         score: encoded_i64_score_with_op(&stream_op, &values)?,
         values,
@@ -8894,8 +8928,18 @@ fn derived_candidate(
     input_slots: Vec<u16>,
     values: Vec<i64>,
 ) -> Result<SlotPlanCandidate> {
+    derived_candidate_with_search(output_slot, op, input_slots, values, I64SearchEffort::Full)
+}
+
+fn derived_candidate_with_search(
+    output_slot: u16,
+    op: DerivedOp,
+    input_slots: Vec<u16>,
+    values: Vec<i64>,
+    effort: I64SearchEffort,
+) -> Result<SlotPlanCandidate> {
     let group_score = derived_group_score(output_slot, op, &input_slots)?;
-    let stream_op = choose_i64_op(&values)?;
+    let stream_op = choose_i64_op_inner(&values, true, effort)?;
     Ok(SlotPlanCandidate::Derived {
         score: encoded_i64_score_with_op(&stream_op, &values)?.saturating_add(group_score),
         op,
@@ -9801,10 +9845,14 @@ fn sparse_candidate_better(
 }
 
 fn choose_i64_op(values: &[i64]) -> Result<GenericStreamOp> {
-    choose_i64_op_inner(values, true)
+    choose_i64_op_inner(values, true, I64SearchEffort::Full)
 }
 
-fn choose_i64_op_inner(values: &[i64], allow_composed_delta: bool) -> Result<GenericStreamOp> {
+fn choose_i64_op_inner(
+    values: &[i64],
+    allow_composed_delta: bool,
+    effort: I64SearchEffort,
+) -> Result<GenericStreamOp> {
     let mut candidates = Vec::new();
     if let Some(op) = derive_fixed_step(values)? {
         candidates.push(op);
@@ -9829,7 +9877,7 @@ fn choose_i64_op_inner(values: &[i64], allow_composed_delta: bool) -> Result<Gen
         candidates.push(op);
     }
     for block_size in [16usize, 64, 256, 512, 1024, 2048] {
-        if values.len() >= block_size {
+        if effort == I64SearchEffort::Full && values.len() >= block_size {
             let mode_count = values.len().div_ceil(block_size);
             candidates.push(GenericStreamOp::BlockLocal {
                 block_size: u16::try_from(block_size)
@@ -9841,14 +9889,14 @@ fn choose_i64_op_inner(values: &[i64], allow_composed_delta: bool) -> Result<Gen
     }
     if allow_composed_delta && values.len() > 2 {
         if let Ok(residuals) = previous_value_residuals(values) {
-            if let Ok(residual_op) = choose_i64_op_inner(&residuals, false) {
+            if let Ok(residual_op) = choose_i64_op_inner(&residuals, false, effort) {
                 candidates.push(GenericStreamOp::PreviousValueDelta {
                     residual_op: Box::new(residual_op),
                 });
             }
         }
         if let Ok(residuals) = delta_of_delta_residuals(values) {
-            if let Ok(residual_op) = choose_i64_op_inner(&residuals, false) {
+            if let Ok(residual_op) = choose_i64_op_inner(&residuals, false, effort) {
                 candidates.push(GenericStreamOp::DeltaOfDelta {
                     residual_op: Box::new(residual_op),
                 });
@@ -9901,7 +9949,7 @@ fn choose_i64_op_with_fixed_stride(values: &[i64], stride: u16) -> Result<Generi
     let Ok(residuals) = fixed_stride_residuals(values, usize::from(stride)) else {
         return Ok(direct_op);
     };
-    let Ok(residual_op) = choose_i64_op_inner(&residuals, false) else {
+    let Ok(residual_op) = choose_i64_op_inner(&residuals, false, I64SearchEffort::Full) else {
         return Ok(direct_op);
     };
     let stride_op = GenericStreamOp::FixedStrideDelta {

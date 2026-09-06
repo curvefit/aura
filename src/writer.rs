@@ -340,6 +340,15 @@ impl AuraI64EventWriter {
         records::encode_i64_events_profile(self.into_input(), target_profile)
     }
 
+    /// Seal Aura0 using an explicit per-writer search budget. Decoder work and
+    /// source semantics are identical; Bounded can trade some size for CPU.
+    pub fn finish_aura0_with_search(
+        self,
+        effort: crate::generic_planner::I64SearchEffort,
+    ) -> Result<Vec<u8>> {
+        records::encode_i64_events_profile_with_search(self.into_input(), Profile::Aura0, effort)
+    }
+
     pub fn compile_profile(bytes: &[u8], target_profile: Profile) -> Result<Vec<u8>> {
         compile_i64(bytes, target_profile)
     }

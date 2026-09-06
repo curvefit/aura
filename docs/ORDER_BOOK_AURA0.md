@@ -88,3 +88,27 @@ The same self-contained example is available as
 
 Select the relationship only from declared schema semantics. A name, venue,
 ticker, path, or fixture identifier must never participate in planning.
+
+## Optional bounded encoder search
+
+The default `finish_profile(Profile::Aura0)` behavior is unchanged. A caller
+with a measured CPU constraint can explicitly choose:
+
+```rust
+use aura_codec::generic_planner::I64SearchEffort;
+let aura0 = writer.finish_aura0_with_search(I64SearchEffort::Bounded)?;
+```
+
+`Bounded` omits the six BlockLocal candidate trials in the explicit-event
+planner, including its composed-delta searches. It still compares direct and
+schema-authorized parent residuals with checked arithmetic and a direct
+fallback. All event boundaries, child ordering, values, metadata and null
+representations remain unchanged. It emits ordinary Aura0; no reader change is
+required. Different writers can choose different efforts concurrently, without
+global state. Other profiles reject this option.
+
+This is a CPU/size tradeoff, not a smaller-data schema or a universal size bound.
+On the four retained Grimoire book samples, the PC reproduced the prior
+restricted-search files: the aggregate Aura increase was about 0.05%, while the
+small Binance snapshot increased 1.98%. Measure complete, verified conversion
+and required restoration metadata on the caller's own data before selecting it.
