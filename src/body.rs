@@ -3146,35 +3146,28 @@ fn derive_prev_delta(values: &[i64]) -> Result<Option<GenericStreamOp>> {
     }))
 }
 
-fn derive_patched_bitpack(values: &[i64]) -> Result<GenericStreamOp> {
-    let GenericStreamOp::BaseBitpack {
-        base,
-        unit,
-        bit_width,
-    } = derive_base_bitpack(values)?
-    else {
-        return Err(AuraError::InvalidValue("block local mode"));
-    };
-    let residuals = values
-        .iter()
-        .map(|value| scaled_unsigned_offset(*value, base, unit))
-        .collect::<Result<Vec<_>>>()?;
+/// Fit every existing patch width using exact body costs. Values are checked
+/// and scaled once; the histogram supplies each width's exception count.
+/// The low, exception-index and high lanes are independently byte-padded.
+/// A strict improvement preserves the existing lowest-width tie winner.
+pub(crate) fn fit_patched_bitpack(values: &[i64], base: i64, unit: i64) -> Result<GenericStreamOp> {
+    let mut widths = [0usize; 65];
+    for value in values {
+        let residual = scaled_unsigned_offset(*value, base, unit)?;
+        widths[usize::from(unsigned_bitpack_width(residual))] += 1;
+    }
+    let max_width = widths.iter().rposition(|count| *count != 0).unwrap_or(0) as u8;
+    let mut exception_count = values.len() - widths[0];
     let mut best: Option<(usize, GenericStreamOp)> = None;
-    for low_width in 0..=bit_width {
-        let mut exception_count = 0usize;
-        let mut max_high = 0u64;
-        for residual in &residuals {
-            let high = if low_width == 64 {
-                0
-            } else {
-                *residual >> low_width
-            };
-            if high != 0 {
-                exception_count += 1;
-                max_high = max_high.max(high);
-            }
-        }
-        let high_width = unsigned_bitpack_width(max_high);
+    for low_width in 0..=max_width {
+        let high_width = max_width - low_width;
+        let low_bytes = bitpacked_len(values.len(), low_width)?;
+        let index_bytes = bitpacked_len(exception_count, index_width(values.len()))?;
+        let high_bytes = bitpacked_len(exception_count, high_width)?;
+        let size = low_bytes
+            .checked_add(index_bytes)
+            .and_then(|size| size.checked_add(high_bytes))
+            .ok_or(AuraError::InvalidValue("patched bitpack size"))?;
         let op = GenericStreamOp::PatchedBitpack {
             base,
             unit,
@@ -3183,13 +3176,22 @@ fn derive_patched_bitpack(values: &[i64]) -> Result<GenericStreamOp> {
             exception_count: u32::try_from(exception_count)
                 .map_err(|_| AuraError::InvalidValue("exception count"))?,
         };
-        let size = local_op_header_len(&op) + encoded_i64_op_len(&op, values)?;
         if best.as_ref().is_none_or(|(best_size, _)| size < *best_size) {
             best = Some((size, op));
+        }
+        if low_width < max_width {
+            exception_count -= widths[usize::from(low_width) + 1];
         }
     }
     best.map(|(_, op)| op)
         .ok_or(AuraError::InvalidValue("patched bitpack"))
+}
+
+fn derive_patched_bitpack(values: &[i64]) -> Result<GenericStreamOp> {
+    let GenericStreamOp::BaseBitpack { base, unit, .. } = derive_base_bitpack(values)? else {
+        return Err(AuraError::InvalidValue("patched bitpack"));
+    };
+    fit_patched_bitpack(values, base, unit)
 }
 
 fn derive_rle(values: &[i64]) -> Result<GenericStreamOp> {
@@ -4363,6 +4365,85 @@ mod tests {
             assert_eq!(
                 Err(AuraError::InvalidValue("dictionary entry count")),
                 try_generic_i64_stream_cursor(&instruction, &[], 1).map(|_| ())
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod patched_fit_tests {
+    use super::*;
+
+    #[test]
+    fn histogram_fit_matches_exhaustive_encoded_cost_and_ties() {
+        let mut cases = vec![
+            vec![],
+            vec![0],
+            vec![7; 65],
+            vec![i64::MIN, i64::MAX, 0, -1, 1],
+        ];
+        for bits in 1..64 {
+            let mut values = vec![0; 257];
+            values[0] = 1;
+            values[16] = ((1u64 << bits) - 1) as i64;
+            values[256] = values[16].saturating_sub(1);
+            cases.push(values);
+        }
+        let mut seed = 0x38ad0cb80f1b2193u64;
+        for count in [2, 7, 16, 63, 64, 129] {
+            let values = (0..count)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    seed as i64
+                })
+                .collect();
+            cases.push(values);
+        }
+        for values in cases {
+            let base = values.iter().copied().min().unwrap_or(0);
+            let residuals = values
+                .iter()
+                .map(|v| (i128::from(*v) - i128::from(base)) as u64)
+                .collect::<Vec<_>>();
+            let unit = storage_unit(&residuals);
+            let residuals = values
+                .iter()
+                .map(|v| scaled_unsigned_offset(*v, base, unit).unwrap())
+                .collect::<Vec<_>>();
+            let width = unsigned_bitpack_width(residuals.iter().copied().max().unwrap_or(0));
+            let mut best: Option<(usize, GenericStreamOp)> = None;
+            for low_width in 0..=width {
+                let highs = residuals
+                    .iter()
+                    .map(|v| if low_width == 64 { 0 } else { *v >> low_width })
+                    .filter(|v| *v != 0)
+                    .collect::<Vec<_>>();
+                let high_width = unsigned_bitpack_width(highs.iter().copied().max().unwrap_or(0));
+                let exception_count = highs.len() as u32;
+                let op = GenericStreamOp::PatchedBitpack {
+                    base,
+                    unit,
+                    low_width,
+                    high_width,
+                    exception_count,
+                };
+                let bytes = encode_patched_bitpack(
+                    base,
+                    unit,
+                    low_width,
+                    high_width,
+                    exception_count,
+                    &values,
+                )
+                .unwrap();
+                if best.as_ref().is_none_or(|(size, _)| bytes.len() < *size) {
+                    best = Some((bytes.len(), op));
+                }
+            }
+            assert_eq!(
+                fit_patched_bitpack(&values, base, unit).unwrap(),
+                best.unwrap().1,
+                "values={values:?}"
             );
         }
     }

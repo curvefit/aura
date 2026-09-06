@@ -326,7 +326,10 @@ fn add_explicit_event_stream(
     let instruction = GenericStreamInstruction {
         stream_id,
         target_slot,
-        op: op.unwrap_or(choose_i64_op(&values)?),
+        op: match op {
+            Some(op) => op,
+            None => choose_i64_op(&values)?,
+        },
     };
     let value_count = values.len();
     let body = encode_generic_stream_body(&instruction, &GenericStreamBodyValue::I64(values))?;
@@ -10071,51 +10074,10 @@ fn derive_prev_varint(values: &[i64]) -> Result<Option<GenericStreamOp>> {
 }
 
 fn derive_patched_bitpack(values: &[i64]) -> Result<GenericStreamOp> {
-    let GenericStreamOp::BaseBitpack {
-        base,
-        unit,
-        bit_width,
-    } = derive_base_bitpack(values)?
-    else {
+    let GenericStreamOp::BaseBitpack { base, unit, .. } = derive_base_bitpack(values)? else {
         return Err(AuraError::InvalidValue("patched bitpack"));
     };
-    let residuals = values
-        .iter()
-        .map(|value| scaled_unsigned_offset(*value, base, unit))
-        .collect::<Result<Vec<_>>>()?;
-    let mut best = None;
-    for low_width in 0..=bit_width {
-        let mut exception_count = 0usize;
-        let mut max_high = 0u64;
-        for residual in &residuals {
-            let high = if low_width == 64 {
-                0
-            } else {
-                *residual >> low_width
-            };
-            if high != 0 {
-                exception_count += 1;
-                max_high = max_high.max(high);
-            }
-        }
-        let op = GenericStreamOp::PatchedBitpack {
-            base,
-            unit,
-            low_width,
-            high_width: unsigned_bitpack_width(max_high),
-            exception_count: u32::try_from(exception_count)
-                .map_err(|_| AuraError::InvalidValue("exception count"))?,
-        };
-        let size = encoded_i64_len_with_op(&op, values)?;
-        if best
-            .as_ref()
-            .is_none_or(|(best_size, _): &(usize, GenericStreamOp)| size < *best_size)
-        {
-            best = Some((size, op));
-        }
-    }
-    best.map(|(_, op)| op)
-        .ok_or(AuraError::InvalidValue("patched bitpack"))
+    crate::body::fit_patched_bitpack(values, base, unit)
 }
 
 fn derive_rle(values: &[i64]) -> Result<GenericStreamOp> {
@@ -11829,17 +11791,6 @@ fn unsigned_offsets(values: &[i64], base: i64) -> Result<Vec<u64>> {
             u64::try_from(delta).map_err(|_| AuraError::InvalidValue("unsigned offset"))
         })
         .collect()
-}
-
-fn scaled_unsigned_offset(value: i64, base: i64, unit: i64) -> Result<u64> {
-    if unit <= 0 {
-        return Err(AuraError::InvalidValue("storage unit"));
-    }
-    let delta = i128::from(value) - i128::from(base);
-    if delta < 0 || delta % i128::from(unit) != 0 {
-        return Err(AuraError::InvalidValue("scaled value"));
-    }
-    u64::try_from(delta / i128::from(unit)).map_err(|_| AuraError::InvalidValue("scaled value"))
 }
 
 fn checked_delta(value: i64, base: i64) -> Result<i64> {
