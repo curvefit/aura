@@ -1788,7 +1788,7 @@ where
     Ok(out)
 }
 
-fn encoded_i64_op_len(op: &GenericStreamOp, values: &[i64]) -> Result<usize> {
+pub(crate) fn encoded_i64_op_len(op: &GenericStreamOp, values: &[i64]) -> Result<usize> {
     match *op {
         GenericStreamOp::FixedStep { base, step } => {
             for (index, value) in values.iter().enumerate() {
@@ -4234,6 +4234,83 @@ mod tests {
                 encode_i64_op(&op, &values).unwrap().len(),
                 encoded_i64_op_len(&op, &values).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn planner_cost_length_matches_encoded_extremes_and_invalid_values() {
+        let mut state = 0x2a53_74dc_165f_981bu64;
+        for count in [0, 1, 2, 3, 7, 64, 257] {
+            for shape in 0..4 {
+                let values = (0..count)
+                    .map(|index| {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        match shape {
+                            0 => i64::MIN,
+                            1 => {
+                                if index % 2 == 0 {
+                                    i64::MIN
+                                } else {
+                                    i64::MAX
+                                }
+                            }
+                            2 => index as i64 - 100,
+                            _ => state as i64,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let base = values.iter().copied().min().unwrap_or(0);
+                let first = values.first().copied().unwrap_or(0);
+                let runs = if values.is_empty() {
+                    0
+                } else {
+                    1 + values.windows(2).filter(|pair| pair[0] != pair[1]).count()
+                };
+                let exceptions = values.iter().filter(|value| **value != base).count();
+                for unit in [0, 1, 2, i64::MAX] {
+                    for width in [0, 1, 8, 63, 64, 65] {
+                        for op in [
+                            GenericStreamOp::FixedStep {
+                                base: first,
+                                step: 0,
+                            },
+                            GenericStreamOp::BaseBitpack {
+                                base,
+                                unit,
+                                bit_width: width,
+                            },
+                            GenericStreamOp::PrevDelta {
+                                base: first,
+                                unit,
+                                bit_width: width,
+                            },
+                            GenericStreamOp::PatchedBitpack {
+                                base,
+                                unit,
+                                low_width: 0,
+                                high_width: width,
+                                exception_count: exceptions as u32,
+                            },
+                            GenericStreamOp::Rle {
+                                base,
+                                unit,
+                                bit_width: width,
+                                run_count: runs as u32,
+                            },
+                        ] {
+                            let expected = encode_i64_op(&op, &values).map(|body| body.len());
+                            let actual = encoded_i64_op_len(&op, &values);
+                            match (actual, expected) {
+                                (Ok(actual), Ok(expected)) => {
+                                    assert_eq!(actual, expected, "{op:?}")
+                                }
+                                (Err(_), Err(_)) => {}
+                                (actual, expected) => panic!("{op:?}: {actual:?} != {expected:?}"),
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
