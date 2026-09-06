@@ -9828,17 +9828,7 @@ fn choose_i64_op_inner(values: &[i64], allow_composed_delta: bool) -> Result<Gen
     if let Some(op) = derive_huffman_dictionary(values)? {
         candidates.push(op);
     }
-    for block_size in [16usize, 64, 256, 512, 1024, 2048] {
-        if values.len() >= block_size {
-            let mode_count = values.len().div_ceil(block_size);
-            candidates.push(GenericStreamOp::BlockLocal {
-                block_size: u16::try_from(block_size)
-                    .map_err(|_| AuraError::InvalidValue("block size"))?,
-                mode_count: u32::try_from(mode_count)
-                    .map_err(|_| AuraError::InvalidValue("block count"))?,
-            });
-        }
-    }
+    // Experimental search budget: omit BlockLocal trials; decoding is unchanged.
     if allow_composed_delta && values.len() > 2 {
         if let Ok(residuals) = previous_value_residuals(values) {
             if let Ok(residual_op) = choose_i64_op_inner(&residuals, false) {
