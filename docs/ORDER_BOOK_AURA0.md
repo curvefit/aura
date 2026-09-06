@@ -112,3 +112,10 @@ On the four retained Grimoire book samples, the PC reproduced the prior
 restricted-search files: the aggregate Aura increase was about 0.05%, while the
 small Binance snapshot increased 1.98%. Measure complete, verified conversion
 and required restoration metadata on the caller's own data before selecting it.
+
+Bounded preparation also avoids constructing a second flattened copy solely
+for a legacy residual search. It retains the valid stats-derived legacy
+program, the authoritative generic event plan and identical timestamp-run
+statistics. The ordinary Full path preserves its historical planning and
+bytes. Both public/independent event decoders and conversion through historical
+Aura1 profiles remain checked. No source field or validation step is omitted.
