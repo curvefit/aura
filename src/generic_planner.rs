@@ -39,7 +39,7 @@ pub struct GenericDecodedI64Events {
     pub children: Vec<Vec<Vec<i64>>>,
 }
 
-/// Writer-side search budget. Both choices emit the same self-describing format.
+/// Writer-side search budget. All choices emit the same self-describing format.
 /// Bounded omits expensive BlockLocal candidate trials; it never omits values,
 /// declared parent relations, direct fallbacks, or decoder validation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -47,6 +47,9 @@ pub enum I64SearchEffort {
     #[default]
     Full,
     Bounded,
+    /// Also omit bitplane-RLE and second-delta trials. Encoding stays lossless;
+    /// callers must measure the CPU/size tradeoff on their own streams.
+    Fast,
 }
 
 /// Encode a source-event stream without flattening its boundaries into the
@@ -10119,7 +10122,9 @@ fn choose_i64_op_inner(
         analysis.unit,
     )?);
     candidates.push(analysis.rle()?);
-    candidates.push(analysis.bitplane_rle());
+    if effort != I64SearchEffort::Fast {
+        candidates.push(analysis.bitplane_rle());
+    }
     candidates.extend(analysis.dictionary_ops()?);
     for block_size in [16usize, 64, 256, 512, 1024, 2048] {
         if effort == I64SearchEffort::Full && values.len() >= block_size {
@@ -10140,11 +10145,13 @@ fn choose_i64_op_inner(
                 });
             }
         }
-        if let Ok(residuals) = delta_of_delta_residuals(values) {
-            if let Ok(residual_op) = choose_i64_op_inner(&residuals, false, effort) {
-                candidates.push(GenericStreamOp::DeltaOfDelta {
-                    residual_op: Box::new(residual_op),
-                });
+        if effort != I64SearchEffort::Fast {
+            if let Ok(residuals) = delta_of_delta_residuals(values) {
+                if let Ok(residual_op) = choose_i64_op_inner(&residuals, false, effort) {
+                    candidates.push(GenericStreamOp::DeltaOfDelta {
+                        residual_op: Box::new(residual_op),
+                    });
+                }
             }
         }
     }
@@ -12352,6 +12359,54 @@ mod tests {
                     estimated_bytes: 0,
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn fast_search_keeps_exact_extremes_and_existing_decoder() {
+        let mut cases = vec![
+            vec![],
+            vec![i64::MIN],
+            vec![i64::MAX; 32],
+            (0..6000).map(|n| n * 100_000).collect(),
+            (0..6000).map(|n| (n % 7) * 300).collect(),
+            (0..6000).map(|n| (n / 97) % 13).collect(),
+        ];
+        cases.push(
+            (0..6000)
+                .map(|n| [i64::MIN, i64::MAX, 0, -1, 1][n % 5])
+                .collect(),
+        );
+        fn allowed(op: &GenericStreamOp) {
+            assert!(!matches!(
+                op,
+                GenericStreamOp::BitplaneRle { .. }
+                    | GenericStreamOp::DeltaOfDelta { .. }
+                    | GenericStreamOp::BlockLocal { .. }
+            ));
+            if let GenericStreamOp::PreviousValueDelta { residual_op } = op {
+                allowed(residual_op);
+            }
+        }
+        for values in cases {
+            let op = choose_i64_op_inner(&values, true, I64SearchEffort::Fast).unwrap();
+            allowed(&op);
+            let instruction = GenericStreamInstruction {
+                stream_id: 0,
+                target_slot: None,
+                op,
+            };
+            let body = encode_generic_stream_body(
+                &instruction,
+                &GenericStreamBodyValue::I64(values.clone()),
+            )
+            .unwrap();
+            let GenericStreamBodyValue::I64(decoded) =
+                decode_generic_stream_body(&instruction, &body, values.len()).unwrap()
+            else {
+                panic!("integer output required")
+            };
+            assert_eq!(decoded, values);
         }
     }
 
