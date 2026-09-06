@@ -386,8 +386,8 @@ conversions per variant per round. Independent collectors and durable receipt
 handling kept running; only other post-close encoders paused during this test.
 Control throughput was 3.000/3.021 GiB/hour; shared analysis reached
 4.516/4.496 GiB/hour. Combined throughput rose **3.011 → 4.506 GiB/hour
-(+49.7%)**, and CPU fell **415.40 → 285.65 seconds (−31.2%)**. All 64 Aura
-outputs matched their control sizes/SHA hashes and passed full verification.
+(+49.7%)**, and CPU fell **415.40 → 285.65 seconds (−31.2%)**. All 64 conversions
+produced Aura files matching their control sizes/SHA hashes and passed full verification.
 The test service peaked at 1.8 GiB RAM overall; the per-variant sum of the four
 largest process RSS values was 2,276/2,279 MiB (an upper bound, not simultaneous
 RSS). The committed implementation passed **670 release tests**, with five
