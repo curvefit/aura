@@ -3639,7 +3639,7 @@ fn ensure_signed_width(value: i64, bit_width: u8, name: &'static str) -> Result<
     }
 }
 
-fn bitpacked_len(value_count: usize, bit_width: u8) -> Result<usize> {
+pub(crate) fn bitpacked_len(value_count: usize, bit_width: u8) -> Result<usize> {
     if bit_width > 64 {
         return Err(AuraError::InvalidValue("bit width"));
     }
