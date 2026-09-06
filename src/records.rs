@@ -777,7 +777,14 @@ fn prepare_i64_events_with_search(
         &children,
         effort,
     )?;
-    let rows = flatten_i64_event_parts(&schema, &event_values, &children)?;
+    // The generic event plan already owns the real body. Full preserves the
+    // historical secondary plan byte-for-byte; Bounded needs only its valid
+    // stats-derived fallback, not another full row copy and residual search.
+    let rows = if effort == crate::generic_planner::I64SearchEffort::Full {
+        Some(flatten_i64_event_parts(&schema, &event_values, &children)?)
+    } else {
+        None
+    };
     let mut stats = IngestStats::new_for_schema(&schema)?;
     let event_slots = schema
         .fields
@@ -845,9 +852,33 @@ fn prepare_i64_events_with_search(
     }
     let timestamp_index = timestamp_field_index(&schema);
     if let Some(timestamp_index) = timestamp_index {
-        observe_timestamp_runs(&mut stats, &rows, timestamp_index);
+        if let Some(rows) = &rows {
+            observe_timestamp_runs(&mut stats, rows, timestamp_index);
+        } else {
+            let event_index = event_slots
+                .iter()
+                .position(|slot| usize::from(*slot) == timestamp_index);
+            let child_index = repeated_slots
+                .iter()
+                .position(|slot| usize::from(*slot) == timestamp_index);
+            let times = event_values
+                .iter()
+                .zip(&children)
+                .flat_map(|(values, children)| {
+                    children.iter().map(move |child| {
+                        event_index
+                            .map(|index| values[index])
+                            .or_else(|| child_index.map(|index| child[index]))
+                    })
+                });
+            observe_timestamp_run_values(&mut stats, times);
+        }
     }
-    let aura0_plan = Aura0Plan::from_schema_rows_stats(&schema, &stats, &rows)?;
+    let aura0_plan = if let Some(rows) = &rows {
+        Aura0Plan::from_schema_rows_stats(&schema, &stats, rows)?
+    } else {
+        Aura0Plan::from_schema_stats(&schema, &stats)?
+    };
     let aura1_plan = Aura1Plan::from_stats(&stats, 1);
     let footer = AuraFooter::new(schema.clone(), stats)
         .with_aura0_plan(aura0_plan)
@@ -6078,10 +6109,19 @@ fn timestamp_field_index(schema: &SchemaDescriptor) -> Option<usize> {
 }
 
 fn observe_timestamp_runs(stats: &mut IngestStats, rows: &[Vec<i64>], timestamp_index: usize) {
+    observe_timestamp_run_values(
+        stats,
+        rows.iter().map(|row| row.get(timestamp_index).copied()),
+    );
+}
+
+fn observe_timestamp_run_values(
+    stats: &mut IngestStats,
+    values: impl IntoIterator<Item = Option<i64>>,
+) {
     let mut previous_ts = None;
     let mut run_len = 0u32;
-    for row in rows {
-        let ts = row.get(timestamp_index).copied();
+    for ts in values {
         if ts == previous_ts {
             run_len += 1;
         } else {

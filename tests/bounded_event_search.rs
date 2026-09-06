@@ -72,3 +72,39 @@ fn bounded_does_not_silently_change_other_profiles() {
     );
     assert!(result.is_err());
 }
+
+#[test]
+fn bounded_compiles_through_historical_profiles_and_preserves_empty_events() {
+    let expected = writer().events().to_vec();
+    let bounded = writer()
+        .finish_aura0_with_search(I64SearchEffort::Bounded)
+        .unwrap();
+    let replay = AuraI64EventWriter::compile_profile(&bounded, Profile::Aura1).unwrap();
+    assert_eq!(
+        AuraI64EventReader::open(&replay).unwrap().events(),
+        expected
+    );
+    let back = AuraI64EventWriter::compile_profile(&replay, Profile::Aura0).unwrap();
+    assert_eq!(AuraI64EventReader::open(&back).unwrap().events(), expected);
+    let schema =
+        generic_i64_parent_schema("empty-bounded", &[100, 0, 200, 205, 0, 0, 5, 0]).unwrap();
+    let mut empty = AuraI64EventWriter::new(schema);
+    for _ in 0..3 {
+        empty
+            .push_event(I64Event {
+                event_values: vec![0, 0],
+                children: vec![],
+            })
+            .unwrap();
+    }
+    let bytes = empty
+        .finish_aura0_with_search(I64SearchEffort::Bounded)
+        .unwrap();
+    assert_eq!(
+        aura_codec::records::decode_i64_events_file(&bytes)
+            .unwrap()
+            .events
+            .len(),
+        3
+    );
+}
