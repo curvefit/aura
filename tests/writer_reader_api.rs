@@ -387,3 +387,38 @@ fn writer_header_schema_map_matches_current_emitted_dialect() {
     assert_eq!(parent_map, decoded.header.schema_mapping.as_slice());
     assert_eq!(Profile::Ingest, decoded.header.profile);
 }
+#[test]
+fn signed_minimum_values_remain_encodable_in_explicit_events() {
+    use aura_codec::generic_planner::I64SearchEffort;
+    use aura_codec::{generic_i64_parent_schema, AuraI64EventReader, AuraI64EventWriter, I64Event};
+    for values in [
+        vec![i64::MIN, i64::MIN],
+        vec![0, i64::MIN],
+        vec![i64::MIN, 0, i64::MIN],
+    ] {
+        for effort in [I64SearchEffort::Full, I64SearchEffort::Bounded] {
+            let schema = generic_i64_parent_schema(
+                "signed-minimum-events",
+                &[100, 0, 200, 205, 0, 0, 5, 0, 0],
+            )
+            .unwrap();
+            let events = values
+                .iter()
+                .copied()
+                .map(|value| I64Event {
+                    event_values: vec![1000, 1, value],
+                    children: vec![vec![0, 100, 20, 19, 1]],
+                })
+                .collect::<Vec<_>>();
+            let mut writer = AuraI64EventWriter::new(schema);
+            for event in &events {
+                writer.push_event(event.clone()).unwrap();
+            }
+            let bytes = writer.finish_aura0_with_search(effort).unwrap();
+            let public = AuraI64EventReader::open(&bytes).unwrap();
+            let independent = aura_codec::records::decode_i64_events_file(&bytes).unwrap();
+            assert_eq!(public.events(), events);
+            assert_eq!(independent.events, events);
+        }
+    }
+}

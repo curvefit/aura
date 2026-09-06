@@ -11921,7 +11921,9 @@ fn signed_gcd_unit(values: &[i64]) -> i64 {
         };
         out = if out == 0 { abs } else { gcd(out, abs) };
     }
-    i64::try_from(out.max(1)).unwrap_or(i64::MAX)
+    // abs(i64::MIN) is 2^63. Clamping that GCD to i64::MAX
+    // invents a non-divisor; unit one remains exact and representable.
+    i64::try_from(out.max(1)).unwrap_or(1)
 }
 
 fn gcd_unit(values: &[u64]) -> u64 {
