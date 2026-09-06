@@ -326,7 +326,10 @@ fn add_explicit_event_stream(
     let instruction = GenericStreamInstruction {
         stream_id,
         target_slot,
-        op: op.unwrap_or(choose_i64_op(&values)?),
+        op: match op {
+            Some(op) => op,
+            None => choose_i64_op(&values)?,
+        },
     };
     let value_count = values.len();
     let body = encode_generic_stream_body(&instruction, &GenericStreamBodyValue::I64(values))?;
