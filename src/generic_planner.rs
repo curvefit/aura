@@ -9848,7 +9848,339 @@ fn choose_i64_op(values: &[i64]) -> Result<GenericStreamOp> {
     choose_i64_op_inner(values, true, I64SearchEffort::Full)
 }
 
+/// Analysis is tied to one immutable constructed integer stream. Raw-value
+/// scaling and base-relative scaling have distinct GCDs. No codec is excluded
+/// by dictionary cardinality: the scratch vectors retain existing SDK bounds.
+struct I64FieldAnalysis<'a> {
+    values: &'a [i64],
+    base: i64,
+    unit: i64,
+    width: u8,
+    signed_unit: i64,
+    runs: usize,
+    run_length_bytes: usize,
+    dictionary: Option<(Vec<i64>, Vec<u64>)>,
+}
+
+impl<'a> I64FieldAnalysis<'a> {
+    fn new(values: &'a [i64]) -> Result<Self> {
+        let first = values.first().copied().unwrap_or(0);
+        let (mut base, mut max) = (first, first);
+        let (mut offset_gcd, mut value_gcd) = (0u64, 0u64);
+        let (mut runs, mut run_length, mut run_length_bytes) = (0usize, 0usize, 0usize);
+        let mut previous = first;
+        for value in values.iter().copied() {
+            base = base.min(value);
+            max = max.max(value);
+            if offset_gcd != 1 {
+                let difference = (i128::from(value) - i128::from(first)).unsigned_abs() as u64;
+                offset_gcd = gcd(offset_gcd, difference);
+            }
+            if value_gcd != 1 {
+                value_gcd = gcd(value_gcd, value.unsigned_abs());
+            }
+            if run_length != 0 && value != previous {
+                run_length_bytes += usize::from(varint_len_u64(run_length as u64));
+                run_length = 0;
+            }
+            if run_length == 0 {
+                runs += 1;
+            }
+            run_length += 1;
+            previous = value;
+        }
+        if run_length != 0 {
+            run_length_bytes += usize::from(varint_len_u64(run_length as u64));
+        }
+        // The GCD of differences from any member equals the GCD of offsets
+        // from the minimum, including differences spanning the full i64 range.
+        let unit = i64::try_from(offset_gcd.max(1)).unwrap_or(1);
+        let signed_unit = i64::try_from(value_gcd.max(1)).unwrap_or(1);
+        let span = (i128::from(max) - i128::from(base)) as u64;
+        let width = unsigned_bitpack_width(span / unit as u64);
+        let dictionary = if values.len() <= 1 {
+            None
+        } else if runs == 1 {
+            Some((vec![first], vec![values.len() as u64]))
+        } else {
+            // Sort original values once. Both positive affine scaling domains
+            // preserve their order, cardinality and symbol frequencies.
+            let mut entries = values.to_vec();
+            entries.sort_unstable();
+            if entries.windows(2).all(|pair| pair[0] != pair[1]) {
+                None
+            } else {
+                let mut frequencies = Vec::new();
+                let mut unique = 0;
+                for index in 0..entries.len() {
+                    let value = entries[index];
+                    if unique == 0 || value != entries[unique - 1] {
+                        entries[unique] = value;
+                        unique += 1;
+                        frequencies.push(1u64);
+                    } else {
+                        frequencies[unique - 1] += 1;
+                    }
+                }
+                entries.truncate(unique);
+                entries.shrink_to_fit();
+                Some((entries, frequencies))
+            }
+        };
+        Ok(Self {
+            values,
+            base,
+            unit,
+            width,
+            signed_unit,
+            runs,
+            run_length_bytes,
+            dictionary,
+        })
+    }
+
+    fn base_bitpack(&self) -> GenericStreamOp {
+        GenericStreamOp::BaseBitpack {
+            base: self.base,
+            unit: self.unit,
+            bit_width: self.width,
+        }
+    }
+    fn rle(&self) -> Result<GenericStreamOp> {
+        Ok(GenericStreamOp::Rle {
+            base: self.base,
+            unit: self.unit,
+            bit_width: self.width,
+            run_count: u32::try_from(self.runs)
+                .map_err(|_| AuraError::InvalidValue("run count"))?,
+        })
+    }
+    fn bitplane_rle(&self) -> GenericStreamOp {
+        GenericStreamOp::BitplaneRle {
+            base: self.base,
+            unit: self.unit,
+            bit_width: self.width,
+        }
+    }
+    fn dictionary_ops(&self) -> Result<Vec<GenericStreamOp>> {
+        let Some((entries, frequencies)) = &self.dictionary else {
+            return Ok(Vec::new());
+        };
+        let entry_count = u32::try_from(entries.len())
+            .map_err(|_| AuraError::InvalidValue("dictionary entry count"))?;
+        let code_width = unsigned_bitpack_width(entries.len().saturating_sub(1) as u64);
+        let mut ops = vec![
+            GenericStreamOp::Dictionary {
+                unit: self.signed_unit,
+                entry_count,
+                code_width,
+            },
+            GenericStreamOp::PackedDictionary {
+                base: self.base,
+                unit: self.unit,
+                entry_count,
+                entry_width: self.width,
+                code_width,
+            },
+        ];
+        if entries.len() > 1 {
+            ops.push(GenericStreamOp::HuffmanDictionary {
+                base: self.base,
+                unit: self.unit,
+                entry_count,
+                entry_width: self.width,
+                code_lengths: huffman_code_lengths(frequencies)?,
+            });
+        }
+        Ok(ops)
+    }
+    fn zstd_varint(&self) -> Result<GenericStreamOp> {
+        let raw_len = self.values.iter().try_fold(0u64, |len, value| {
+            len.checked_add(u64::from(varint_len_u64(varint::zigzag_encode(
+                *value / self.signed_unit,
+            ))))
+            .ok_or(AuraError::InvalidValue("zstd varint raw length"))
+        })?;
+        Ok(GenericStreamOp::ZstdVarint {
+            unit: self.signed_unit,
+            raw_len,
+        })
+    }
+    fn score(&self, op: &GenericStreamOp) -> Result<usize> {
+        // These candidates were derived from this borrowed stream. Other
+        // operations retain the existing independently validating cost path.
+        let body = match op {
+            GenericStreamOp::BaseBitpack {
+                base,
+                unit,
+                bit_width,
+            } if (*base, *unit, *bit_width) == (self.base, self.unit, self.width) => {
+                crate::body::bitpacked_len(self.values.len(), self.width)?
+            }
+            GenericStreamOp::Rle {
+                base,
+                unit,
+                bit_width,
+                run_count,
+            } if (*base, *unit, *bit_width, *run_count as usize)
+                == (self.base, self.unit, self.width, self.runs) =>
+            {
+                crate::body::bitpacked_len(self.runs, self.width)? + self.run_length_bytes
+            }
+            GenericStreamOp::Dictionary {
+                unit,
+                entry_count,
+                code_width,
+            } if *unit == self.signed_unit
+                && self
+                    .dictionary
+                    .as_ref()
+                    .is_some_and(|d| d.0.len() == *entry_count as usize)
+                && *code_width
+                    == unsigned_bitpack_width(u64::from(entry_count.saturating_sub(1))) =>
+            {
+                let entries = &self.dictionary.as_ref().unwrap().0;
+                let entry_bytes = entries
+                    .iter()
+                    .map(|v| {
+                        usize::from(varint_len_u64(varint::zigzag_encode(*v / self.signed_unit)))
+                    })
+                    .sum::<usize>();
+                entry_bytes + crate::body::bitpacked_len(self.values.len(), *code_width)?
+            }
+            GenericStreamOp::PackedDictionary {
+                base,
+                unit,
+                entry_count,
+                entry_width,
+                code_width,
+            } if (*base, *unit, *entry_width) == (self.base, self.unit, self.width)
+                && self
+                    .dictionary
+                    .as_ref()
+                    .is_some_and(|d| d.0.len() == *entry_count as usize)
+                && *code_width
+                    == unsigned_bitpack_width(u64::from(entry_count.saturating_sub(1))) =>
+            {
+                crate::body::bitpacked_len(*entry_count as usize, *entry_width)?
+                    + crate::body::bitpacked_len(self.values.len(), *code_width)?
+            }
+            GenericStreamOp::HuffmanDictionary {
+                base,
+                unit,
+                entry_count,
+                entry_width,
+                code_lengths,
+            } if (*base, *unit, *entry_width) == (self.base, self.unit, self.width)
+                && self
+                    .dictionary
+                    .as_ref()
+                    .is_some_and(|d| d.0.len() == *entry_count as usize)
+                && code_lengths.len() == *entry_count as usize =>
+            {
+                let frequencies = &self.dictionary.as_ref().unwrap().1;
+                let bits = frequencies.iter().zip(code_lengths).try_fold(
+                    0usize,
+                    |sum, (count, width)| {
+                        (*count as usize)
+                            .checked_mul(usize::from(*width))
+                            .and_then(|n| sum.checked_add(n))
+                            .ok_or(AuraError::InvalidValue("dictionary size"))
+                    },
+                )?;
+                crate::body::bitpacked_len(*entry_count as usize, *entry_width)? + bits.div_ceil(8)
+            }
+            _ => encoded_i64_len_with_op(op, self.values)?,
+        };
+        Ok(body + op.encoded_len()?)
+    }
+}
+
 fn choose_i64_op_inner(
+    values: &[i64],
+    allow_composed_delta: bool,
+    effort: I64SearchEffort,
+) -> Result<GenericStreamOp> {
+    let analysis = I64FieldAnalysis::new(values)?;
+    let mut candidates = Vec::new();
+    if let Some(op) = derive_fixed_step(values)? {
+        candidates.push(op);
+    }
+    candidates.push(analysis.base_bitpack());
+    if let Some(op) = derive_prev_delta(values)? {
+        candidates.push(op);
+    }
+    if let Some(op) = derive_prev_varint(values)? {
+        candidates.push(op);
+    }
+    candidates.push(crate::body::fit_patched_bitpack(
+        values,
+        analysis.base,
+        analysis.unit,
+    )?);
+    candidates.push(analysis.rle()?);
+    candidates.push(analysis.bitplane_rle());
+    candidates.extend(analysis.dictionary_ops()?);
+    for block_size in [16usize, 64, 256, 512, 1024, 2048] {
+        if effort == I64SearchEffort::Full && values.len() >= block_size {
+            let mode_count = values.len().div_ceil(block_size);
+            candidates.push(GenericStreamOp::BlockLocal {
+                block_size: u16::try_from(block_size)
+                    .map_err(|_| AuraError::InvalidValue("block size"))?,
+                mode_count: u32::try_from(mode_count)
+                    .map_err(|_| AuraError::InvalidValue("block count"))?,
+            });
+        }
+    }
+    if allow_composed_delta && values.len() > 2 {
+        if let Ok(residuals) = previous_value_residuals(values) {
+            if let Ok(residual_op) = choose_i64_op_inner(&residuals, false, effort) {
+                candidates.push(GenericStreamOp::PreviousValueDelta {
+                    residual_op: Box::new(residual_op),
+                });
+            }
+        }
+        if let Ok(residuals) = delta_of_delta_residuals(values) {
+            if let Ok(residual_op) = choose_i64_op_inner(&residuals, false, effort) {
+                candidates.push(GenericStreamOp::DeltaOfDelta {
+                    residual_op: Box::new(residual_op),
+                });
+            }
+        }
+    }
+    let mut scored = candidates
+        .into_iter()
+        .map(|op| {
+            let size = analysis.score(&op)?;
+            Ok((size, op_preference(&op), op))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let best_size = scored
+        .iter()
+        .map(|(size, _, _)| *size)
+        .min()
+        .ok_or(AuraError::InvalidValue("stream op"))?;
+    if best_size < 1_024 {
+        return scored
+            .into_iter()
+            .min_by_key(|(size, preference, _)| (*size, *preference))
+            .map(|(_, _, op)| op)
+            .ok_or(AuraError::InvalidValue("stream op"));
+    }
+    let zstd_op = analysis.zstd_varint()?;
+    let zstd_size = analysis.score(&zstd_op)?;
+    if zstd_varint_meaningfully_wins(zstd_size, best_size) {
+        scored.push((zstd_size, op_preference(&zstd_op), zstd_op));
+    }
+    scored
+        .into_iter()
+        .min_by_key(|(size, preference, _)| (*size, *preference))
+        .map(|(_, _, op)| op)
+        .ok_or(AuraError::InvalidValue("stream op"))
+}
+
+#[cfg(test)]
+fn reference_choose_i64_op_inner(
     values: &[i64],
     allow_composed_delta: bool,
     effort: I64SearchEffort,
@@ -9889,14 +10221,14 @@ fn choose_i64_op_inner(
     }
     if allow_composed_delta && values.len() > 2 {
         if let Ok(residuals) = previous_value_residuals(values) {
-            if let Ok(residual_op) = choose_i64_op_inner(&residuals, false, effort) {
+            if let Ok(residual_op) = reference_choose_i64_op_inner(&residuals, false, effort) {
                 candidates.push(GenericStreamOp::PreviousValueDelta {
                     residual_op: Box::new(residual_op),
                 });
             }
         }
         if let Ok(residuals) = delta_of_delta_residuals(values) {
-            if let Ok(residual_op) = choose_i64_op_inner(&residuals, false, effort) {
+            if let Ok(residual_op) = reference_choose_i64_op_inner(&residuals, false, effort) {
                 candidates.push(GenericStreamOp::DeltaOfDelta {
                     residual_op: Box::new(residual_op),
                 });
@@ -10002,6 +10334,7 @@ fn op_preference(op: &GenericStreamOp) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn derive_zstd_varint(values: &[i64]) -> Result<GenericStreamOp> {
     let candidate_unit = signed_gcd_unit(values);
     let unit = if candidate_unit > 0
@@ -10056,6 +10389,7 @@ fn derive_fixed_step(values: &[i64]) -> Result<Option<GenericStreamOp>> {
     Ok(Some(GenericStreamOp::FixedStep { base, step }))
 }
 
+#[cfg(test)]
 fn derive_base_bitpack(values: &[i64]) -> Result<GenericStreamOp> {
     let base = values.iter().copied().min().unwrap_or(0);
     let residuals = unsigned_offsets(values, base)?;
@@ -10116,6 +10450,7 @@ fn derive_prev_varint(values: &[i64]) -> Result<Option<GenericStreamOp>> {
     }))
 }
 
+#[cfg(test)]
 fn derive_patched_bitpack(values: &[i64]) -> Result<GenericStreamOp> {
     let GenericStreamOp::BaseBitpack { base, unit, .. } = derive_base_bitpack(values)? else {
         return Err(AuraError::InvalidValue("patched bitpack"));
@@ -10123,6 +10458,7 @@ fn derive_patched_bitpack(values: &[i64]) -> Result<GenericStreamOp> {
     crate::body::fit_patched_bitpack(values, base, unit)
 }
 
+#[cfg(test)]
 fn derive_rle(values: &[i64]) -> Result<GenericStreamOp> {
     let base = values.iter().copied().min().unwrap_or(0);
     let residuals = unsigned_offsets(values, base)?;
@@ -10140,6 +10476,7 @@ fn derive_rle(values: &[i64]) -> Result<GenericStreamOp> {
     })
 }
 
+#[cfg(test)]
 fn derive_bitplane_rle(values: &[i64]) -> Result<GenericStreamOp> {
     let base = values.iter().copied().min().unwrap_or(0);
     let residuals = unsigned_offsets(values, base)?;
@@ -10156,6 +10493,7 @@ fn derive_bitplane_rle(values: &[i64]) -> Result<GenericStreamOp> {
     })
 }
 
+#[cfg(test)]
 fn derive_dictionary(values: &[i64]) -> Result<Option<GenericStreamOp>> {
     if values.is_empty() {
         return Ok(None);
@@ -10176,6 +10514,7 @@ fn derive_dictionary(values: &[i64]) -> Result<Option<GenericStreamOp>> {
     }))
 }
 
+#[cfg(test)]
 fn derive_packed_dictionary(values: &[i64]) -> Result<Option<GenericStreamOp>> {
     if values.is_empty() {
         return Ok(None);
@@ -10205,6 +10544,7 @@ fn derive_packed_dictionary(values: &[i64]) -> Result<Option<GenericStreamOp>> {
     }))
 }
 
+#[cfg(test)]
 fn derive_huffman_dictionary(values: &[i64]) -> Result<Option<GenericStreamOp>> {
     if values.is_empty() {
         return Ok(None);
@@ -11823,6 +12163,7 @@ fn same_slots_from_columns(
     Ok(true)
 }
 
+#[cfg(test)]
 fn unsigned_offsets(values: &[i64], base: i64) -> Result<Vec<u64>> {
     values
         .iter()
@@ -11926,6 +12267,7 @@ fn signed_gcd_unit(values: &[i64]) -> i64 {
     i64::try_from(out.max(1)).unwrap_or(1)
 }
 
+#[cfg(test)]
 fn gcd_unit(values: &[u64]) -> u64 {
     let mut out = 0u64;
     for value in values.iter().copied().filter(|value| *value != 0) {
@@ -11934,6 +12276,7 @@ fn gcd_unit(values: &[u64]) -> u64 {
     out.max(1)
 }
 
+#[cfg(test)]
 fn storage_unit(values: &[u64]) -> i64 {
     let unit = gcd_unit(values);
     i64::try_from(unit).unwrap_or(1)
@@ -11948,6 +12291,7 @@ fn gcd(mut left: u64, mut right: u64) -> u64 {
     left
 }
 
+#[cfg(test)]
 fn run_count<T: Eq>(values: &[T]) -> usize {
     let Some(first) = values.first() else {
         return 0;
@@ -12008,6 +12352,67 @@ mod tests {
                     estimated_bytes: 0,
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn shared_field_analysis_preserves_candidates_and_exact_sizes() {
+        let mut cases = vec![
+            vec![],
+            vec![0],
+            vec![i64::MIN],
+            vec![i64::MAX],
+            vec![0; 24],
+            vec![i64::MIN; 24],
+            vec![i64::MAX; 24],
+            vec![i64::MIN, 0, i64::MIN, 0],
+            vec![i64::MIN, i64::MAX, 0, i64::MIN, i64::MAX, 0],
+            vec![12, 18, 12, 24, 18, 12, 24, 12],
+            vec![-18, -12, -18, 6, -12, 6, -18],
+            (0..96)
+                .map(|v| 1_700_000_000_000_000_000i64 + v * 1_000_000)
+                .collect(),
+        ];
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for count in [2, 3, 16, 63, 64, 129] {
+            for unit in [1i64, 7, 1000] {
+                let mut values = Vec::new();
+                for _ in 0..count {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    values.push(((seed >> 32) as i64 % 31 - 15) * unit);
+                }
+                cases.push(values);
+            }
+        }
+        // Cardinality exceeds a small dictionary cache, while repeated values
+        // remain eligible under the original rules.
+        cases.push((0..8200).map(|v| i64::from(v % 4100) * 7).collect());
+        for values in cases {
+            let analysis = I64FieldAnalysis::new(&values).unwrap();
+            let mut ops = vec![
+                analysis.base_bitpack(),
+                analysis.rle().unwrap(),
+                analysis.bitplane_rle(),
+            ];
+            ops.extend(analysis.dictionary_ops().unwrap());
+            for op in ops {
+                assert_eq!(
+                    analysis.score(&op).unwrap(),
+                    encoded_i64_score_with_op(&op, &values).unwrap(),
+                    "cost mismatch: {op:?}"
+                );
+            }
+            for effort in [I64SearchEffort::Bounded, I64SearchEffort::Full] {
+                if effort == I64SearchEffort::Full && values.len() > 256 {
+                    continue;
+                }
+                assert_eq!(
+                    choose_i64_op_inner(&values, true, effort).unwrap(),
+                    reference_choose_i64_op_inner(&values, true, effort).unwrap(),
+                    "selection changed: count={}, effort={effort:?}",
+                    values.len()
+                );
+            }
         }
     }
 

@@ -342,3 +342,41 @@ callback pull selected field values from the batch view.
 Do not compare grouped replay directly to row replay unless the callback
 semantics are labeled: grouped replay invokes one callback per consecutive run,
 not one callback per row.
+
+## Shared integer-field analysis (PC, 2026-09-06)
+
+A constructed integer stream now owns one borrowed analysis for range, raw-value
+and base-relative GCD units, run lengths, sorted dictionary entries and symbol
+frequencies. Candidate construction and exact costing reuse it. Dictionary
+cardinality does not remove candidates; scratch remains bounded by the existing
+stream limits. Constant streams avoid sorting, and the old selector exists only
+in tests as a decision oracle. Codec preference, search effort, wire format,
+selected-body encoding and both decoders are unchanged.
+
+On a Ryzen 7 5800X, a fresh optimized-build profile attributed 2.73 of 6.34 SDK
+seconds for the Binance shard to dictionary construction/costing. Selected-body
+encoding took 0.09 seconds. The improvement removes repeated scans, scaled
+vectors, sorts and frequency reconstruction; it does not move them into network
+receipt handling. Analysis belongs to the exact constructed stream, including
+its existing placeholders and event/kind partitions. No VPS hints are used.
+
+A matched uninstrumented comparison alternated control/candidate order over two
+repetitions of four preserved Parquet shards: 313,815 events and 2,363,562 levels
+per repetition. One single-thread encoder ran alongside independent capture
+and other bounded home work. Timing includes Parquet decoding, planning,
+encoding, both Aura decoders, complete Parquet restoration/parity and durable
+receipt publication. Every output Aura size/SHA matched the control.
+
+| Venue | Wall seconds, control → shared | CPU seconds | Peak RSS MiB | Full archival saving, unchanged |
+| --- | ---: | ---: | ---: | ---: |
+| Binance | 14.66 → 11.66 | 13.55 → 10.40 | 569.3 → 570.5 | 47.30% |
+| Bybit | 13.81 → 10.43 | 12.77 → 9.62 | 449.7 → 450.3 | 29.08% |
+| Bitget | 9.38 → 7.59 | 8.92 → 7.15 | 406.1 → 406.6 | 31.33% |
+| OKX | 11.75 → 9.95 | 11.14 → 9.21 | 434.2 → 434.7 | 45.40% |
+
+Combined verified throughput was 0.901 → 1.128 source GiB/hour (+25.2%);
+CPU fell 92.75 → 72.76 seconds (−21.6%). Savings include mandatory receipts.
+These are matched results under that background load, not comparisons with
+older timing sessions. Bitplane scoring, delta buffers and the separate footer
+statistics pass remain possible later targets. Four-thread saturation and the
+complete release/Clippy gates are separate checks before deployment.
