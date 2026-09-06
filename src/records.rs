@@ -538,6 +538,21 @@ pub fn encode_i64_events_profile(
     input: I64EventFileInput,
     target_profile: Profile,
 ) -> Result<Vec<u8>> {
+    encode_i64_events_profile_with_search(
+        input,
+        target_profile,
+        crate::generic_planner::I64SearchEffort::Full,
+    )
+}
+
+pub fn encode_i64_events_profile_with_search(
+    input: I64EventFileInput,
+    target_profile: Profile,
+    effort: crate::generic_planner::I64SearchEffort,
+) -> Result<Vec<u8>> {
+    if effort != crate::generic_planner::I64SearchEffort::Full && target_profile != Profile::Aura0 {
+        return Err(AuraError::InvalidValue("bounded search requires Aura0"));
+    }
     match target_profile {
         Profile::Ingest => encode_ingest_i64_events_file_inner(input),
         Profile::Aura0 => {
@@ -550,7 +565,7 @@ pub fn encode_i64_events_profile(
                     .ok_or(AuraError::InvalidValue("record count"))
             })?;
             validate_direct_i64_event_profile_limits(&input.schema, record_count, 0)?;
-            let prepared = prepare_i64_events(input)?;
+            let prepared = prepare_i64_events_with_search(input, effort)?;
             validate_direct_i64_event_profile_limits(
                 &prepared.footer.schema,
                 record_count,
@@ -730,6 +745,13 @@ struct PreparedI64Events {
 }
 
 fn prepare_i64_events(input: I64EventFileInput) -> Result<PreparedI64Events> {
+    prepare_i64_events_with_search(input, crate::generic_planner::I64SearchEffort::Full)
+}
+
+fn prepare_i64_events_with_search(
+    input: I64EventFileInput,
+    effort: crate::generic_planner::I64SearchEffort,
+) -> Result<PreparedI64Events> {
     let I64EventFileInput {
         schema,
         events,
@@ -749,7 +771,12 @@ fn prepare_i64_events(input: I64EventFileInput) -> Result<PreparedI64Events> {
         event_values.push(event.event_values);
         children.push(event.children);
     }
-    let encoded = encode_generic_i64_events(&schema, &event_values, &children)?;
+    let encoded = crate::generic_planner::encode_generic_i64_events_with_search(
+        &schema,
+        &event_values,
+        &children,
+        effort,
+    )?;
     let rows = flatten_i64_event_parts(&schema, &event_values, &children)?;
     let mut stats = IngestStats::new_for_schema(&schema)?;
     let event_slots = schema
