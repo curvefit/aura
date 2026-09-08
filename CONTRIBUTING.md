@@ -17,7 +17,7 @@ checks. Cargo needs registry access once, or a populated dependency cache for
 ```bash
 cargo build --locked --release --lib --bins --examples -j 2
 bash scripts/check-onboarding.sh
-cargo test --locked -j 2 -- --test-threads=2
+cargo test --locked -j 2 -- --test-threads=1
 cargo clippy --locked --all-targets -j 2 -- -D warnings
 cargo fmt --all -- --check
 cargo package --locked --list
