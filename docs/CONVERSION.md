@@ -28,7 +28,13 @@ Supported V2 conversions:
 - byte-lane codec and lane selection for Aura0 profiles that support byte lanes
 - verification by decoding the output and comparing rows with the input
 
-The conversion API builds and exposes the same schema-derived plan used by the writer and reader. Verification is off by default. Unsupported source formats, target formats, schemas, and byte-lane requests return `AuraError` instead of falling back silently.
+The conversion API uses the same V2 schema and compiled conversion paths as the
+writer and reader, but it does not expose a `CompiledAuraPlan` in
+`ConversionSummary`. The current helper buffers the complete input and output;
+`record_count`, `output_bytes`, `schema_hash`, and `verified` summarize the
+operation. Verification is off by default. Unsupported source formats, target
+formats, schemas, and byte-lane requests return `AuraError` instead of falling
+back silently.
 
 The explicit V3 flat, grouped, and planned Aura0 files are outside this V2
 conversion matrix. They carry their own V3 header/footer and schema contracts;

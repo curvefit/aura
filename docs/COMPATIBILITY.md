@@ -3,6 +3,10 @@
 The current format version is checked during footer decode. Unsupported versions
 return an error instead of falling back silently.
 
+`LegacyV1` is recognized for historical front-header parsing only. This crate
+has no supported complete V1 container/footer read or write contract; recognition
+of its header does not imply a successful complete-file decode.
+
 Current production and default SDK writers emit complete V2 containers. V3 has
 two complete, explicitly selected, uncompressed Aura0 SDK compatibility
 subsets: flat event-only `AURAV3VB` exact-value blocks, and grouped exact-event
@@ -41,7 +45,7 @@ Its 32-bit schema ID is only a routing hint; a SHA-256 fingerprint of the
 canonical tag-4 schema is the strong binding. It is not a container or
 conversion target. Version 1 supports flat event-scoped schemas only and
 rejects repeated fields/groups rather than flattening child rows. V2 schema encode/decode and
-every current ingest/compiled writer path reject field codes 12
+V2 ingest/compiled writer paths reject field codes 12
 (`TimestampMs`), 13 (`Utf8`), and 14 (`DecimalText`). Codes 1 through 11 and all
 checked-in V2 fixture bytes/hashes remain unchanged. Adding the reference block
 does not by itself permit a V3 writer, stamp, restamp, or profile conversion.
@@ -261,9 +265,11 @@ continuity with existing benchmark output.
 
 ## Generated Fixture Coverage
 
-`aura-fixture-gen` produces current-format tiny, dense/few-symbol,
-sparse/many-symbol, nohuff, and larger fixture pairs plus `.aura1.zst`
-baselines. The generated `huff` entry is intentionally blocked rather than
+`aura-fixture-gen` produces current-format fixture pairs plus `.aura1.zst`
+baselines. Coverage includes tiny, dense/sparse, reordered/wide/edge-case SDK,
+repeated-key, high-cardinality, nohuff, and larger inputs. `fixtures.json` is
+the generated inventory; `tiny` (16-row OHLCV) and `sdk-tiny` (4-row SDK) are
+distinct datasets. The generated `huff` entry is intentionally blocked rather than
 silently mislabeled: the current public writer/planner did not select a
 `HuffmanDictionary` stream for generated rows under the 2x Huffman speed gate.
 Use the external `grimoire-50mb-huff` artifact for Huffman-heavy benchmarking

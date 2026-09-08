@@ -1,13 +1,18 @@
 # Conversion flow
 
+This is historical architecture rationale. The maintained V2 conversion API is
+documented in [CONVERSION.md](CONVERSION.md); the current helper is an
+all-memory operation that buffers and re-encodes its input.
+
 `.aura` ingest files are the canonical compile source because they keep the
 logical stream plus seal-time stats and stamped physical plans. `.aura0` and
 `.aura1` are compiled from the same stamped `.aura` into code-only field
 programs.
 
-The Rust crate's intended API boundary is `writer` for sealing/compiling and
-`reader` for decoding. The older `records::*` helpers remain compatibility
-aliases over those facades.
+The Rust crate's public API boundary is `writer` for sealing/compiling and
+`reader` for decoding. The lower-level `records::*` helpers remain public for
+existing consumers and are used by those facades; they are implementation
+helpers, not a second current conversion guide.
 
 `writer::stamp_i64` seals the current in-memory ingest representation into a
 canonical `.aura` source. `writer::restamp_i64` decodes an existing sealed file,
@@ -22,8 +27,8 @@ and rows by default.
 .aura1 -> .aura0
 ```
 
-The conversion is intentionally simple because the compiled footer carries both
-profile programs and is copied unchanged between compiled profiles:
+The intended V2 conversion model is simple because compiled metadata carries
+both profile programs. The conceptual chunk-friendly flow is:
 
 ```text
 read stamped footer
@@ -38,10 +43,10 @@ access, text parsing, decimal parsing, or source-specific logic. Schema-specific
 logic belongs in the source adapter's Aura schema definition, not in compiled
 profile converters.
 
-Compiled files are not optimization sources: conversion must not re-score or
-mutate the footer. A reader can materialize logical records from `.aura0` or
-`.aura1`, then write the other compiled body using the other program already in
-the same footer.
+Compiled files are not optimization sources: conversion should not infer new
+source semantics from a compiled body. The current helper materializes logical
+records in memory and emits a target V2 file; it does not provide the
+chunk-streaming or unchanged-footer implementation sketched above.
 
 The current crate provides small in-memory helpers for generic integer records
 and OHLCV Parquet input. The production version should stream chunk-by-chunk and

@@ -162,7 +162,12 @@ while let Some(batch) = reader.next_batch(1024)? {
 # Ok::<(), aura_codec::AuraError>(())
 ```
 
-Aura1 reads stream fixed-width rows directly from the Aura1 body. Aura0 compact reads parse metadata during open and lazily build bounded row batches from compact stream columns. `read_batches()` is a convenience collector implemented on top of the batch reader.
+Aura1 reads stream fixed-width rows directly from the Aura1 body. Aura0 compact
+reads parse metadata during open, then materialize the complete decoded columns
+on first data access before returning bounded row batches. Batch size therefore
+does not bound total Aura0 decoding memory. File-backed non-Aura1 inputs fall
+back to a full-file copy; only Aura1 has the range-read behavior described above.
+`read_batches()` collects all batches into memory.
 
 For faster Aura1 parsing into SDK batches, use column batches:
 

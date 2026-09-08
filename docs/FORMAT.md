@@ -21,7 +21,7 @@ Aura is one Rust package, `aura-codec`, with library name `aura_codec` and
 explicit binary targets in `Cargo.toml`. The SDK is the integration boundary;
 low-level public helpers remain available for existing consumers. External
 collectors own capture, source normalization, storage lifecycle, and retention.
-Research tooling belongs in [Aura-ar](https://github.com/L3data/aura-ar); its
+Research tooling belongs in [Aura-ar](https://github.com/curvefit/aura-ar); its
 research claims do not override this repository's format or compatibility
 contracts.
 
