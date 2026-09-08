@@ -52,3 +52,7 @@ path = "src/bin/json_i64_rows.rs"
 [[bin]]
 name = "aura"
 path = "src/bin/aura.rs"
+
+[[bin]]
+name = "aura-replay-bench"
+path = "src/bin/aura_replay_bench.rs"
