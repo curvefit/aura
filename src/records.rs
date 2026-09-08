@@ -1671,17 +1671,6 @@ fn try_compile_explicit_i64_events(
             )?
         }
     };
-    let event_values = events
-        .iter()
-        .map(|event| event.event_values.clone())
-        .collect::<Vec<_>>();
-    let children = events
-        .iter()
-        .map(|event| event.children.clone())
-        .collect::<Vec<_>>();
-    let encoded = encode_generic_i64_events(&metadata.schema, &event_values, &children)?;
-    let compact_body = encode_generic_i64_rows_body(&encoded)?;
-    let rows = flatten_i64_events(&metadata.schema, &events)?;
     let mut footer = if let Some(footer) = metadata.compiled_footer.clone() {
         footer
     } else {
@@ -1693,10 +1682,33 @@ fn try_compile_explicit_i64_events(
             metadata.record_count,
         )?
     };
-    footer.generic_aura0_plan = Some(encoded.plan);
     let body = match target_profile {
-        Profile::Aura0 => compact_body,
+        Profile::Aura0 => {
+            let event_values = events
+                .iter()
+                .map(|event| event.event_values.clone())
+                .collect::<Vec<_>>();
+            let children = events
+                .iter()
+                .map(|event| event.children.clone())
+                .collect::<Vec<_>>();
+            let encoded = encode_generic_i64_events(&metadata.schema, &event_values, &children)?;
+            let compact_body = encode_generic_i64_rows_body(&encoded)?;
+            // Retain the reference compiler's row/value validation on this path.
+            let _ = flatten_i64_events(&metadata.schema, &events)?;
+            footer.generic_aura0_plan = Some(encoded.plan);
+            compact_body
+        }
         Profile::Aura1 => {
+            // The source footer already carries the explicit-event contract and
+            // a validated compact plan. Aura1 needs its stamped fixed widths and
+            // event sidecar, not another compact codec search or encoded body.
+            // Preserve that plan, including a writer's bounded-search choices.
+            // Metadata/body decoding above retains schema, relation, stream and
+            // event-count validation; flattening retains row/value validation.
+            metadata.schema.validate_derived_expressions()?;
+            let rows = flatten_i64_events(&metadata.schema, &events)?;
+            footer.aura1_byte_lanes.clear();
             let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
             let event_field_count = metadata
                 .schema
