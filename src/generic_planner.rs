@@ -1366,7 +1366,12 @@ pub fn decode_generic_i64_events_body(
 ) -> Result<GenericDecodedI64Events> {
     let (explicit_group_id, child_count_stream_id) =
         explicit_event_group(&plan).ok_or(AuraError::InvalidValue("explicit event plan"))?;
-    let stream_values = decode_generic_i64_stream_values(&plan, bytes)?;
+    // This path used to decode every stream once here and then call
+    // `decode_generic_i64_rows_body`, which parsed and decoded the same framed
+    // body a second time. Keep the rows-body framing limits while retaining
+    // the values produced by the first decode.
+    let stream_values =
+        decode_generic_i64_stream_values_checked(&plan, bytes, record_count, schema.fields.len())?;
     validate_explicit_event_counts(&plan, &stream_values, record_count)?;
     let child_counts = stream_values
         .get(&child_count_stream_id)
@@ -1383,8 +1388,13 @@ pub fn decode_generic_i64_events_body(
         .filter(|field| field.scope == FieldScope::Repeated)
         .map(|field| field.index)
         .collect::<Vec<_>>();
-    let rows =
-        decode_generic_i64_rows_body(plan.clone(), bytes, record_count, schema.fields.len())?;
+    validate_quotient_remainder_decode_plan(&plan, schema.fields.len())?;
+    let rows = materialize_generic_i64_rows_from_stream_values(
+        &plan,
+        &stream_values,
+        record_count,
+        schema.fields.len(),
+    )?;
     let mut event_streams = BTreeMap::new();
     for group in &plan.groups {
         if let GenericGroupInstruction::GroupValueStream {
@@ -4685,6 +4695,64 @@ fn decode_generic_i64_stream_values(
     decode_generic_i64_stream_values_profiled(plan, bytes, None)
 }
 
+/// Decode a framed generic stream body while retaining the limits enforced by
+/// `decode_generic_i64_rows_body`. The explicit-event decoder uses this once
+/// and then materializes rows from the resulting values, so stream codecs and
+/// encoded stream bodies are not visited a second time.
+fn decode_generic_i64_stream_values_checked(
+    plan: &GenericInstructionPlan,
+    bytes: &[u8],
+    record_count: usize,
+    field_count: usize,
+) -> Result<BTreeMap<u16, Vec<i64>>> {
+    let _ = validate_i64_decode_dimensions_usize(record_count, field_count, bytes.len())?;
+    let mut reader = ByteReader::new(bytes);
+    let stream_count = reader.read_u16_le()? as usize;
+    let max_streams = field_count
+        .checked_mul(16)
+        .ok_or(AuraError::InvalidValue("generic stream count"))?;
+    if stream_count > max_streams || stream_count.saturating_mul(14) > reader.remaining() {
+        return Err(AuraError::InvalidValue("generic stream count"));
+    }
+    let instructions = plan
+        .streams
+        .iter()
+        .map(|instruction| (instruction.stream_id, instruction))
+        .collect::<BTreeMap<_, _>>();
+    let mut frames = Vec::new();
+    try_reserve_exact(&mut frames, stream_count, "generic stream allocation")?;
+    let mut total_values = 0usize;
+    for _ in 0..stream_count {
+        let stream_id = reader.read_u16_le()?;
+        let value_count = usize::try_from(reader.read_u64_le()?)
+            .map_err(|_| AuraError::InvalidValue("stream value count"))?;
+        total_values = total_values
+            .checked_add(value_count)
+            .ok_or(AuraError::InvalidValue("generic stream value count"))?;
+        if value_count > MAX_V2_I64_DECODE_VALUES || total_values > MAX_V2_I64_DECODE_VALUES {
+            return Err(AuraError::InvalidValue("generic stream value limit"));
+        }
+        let body_len = reader.read_u32_le()? as usize;
+        let body = reader.read_exact(body_len)?;
+        frames.push((stream_id, value_count, body));
+    }
+    reader.finish()?;
+
+    let mut stream_values = BTreeMap::new();
+    for (stream_id, value_count, body) in frames {
+        let instruction = instructions
+            .get(&stream_id)
+            .ok_or(AuraError::InvalidValue("stream id"))?;
+        match decode_generic_stream_body(instruction, body, value_count)? {
+            GenericStreamBodyValue::I64(values) => {
+                stream_values.insert(stream_id, values);
+            }
+            GenericStreamBodyValue::U128(_) => return Err(AuraError::InvalidValue("body type")),
+        }
+    }
+    Ok(stream_values)
+}
+
 pub(crate) fn decode_generic_i64_stream_values_profiled(
     plan: &GenericInstructionPlan,
     bytes: &[u8],
@@ -5586,7 +5654,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
             return Err(AuraError::InvalidValue("generic stream value limit"));
         }
     }
-    validate_quotient_remainder_decode_plan(encoded)?;
+    validate_quotient_remainder_decode_plan(&encoded.plan, encoded.field_count)?;
     let instructions = encoded
         .plan
         .streams
@@ -5607,35 +5675,41 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
     }
     validate_explicit_event_counts(&encoded.plan, &stream_values, encoded.record_count)?;
 
-    let mut rows = zero_i64_rows(encoded.record_count, encoded.field_count)?;
-    let mut filled = Vec::new();
-    try_reserve_exact(
-        &mut filled,
+    materialize_generic_i64_rows_from_stream_values(
+        &encoded.plan,
+        &stream_values,
         encoded.record_count,
-        "generic filled row allocation",
-    )?;
-    for _ in 0..encoded.record_count {
+        encoded.field_count,
+    )
+}
+
+fn materialize_generic_i64_rows_from_stream_values(
+    plan: &GenericInstructionPlan,
+    stream_values: &BTreeMap<u16, Vec<i64>>,
+    record_count: usize,
+    field_count: usize,
+) -> Result<Vec<Vec<i64>>> {
+    let mut rows = zero_i64_rows(record_count, field_count)?;
+    let mut filled = Vec::new();
+    try_reserve_exact(&mut filled, record_count, "generic filled row allocation")?;
+    for _ in 0..record_count {
         let mut row = Vec::new();
-        try_reserve_exact(
-            &mut row,
-            encoded.field_count,
-            "generic filled value allocation",
-        )?;
-        row.resize(encoded.field_count, false);
+        try_reserve_exact(&mut row, field_count, "generic filled value allocation")?;
+        row.resize(field_count, false);
         filled.push(row);
     }
-    for instruction in &encoded.plan.streams {
+    for instruction in &plan.streams {
         let Some(slot) = instruction.target_slot else {
             continue;
         };
         let slot = usize::from(slot);
-        if slot >= encoded.field_count {
+        if slot >= field_count {
             return Err(AuraError::InvalidValue("target slot"));
         }
         let values = stream_values
             .get(&instruction.stream_id)
             .ok_or(AuraError::InvalidValue("stream body"))?;
-        if values.len() != encoded.record_count {
+        if values.len() != record_count {
             return Err(AuraError::InvalidValue("stream value count"));
         }
         for (row_index, value) in values.iter().copied().enumerate() {
@@ -5645,33 +5719,32 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
     }
 
     let partition_runs = materialize_partition_run_lengths(
-        &encoded.plan,
+        &plan,
         &stream_values,
-        encoded.record_count,
-        encoded.field_count,
+        record_count,
+        field_count,
         &mut rows,
         &mut filled,
     )?;
     materialize_group_value_streams(
-        &encoded.plan,
+        &plan,
         &stream_values,
         &partition_runs,
-        encoded.field_count,
+        field_count,
         &mut rows,
         &mut filled,
     )?;
     materialize_segmented_delta_streams(
-        &encoded.plan,
+        &plan,
         &stream_values,
         &partition_runs,
-        encoded.field_count,
+        field_count,
         &mut rows,
         &mut filled,
     )?;
 
-    let presence_maps =
-        presence_maps_by_group(&encoded.plan, &stream_values, encoded.record_count)?;
-    for group in &encoded.plan.groups {
+    let presence_maps = presence_maps_by_group(&plan, &stream_values, record_count)?;
+    for group in &plan.groups {
         match group {
             GenericGroupInstruction::SparseStream {
                 presence_group_id,
@@ -5681,7 +5754,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                 ..
             } => {
                 let output_slot = usize::from(*output_slot);
-                if output_slot >= encoded.field_count {
+                if output_slot >= field_count {
                     return Err(AuraError::InvalidValue("target slot"));
                 }
                 let masks = presence_maps
@@ -5717,7 +5790,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                 ..
             } => {
                 let output_slot = usize::from(*output_slot);
-                if output_slot >= encoded.field_count {
+                if output_slot >= field_count {
                     return Err(AuraError::InvalidValue("target slot"));
                 }
                 let masks = presence_maps
@@ -5736,8 +5809,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
         }
     }
 
-    let derived = encoded
-        .plan
+    let derived = plan
         .groups
         .iter()
         .filter_map(|group| match group {
@@ -5799,7 +5871,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
         })
         .collect::<Vec<_>>();
 
-    for _ in 0..encoded.field_count.saturating_mul(2).saturating_add(1) {
+    for _ in 0..field_count.saturating_mul(2).saturating_add(1) {
         let mut progress = false;
         for derived in &derived {
             let PendingDerivedInstruction::Residual {
@@ -5816,7 +5888,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                 continue;
             }
             let output_index = usize::from(*output_slot);
-            if output_index >= encoded.field_count {
+            if output_index >= field_count {
                 return Err(AuraError::InvalidValue("target slot"));
             }
             if filled
@@ -5825,7 +5897,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
             {
                 continue;
             }
-            let event_slots = group_event_slots(&encoded.plan, *parent_group_id)?;
+            let event_slots = group_event_slots(&plan, *parent_group_id)?;
             if !event_slots.iter().chain(input_slots.iter()).all(|slot| {
                 filled
                     .iter()
@@ -5836,7 +5908,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
             let residuals = stream_values
                 .get(stream_id)
                 .ok_or(AuraError::InvalidValue("stream body"))?;
-            if residuals.len() != encoded.record_count {
+            if residuals.len() != record_count {
                 return Err(AuraError::InvalidValue("stream value count"));
             }
             match op {
@@ -5852,7 +5924,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                 }
                 DerivedOp::PreviousMutationSameKeyResidual => {
                     if !materialize_explicit_previous_same_key(
-                        &encoded.plan,
+                        &plan,
                         &stream_values,
                         input_slots,
                         *output_slot,
@@ -5873,7 +5945,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                 }
                 DerivedOp::PreviousOutputByKeyResidual => {
                     if !materialize_explicit_previous_same_key(
-                        &encoded.plan,
+                        &plan,
                         &stream_values,
                         input_slots,
                         *output_slot,
@@ -5896,7 +5968,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
             }
             progress = true;
         }
-        for row_index in 0..encoded.record_count {
+        for row_index in 0..record_count {
             for derived in &derived {
                 if matches!(
                     derived,
@@ -5926,7 +5998,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                     }
                 };
                 let output_slot = usize::from(output_slot);
-                if output_slot >= encoded.field_count || filled[row_index][output_slot] {
+                if output_slot >= field_count || filled[row_index][output_slot] {
                     continue;
                 }
                 if !pending_derived_inputs_ready(derived, row_index, &filled) {
@@ -5936,7 +6008,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                     let values = stream_values
                         .get(&stream_id)
                         .ok_or(AuraError::InvalidValue("stream body"))?;
-                    if values.len() != encoded.record_count {
+                    if values.len() != record_count {
                         return Err(AuraError::InvalidValue("stream value count"));
                     }
                     values[row_index]
@@ -5960,9 +6032,7 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
                         let remainders = stream_values
                             .get(remainder_stream_id)
                             .ok_or(AuraError::InvalidValue("quotient remainder"))?;
-                        if quotients.len() != encoded.record_count
-                            || remainders.len() != encoded.record_count
-                        {
+                        if quotients.len() != record_count || remainders.len() != record_count {
                             return Err(AuraError::InvalidValue("quotient remainder"));
                         }
                         let quotient = quotients
@@ -5995,9 +6065,11 @@ pub fn decode_generic_i64_rows(encoded: &GenericEncodedI64Rows) -> Result<Vec<Ve
 
     Err(AuraError::InvalidValue("derived streams"))
 }
-
-fn validate_quotient_remainder_decode_plan(encoded: &GenericEncodedI64Rows) -> Result<()> {
-    for group in &encoded.plan.groups {
+fn validate_quotient_remainder_decode_plan(
+    plan: &GenericInstructionPlan,
+    field_count: usize,
+) -> Result<()> {
+    for group in &plan.groups {
         let GenericGroupInstruction::QuotientRemainder {
             output_slot,
             divisor_slot,
@@ -6008,25 +6080,21 @@ fn validate_quotient_remainder_decode_plan(encoded: &GenericEncodedI64Rows) -> R
         else {
             continue;
         };
-        if usize::from(*output_slot) >= encoded.field_count
-            || usize::from(*divisor_slot) >= encoded.field_count
-            || encoded
-                .plan
+        if usize::from(*output_slot) >= field_count
+            || usize::from(*divisor_slot) >= field_count
+            || plan
                 .streams
                 .iter()
                 .any(|stream| stream.target_slot == Some(*output_slot))
             || [quotient_stream_id, remainder_stream_id]
                 .into_iter()
                 .any(|stream_id| {
-                    encoded
-                        .plan
-                        .streams
+                    plan.streams
                         .iter()
                         .find(|stream| stream.stream_id == *stream_id)
                         .is_none_or(|stream| stream.target_slot.is_some())
                 })
-            || encoded
-                .plan
+            || plan
                 .groups
                 .iter()
                 .filter(|candidate| group_output_slot(candidate) == Some(*output_slot))
