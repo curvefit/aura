@@ -162,3 +162,11 @@ branch/destination, and the normal Git push succeeded. No alternate transport
 or indirect push was used. A verified local bundle at
 `/home/anton/Downloads/lean-node-20260907/w05-aura-cleanup.bundle` preserves the
 work with prerequisite `cc04f75`; it is a local handoff, not remote receipt.
+
+## Publication CI follow-up
+
+The approved push started Actions run `34178771563`. Formatting passed, but
+Rust 1.98 Clippy rejected 12 existing constant-size `chunks_exact` loops through
+its new `chunks_exact_to_as_chunks` lint. CI now pins the locally validated
+Rust 1.97.1 toolchain for reproducibility. No codec loop or lint suppression
+was changed; the follow-up CI result remains pending.

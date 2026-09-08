@@ -9,7 +9,9 @@ retention policy outside the codec.
 
 Use stable Rust/Cargo with rustfmt and Clippy, a C/C++ compiler and native build
 tools, Git, Bash, and Python 3. Commit `Cargo.lock` when dependencies change.
-An MSRV is not currently promised; CI checks stable Rust. No `.env`, private
+An MSRV is not currently promised; CI pins Rust 1.97.1, the validated campaign
+toolchain. Update that pin deliberately and review new lints before requiring
+mechanical changes to codec internals. No `.env`, private
 fixture, external service, or Python package install is required for the normal
 checks. Cargo needs registry access once, or a populated dependency cache for
 `CARGO_NET_OFFLINE=true`.

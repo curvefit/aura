@@ -16,10 +16,10 @@ jobs:
       RUST_TEST_THREADS: 1
     steps:
       - uses: actions/checkout@v4
-      - name: Install stable Rust tooling
-        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
-      - name: Select stable toolchain
-        run: rustup default stable
+      - name: Install validated Rust tooling
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+      - name: Select validated toolchain
+        run: rustup default 1.97.1
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check all targets
