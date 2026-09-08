@@ -759,6 +759,7 @@ struct FairBytesContext {
     aura0_sha256: String,
     aura1_sha256: String,
     aura1_zst_sha256: String,
+    zstd_creation_ns: u128,
     record_count: usize,
     zstd_level: i32,
     byte_lane: Option<RealAura0ProfileFile>,
@@ -1039,6 +1040,10 @@ fn run_benchmark(config: &Config) -> Result<String> {
                 "benchmark_input_bytes": benchmark_input_len,
                 "output_bytes": first.output_bytes,
                 "runtime_ns": runtime_ns,
+                "runtime_samples_ns": measurements.iter().map(|m| ns_u64(m.operation_duration.as_nanos())).collect::<Vec<_>>(),
+                "total_runtime_samples_ns": measurements.iter().map(|m| ns_u64(m.total_duration.as_nanos())).collect::<Vec<_>>(),
+                "zstd_creation_ns": fair_context.as_ref().map(|c| ns_u64(c.zstd_creation_ns)),
+                "zstd_creation_note": "one setup compression of complete reference Aura1; outside conversion timing",
                 "median_runtime_ns": median_ns,
                 "p95_runtime_ns": p95_ns,
                 "total_runtime_ns": median_total_ns,
@@ -1204,9 +1209,11 @@ fn load_fair_bytes_context(
         bail!("--input must match --reference-aura1 for zstd fair bytes benchmark");
     }
 
+    let zstd_creation_start = Instant::now();
     let aura1_zst_bytes =
         zstd::stream::encode_all(Cursor::new(aura1_bytes.as_slice()), config.zstd_level)
             .context("zstd-compress reference Aura1")?;
+    let zstd_creation_ns = zstd_creation_start.elapsed().as_nanos();
     let aura1_zst_sha256 = sha256_hex(&aura1_zst_bytes);
     let record_count = records::visit_i64_rows_file(&aura1_bytes, |_| Ok(()))?;
     let byte_lane = if config.operation.is_fair_byte_lane() {
@@ -1230,6 +1237,7 @@ fn load_fair_bytes_context(
         aura0_sha256,
         aura1_sha256,
         aura1_zst_sha256,
+        zstd_creation_ns,
         record_count,
         zstd_level: config.zstd_level,
         byte_lane,
