@@ -2766,13 +2766,13 @@ pub fn decode_i64_events_file(bytes: &[u8]) -> Result<DecodedI64EventFile> {
                 .as_ref()
                 .ok_or(AuraError::InvalidValue("compiled footer"))?;
             let aura1_plan = footer.aura1_program.to_aura1_plan(footer.block_capacity)?;
-            let rows = decode_aura1_body(
-                fixed_body,
+            decode_aura1_events_body(
+                &metadata.schema,
                 &aura1_plan,
                 metadata.record_count,
-                metadata.schema.fields.len(),
-            )?;
-            decode_explicit_event_sidecar(&metadata.schema, &rows, sidecar)?
+                fixed_body,
+                sidecar,
+            )?
         }
     };
     Ok(DecodedI64EventFile {
@@ -3657,6 +3657,124 @@ fn append_explicit_event_sidecar(
     );
     body.extend_from_slice(EXPLICIT_EVENT_SIDECAR_MAGIC);
     Ok(body)
+}
+
+// Decode fixed rows directly into the public event result. A single row scratch
+// buffer replaces the complete flattened Vec<Vec<i64>> intermediate; counts and
+// repeated copies of event headers are still validated before returning events.
+fn decode_aura1_events_body(
+    schema: &SchemaDescriptor,
+    plan: &Aura1Plan,
+    record_count: usize,
+    fixed_body: &[u8],
+    sidecar: &[u8],
+) -> Result<Vec<I64Event>> {
+    let field_count = schema.fields.len();
+    let _ = validate_i64_decode_dimensions_usize(record_count, field_count, fixed_body.len())?;
+    validate_aura1_plan_fields(plan, field_count)?;
+    if fixed_body.len() != aura1_body_capacity(record_count, plan)? {
+        return Err(AuraError::InvalidValue("aura1 body length"));
+    }
+    let event_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Event)
+        .map(|field| usize::from(field.index))
+        .collect::<Vec<_>>();
+    let repeated_slots = schema
+        .fields
+        .iter()
+        .filter(|field| field.scope == FieldScope::Repeated)
+        .map(|field| usize::from(field.index))
+        .collect::<Vec<_>>();
+    let mut sidecar_reader = ByteReader::new(sidecar);
+    let event_count = usize::try_from(decode_varint_u64(&mut sidecar_reader)?)
+        .map_err(|_| AuraError::InvalidValue("event count"))?;
+    let event_field_count = usize::try_from(decode_varint_u64(&mut sidecar_reader)?)
+        .map_err(|_| AuraError::InvalidValue("event field count"))?;
+    if event_field_count != event_slots.len() {
+        return Err(AuraError::InvalidValue("event field count"));
+    }
+    if event_count > sidecar_reader.remaining() {
+        return Err(AuraError::InvalidValue("event count"));
+    }
+    let mut counts = Vec::new();
+    try_reserve_exact(&mut counts, event_count, "event count")?;
+    for _ in 0..event_count {
+        counts.push(
+            usize::try_from(decode_varint_u64(&mut sidecar_reader)?)
+                .map_err(|_| AuraError::InvalidValue("child count"))?,
+        );
+    }
+    let mut row = Vec::new();
+    try_reserve_exact(&mut row, field_count, "i64 decode value allocation")?;
+    row.resize(field_count, 0);
+    let mut fixed_reader = ByteReader::new(fixed_body);
+    let mut read_row = |row: &mut [i64]| -> Result<()> {
+        for field in &plan.fields {
+            row[usize::from(field.field_index)] = read_i64_width(&mut fixed_reader, field.width)?;
+        }
+        Ok(())
+    };
+    let mut events = Vec::new();
+    try_reserve_exact(&mut events, event_count, "event count")?;
+    let mut cursor = 0usize;
+    for count in counts {
+        let end = cursor
+            .checked_add(count)
+            .ok_or(AuraError::InvalidValue("child count"))?;
+        if end > record_count {
+            return Err(AuraError::InvalidValue("child count"));
+        }
+        let event_values = if count == 0 {
+            (0..event_field_count)
+                .map(|_| decode_varint_i64(&mut sidecar_reader))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            read_row(&mut row)?;
+            event_slots
+                .iter()
+                .map(|slot| {
+                    row.get(*slot)
+                        .copied()
+                        .ok_or(AuraError::InvalidValue("event slot"))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mut children = Vec::new();
+        try_reserve_exact(&mut children, count, "child count")?;
+        for child_index in 0..count {
+            if child_index != 0 {
+                read_row(&mut row)?;
+            }
+            for (event_index, slot) in event_slots.iter().copied().enumerate() {
+                if row.get(slot).copied() != Some(event_values[event_index]) {
+                    return Err(AuraError::InvalidValue("event value mismatch"));
+                }
+            }
+            children.push(
+                repeated_slots
+                    .iter()
+                    .map(|slot| {
+                        row.get(*slot)
+                            .copied()
+                            .ok_or(AuraError::InvalidValue("repeated slot"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        events.push(I64Event {
+            event_values,
+            children,
+        });
+        cursor = end;
+    }
+    if cursor != record_count {
+        return Err(AuraError::InvalidValue("child count"));
+    }
+    fixed_reader.finish()?;
+    sidecar_reader.finish()?;
+    Ok(events)
 }
 
 fn decode_explicit_event_sidecar(

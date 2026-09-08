@@ -48,3 +48,27 @@ receipt verifications without the shared lock around 00:20:48–00:21:31 UTC. No
 exact subprocess timestamps were retained. This was reported to the integration
 owner; overlapping timing must be excluded. The w04 baseline above ran afterward
 under the lock.
+
+## Candidate screening
+
+A safe reusable row buffer replaces only the flattened row intermediate in
+`decode_i64_events_file`'s Aura1 branch. The public output remains fully materialized
+`I64Event` values. Both bodies, field coverage, counts, each repeated event-header
+copy and empty-event headers remain validated. No format/API/encoder change and
+no new unsafe code. Multiple simultaneous corruptions can be discovered in a
+different order; malformed input still rejects.
+
+Screen medians: ETH-parent decode 8.896 → 5.072 ms (43.0% less wall time);
+BTC-parent 15.918 → 10.158 ms (36.2%). Full consumption 10.770 → 5.223 ms
+and 19.913 → 11.957 ms. Individual results and percentage denominators are
+in `screen.json`. These separate locked slots are screening evidence, pending
+a matched full-production comparison.
+
+The removed allocation work is one field buffer per flattened child plus the
+outer flattened-row vector, replaced by one reusable field buffer. Thus nonempty
+files avoid exactly one allocation per child by source-level accounting; this is
+not an instrumented allocator count. The final event/child output allocations
+remain required and charged.
+
+Validation: release tests `aura1_event_decode`, `explicit_events`, `decode_bounds`,
+and `repeated_parent_edge_cases` passed under the canonical lock.
