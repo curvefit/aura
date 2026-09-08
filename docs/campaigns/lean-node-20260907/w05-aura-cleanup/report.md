@@ -2,10 +2,12 @@
 
 Owner: `w05-aura-cleanup`, campaign `lean-node-20260907`.
 
-Implemented and locally integrated. Clean example/fixture checks pass; the
-combined release build, full suite, Clippy, and public release smoke are pending
-w01's scheduled validation. Publication is blocked by automatic approval review;
-an explicit approval request for this exact campaign branch is pending.
+Implemented and locally integrated. The clean example/fixture checks and full
+release build pass. W01 reports the integrated all-target suite passed on the
+host after environment corrections; the passing raw log was requested but not
+delivered before closeout. Clippy and the complete release smoke script are
+unconfirmed. Publication remains blocked by automatic approval review, with an
+explicit approval request for this exact campaign branch pending.
 
 ## Revisions and state
 
@@ -107,18 +109,43 @@ lock from 01:13:03 to 01:13:32 UTC and passed. One early delegated debug check
 mistakenly ran unlocked at 00:16:13 UTC; peers were notified and overlapping
 performance observations were excluded. No performance claim uses that run.
 
-Pending combined checks (w01 owns the one integrated run):
+The combined release build at `e88f8ea4` passed:
 
 ```bash
-cargo build --locked --release --lib --bins --examples -j 2
+cargo build --offline --locked --release --lib --bins --examples -j 2
+```
+
+It completed in 277.176 seconds in w01's writable campaign target. The all-target
+suite initially recorded 650 passes and four ignored maintenance tests before
+one environment failure: first Unix-socket permission, then an overlong socket
+path. W01's 01:50:59 UTC closeout reports this full command passed on the host
+after correction:
+
+```bash
+cargo test --offline --locked --release --all-targets -j 2
+```
+
+The passing raw host log was requested but not delivered before closeout; the
+report identifies that result as owner-reported. The actual build and earlier
+test logs are hashed in `validation.json`. The developer guide now records the
+observed Unix-socket permission/short-TMPDIR requirement.
+
+Unconfirmed checks remain visible for the next approved validation run:
+
+```bash
 bash scripts/check-onboarding.sh
-cargo test --locked -j 2 -- --test-threads=1
 cargo clippy --locked --all-targets -j 2 -- -D warnings
 ```
 
+The script's individual operations were exercised through the fresh debug
+examples and frozen release benchmark binary; the complete release script is
+not claimed as executed. Final package inventory is 229 files, including the
+new validation JSON.
+
 The meaningful reduction is 11 unused locked packages. Runtime performance is
 unmeasured here. Public smoke timings are deliberately not used as throughput
-claims. Final combined check results will be added before the handoff is closed.
+claims. The user requested a bounded one-to-two-hour finish; this handoff
+preserves the remaining verification limits instead of running new heavy suites.
 
 ## Resume
 

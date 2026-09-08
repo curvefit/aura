@@ -23,6 +23,11 @@ cargo fmt --all -- --check
 cargo package --locked --list
 ```
 
+On Unix, a publication test creates a real Unix socket file. It requires local
+socket permission and a short writable temporary path (for example,
+`TMPDIR=/tmp`); a long temporary root can exceed the OS socket-path limit.
+Correct that environment before rerunning the affected test.
+
 The smoke script preserves its tiny synthetic output directory for inspection.
 The tests include historical fixture decoding, CLI behavior, corruption/bounds,
 exact events, schema validation, and current experimental formats. Ignored
