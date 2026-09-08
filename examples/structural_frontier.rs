@@ -672,6 +672,7 @@ fn huffman_code_lengths(frequencies: &[u64]) -> Result<Vec<u8>, aura_codec::Aura
     Ok(lengths)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rebuild_variant(
     input: &[u8],
     metadata: &DecodedI64FileMetadata,

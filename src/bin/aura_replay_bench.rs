@@ -115,7 +115,7 @@ fn median(values: &[u128]) -> u128 {
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
     let middle = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         sorted[middle - 1].saturating_add(sorted[middle]) / 2
     } else {
         sorted[middle]
