@@ -6,8 +6,8 @@ Implemented and locally integrated. The clean example/fixture checks and full
 release build pass. W01 reports the integrated all-target suite passed on the
 host after environment corrections; the passing raw log was requested but not
 delivered before closeout. Clippy and the complete release smoke script are
-unconfirmed. Publication remains blocked by automatic approval review, with an
-explicit approval request for this exact campaign branch pending.
+unconfirmed. Publication succeeded after explicit user approval: implementation/handoff
+commit `cd7e22237a3095535b13510953918fb7265917ce` was pushed to the campaign branch.
 
 ## Revisions and state
 
@@ -16,7 +16,7 @@ explicit approval request for this exact campaign branch pending.
 - Final implementation: `d8afc37878f3bf6f3520ce601d01481f63bf8b74`.
 - Local integration observed: `e88f8ea4a596788e4e7921f7a34543c7436adb2f`.
 - Branch: `campaign/lean-node-20260907/w05-aura-cleanup`.
-- Remote: `https://github.com/curvefit/aura.git`; no successful w05 push yet.
+- Remote: `https://github.com/curvefit/aura.git`; campaign branch published after explicit user approval.
 
 The untouched isolated branch moved to current remote main before edits.
 Original main, other owners' worktrees, historical readers, fixture bytes,
@@ -24,7 +24,7 @@ formats, and algorithm implementations were preserved. The integration branch
 contains the cleanup commit and identical package/example/smoke files. Integration
 of w03/w04 code is a separate result and must use their correctness evidence.
 No service, dataset retention policy, release, or repository visibility changed
-in this lane. The CI workflow is implemented locally and is not remotely active.
+in this lane. The CI workflow is now published; its result has not yet been confirmed.
 
 ## What changed and why
 
@@ -149,15 +149,16 @@ preserves the remaining verification limits instead of running new heavy suites.
 
 ## Resume
 
-After explicit approval for the previously blocked external export, push this
-reviewable branch (no release or visibility change):
+The approved push has completed. The command for subsequent authorized branch
+updates is:
 
 ```bash
 git -C /home/anton/Downloads/lean-node-20260907/aura-w05 push -u origin HEAD:refs/heads/campaign/lean-node-20260907/w05-aura-cleanup
 ```
 
-Automatic approval review rejected the earlier push because it did not find
-trusted destination-specific authorization for exporting this branch. No
-alternate transport or indirect push was attempted. A verified local bundle at
+Automatic approval review initially rejected the push for missing trusted
+destination-specific authorization. The user subsequently approved this exact
+branch/destination, and the normal Git push succeeded. No alternate transport
+or indirect push was used. A verified local bundle at
 `/home/anton/Downloads/lean-node-20260907/w05-aura-cleanup.bundle` preserves the
 work with prerequisite `cc04f75`; it is a local handoff, not remote receipt.

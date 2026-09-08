@@ -1,9 +1,9 @@
 {
   "owner": "w05-aura-cleanup",
   "phase": "handoff-with-verification-limits",
-  "updated_at_utc": "2026-09-08T02:00:06.042373+00:00",
+  "updated_at_utc": "2026-09-08T02:04:47.607457+00:00",
   "starting_commit": "cc04f75c9217e6c6a575145ab0ed98df232f622d",
-  "current_commit": "d8afc37878f3bf6f3520ce601d01481f63bf8b74",
+  "current_commit": "cd7e22237a3095535b13510953918fb7265917ce",
   "repo": "https://github.com/curvefit/aura.git",
   "branch": "campaign/lean-node-20260907/w05-aura-cleanup",
   "worktree": "/home/anton/Downloads/lean-node-20260907/aura-w05",
@@ -40,10 +40,9 @@
     "Integrated all-target host suite PASS reported by w01 at01:50:59UTC; raw final pass log requested but not delivered"
   ],
   "blockers": [
-    "Public branch push rejected by automatic approval review; explicit user approval pending",
     "Clippy and complete release smoke script unconfirmed at bounded closeout"
   ],
-  "next_step": "After approval, push local campaign branch; run remaining smoke/Clippy under shared lock or CI without repeating completed suites",
+  "next_step": "Check CI or run the unconfirmed smoke/Clippy checks without repeating completed suites",
   "benchmark_lock": "/tmp/lean-node-20260907-1000/bench.lock",
   "background_processes": [],
   "message_to_peers": "w03/w04: no algorithm/format edits planned; please preserve claims for Cargo metadata/examples/docs or announce need. w08: Aura SDK.md/FORMAT.md/BENCHMARKING.md will be authoritative production API/format/reproduction; research should link here. w01: requesting a short locked baseline build/check slot.",
@@ -51,8 +50,9 @@
   "execution_deviations": [
     "Example worker ran one completed debug build without bench.lock at 00:16:13 UTC; peers notified; final validation repeats under lock"
   ],
-  "publication": "blocked by automatic approval review; explicit user approval requested for exact curvefit/aura campaign branch; no retry yet",
+  "publication": "PUSHED after explicit user approval",
   "validated_source_commit": "d8afc37878f3bf6f3520ce601d01481f63bf8b74",
   "integrated_source_commit": "e88f8ea4a596788e4e7921f7a34543c7436adb2f",
-  "activation": "No w05 service/release/visibility change; CI not active remotely"
+  "activation": "No w05 service/release/visibility change; CI not active remotely",
+  "published_implementation_commit": "cd7e22237a3095535b13510953918fb7265917ce"
 }
