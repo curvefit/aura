@@ -1,0 +1,41 @@
+{
+  "source_commit": "d8afc37878f3bf6f3520ce601d01481f63bf8b74",
+  "environment": "/usr/bin/env -i; PATH=/usr/bin:/bin; CARGO_HOME=/tmp/aura-w05-cargo-home (public registry cache only); CARGO_NET_OFFLINE=true; 2 build jobs, 1 test thread; no .env/private inputs",
+  "lock_path": "/tmp/lean-node-20260907-1000/bench.lock",
+  "started_utc": "2026-09-08T01:13:03Z",
+  "finished_utc": "2026-09-08T01:13:32Z",
+  "exit_code": 0,
+  "cargo_build_seconds": 29.3,
+  "command": "cargo build --locked --example roundtrip --example order_book_aura0 -j 2",
+  "example_rows": 4,
+  "source_fact_comparison": "Exact AuraValue rows in examples/roundtrip.rs; repetitions and nonmonotonic timestamps preserved, scaled signed integer values exact; schema and metadata assertions passed for ingest, Aura0, Aura1 and both compiled conversion directions",
+  "explicit_event_example": "passed exact event/child assertion; 584 bytes",
+  "benchmark": "Frozen cc04f75 baseline aura-bench executed on newly generated fixture; correctness smoke only, no timing claim",
+  "benchmark_checks": {
+    "operation": "transcode-aura0-to-aura1",
+    "record_count": 4,
+    "decoded_row_equality": true,
+    "record_count_equality": true,
+    "schema_footer_validation": true,
+    "output_preserved": true
+  },
+  "fixture_files": {
+    "converted.aura1": {
+      "bytes": 581,
+      "sha256": "5a1d10cdcc8d283e094611de7eeff2ec5a927f9b6b41866d9d285e09d0ef93ae"
+    },
+    "roundtrip.aura": {
+      "bytes": 1275,
+      "sha256": "3bd7a9f1964903a863cbd932a0804242270c8b4f0a152bfa9f81db042a023946"
+    },
+    "roundtrip.aura0": {
+      "bytes": 639,
+      "sha256": "c8c5c0a68c217e669aaf33ec9f402faebab6f96d611ae7360b681986908ad97b"
+    },
+    "roundtrip.aura1": {
+      "bytes": 581,
+      "sha256": "5a1d10cdcc8d283e094611de7eeff2ec5a927f9b6b41866d9d285e09d0ef93ae"
+    }
+  },
+  "full_release_build_tests_clippy": "pending combined local integration validation"
+}

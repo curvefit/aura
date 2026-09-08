@@ -1,9 +1,9 @@
 {
   "owner": "w05-aura-cleanup",
-  "phase": "implementation-awaiting-validation",
-  "updated_at_utc": "2026-09-08T00:19:40.311006+00:00",
+  "phase": "examples-verified-awaiting-integrated-suite",
+  "updated_at_utc": "2026-09-08T01:35:25.434623+00:00",
   "starting_commit": "cc04f75c9217e6c6a575145ab0ed98df232f622d",
-  "current_commit": "cc04f75c9217e6c6a575145ab0ed98df232f622d",
+  "current_commit": "d8afc37878f3bf6f3520ce601d01481f63bf8b74",
   "repo": "https://github.com/curvefit/aura.git",
   "branch": "campaign/lean-node-20260907/w05-aura-cleanup",
   "worktree": "/home/anton/Downloads/lean-node-20260907/aura-w05",
@@ -21,21 +21,33 @@
     "docs/benchmarking.md",
     "examples/",
     "scripts/check-onboarding.sh",
-    "docs/campaigns/lean-node-20260907/w05-aura-cleanup/"
+    "docs/campaigns/lean-node-20260907/w05-aura-cleanup/",
+    "docs/READER.md",
+    "docs/CONVERSION.md",
+    "docs/ERRORS.md",
+    "docs/naming.md",
+    "docs/conversion.md",
+    "docs/DBN_PARITY.md"
   ],
   "completed_evidence": [
     "Main clean at discovery; isolated worktree created; Apache-2.0 license present",
     "Remote main verified with git ls-remote at cc04f75; clean campaign branch moved off stale local main before edits",
     "Replaced legacy-only onboarding with public SDK example; docs consolidated; format check passes",
-    "Removed unused Arrow CSV/JSON/prettyprint feature closure (11 lockfile packages), all 8 explicit CLI targets preserved"
+    "Removed unused Arrow CSV/JSON/prettyprint feature closure (11 lockfile packages), all 8 explicit CLI targets preserved",
+    "Locked isolated-env example build ran01:00:51-01:01:51UTC, hard60s timeout while compiling deps; no compiler error; not a passing build",
+    "Clean source d8afc37 with cleared env/public cache: locked 29.30s example build, exact four-row SDK roundtrips and explicit event check pass; tiny conversion all semantic booleans true"
   ],
-  "blockers": [],
-  "next_step": "Validate the committed candidate from an isolated source checkout under the host lock",
+  "blockers": [
+    "Full combined release build/tests/Clippy/public script smoke pending w01 run",
+    "Remote push blocked by automatic approval review; explicit user approval requested, not received"
+  ],
+  "next_step": "Consume exact integrated full release/test/Clippy evidence after scheduled01:23 slot; commit final handoff and resolve pending push approval",
   "benchmark_lock": "/tmp/lean-node-20260907-1000/bench.lock",
   "background_processes": [],
   "message_to_peers": "w03/w04: no algorithm/format edits planned; please preserve claims for Cargo metadata/examples/docs or announce need. w08: Aura SDK.md/FORMAT.md/BENCHMARKING.md will be authoritative production API/format/reproduction; research should link here. w01: requesting a short locked baseline build/check slot.",
   "original_checkout_commit": "420052ceb50ea7a720dbf6bf46ebd6e4d3d61634",
   "execution_deviations": [
     "Example worker ran one completed debug build without bench.lock at 00:16:13 UTC; peers notified; final validation repeats under lock"
-  ]
+  ],
+  "publication": "blocked by automatic approval review; explicit user approval requested for exact curvefit/aura campaign branch; no retry yet"
 }

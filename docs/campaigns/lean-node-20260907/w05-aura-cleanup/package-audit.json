@@ -80,7 +80,8 @@
     "sibling_consumers": {
       "grimoire": "v2/book Cargo.lock pins aura-codec from curvefit/aura at cc04f75; home docs and reproduction use curvefit/aura",
       "aura-ar": "research/reproduction docs use aura-fixture-gen, aura-bench, aura-sdk-bench and curvefit/aura; no package metadata consumer requiring CSV/JSON/pretty-print Arrow features"
-    }
+    },
+    "common_credential_pattern_scan": "No matches in packaged text; private key, GitHub token, AWS key, and long credential-assignment patterns checked without printing values"
   },
   "commands": [
     "git remote -v",
@@ -92,5 +93,5 @@
     "cargo tree --locked --depth 1 --edges normal,build,dev",
     "cargo package --allow-dirty --list"
   ],
-  "heavy_validation": "not run; requires the shared bench.lock slot"
+  "heavy_validation": "Clean isolated source/env example build and SDK/event checks passed under canonical lock at 01:13:03-01:13:32 UTC; all-target/full release/Clippy checks pending integration owner"
 }
