@@ -1,5 +1,11 @@
 name: Rust checks
-on: [push, pull_request]
+on:
+  push:
+    paths-ignore:
+      - 'docs/campaigns/**'
+  pull_request:
+    paths-ignore:
+      - 'docs/campaigns/**'
 permissions:
   contents: read
 jobs:
