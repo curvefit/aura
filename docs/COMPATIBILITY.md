@@ -232,19 +232,9 @@ supported `.aura0 -> .aura1` plans, but measured grimoire runs were slower than
 the materialized/profiled path. Treat it as experimental evidence, not the
 production default.
 
-The profiled materialized `.aura0 -> .aura1` path now stays compiled-plan-backed
-when the specialized partitioned-sparse writer declines and the generic direct
-writer can reconstruct all Aura1 fields. This resolved the prior
-no-Huffman/`PartitionRuns` fallback gap:
-
-```text
-grimoire-50mb-nohuff Aura0 -> Aura1 bytes:
-before generic profiled fallback: 154.896 ms, compiled_plan_used=false
-after generic profiled fallback:  107.088 ms, compiled_plan_used=true
-```
-
-The current path still materializes 12 stream vectors and 2,754,892 stream
-values on the grimoire artifacts. It is not the final answer to the zstd target.
+Historical fallback-resolution timings and materialization counts are retained
+in [BENCHMARKING.md](BENCHMARKING.md#historical-benchmark-evidence); they are not
+current-head or all-schema performance guarantees.
 
 `--encoder-path column-free` is currently rejected with a specific error. The
 existing `.aura1 -> .aura0` encoder decodes Aura1 into per-field column buffers

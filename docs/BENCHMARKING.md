@@ -248,7 +248,8 @@ requires Aura1 column buffers for dictionary/Huffman stream construction.
 
 ## Default Benchmark Commands
 
-Current default-candidate command shapes:
+Operation option shapes (supply `--dataset` and `--input` as in the complete
+small-fixture commands above):
 
 ```text
 target/release/aura-bench --operation aura0-to-aura1-bytes --guard-mode no_guard --canonical-hash-mode none
@@ -271,6 +272,20 @@ files are not distributed with this repository. They are workload-specific
 historical evidence, not current-head reproducible speed guarantees. Preserve
 these observations, but use the synthetic commands above for a public checkout
 and publish fresh input identities and complete commands for new claims.
+
+The historical profiled materialized `.aura0 -> .aura1` path stayed compiled-plan-backed
+when the specialized partitioned-sparse writer declines and the generic direct
+writer can reconstruct all Aura1 fields. This resolved the prior
+no-Huffman/`PartitionRuns` fallback gap:
+
+```text
+grimoire-50mb-nohuff Aura0 -> Aura1 bytes:
+before generic profiled fallback: 154.896 ms, compiled_plan_used=false
+after generic profiled fallback:  107.088 ms, compiled_plan_used=true
+```
+
+Those runs materialized 12 stream vectors and 2,754,892 stream values on the
+specified Grimoire artifacts. These counters are historical workload observations.
 
 Resolution artifacts used for that historical decision:
 
