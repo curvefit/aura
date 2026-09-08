@@ -1,0 +1,5336 @@
+{
+  "binaries_sha256": {
+    "book_baseline": "76f26272d8cc36558a3a6d3063c50cbce38287c0110c6cd0ab9c90f704805783",
+    "book_candidate": "6e1541c4ba0db1ad3c8a5008cd30a30141666164da89b2f0aa61133d601e2b21",
+    "raw_baseline": "8527315e57cfdc33b688649a8e4b110c9d4706fbd78474b284e30476734478f5",
+    "raw_candidate": "1c098345903fff0d6a087094c4ff455e7e8797e90548398e88a5d29e9544c942"
+  },
+  "defaults": {
+    "repetitions": 3,
+    "warmups": 1
+  },
+  "finished_utc": "2026-09-08T01:30:54.697935+00:00",
+  "immutable_inputs_rechecked": true,
+  "inputs_sha256": [
+    "06b1021ea3ad49b3055a20ef2965f2519ce8c3616bf02af1cd1b5bdf4b56de79",
+    "100113885f1eb8ef696f90e0768224fe14c4854e0efef42c5772761870b90b36",
+    "20e172f768d47b70afadb8147fb3ec53009c638625f8365821b3372110c8dfcf",
+    "2d83b3155f98ff855795e53df6ef51b814f6717109ed97b66956c4a43409fda0",
+    "33c29b49dfabf93d996c454c88dbb7b0519c4f9ab7e0dd22df29474f514067a3",
+    "467cf4879808a0442d30786c719f24f1918351bdb1b70fd8cad4e81ba93654f2",
+    "5233bcdcb5c9cd24292ea8231c71de39b11f5be5e634dc1a0cb97e120224d4c6",
+    "5de31c4239aaba96ab2e97abf486ef2a5ded21d0a5532323774492dc97f493f8",
+    "5f25e64c7ef295a37a7d791a5d77c3f1fff1b919270b0b999c143233945e1ca3",
+    "6342fa4c6d66db242207e53eb9ca07fc64b30b9c56354d3a4c21e6df5b6bbf1e",
+    "636fd78ce2e097ba91b4ca98b65c44b60e0811b55ebbfc316211bfa03fbd46ce",
+    "68eceaa0efb2f223f8878fcfbc3663dd602f1ffffa4d696df8a53ecb222b9b2b",
+    "7524f634aeb4e1f318e8430c8cd316617e9a8ce06f3451d773237dcb96cfea18",
+    "7e12479ff32b212e6dd6a29f83bd7b4ee38dc8e2e59db06f2cdab60aa53aca49",
+    "a1c93f73782fe86684697537541c7b12422d98c0b89b1197b31cc0af197e4ed6",
+    "bd24faeb3a336ed91cc9f9f26cad91db7c2b19f244581c942a54a02481538c9d",
+    "d8539c5f38508956b9569fbdb3b73f9c3443819f10955c2816d4083afce9ef70",
+    "f8c4205cbc53c1e55f30fb4d531f8bae393e8d94abab70a73675bfdb8e408c6d"
+  ],
+  "manifest_sha256": "5fc9721ee84fddb18e9871e63dd56c8a558f4b4cd0eadc5bc0ae3f30b2be5a87",
+  "runs": [
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          193620,
+          0,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            193620,
+            0,
+            0
+          ],
+          "max": 193620,
+          "median": 0,
+          "min": 0,
+          "range": 193620
+        }
+      },
+      "denominators": {
+        "events": 3,
+        "levels": 482
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          3612,
+          3612,
+          3612
+        ],
+        "peak_measured": 3612,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_snapshot.raw.decode.memory.baseline.json",
+      "sample": "raw-bitget_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          161233,
+          137913,
+          140182
+        ],
+        "max": 161233,
+        "median": 140182,
+        "min": 137913,
+        "range": 23320
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          0,
+          0,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            0,
+            0,
+            0
+          ],
+          "max": 0,
+          "median": 0,
+          "min": 0,
+          "range": 0
+        }
+      },
+      "denominators": {
+        "events": 3,
+        "levels": 482
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          3540,
+          3540,
+          3540
+        ],
+        "peak_measured": 3540,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_snapshot.raw.decode.memory.candidate.json",
+      "sample": "raw-bitget_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          112302,
+          118322,
+          114632
+        ],
+        "max": 118322,
+        "median": 114632,
+        "min": 112302,
+        "range": 6020
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          0,
+          0,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            0,
+            0,
+            0
+          ],
+          "max": 0,
+          "median": 0,
+          "min": 0,
+          "range": 0
+        }
+      },
+      "denominators": {
+        "events": 3,
+        "levels": 482
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          3532,
+          3532,
+          3532
+        ],
+        "peak_measured": 3532,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_snapshot.raw.decode.warm_file_backed.candidate.json",
+      "sample": "raw-bitget_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          121103,
+          132733,
+          139962
+        ],
+        "max": 139962,
+        "median": 132733,
+        "min": 121103,
+        "range": 18859
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          421080,
+          0,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            421080,
+            0,
+            0
+          ],
+          "max": 421080,
+          "median": 0,
+          "min": 0,
+          "range": 421080
+        }
+      },
+      "denominators": {
+        "events": 3,
+        "levels": 482
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          3640,
+          3644,
+          3644
+        ],
+        "peak_measured": 3644,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_snapshot.raw.decode.warm_file_backed.baseline.json",
+      "sample": "raw-bitget_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          164213,
+          135042,
+          192003
+        ],
+        "max": 192003,
+        "median": 164213,
+        "min": 135042,
+        "range": 56961
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          0,
+          0,
+          395640
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            0,
+            0,
+            395640
+          ],
+          "max": 395640,
+          "median": 0,
+          "min": 0,
+          "range": 395640
+        }
+      },
+      "denominators": {
+        "events": 3,
+        "levels": 482
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          3548,
+          3548,
+          3548
+        ],
+        "peak_measured": 3548,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_snapshot.raw.consume.memory.baseline.json",
+      "sample": "raw-bitget_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          119132,
+          200494,
+          153203
+        ],
+        "max": 200494,
+        "median": 153203,
+        "min": 119132,
+        "range": 81362
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          193790,
+          0,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            193790,
+            0,
+            0
+          ],
+          "max": 193790,
+          "median": 0,
+          "min": 0,
+          "range": 193790
+        }
+      },
+      "denominators": {
+        "events": 3,
+        "levels": 482
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          3540,
+          3540,
+          3540
+        ],
+        "peak_measured": 3540,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_snapshot.raw.consume.memory.candidate.json",
+      "sample": "raw-bitget_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          120952,
+          155533,
+          102821
+        ],
+        "max": 155533,
+        "median": 120952,
+        "min": 102821,
+        "range": 52712
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          0,
+          0,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            0,
+            0,
+            0
+          ],
+          "max": 0,
+          "median": 0,
+          "min": 0,
+          "range": 0
+        }
+      },
+      "denominators": {
+        "events": 3,
+        "levels": 482
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          3604,
+          3604,
+          3604
+        ],
+        "peak_measured": 3604,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_snapshot.raw.consume.warm_file_backed.candidate.json",
+      "sample": "raw-bitget_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          133823,
+          130492,
+          133323
+        ],
+        "max": 133823,
+        "median": 133323,
+        "min": 130492,
+        "range": 3331
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          429170,
+          0,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            429170,
+            0,
+            0
+          ],
+          "max": 429170,
+          "median": 0,
+          "min": 0,
+          "range": 429170
+        }
+      },
+      "denominators": {
+        "events": 3,
+        "levels": 482
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          3568,
+          3572,
+          3572
+        ],
+        "peak_measured": 3572,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_snapshot.raw.consume.warm_file_backed.baseline.json",
+      "sample": "raw-bitget_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          191203,
+          174343,
+          165633
+        ],
+        "max": 191203,
+        "median": 174343,
+        "min": 165633,
+        "range": 25570
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          0,
+          0,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            0,
+            0,
+            0
+          ],
+          "max": 0,
+          "median": 0,
+          "min": 0,
+          "range": 0
+        }
+      },
+      "denominators": {
+        "events": 3,
+        "levels": 482
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          3588,
+          3592,
+          3596
+        ],
+        "peak_measured": 3596,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_snapshot.raw.open.memory.baseline.json",
+      "sample": "raw-bitget_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          215773,
+          159093,
+          152223
+        ],
+        "max": 215773,
+        "median": 159093,
+        "min": 152223,
+        "range": 63550
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          0,
+          0,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            0,
+            0,
+            0
+          ],
+          "max": 0,
+          "median": 0,
+          "min": 0,
+          "range": 0
+        }
+      },
+      "denominators": {
+        "events": 3,
+        "levels": 482
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          3604,
+          3604,
+          3604
+        ],
+        "peak_measured": 3604,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_snapshot.raw.open.memory.candidate.json",
+      "sample": "raw-bitget_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          149123,
+          135782,
+          130022
+        ],
+        "max": 149123,
+        "median": 135782,
+        "min": 130022,
+        "range": 19101
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          0,
+          0,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            0,
+            0,
+            0
+          ],
+          "max": 0,
+          "median": 0,
+          "min": 0,
+          "range": 0
+        }
+      },
+      "denominators": {
+        "events": 3,
+        "levels": 482
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          3608,
+          3608,
+          3608
+        ],
+        "peak_measured": 3608,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_snapshot.raw.open.warm_file_backed.candidate.json",
+      "sample": "raw-bitget_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          200014,
+          204813,
+          199854
+        ],
+        "max": 204813,
+        "median": 200014,
+        "min": 199854,
+        "range": 4959
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          809631,
+          0,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            809631,
+            0,
+            0
+          ],
+          "max": 809631,
+          "median": 0,
+          "min": 0,
+          "range": 809631
+        }
+      },
+      "denominators": {
+        "events": 3,
+        "levels": 482
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          3672,
+          3676,
+          3676
+        ],
+        "peak_measured": 3676,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_snapshot.raw.open.warm_file_backed.baseline.json",
+      "sample": "raw-bitget_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          236374,
+          274395,
+          237724
+        ],
+        "max": 274395,
+        "median": 237724,
+        "min": 236374,
+        "range": 38021
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          306141470,
+          246696140,
+          281941746
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            306141470,
+            246696140,
+            281941746
+          ],
+          "max": 306141470,
+          "median": 281941746,
+          "min": 246696140,
+          "range": 59445330
+        }
+      },
+      "denominators": {
+        "events": 105576,
+        "levels": 738656
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          646092,
+          646092,
+          646092
+        ],
+        "peak_measured": 646092,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_delta.raw.decode.memory.baseline.json",
+      "sample": "raw-bitget_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          316581714,
+          256912807,
+          286001506
+        ],
+        "max": 316581714,
+        "median": 286001506,
+        "min": 256912807,
+        "range": 59668907
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          252149231,
+          233091815,
+          197312284
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            252149231,
+            233091815,
+            197312284
+          ],
+          "max": 252149231,
+          "median": 233091815,
+          "min": 197312284,
+          "range": 54836947
+        }
+      },
+      "denominators": {
+        "events": 105576,
+        "levels": 738656
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          569580,
+          569580,
+          569580
+        ],
+        "peak_measured": 569580,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_delta.raw.decode.memory.candidate.json",
+      "sample": "raw-bitget_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          262200311,
+          247418596,
+          204892157
+        ],
+        "max": 262200311,
+        "median": 247418596,
+        "min": 204892157,
+        "range": 57308154
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          279495127,
+          287324049,
+          257841115
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            279495127,
+            287324049,
+            257841115
+          ],
+          "max": 287324049,
+          "median": 279495127,
+          "min": 257841115,
+          "range": 29482934
+        }
+      },
+      "denominators": {
+        "events": 105576,
+        "levels": 738656
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          569516,
+          569516,
+          569516
+        ],
+        "peak_measured": 569516,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_delta.raw.decode.warm_file_backed.candidate.json",
+      "sample": "raw-bitget_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          297453818,
+          304338921,
+          260812804
+        ],
+        "max": 304338921,
+        "median": 297453818,
+        "min": 260812804,
+        "range": 43526117
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          393464467,
+          380988941,
+          340603749
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            393464467,
+            380988941,
+            340603749
+          ],
+          "max": 393464467,
+          "median": 380988941,
+          "min": 340603749,
+          "range": 52860718
+        }
+      },
+      "denominators": {
+        "events": 105576,
+        "levels": 738656
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          703092,
+          703096,
+          703100
+        ],
+        "peak_measured": 703100,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_delta.raw.decode.warm_file_backed.baseline.json",
+      "sample": "raw-bitget_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          404015797,
+          402543771,
+          353977624
+        ],
+        "max": 404015797,
+        "median": 402543771,
+        "min": 353977624,
+        "range": 50038173
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          320279051,
+          317514217,
+          293793035
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            320279051,
+            317514217,
+            293793035
+          ],
+          "max": 320279051,
+          "median": 317514217,
+          "min": 293793035,
+          "range": 26486016
+        }
+      },
+      "denominators": {
+        "events": 105576,
+        "levels": 738656
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          646084,
+          646084,
+          646084
+        ],
+        "peak_measured": 646084,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_delta.raw.consume.memory.baseline.json",
+      "sample": "raw-bitget_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          336233106,
+          329008326,
+          310141739
+        ],
+        "max": 336233106,
+        "median": 329008326,
+        "min": 310141739,
+        "range": 26091367
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          222466649,
+          233212543,
+          238716635
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            222466649,
+            233212543,
+            238716635
+          ],
+          "max": 238716635,
+          "median": 233212543,
+          "min": 222466649,
+          "range": 16249986
+        }
+      },
+      "denominators": {
+        "events": 105576,
+        "levels": 738656
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          569512,
+          569512,
+          569512
+        ],
+        "peak_measured": 569512,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_delta.raw.consume.memory.candidate.json",
+      "sample": "raw-bitget_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          228374190,
+          243345957,
+          245120249
+        ],
+        "max": 245120249,
+        "median": 243345957,
+        "min": 228374190,
+        "range": 16746059
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          239772105,
+          237877906,
+          230998731
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            239772105,
+            237877906,
+            230998731
+          ],
+          "max": 239772105,
+          "median": 237877906,
+          "min": 230998731,
+          "range": 8773374
+        }
+      },
+      "denominators": {
+        "events": 105576,
+        "levels": 738656
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          569516,
+          569516,
+          569516
+        ],
+        "peak_measured": 569516,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_delta.raw.consume.warm_file_backed.candidate.json",
+      "sample": "raw-bitget_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          244763721,
+          240220919,
+          234981997
+        ],
+        "max": 244763721,
+        "median": 240220919,
+        "min": 234981997,
+        "range": 9781724
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          328040083,
+          343607694,
+          324426518
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            328040083,
+            343607694,
+            324426518
+          ],
+          "max": 343607694,
+          "median": 328040083,
+          "min": 324426518,
+          "range": 19181176
+        }
+      },
+      "denominators": {
+        "events": 105576,
+        "levels": 738656
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          703152,
+          703144,
+          703152
+        ],
+        "peak_measured": 703152,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_delta.raw.consume.warm_file_backed.baseline.json",
+      "sample": "raw-bitget_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          338810685,
+          356579741,
+          337237876
+        ],
+        "max": 356579741,
+        "median": 338810685,
+        "min": 337237876,
+        "range": 19341865
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          316306187,
+          351753825,
+          399177300
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            316306187,
+            351753825,
+            399177300
+          ],
+          "max": 399177300,
+          "median": 351753825,
+          "min": 316306187,
+          "range": 82871113
+        }
+      },
+      "denominators": {
+        "events": 105576,
+        "levels": 738656
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          646164,
+          646164,
+          646164
+        ],
+        "peak_measured": 646164,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_delta.raw.open.memory.baseline.json",
+      "sample": "raw-bitget_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          327796556,
+          364519119,
+          415188242
+        ],
+        "max": 415188242,
+        "median": 364519119,
+        "min": 327796556,
+        "range": 87391686
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          284523539,
+          253428603,
+          258021427
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            284523539,
+            253428603,
+            258021427
+          ],
+          "max": 284523539,
+          "median": 258021427,
+          "min": 253428603,
+          "range": 31094936
+        }
+      },
+      "denominators": {
+        "events": 105576,
+        "levels": 738656
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          569584,
+          569584,
+          569584
+        ],
+        "peak_measured": 569584,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_delta.raw.open.memory.candidate.json",
+      "sample": "raw-bitget_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          298717656,
+          264413656,
+          268817705
+        ],
+        "max": 298717656,
+        "median": 268817705,
+        "min": 264413656,
+        "range": 34304000
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          259208597,
+          286998450,
+          260023226
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            259208597,
+            286998450,
+            260023226
+          ],
+          "max": 286998450,
+          "median": 260023226,
+          "min": 259208597,
+          "range": 27789853
+        }
+      },
+      "denominators": {
+        "events": 105576,
+        "levels": 738656
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          569520,
+          569520,
+          569520
+        ],
+        "peak_measured": 569520,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_delta.raw.open.warm_file_backed.candidate.json",
+      "sample": "raw-bitget_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          269597998,
+          294513048,
+          265226539
+        ],
+        "max": 294513048,
+        "median": 269597998,
+        "min": 265226539,
+        "range": 29286509
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          428921060,
+          405510402,
+          385629632
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            428921060,
+            405510402,
+            385629632
+          ],
+          "max": 428921060,
+          "median": 405510402,
+          "min": 385629632,
+          "range": 43291428
+        }
+      },
+      "denominators": {
+        "events": 105576,
+        "levels": 738656
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          646208,
+          646208,
+          646208
+        ],
+        "peak_measured": 646208,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bitget_delta.raw.open.warm_file_backed.baseline.json",
+      "sample": "raw-bitget_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          454064556,
+          417354123,
+          404831050
+        ],
+        "max": 454064556,
+        "median": 417354123,
+        "min": 404831050,
+        "range": 49233506
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          994620,
+          370420,
+          612041
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            994620,
+            370420,
+            612041
+          ],
+          "max": 994620,
+          "median": 612041,
+          "min": 370420,
+          "range": 624200
+        }
+      },
+      "denominators": {
+        "events": 30,
+        "levels": 2692
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          5360,
+          5360,
+          5360
+        ],
+        "peak_measured": 5360,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_snapshot.raw.decode.memory.baseline.json",
+      "sample": "raw-bybit_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          789234,
+          568470,
+          510699
+        ],
+        "max": 789234,
+        "median": 568470,
+        "min": 510699,
+        "range": 278535
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          0,
+          0,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            0,
+            0,
+            0
+          ],
+          "max": 0,
+          "median": 0,
+          "min": 0,
+          "range": 0
+        }
+      },
+      "denominators": {
+        "events": 30,
+        "levels": 2692
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          5316,
+          5316,
+          5316
+        ],
+        "peak_measured": 5316,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_snapshot.raw.decode.memory.candidate.json",
+      "sample": "raw-bybit_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          433938,
+          416827,
+          417547
+        ],
+        "max": 433938,
+        "median": 417547,
+        "min": 416827,
+        "range": 17111
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          0,
+          964301,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            0,
+            964301,
+            0
+          ],
+          "max": 964301,
+          "median": 0,
+          "min": 0,
+          "range": 964301
+        }
+      },
+      "denominators": {
+        "events": 30,
+        "levels": 2692
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          5260,
+          5260,
+          5260
+        ],
+        "peak_measured": 5260,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_snapshot.raw.decode.warm_file_backed.candidate.json",
+      "sample": "raw-bybit_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          522279,
+          586260,
+          449498
+        ],
+        "max": 586260,
+        "median": 522279,
+        "min": 449498,
+        "range": 136762
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          952880,
+          0,
+          955771
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            952880,
+            0,
+            955771
+          ],
+          "max": 955771,
+          "median": 952880,
+          "min": 0,
+          "range": 955771
+        }
+      },
+      "denominators": {
+        "events": 30,
+        "levels": 2692
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          5776,
+          5776,
+          5776
+        ],
+        "peak_measured": 5776,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_snapshot.raw.decode.warm_file_backed.baseline.json",
+      "sample": "raw-bybit_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          799775,
+          609821,
+          674012
+        ],
+        "max": 799775,
+        "median": 674012,
+        "min": 609821,
+        "range": 189954
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          944010,
+          941311,
+          995770
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            944010,
+            941311,
+            995770
+          ],
+          "max": 995770,
+          "median": 944010,
+          "min": 941311,
+          "range": 54459
+        }
+      },
+      "denominators": {
+        "events": 30,
+        "levels": 2692
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          5288,
+          5288,
+          5288
+        ],
+        "peak_measured": 5288,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_snapshot.raw.consume.memory.baseline.json",
+      "sample": "raw-bybit_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          714423,
+          752593,
+          630311
+        ],
+        "max": 752593,
+        "median": 714423,
+        "min": 630311,
+        "range": 122282
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          905801,
+          922680,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            905801,
+            922680,
+            0
+          ],
+          "max": 922680,
+          "median": 905801,
+          "min": 0,
+          "range": 922680
+        }
+      },
+      "denominators": {
+        "events": 30,
+        "levels": 2692
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          5320,
+          5320,
+          5320
+        ],
+        "peak_measured": 5320,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_snapshot.raw.consume.memory.candidate.json",
+      "sample": "raw-bybit_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          531320,
+          589781,
+          548440
+        ],
+        "max": 589781,
+        "median": 548440,
+        "min": 531320,
+        "range": 58461
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          0,
+          975661,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            0,
+            975661,
+            0
+          ],
+          "max": 975661,
+          "median": 0,
+          "min": 0,
+          "range": 975661
+        }
+      },
+      "denominators": {
+        "events": 30,
+        "levels": 2692
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          5320,
+          5320,
+          5320
+        ],
+        "peak_measured": 5320,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_snapshot.raw.consume.warm_file_backed.candidate.json",
+      "sample": "raw-bybit_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          497209,
+          597470,
+          550319
+        ],
+        "max": 597470,
+        "median": 550319,
+        "min": 497209,
+        "range": 100261
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          945661,
+          938501,
+          992280
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            945661,
+            938501,
+            992280
+          ],
+          "max": 992280,
+          "median": 945661,
+          "min": 938501,
+          "range": 53779
+        }
+      },
+      "denominators": {
+        "events": 30,
+        "levels": 2692
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          5720,
+          5720,
+          5720
+        ],
+        "peak_measured": 5720,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_snapshot.raw.consume.warm_file_backed.baseline.json",
+      "sample": "raw-bybit_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          1064350,
+          991778,
+          1011468
+        ],
+        "max": 1064350,
+        "median": 1011468,
+        "min": 991778,
+        "range": 72572
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          1984401,
+          993730,
+          995551
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            1984401,
+            993730,
+            995551
+          ],
+          "max": 1984401,
+          "median": 995551,
+          "min": 993730,
+          "range": 990671
+        }
+      },
+      "denominators": {
+        "events": 30,
+        "levels": 2692
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          5712,
+          5712,
+          5712
+        ],
+        "peak_measured": 5712,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_snapshot.raw.open.memory.baseline.json",
+      "sample": "raw-bybit_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          1213051,
+          986208,
+          946327
+        ],
+        "max": 1213051,
+        "median": 986208,
+        "min": 946327,
+        "range": 266724
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          0,
+          993671,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            0,
+            993671,
+            0
+          ],
+          "max": 993671,
+          "median": 0,
+          "min": 0,
+          "range": 993671
+        }
+      },
+      "denominators": {
+        "events": 30,
+        "levels": 2692
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          5324,
+          5324,
+          5324
+        ],
+        "peak_measured": 5324,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_snapshot.raw.open.memory.candidate.json",
+      "sample": "raw-bybit_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          588681,
+          512709,
+          593301
+        ],
+        "max": 593301,
+        "median": 588681,
+        "min": 512709,
+        "range": 80592
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          993740,
+          0,
+          0
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            993740,
+            0,
+            0
+          ],
+          "max": 993740,
+          "median": 0,
+          "min": 0,
+          "range": 993740
+        }
+      },
+      "denominators": {
+        "events": 30,
+        "levels": 2692
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          5264,
+          5264,
+          5264
+        ],
+        "peak_measured": 5264,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_snapshot.raw.open.warm_file_backed.candidate.json",
+      "sample": "raw-bybit_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          640171,
+          661072,
+          611111
+        ],
+        "max": 661072,
+        "median": 640171,
+        "min": 611111,
+        "range": 49961
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          1222991,
+          738410,
+          988050
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            1222991,
+            738410,
+            988050
+          ],
+          "max": 1222991,
+          "median": 988050,
+          "min": 738410,
+          "range": 484581
+        }
+      },
+      "denominators": {
+        "events": 30,
+        "levels": 2692
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          5716,
+          5716,
+          5716
+        ],
+        "peak_measured": 5716,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_snapshot.raw.open.warm_file_backed.baseline.json",
+      "sample": "raw-bybit_snapshot",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          997388,
+          732873,
+          698902
+        ],
+        "max": 997388,
+        "median": 732873,
+        "min": 698902,
+        "range": 298486
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          460569216,
+          437784044,
+          429647067
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            460569216,
+            437784044,
+            429647067
+          ],
+          "max": 460569216,
+          "median": 437784044,
+          "min": 429647067,
+          "range": 30922149
+        }
+      },
+      "denominators": {
+        "events": 187792,
+        "levels": 1064800
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          944780,
+          944780,
+          944780
+        ],
+        "peak_measured": 944780,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_delta.raw.decode.memory.baseline.json",
+      "sample": "raw-bybit_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          483478565,
+          454883916,
+          445866226
+        ],
+        "max": 483478565,
+        "median": 454883916,
+        "min": 445866226,
+        "range": 37612339
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          394949938,
+          397766980,
+          410762506
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            394949938,
+            397766980,
+            410762506
+          ],
+          "max": 410762506,
+          "median": 397766980,
+          "min": 394949938,
+          "range": 15812568
+        }
+      },
+      "denominators": {
+        "events": 187792,
+        "levels": 1064800
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          836056,
+          836056,
+          836056
+        ],
+        "peak_measured": 836056,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_delta.raw.decode.memory.candidate.json",
+      "sample": "raw-bybit_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          396678079,
+          400027698,
+          413480346
+        ],
+        "max": 413480346,
+        "median": 400027698,
+        "min": 396678079,
+        "range": 16802267
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          406973284,
+          403130494,
+          432653540
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            406973284,
+            403130494,
+            432653540
+          ],
+          "max": 432653540,
+          "median": 406973284,
+          "min": 403130494,
+          "range": 29523046
+        }
+      },
+      "denominators": {
+        "events": 187792,
+        "levels": 1064800
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          836056,
+          836056,
+          836056
+        ],
+        "peak_measured": 836056,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_delta.raw.decode.warm_file_backed.candidate.json",
+      "sample": "raw-bybit_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          409675856,
+          413251220,
+          441614323
+        ],
+        "max": 441614323,
+        "median": 413251220,
+        "min": 409675856,
+        "range": 31938467
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          479240656,
+          528510708,
+          466909704
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            479240656,
+            528510708,
+            466909704
+          ],
+          "max": 528510708,
+          "median": 479240656,
+          "min": 466909704,
+          "range": 61601004
+        }
+      },
+      "denominators": {
+        "events": 187792,
+        "levels": 1064800
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          1010292,
+          1010292,
+          1010292
+        ],
+        "peak_measured": 1010292,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_delta.raw.decode.warm_file_backed.baseline.json",
+      "sample": "raw-bybit_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          497227686,
+          542090762,
+          473911631
+        ],
+        "max": 542090762,
+        "median": 497227686,
+        "min": 473911631,
+        "range": 68179131
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          377396210,
+          430528349,
+          423181242
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            377396210,
+            430528349,
+            423181242
+          ],
+          "max": 430528349,
+          "median": 423181242,
+          "min": 377396210,
+          "range": 53132139
+        }
+      },
+      "denominators": {
+        "events": 187792,
+        "levels": 1064800
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          944836,
+          944836,
+          944836
+        ],
+        "peak_measured": 944836,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_delta.raw.consume.memory.baseline.json",
+      "sample": "raw-bybit_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          380628612,
+          447189852,
+          442847815
+        ],
+        "max": 447189852,
+        "median": 442847815,
+        "min": 380628612,
+        "range": 66561240
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          447970072,
+          408795404,
+          418678239
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            447970072,
+            408795404,
+            418678239
+          ],
+          "max": 447970072,
+          "median": 418678239,
+          "min": 408795404,
+          "range": 39174668
+        }
+      },
+      "denominators": {
+        "events": 187792,
+        "levels": 1064800
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          836052,
+          836052,
+          836052
+        ],
+        "peak_measured": 836052,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_delta.raw.consume.memory.candidate.json",
+      "sample": "raw-bybit_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          461041725,
+          422458031,
+          422624213
+        ],
+        "max": 461041725,
+        "median": 422624213,
+        "min": 422458031,
+        "range": 38583694
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          370925285,
+          387433655,
+          381530258
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            370925285,
+            387433655,
+            381530258
+          ],
+          "max": 387433655,
+          "median": 381530258,
+          "min": 370925285,
+          "range": 16508370
+        }
+      },
+      "denominators": {
+        "events": 187792,
+        "levels": 1064800
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          836120,
+          836120,
+          836120
+        ],
+        "peak_measured": 836120,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_delta.raw.consume.warm_file_backed.candidate.json",
+      "sample": "raw-bybit_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          376714536,
+          399667154,
+          393931541
+        ],
+        "max": 399667154,
+        "median": 393931541,
+        "min": 376714536,
+        "range": 22952618
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          461351883,
+          432060572,
+          446592863
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            461351883,
+            432060572,
+            446592863
+          ],
+          "max": 461351883,
+          "median": 446592863,
+          "min": 432060572,
+          "range": 29291311
+        }
+      },
+      "denominators": {
+        "events": 187792,
+        "levels": 1064800
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          1010240,
+          1010240,
+          1010240
+        ],
+        "peak_measured": 1010240,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_delta.raw.consume.warm_file_backed.baseline.json",
+      "sample": "raw-bybit_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          480654625,
+          449243818,
+          464255313
+        ],
+        "max": 480654625,
+        "median": 464255313,
+        "min": 449243818,
+        "range": 31410807
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          437455551,
+          442420223,
+          488665076
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            437455551,
+            442420223,
+            488665076
+          ],
+          "max": 488665076,
+          "median": 442420223,
+          "min": 437455551,
+          "range": 51209525
+        }
+      },
+      "denominators": {
+        "events": 187792,
+        "levels": 1064800
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          1010232,
+          1010232,
+          951920
+        ],
+        "peak_measured": 1010232,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_delta.raw.open.memory.baseline.json",
+      "sample": "raw-bybit_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          453152874,
+          457640222,
+          512209519
+        ],
+        "max": 512209519,
+        "median": 457640222,
+        "min": 453152874,
+        "range": 59056645
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          378345915,
+          410499999,
+          383873653
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            378345915,
+            410499999,
+            383873653
+          ],
+          "max": 410499999,
+          "median": 383873653,
+          "min": 378345915,
+          "range": 32154084
+        }
+      },
+      "denominators": {
+        "events": 187792,
+        "levels": 1064800
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          836120,
+          836120,
+          836120
+        ],
+        "peak_measured": 836120,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_delta.raw.open.memory.candidate.json",
+      "sample": "raw-bybit_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          393218730,
+          425154534,
+          398441122
+        ],
+        "max": 425154534,
+        "median": 398441122,
+        "min": 393218730,
+        "range": 31935804
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          403858373,
+          420153343,
+          393658599
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            403858373,
+            420153343,
+            393658599
+          ],
+          "max": 420153343,
+          "median": 403858373,
+          "min": 393658599,
+          "range": 26494744
+        }
+      },
+      "denominators": {
+        "events": 187792,
+        "levels": 1064800
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          836060,
+          836060,
+          836060
+        ],
+        "peak_measured": 836060,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_delta.raw.open.warm_file_backed.candidate.json",
+      "sample": "raw-bybit_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          417320843,
+          436993261,
+          405956301
+        ],
+        "max": 436993261,
+        "median": 417320843,
+        "min": 405956301,
+        "range": 31036960
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          515767170,
+          510188876,
+          428300823
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            515767170,
+            510188876,
+            428300823
+          ],
+          "max": 515767170,
+          "median": 510188876,
+          "min": 428300823,
+          "range": 87466347
+        }
+      },
+      "denominators": {
+        "events": 187792,
+        "levels": 1064800
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          944964,
+          1010344,
+          952028
+        ],
+        "peak_measured": 1010344,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-bybit_delta.raw.open.warm_file_backed.baseline.json",
+      "sample": "raw-bybit_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          526755125,
+          525495672,
+          439876187
+        ],
+        "max": 526755125,
+        "median": 525495672,
+        "min": 439876187,
+        "range": 86878938
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          247350964,
+          226303750,
+          258725528
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            247350964,
+            226303750,
+            258725528
+          ],
+          "max": 258725528,
+          "median": 247350964,
+          "min": 226303750,
+          "range": 32421778
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          699192,
+          699192,
+          699192
+        ],
+        "peak_measured": 699192,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-binance_delta.raw.decode.memory.baseline.json",
+      "sample": "raw-binance_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          259310294,
+          230378202,
+          262536890
+        ],
+        "max": 262536890,
+        "median": 259310294,
+        "min": 230378202,
+        "range": 32158688
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          238592335,
+          237991405,
+          254785534
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            238592335,
+            237991405,
+            254785534
+          ],
+          "max": 254785534,
+          "median": 238592335,
+          "min": 237991405,
+          "range": 16794129
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          615604,
+          615604,
+          615604
+        ],
+        "peak_measured": 615604,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-binance_delta.raw.decode.memory.candidate.json",
+      "sample": "raw-binance_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          243085106,
+          241301424,
+          263603248
+        ],
+        "max": 263603248,
+        "median": 243085106,
+        "min": 241301424,
+        "range": 22301824
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          263356437,
+          259199136,
+          254890686
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            263356437,
+            259199136,
+            254890686
+          ],
+          "max": 263356437,
+          "median": 259199136,
+          "min": 254890686,
+          "range": 8465751
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          615604,
+          615604,
+          615604
+        ],
+        "peak_measured": 615604,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-binance_delta.raw.decode.warm_file_backed.candidate.json",
+      "sample": "raw-binance_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          269130355,
+          269203555,
+          267200000
+        ],
+        "max": 269203555,
+        "median": 269130355,
+        "min": 267200000,
+        "range": 2003555
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          275796338,
+          358126709,
+          376652615
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            275796338,
+            358126709,
+            376652615
+          ],
+          "max": 376652615,
+          "median": 358126709,
+          "min": 275796338,
+          "range": 100856277
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          787008,
+          787032,
+          787024
+        ],
+        "peak_measured": 787032,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-binance_delta.raw.decode.warm_file_backed.baseline.json",
+      "sample": "raw-binance_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          285719346,
+          373631178,
+          385570649
+        ],
+        "max": 385570649,
+        "median": 373631178,
+        "min": 285719346,
+        "range": 99851303
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          308987443,
+          344633645,
+          380150927
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            308987443,
+            344633645,
+            380150927
+          ],
+          "max": 380150927,
+          "median": 344633645,
+          "min": 308987443,
+          "range": 71163484
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          699260,
+          699260,
+          699260
+        ],
+        "peak_measured": 699260,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-binance_delta.raw.consume.memory.baseline.json",
+      "sample": "raw-binance_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          318057435,
+          359204971,
+          394961192
+        ],
+        "max": 394961192,
+        "median": 359204971,
+        "min": 318057435,
+        "range": 76903757
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          254712718,
+          265083232,
+          282216218
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            254712718,
+            265083232,
+            282216218
+          ],
+          "max": 282216218,
+          "median": 265083232,
+          "min": 254712718,
+          "range": 27503500
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          615604,
+          615604,
+          615604
+        ],
+        "peak_measured": 615604,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-binance_delta.raw.consume.memory.candidate.json",
+      "sample": "raw-binance_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          264375685,
+          276403678,
+          294260863
+        ],
+        "max": 294260863,
+        "median": 276403678,
+        "min": 264375685,
+        "range": 29885178
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          341838148,
+          323789361,
+          305413578
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            341838148,
+            323789361,
+            305413578
+          ],
+          "max": 341838148,
+          "median": 323789361,
+          "min": 305413578,
+          "range": 36424570
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          615648,
+          615648,
+          615648
+        ],
+        "peak_measured": 615648,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-binance_delta.raw.consume.warm_file_backed.candidate.json",
+      "sample": "raw-binance_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          353633889,
+          338853908,
+          317270818
+        ],
+        "max": 353633889,
+        "median": 338853908,
+        "min": 317270818,
+        "range": 36363071
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          314199752,
+          314444957,
+          332533143
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            314199752,
+            314444957,
+            332533143
+          ],
+          "max": 332533143,
+          "median": 314444957,
+          "min": 314199752,
+          "range": 18333391
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          786948,
+          786972,
+          786964
+        ],
+        "peak_measured": 786972,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-binance_delta.raw.consume.warm_file_backed.baseline.json",
+      "sample": "raw-binance_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          321208675,
+          319374333,
+          340835840
+        ],
+        "max": 340835840,
+        "median": 321208675,
+        "min": 319374333,
+        "range": 21461507
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          335363992,
+          327138095,
+          313281755
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            335363992,
+            327138095,
+            313281755
+          ],
+          "max": 335363992,
+          "median": 327138095,
+          "min": 313281755,
+          "range": 22082237
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          699248,
+          699248,
+          699248
+        ],
+        "peak_measured": 699248,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-binance_delta.raw.open.memory.baseline.json",
+      "sample": "raw-binance_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          344495553,
+          340081836,
+          324755245
+        ],
+        "max": 344495553,
+        "median": 340081836,
+        "min": 324755245,
+        "range": 19740308
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          318116273,
+          304422520,
+          265685548
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            318116273,
+            304422520,
+            265685548
+          ],
+          "max": 318116273,
+          "median": 304422520,
+          "min": 265685548,
+          "range": 52430725
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          615672,
+          615672,
+          615672
+        ],
+        "peak_measured": 615672,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-binance_delta.raw.open.memory.candidate.json",
+      "sample": "raw-binance_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          326997833,
+          321835753,
+          274615760
+        ],
+        "max": 326997833,
+        "median": 321835753,
+        "min": 274615760,
+        "range": 52382073
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          278622138,
+          217819045,
+          253769294
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            278622138,
+            217819045,
+            253769294
+          ],
+          "max": 278622138,
+          "median": 253769294,
+          "min": 217819045,
+          "range": 60803093
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          615672,
+          615672,
+          615672
+        ],
+        "peak_measured": 615672,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-binance_delta.raw.open.warm_file_backed.candidate.json",
+      "sample": "raw-binance_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          285202975,
+          225493413,
+          260069132
+        ],
+        "max": 285202975,
+        "median": 260069132,
+        "min": 225493413,
+        "range": 59709562
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          318321996,
+          386842453,
+          320443119
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            318321996,
+            386842453,
+            320443119
+          ],
+          "max": 386842453,
+          "median": 320443119,
+          "min": 318321996,
+          "range": 68520457
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          702652,
+          720628,
+          702652
+        ],
+        "peak_measured": 720628,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-binance_delta.raw.open.warm_file_backed.baseline.json",
+      "sample": "raw-binance_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          324299852,
+          396899212,
+          322363658
+        ],
+        "max": 396899212,
+        "median": 324299852,
+        "min": 322363658,
+        "range": 74535554
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          142972085,
+          151399872,
+          149284397
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            142972085,
+            151399872,
+            149284397
+          ],
+          "max": 151399872,
+          "median": 149284397,
+          "min": 142972085,
+          "range": 8427787
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          501440,
+          501440,
+          501440
+        ],
+        "peak_measured": 501440,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-okx_delta.raw.decode.memory.baseline.json",
+      "sample": "raw-okx_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          147859224,
+          156027717,
+          153905360
+        ],
+        "max": 156027717,
+        "median": 153905360,
+        "min": 147859224,
+        "range": 8168493
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          158122390,
+          160340854,
+          162283885
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            158122390,
+            160340854,
+            162283885
+          ],
+          "max": 162283885,
+          "median": 160340854,
+          "min": 158122390,
+          "range": 4161495
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          443932,
+          443932,
+          443932
+        ],
+        "peak_measured": 443932,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-okx_delta.raw.decode.memory.candidate.json",
+      "sample": "raw-okx_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          162681125,
+          165164678,
+          167171123
+        ],
+        "max": 167171123,
+        "median": 165164678,
+        "min": 162681125,
+        "range": 4489998
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          215886733,
+          204823388,
+          188759842
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            215886733,
+            204823388,
+            188759842
+          ],
+          "max": 215886733,
+          "median": 204823388,
+          "min": 188759842,
+          "range": 27126891
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          443928,
+          443928,
+          443928
+        ],
+        "peak_measured": 443928,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-okx_delta.raw.decode.warm_file_backed.candidate.json",
+      "sample": "raw-okx_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          219741888,
+          211679857,
+          198530835
+        ],
+        "max": 219741888,
+        "median": 211679857,
+        "min": 198530835,
+        "range": 21211053
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          184985815,
+          189202909,
+          196289714
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            184985815,
+            189202909,
+            196289714
+          ],
+          "max": 196289714,
+          "median": 189202909,
+          "min": 184985815,
+          "range": 11303899
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "decode",
+      "rss_kib": {
+        "individual": [
+          547716,
+          547760,
+          547772
+        ],
+        "peak_measured": 547772,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-okx_delta.raw.decode.warm_file_backed.baseline.json",
+      "sample": "raw-okx_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          190058795,
+          193560607,
+          202063006
+        ],
+        "max": 202063006,
+        "median": 193560607,
+        "min": 190058795,
+        "range": 12004211
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          162346565,
+          155634571,
+          152706491
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            162346565,
+            155634571,
+            152706491
+          ],
+          "max": 162346565,
+          "median": 155634571,
+          "min": 152706491,
+          "range": 9640074
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          501384,
+          501384,
+          501384
+        ],
+        "peak_measured": 501384,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-okx_delta.raw.consume.memory.baseline.json",
+      "sample": "raw-okx_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          168440884,
+          160317571,
+          158307955
+        ],
+        "max": 168440884,
+        "median": 160317571,
+        "min": 158307955,
+        "range": 10132929
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          170593630,
+          184559507,
+          172355581
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            170593630,
+            184559507,
+            172355581
+          ],
+          "max": 184559507,
+          "median": 172355581,
+          "min": 170593630,
+          "range": 13965877
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          443996,
+          443996,
+          443996
+        ],
+        "peak_measured": 443996,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-okx_delta.raw.consume.memory.candidate.json",
+      "sample": "raw-okx_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          172004377,
+          188434635,
+          176135419
+        ],
+        "max": 188434635,
+        "median": 176135419,
+        "min": 172004377,
+        "range": 16430258
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          182948970,
+          199927726,
+          232379752
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            182948970,
+            199927726,
+            232379752
+          ],
+          "max": 232379752,
+          "median": 199927726,
+          "min": 182948970,
+          "range": 49430782
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          443932,
+          443932,
+          443932
+        ],
+        "peak_measured": 443932,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-okx_delta.raw.consume.warm_file_backed.candidate.json",
+      "sample": "raw-okx_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          188709159,
+          205840471,
+          240530891
+        ],
+        "max": 240530891,
+        "median": 205840471,
+        "min": 188709159,
+        "range": 51821732
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          224508006,
+          228536009,
+          228362657
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            224508006,
+            228536009,
+            228362657
+          ],
+          "max": 228536009,
+          "median": 228362657,
+          "min": 224508006,
+          "range": 4028003
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "consume",
+      "rss_kib": {
+        "individual": [
+          547776,
+          547704,
+          547760
+        ],
+        "peak_measured": 547776,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-okx_delta.raw.consume.warm_file_backed.baseline.json",
+      "sample": "raw-okx_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          235961519,
+          236211494,
+          232578760
+        ],
+        "max": 236211494,
+        "median": 235961519,
+        "min": 232578760,
+        "range": 3632734
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          200321103,
+          197830434,
+          213932502
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            200321103,
+            197830434,
+            213932502
+          ],
+          "max": 213932502,
+          "median": 200321103,
+          "min": 197830434,
+          "range": 16102068
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          547852,
+          547828,
+          521504
+        ],
+        "peak_measured": 547852,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-okx_delta.raw.open.memory.baseline.json",
+      "sample": "raw-okx_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          208314083,
+          203911665,
+          221672658
+        ],
+        "max": 221672658,
+        "median": 208314083,
+        "min": 203911665,
+        "range": 17760993
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          205023914,
+          207316101,
+          208855161
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            205023914,
+            207316101,
+            208855161
+          ],
+          "max": 208855161,
+          "median": 207316101,
+          "min": 205023914,
+          "range": 3831247
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          443936,
+          443936,
+          443936
+        ],
+        "peak_measured": 443936,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-okx_delta.raw.open.memory.candidate.json",
+      "sample": "raw-okx_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          213547564,
+          214691464,
+          216751440
+        ],
+        "max": 216751440,
+        "median": 214691464,
+        "min": 213547564,
+        "range": 3203876
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          164921547,
+          166287668,
+          181807955
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            164921547,
+            166287668,
+            181807955
+          ],
+          "max": 181807955,
+          "median": 166287668,
+          "min": 164921547,
+          "range": 16886408
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          443936,
+          443936,
+          443936
+        ],
+        "peak_measured": 443936,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-okx_delta.raw.open.warm_file_backed.candidate.json",
+      "sample": "raw-okx_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          169239875,
+          174044169,
+          189405839
+        ],
+        "max": 189405839,
+        "median": 174044169,
+        "min": 169239875,
+        "range": 20165964
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          214614312,
+          227152547,
+          190916112
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            214614312,
+            227152547,
+            190916112
+          ],
+          "max": 227152547,
+          "median": 214614312,
+          "min": 190916112,
+          "range": 36236435
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "raw",
+      "mode": "open",
+      "rss_kib": {
+        "individual": [
+          547800,
+          547760,
+          547816
+        ],
+        "peak_measured": 547816,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "run_file": "raw-okx_delta.raw.open.warm_file_backed.baseline.json",
+      "sample": "raw-okx_delta",
+      "stages_ns": {},
+      "wall_ns": {
+        "individual": [
+          215603869,
+          236121379,
+          202248184
+        ],
+        "max": 236121379,
+        "median": 215603869,
+        "min": 202248184,
+        "range": 33873195
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          974569638,
+          917048165,
+          916990843
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            974569638,
+            917048165,
+            916990843
+          ],
+          "max": 974569638,
+          "median": 917048165,
+          "min": 916990843,
+          "range": 57578795
+        }
+      },
+      "denominators": {
+        "events": 105579,
+        "levels": 739138
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          795236,
+          795256,
+          795240
+        ],
+        "peak_measured": 795256,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-bitget.book.replay.memory.baseline.json",
+      "sample": "book-bitget",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            186979804,
+            199702337,
+            192633301
+          ],
+          "max": 199702337,
+          "median": 192633301,
+          "min": 186979804,
+          "range": 12722533
+        },
+        "adapter_ns": {
+          "individual": [
+            371471165,
+            355569513,
+            360540230
+          ],
+          "max": 371471165,
+          "median": 360540230,
+          "min": 355569513,
+          "range": 15901652
+        },
+        "decode_ns": {
+          "individual": [
+            390390556,
+            317015097,
+            317009135
+          ],
+          "max": 390390556,
+          "median": 317015097,
+          "min": 317009135,
+          "range": 73381421
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          1019265742,
+          948775780,
+          949724503
+        ],
+        "max": 1019265742,
+        "median": 949724503,
+        "min": 948775780,
+        "range": 70489962
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          925408207,
+          834269097,
+          841290442
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            925408207,
+            834269097,
+            841290442
+          ],
+          "max": 925408207,
+          "median": 841290442,
+          "min": 834269097,
+          "range": 91139110
+        }
+      },
+      "denominators": {
+        "events": 105579,
+        "levels": 739138
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          795412,
+          795416,
+          795416
+        ],
+        "peak_measured": 795416,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-bitget.book.replay.memory.candidate.json",
+      "sample": "book-bitget",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            194170656,
+            170124353,
+            175045990
+          ],
+          "max": 194170656,
+          "median": 175045990,
+          "min": 170124353,
+          "range": 24046303
+        },
+        "adapter_ns": {
+          "individual": [
+            405045405,
+            366373676,
+            383276350
+          ],
+          "max": 405045405,
+          "median": 383276350,
+          "min": 366373676,
+          "range": 38671729
+        },
+        "decode_ns": {
+          "individual": [
+            265201153,
+            243275967,
+            240359225
+          ],
+          "max": 265201153,
+          "median": 243275967,
+          "min": 240359225,
+          "range": 24841928
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          942262020,
+          850210972,
+          865883173
+        ],
+        "max": 942262020,
+        "median": 865883173,
+        "min": 850210972,
+        "range": 92051048
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          955181150,
+          954157782,
+          968977800
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            955181150,
+            954157782,
+            968977800
+          ],
+          "max": 968977800,
+          "median": 955181150,
+          "min": 954157782,
+          "range": 14820018
+        }
+      },
+      "denominators": {
+        "events": 105579,
+        "levels": 739138
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          914812,
+          914816,
+          914816
+        ],
+        "peak_measured": 914816,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-bitget.book.replay.warm_file_backed.candidate.json",
+      "sample": "book-bitget",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            179563746,
+            175949892,
+            182763351
+          ],
+          "max": 182763351,
+          "median": 179563746,
+          "min": 175949892,
+          "range": 6813459
+        },
+        "adapter_ns": {
+          "individual": [
+            400852944,
+            413965732,
+            401782347
+          ],
+          "max": 413965732,
+          "median": 401782347,
+          "min": 400852944,
+          "range": 13112788
+        },
+        "decode_ns": {
+          "individual": [
+            332423576,
+            314456500,
+            322855256
+          ],
+          "max": 332423576,
+          "median": 322855256,
+          "min": 314456500,
+          "range": 17967076
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          983085617,
+          979797006,
+          981289948
+        ],
+        "max": 983085617,
+        "median": 981289948,
+        "min": 979797006,
+        "range": 3288611
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          974727436,
+          1018420266,
+          959958413
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            974727436,
+            1018420266,
+            959958413
+          ],
+          "max": 1018420266,
+          "median": 974727436,
+          "min": 959958413,
+          "range": 58461853
+        }
+      },
+      "denominators": {
+        "events": 105579,
+        "levels": 739138
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          914392,
+          914408,
+          914396
+        ],
+        "peak_measured": 914408,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-bitget.book.replay.warm_file_backed.baseline.json",
+      "sample": "book-bitget",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            175058775,
+            204581069,
+            183596042
+          ],
+          "max": 204581069,
+          "median": 183596042,
+          "min": 175058775,
+          "range": 29522294
+        },
+        "adapter_ns": {
+          "individual": [
+            389408136,
+            417770181,
+            372905984
+          ],
+          "max": 417770181,
+          "median": 389408136,
+          "min": 372905984,
+          "range": 44864197
+        },
+        "decode_ns": {
+          "individual": [
+            352282996,
+            380425928,
+            367134113
+          ],
+          "max": 380425928,
+          "median": 367134113,
+          "min": 352282996,
+          "range": 28142932
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          983864591,
+          1072779053,
+          992985903
+        ],
+        "max": 1072779053,
+        "median": 992985903,
+        "min": 983864591,
+        "range": 88914462
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          1414634631,
+          1447467824,
+          1514312766
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            1414634631,
+            1447467824,
+            1514312766
+          ],
+          "max": 1514312766,
+          "median": 1447467824,
+          "min": 1414634631,
+          "range": 99678135
+        }
+      },
+      "denominators": {
+        "events": 187822,
+        "levels": 1067492
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          1253248,
+          1253248,
+          1253252
+        ],
+        "peak_measured": 1253252,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-bybit.book.replay.memory.baseline.json",
+      "sample": "book-bybit",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            264846519,
+            266885683,
+            264743114
+          ],
+          "max": 266885683,
+          "median": 264846519,
+          "min": 264743114,
+          "range": 2142569
+        },
+        "adapter_ns": {
+          "individual": [
+            513183920,
+            531981005,
+            548273576
+          ],
+          "max": 548273576,
+          "median": 531981005,
+          "min": 513183920,
+          "range": 35089656
+        },
+        "decode_ns": {
+          "individual": [
+            550240988,
+            581636042,
+            615221316
+          ],
+          "max": 615221316,
+          "median": 581636042,
+          "min": 550240988,
+          "range": 64980328
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          1454357621,
+          1506493222,
+          1552015038
+        ],
+        "max": 1552015038,
+        "median": 1506493222,
+        "min": 1454357621,
+        "range": 97657417
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          1294594347,
+          1342809375,
+          1334535124
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            1294594347,
+            1342809375,
+            1334535124
+          ],
+          "max": 1342809375,
+          "median": 1334535124,
+          "min": 1294594347,
+          "range": 48215028
+        }
+      },
+      "denominators": {
+        "events": 187822,
+        "levels": 1067492
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          1253332,
+          1253332,
+          1253332
+        ],
+        "peak_measured": 1253332,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-bybit.book.replay.memory.candidate.json",
+      "sample": "book-bybit",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            267230083,
+            263610078,
+            274427244
+          ],
+          "max": 274427244,
+          "median": 267230083,
+          "min": 263610078,
+          "range": 10817166
+        },
+        "adapter_ns": {
+          "individual": [
+            538050529,
+            587039500,
+            525530835
+          ],
+          "max": 587039500,
+          "median": 538050529,
+          "min": 525530835,
+          "range": 61508665
+        },
+        "decode_ns": {
+          "individual": [
+            390261540,
+            404925723,
+            466595716
+          ],
+          "max": 466595716,
+          "median": 404925723,
+          "min": 390261540,
+          "range": 76334176
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          1321683402,
+          1372437790,
+          1381211954
+        ],
+        "max": 1381211954,
+        "median": 1372437790,
+        "min": 1321683402,
+        "range": 59528552
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          1427785751,
+          1452327754,
+          1464385450
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            1427785751,
+            1452327754,
+            1464385450
+          ],
+          "max": 1464385450,
+          "median": 1452327754,
+          "min": 1427785751,
+          "range": 36599699
+        }
+      },
+      "denominators": {
+        "events": 187822,
+        "levels": 1067492
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          1413840,
+          1413836,
+          1413844
+        ],
+        "peak_measured": 1413844,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-bybit.book.replay.warm_file_backed.candidate.json",
+      "sample": "book-bybit",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            246615127,
+            272461905,
+            250234815
+          ],
+          "max": 272461905,
+          "median": 250234815,
+          "min": 246615127,
+          "range": 25846778
+        },
+        "adapter_ns": {
+          "individual": [
+            546130554,
+            550700061,
+            552106372
+          ],
+          "max": 552106372,
+          "median": 550700061,
+          "min": 546130554,
+          "range": 5975818
+        },
+        "decode_ns": {
+          "individual": [
+            532738051,
+            512938443,
+            551651854
+          ],
+          "max": 551651854,
+          "median": 532738051,
+          "min": 512938443,
+          "range": 38713411
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          1439246443,
+          1462394008,
+          1472374923
+        ],
+        "max": 1472374923,
+        "median": 1462394008,
+        "min": 1439246443,
+        "range": 33128480
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          1585433754,
+          1547621915,
+          1531809304
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            1585433754,
+            1547621915,
+            1531809304
+          ],
+          "max": 1585433754,
+          "median": 1547621915,
+          "min": 1531809304,
+          "range": 53624450
+        }
+      },
+      "denominators": {
+        "events": 187822,
+        "levels": 1067492
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          1414264,
+          1414264,
+          1414268
+        ],
+        "peak_measured": 1414268,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-bybit.book.replay.warm_file_backed.baseline.json",
+      "sample": "book-bybit",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            289137189,
+            271882007,
+            262873829
+          ],
+          "max": 289137189,
+          "median": 271882007,
+          "min": 262873829,
+          "range": 26263360
+        },
+        "adapter_ns": {
+          "individual": [
+            578825017,
+            523496102,
+            531820653
+          ],
+          "max": 578825017,
+          "median": 531820653,
+          "min": 523496102,
+          "range": 55328915
+        },
+        "decode_ns": {
+          "individual": [
+            603775291,
+            643801124,
+            627409085
+          ],
+          "max": 643801124,
+          "median": 627409085,
+          "min": 603775291,
+          "range": 40025833
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          1593056217,
+          1556381920,
+          1555228880
+        ],
+        "max": 1593056217,
+        "median": 1556381920,
+        "min": 1555228880,
+        "range": 37827337
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          1213600610,
+          1300155502,
+          1239918225
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            1213600610,
+            1300155502,
+            1239918225
+          ],
+          "max": 1300155502,
+          "median": 1239918225,
+          "min": 1213600610,
+          "range": 86554892
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          787872,
+          787868,
+          787868
+        ],
+        "peak_measured": 787872,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-binance.book.replay.memory.baseline.json",
+      "sample": "book-binance",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            273048842,
+            369974973,
+            293873040
+          ],
+          "max": 369974973,
+          "median": 293873040,
+          "min": 273048842,
+          "range": 96926131
+        },
+        "adapter_ns": {
+          "individual": [
+            350161521,
+            430990893,
+            349366534
+          ],
+          "max": 430990893,
+          "median": 350161521,
+          "min": 349366534,
+          "range": 81624359
+        },
+        "decode_ns": {
+          "individual": [
+            538363630,
+            564628083,
+            619132897
+          ],
+          "max": 619132897,
+          "median": 564628083,
+          "min": 538363630,
+          "range": 80769267
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          1243373664,
+          1460472136,
+          1347580210
+        ],
+        "max": 1460472136,
+        "median": 1347580210,
+        "min": 1243373664,
+        "range": 217098472
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          1099443821,
+          1141354279,
+          1043068220
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            1099443821,
+            1141354279,
+            1043068220
+          ],
+          "max": 1141354279,
+          "median": 1099443821,
+          "min": 1043068220,
+          "range": 98286059
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          776372,
+          776372,
+          776372
+        ],
+        "peak_measured": 776372,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-binance.book.replay.memory.candidate.json",
+      "sample": "book-binance",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            326473353,
+            281366319,
+            276880650
+          ],
+          "max": 326473353,
+          "median": 281366319,
+          "min": 276880650,
+          "range": 49592703
+        },
+        "adapter_ns": {
+          "individual": [
+            449209451,
+            451794634,
+            395767691
+          ],
+          "max": 451794634,
+          "median": 449209451,
+          "min": 395767691,
+          "range": 56026943
+        },
+        "decode_ns": {
+          "individual": [
+            413427491,
+            386468021,
+            324685029
+          ],
+          "max": 413427491,
+          "median": 386468021,
+          "min": 324685029,
+          "range": 88742462
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          1267058526,
+          1197724228,
+          1074215522
+        ],
+        "max": 1267058526,
+        "median": 1197724228,
+        "min": 1074215522,
+        "range": 192843004
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          1220975952,
+          1241745601,
+          1214242229
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            1220975952,
+            1241745601,
+            1214242229
+          ],
+          "max": 1241745601,
+          "median": 1220975952,
+          "min": 1214242229,
+          "range": 27503372
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          923848,
+          924760,
+          923852
+        ],
+        "peak_measured": 924760,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-binance.book.replay.warm_file_backed.candidate.json",
+      "sample": "book-binance",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            279687134,
+            288906394,
+            292379832
+          ],
+          "max": 292379832,
+          "median": 288906394,
+          "min": 279687134,
+          "range": 12692698
+        },
+        "adapter_ns": {
+          "individual": [
+            390037607,
+            436592781,
+            407438164
+          ],
+          "max": 436592781,
+          "median": 407438164,
+          "min": 390037607,
+          "range": 46555174
+        },
+        "decode_ns": {
+          "individual": [
+            489368508,
+            495161866,
+            496017879
+          ],
+          "max": 496017879,
+          "median": 495161866,
+          "min": 489368508,
+          "range": 6649371
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          1238534266,
+          1296719528,
+          1282621888
+        ],
+        "max": 1296719528,
+        "median": 1282621888,
+        "min": 1238534266,
+        "range": 58185262
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          1302312749,
+          1380780380,
+          980832297
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            1302312749,
+            1380780380,
+            980832297
+          ],
+          "max": 1380780380,
+          "median": 1302312749,
+          "min": 980832297,
+          "range": 399948083
+        }
+      },
+      "denominators": {
+        "events": 37817,
+        "levels": 843525
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          935440,
+          935436,
+          935440
+        ],
+        "peak_measured": 935440,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-binance.book.replay.warm_file_backed.baseline.json",
+      "sample": "book-binance",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            322814875,
+            256515607,
+            254617933
+          ],
+          "max": 322814875,
+          "median": 256515607,
+          "min": 254617933,
+          "range": 68196942
+        },
+        "adapter_ns": {
+          "individual": [
+            382118151,
+            374758752,
+            236968608
+          ],
+          "max": 382118151,
+          "median": 374758752,
+          "min": 236968608,
+          "range": 145149543
+        },
+        "decode_ns": {
+          "individual": [
+            749459187,
+            731907629,
+            431468001
+          ],
+          "max": 749459187,
+          "median": 731907629,
+          "min": 431468001,
+          "range": 317991186
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          1533220477,
+          1441938250,
+          995453084
+        ],
+        "max": 1533220477,
+        "median": 1441938250,
+        "min": 995453084,
+        "range": 537767393
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          768647234,
+          692974045,
+          750176134
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            768647234,
+            692974045,
+            750176134
+          ],
+          "max": 768647234,
+          "median": 750176134,
+          "min": 692974045,
+          "range": 75673189
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          674224,
+          680832,
+          728496
+        ],
+        "peak_measured": 728496,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-okx.book.replay.memory.baseline.json",
+      "sample": "book-okx",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            171785709,
+            138182488,
+            173645210
+          ],
+          "max": 173645210,
+          "median": 171785709,
+          "min": 138182488,
+          "range": 35462722
+        },
+        "adapter_ns": {
+          "individual": [
+            271245798,
+            239128252,
+            249403590
+          ],
+          "max": 271245798,
+          "median": 249403590,
+          "min": 239128252,
+          "range": 32117546
+        },
+        "decode_ns": {
+          "individual": [
+            265043161,
+            250843046,
+            259950392
+          ],
+          "max": 265043161,
+          "median": 259950392,
+          "min": 250843046,
+          "range": 14200115
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          773511779,
+          697465404,
+          754019480
+        ],
+        "max": 773511779,
+        "median": 754019480,
+        "min": 697465404,
+        "range": 76046375
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "memory",
+      "cpu_ns": {
+        "individual": [
+          711916682,
+          663693148,
+          741879776
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            711916682,
+            663693148,
+            741879776
+          ],
+          "max": 741879776,
+          "median": 711916682,
+          "min": 663693148,
+          "range": 78186628
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          674196,
+          674196,
+          674196
+        ],
+        "peak_measured": 674196,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-okx.book.replay.memory.candidate.json",
+      "sample": "book-okx",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            154613620,
+            155579937,
+            184292972
+          ],
+          "max": 184292972,
+          "median": 155579937,
+          "min": 154613620,
+          "range": 29679352
+        },
+        "adapter_ns": {
+          "individual": [
+            288720727,
+            266658905,
+            292611843
+          ],
+          "max": 292611843,
+          "median": 288720727,
+          "min": 266658905,
+          "range": 25952938
+        },
+        "decode_ns": {
+          "individual": [
+            211894830,
+            188429794,
+            209358975
+          ],
+          "max": 211894830,
+          "median": 209358975,
+          "min": 188429794,
+          "range": 23465036
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          715592490,
+          667531538,
+          755874522
+        ],
+        "max": 755874522,
+        "median": 715592490,
+        "min": 667531538,
+        "range": 88342984
+      }
+    },
+    {
+      "backend": "candidate",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          749875393,
+          781636002,
+          806247535
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            749875393,
+            781636002,
+            806247535
+          ],
+          "max": 806247535,
+          "median": 781636002,
+          "min": 749875393,
+          "range": 56372142
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          768604,
+          768600,
+          768604
+        ],
+        "peak_measured": 768604,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-okx.book.replay.warm_file_backed.candidate.json",
+      "sample": "book-okx",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            165850312,
+            173116927,
+            179529218
+          ],
+          "max": 179529218,
+          "median": 173116927,
+          "min": 165850312,
+          "range": 13678906
+        },
+        "adapter_ns": {
+          "individual": [
+            304725520,
+            331376240,
+            326280410
+          ],
+          "max": 331376240,
+          "median": 326280410,
+          "min": 304725520,
+          "range": 26650720
+        },
+        "decode_ns": {
+          "individual": [
+            223165213,
+            220091028,
+            257976262
+          ],
+          "max": 257976262,
+          "median": 223165213,
+          "min": 220091028,
+          "range": 37885234
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          754373772,
+          785855533,
+          824688121
+        ],
+        "max": 824688121,
+        "median": 785855533,
+        "min": 754373772,
+        "range": 70314349
+      }
+    },
+    {
+      "backend": "baseline",
+      "cache": "warm_file_backed",
+      "cpu_ns": {
+        "individual": [
+          787531963,
+          728139334,
+          713460338
+        ],
+        "source": "/proc/self/schedstat running time; null when unavailable",
+        "summary": {
+          "individual": [
+            787531963,
+            728139334,
+            713460338
+          ],
+          "max": 787531963,
+          "median": 728139334,
+          "min": 713460338,
+          "range": 74071625
+        }
+      },
+      "denominators": {
+        "events": 76108,
+        "levels": 564384
+      },
+      "exact_equality": true,
+      "family": "book",
+      "mode": "replay",
+      "rss_kib": {
+        "individual": [
+          768488,
+          768484,
+          768484
+        ],
+        "peak_measured": 768488,
+        "scope": "includes retained source Parquet rows used for exact post-timing checks",
+        "source": "/proc/self/status VmRSS"
+      },
+      "run_file": "book-okx.book.replay.warm_file_backed.baseline.json",
+      "sample": "book-okx",
+      "stages_ns": {
+        "actual_bookstate_apply_ns": {
+          "individual": [
+            174275157,
+            163314137,
+            168281771
+          ],
+          "max": 174275157,
+          "median": 168281771,
+          "min": 163314137,
+          "range": 10961020
+        },
+        "adapter_ns": {
+          "individual": [
+            275963190,
+            237536087,
+            229619660
+          ],
+          "max": 275963190,
+          "median": 237536087,
+          "min": 229619660,
+          "range": 46343530
+        },
+        "decode_ns": {
+          "individual": [
+            301383818,
+            276203943,
+            276949496
+          ],
+          "max": 301383818,
+          "median": 276949496,
+          "min": 276203943,
+          "range": 25179875
+        }
+      },
+      "wall_ns": {
+        "individual": [
+          820734357,
+          732245129,
+          734055808
+        ],
+        "max": 820734357,
+        "median": 734055808,
+        "min": 732245129,
+        "range": 88489228
+      }
+    }
+  ],
+  "schema": "aura1_replay_campaign_v1",
+  "started_utc": "2026-09-08T01:18:41.705870+00:00",
+  "warm_cache_label": "warm_file_backed reads each input on every repetition; the OS cache is not flushed"
+}
