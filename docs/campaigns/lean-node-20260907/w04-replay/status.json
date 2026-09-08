@@ -1,0 +1,21 @@
+{
+  "owner": "w04-replay",
+  "phase": "discovery",
+  "updated_at_utc": "2026-09-08T00:09:26.161482+00:00",
+  "branch": "campaign/lean-node-20260907/w04-replay",
+  "starting_commit": "cc04f75c9217e6c6a575145ab0ed98df232f622d",
+  "current_commit": "cc04f75c9217e6c6a575145ab0ed98df232f622d",
+  "claimed_paths": [
+    "src/orderbook.rs (after audit; no format changes)",
+    "src/bin/aura_replay_bench.rs (new maintained benchmark)",
+    "tests/replay-focused tests (as needed)",
+    "docs/campaigns/lean-node-20260907/w04-replay/"
+  ],
+  "completed_evidence": [
+    "Original Aura checkout clean; exact base recorded; isolated branch created",
+    "Discovered obsolete diverged original main; moved untouched branch to maintained/deployed origin/main cc04f75"
+  ],
+  "blockers": [],
+  "next_step": "Audit maintained APIs and existing fused replay; coordinate corpus with w03",
+  "original_checkout_commit": "420052ceb50ea7a720dbf6bf46ebd6e4d3d61634"
+}
