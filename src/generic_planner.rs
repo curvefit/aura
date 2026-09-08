@@ -5719,31 +5719,31 @@ fn materialize_generic_i64_rows_from_stream_values(
     }
 
     let partition_runs = materialize_partition_run_lengths(
-        &plan,
-        &stream_values,
+        plan,
+        stream_values,
         record_count,
         field_count,
         &mut rows,
         &mut filled,
     )?;
     materialize_group_value_streams(
-        &plan,
-        &stream_values,
+        plan,
+        stream_values,
         &partition_runs,
         field_count,
         &mut rows,
         &mut filled,
     )?;
     materialize_segmented_delta_streams(
-        &plan,
-        &stream_values,
+        plan,
+        stream_values,
         &partition_runs,
         field_count,
         &mut rows,
         &mut filled,
     )?;
 
-    let presence_maps = presence_maps_by_group(&plan, &stream_values, record_count)?;
+    let presence_maps = presence_maps_by_group(plan, stream_values, record_count)?;
     for group in &plan.groups {
         match group {
             GenericGroupInstruction::SparseStream {
@@ -5897,7 +5897,7 @@ fn materialize_generic_i64_rows_from_stream_values(
             {
                 continue;
             }
-            let event_slots = group_event_slots(&plan, *parent_group_id)?;
+            let event_slots = group_event_slots(plan, *parent_group_id)?;
             if !event_slots.iter().chain(input_slots.iter()).all(|slot| {
                 filled
                     .iter()
@@ -5924,8 +5924,8 @@ fn materialize_generic_i64_rows_from_stream_values(
                 }
                 DerivedOp::PreviousMutationSameKeyResidual => {
                     if !materialize_explicit_previous_same_key(
-                        &plan,
-                        &stream_values,
+                        plan,
+                        stream_values,
                         input_slots,
                         *output_slot,
                         residuals,
@@ -5945,8 +5945,8 @@ fn materialize_generic_i64_rows_from_stream_values(
                 }
                 DerivedOp::PreviousOutputByKeyResidual => {
                     if !materialize_explicit_previous_same_key(
-                        &plan,
-                        &stream_values,
+                        plan,
+                        stream_values,
                         input_slots,
                         *output_slot,
                         residuals,
