@@ -6,8 +6,8 @@ Common validation errors:
 
 - duplicate schema field names
 - duplicate field IDs
-- unsupported physical types such as floats, UTF-8, and binary payloads
-- nullable fields, until the format has explicit presence/offset support
+- unsupported V2 SDK physical types such as floats, UTF-8, and binary payloads
+- nullable fields in the V2 SDK facade, which has no presence/offset support
 - missing, extra, or type-mismatched columns in `AuraColumnBatch`
 - row values outside the declared integer width
 - unsupported Aura0 byte-lane selection or codec
@@ -15,14 +15,18 @@ Common validation errors:
 
 Unsupported features are rejected before writing whenever the SDK can know the schema or value shape. Reader and converter errors are intentionally explicit; the SDK does not silently reinterpret a schema as a different physical layout.
 
-For v1, these are deliberate limitations rather than partial implementations:
+For the V2 SDK facade, these are deliberate limitations rather than partial
+implementations:
 
 - variable-width `Utf8` and `Binary`
 - nullable fields
 - `F32` and `F64`
 - true zero-copy/block-streaming `AuraReader`
 
-The reader exposes a batch-iteration API today, but internally it still decodes through the existing generic row engine before serving batches.
+The V2 reader exposes a batch-iteration API today, but Aura0 compact batches
+materialize compact columns on first access and Aura1 file-backed reads use
+bounded ranges. The V3 readers below have separate exact-value and verification
+contracts.
 
 The standalone V3 exact-value block reports the same typed `AuraError` family.
 It rejects stale schema IDs, grouped/repeated schemas in flat block v1, wrong

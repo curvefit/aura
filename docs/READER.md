@@ -1,8 +1,9 @@
 # Aura Reader API
 
-Use `AuraReader::open(input)` to read any supported sealed Aura profile from
-an in-memory or generic `Read` source. Use `AuraReader::open_path(path)` or
-`AuraReader::open_file(file)` for file-backed Aura1 replay.
+Use `AuraReader::open(input)` to read any supported sealed V2 Aura profile from
+an in-memory or generic `Read` source. V3 has separate reader types described
+below. Use `AuraReader::open_path(path)` or `AuraReader::open_file(file)` for
+file-backed Aura1 replay.
 
 ```rust
 let mut reader = aura_codec::AuraReader::open(input)?;
@@ -28,7 +29,11 @@ Available reader methods:
 - `replay_row_views(visitor)`
 - `grouped_replay(group_by, visitor)`
 
-Aura1 reads stream fixed-width rows directly from the Aura1 body. Aura0 compact opens by parsing metadata only, then lazily builds bounded row batches from compact stream columns. `read_batches()` is a convenience collector over `next_batch`.
+Aura1 reads fixed-width rows directly from the Aura1 body. Aura0 compact opens
+with metadata, then materializes its compact stream columns on the first batch
+request and slices bounded row or column batches from those columns.
+`read_batches()` is a convenience collector over `next_batch`; it does not make
+Aura0 decoding streaming.
 
 For Aura1 files on disk, `open_path` and `open_file` use the existing
 header/trailer/footer metadata to avoid copying the whole file at open. The
@@ -71,7 +76,7 @@ can process row ranges or pull only selected fields.
 Do not treat a view-only batch callback as parse throughput. The true parse
 benchmark is the path that calls `value_i64`, `field_i64`, `checksum_field`, or
 `checksum_all_fields` for the selected fields. View construction is measured
-separately in `aura_sdk_bench`.
+separately in `aura-sdk-bench`.
 
 For ergonomic per-row borrowed access without the temporary full-row i64
 buffer used by `replay_i64`, use row views:

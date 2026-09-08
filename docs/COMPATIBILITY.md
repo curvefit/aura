@@ -3,6 +3,10 @@
 The current format version is checked during footer decode. Unsupported versions
 return an error instead of falling back silently.
 
+`LegacyV1` is recognized for historical front-header parsing only. This crate
+has no supported complete V1 container/footer read or write contract; recognition
+of its header does not imply a successful complete-file decode.
+
 Current production and default SDK writers emit complete V2 containers. V3 has
 two complete, explicitly selected, uncompressed Aura0 SDK compatibility
 subsets: flat event-only `AURAV3VB` exact-value blocks, and grouped exact-event
@@ -41,7 +45,7 @@ Its 32-bit schema ID is only a routing hint; a SHA-256 fingerprint of the
 canonical tag-4 schema is the strong binding. It is not a container or
 conversion target. Version 1 supports flat event-scoped schemas only and
 rejects repeated fields/groups rather than flattening child rows. V2 schema encode/decode and
-every current ingest/compiled writer path reject field codes 12
+V2 ingest/compiled writer paths reject field codes 12
 (`TimestampMs`), 13 (`Utf8`), and 14 (`DecimalText`). Codes 1 through 11 and all
 checked-in V2 fixture bytes/hashes remain unchanged. Adding the reference block
 does not by itself permit a V3 writer, stamp, restamp, or profile conversion.
@@ -142,7 +146,7 @@ create-once publication and recovery state machine. Verification boundedly
 routes from the held footer tuple, then fully verifies and hashes that exact
 held file without an external schema.
 
-## Default Path Matrix
+## Execution and storage choices
 
 | Role | Current default candidate | Reference/experimental alternatives |
 | --- | --- | --- |
@@ -151,12 +155,12 @@ held file without an external schema.
 | `.aura1` replay | `aura1-scan-fixed` / fixed replay visitor | `aura1-parse-to-rows` materializes rows for comparison only |
 | guard mode | `no_guard` | strict modes for verification only |
 | canonical hash | `none` | `verify` for correctness checks |
-| Aura0 profile | `hybrid` for speed + semantic fallback, `compact` for smallest archive | `fast` for byte-lane-only speed files |
+| Aura0 profile | `compact` is the SDK writer/converter default | `hybrid` adds a byte lane with semantic fallback; `fast` is byte-lane-only |
 | V3 flat/grouped SDK | no production/default candidate; select the explicit API or CLI | `V3FlatLimits::HARD` / `V3GroupedLimits::HARD` for explicit hard-envelope tests |
 
-The default candidates are conservative. They are chosen from current test and
-benchmark evidence, not from an assertion that remaining materialization is
-unavoidable.
+The execution candidates describe benchmark paths, not a universal speed
+promise. Optional storage profiles must be chosen explicitly. Historical
+workload results are labeled in [BENCHMARKING.md](BENCHMARKING.md#historical-benchmark-evidence).
 
 ## Guard Modes
 
@@ -228,19 +232,9 @@ supported `.aura0 -> .aura1` plans, but measured grimoire runs were slower than
 the materialized/profiled path. Treat it as experimental evidence, not the
 production default.
 
-The profiled materialized `.aura0 -> .aura1` path now stays compiled-plan-backed
-when the specialized partitioned-sparse writer declines and the generic direct
-writer can reconstruct all Aura1 fields. This resolved the prior
-no-Huffman/`PartitionRuns` fallback gap:
-
-```text
-grimoire-50mb-nohuff Aura0 -> Aura1 bytes:
-before generic profiled fallback: 154.896 ms, compiled_plan_used=false
-after generic profiled fallback:  107.088 ms, compiled_plan_used=true
-```
-
-The current path still materializes 12 stream vectors and 2,754,892 stream
-values on the grimoire artifacts. It is not the final answer to the zstd target.
+Historical fallback-resolution timings and materialization counts are retained
+in [BENCHMARKING.md](BENCHMARKING.md#historical-benchmark-evidence); they are not
+current-head or all-schema performance guarantees.
 
 `--encoder-path column-free` is currently rejected with a specific error. The
 existing `.aura1 -> .aura0` encoder decodes Aura1 into per-field column buffers
@@ -261,74 +255,24 @@ continuity with existing benchmark output.
 
 ## Generated Fixture Coverage
 
-`aura-fixture-gen` produces current-format tiny, dense/few-symbol,
-sparse/many-symbol, nohuff, and larger fixture pairs plus `.aura1.zst`
-baselines. The generated `huff` entry is intentionally blocked rather than
+`aura-fixture-gen` produces current-format fixture pairs plus `.aura1.zst`
+baselines. Coverage includes tiny, dense/sparse, reordered/wide/edge-case SDK,
+repeated-key, high-cardinality, nohuff, and larger inputs. `fixtures.json` is
+the generated inventory; `tiny` (16-row OHLCV) and `sdk-tiny` (4-row SDK) are
+distinct datasets. The generated `huff` entry is intentionally blocked rather than
 silently mislabeled: the current public writer/planner did not select a
 `HuffmanDictionary` stream for generated rows under the 2x Huffman speed gate.
 Use the external `grimoire-50mb-huff` artifact for Huffman-heavy benchmarking
 until a repo-native Huffman fixture generator or fixture blob is added.
 
-## Aura0 Versus Zstd Status
+## Aura0 profile reader compatibility
 
-The current fair product comparison for compact semantic Aura0 remains in favor
-of zstd:
+The workload-specific compact/fast/hybrid versus zstd results are retained in
+[BENCHMARKING.md](BENCHMARKING.md#historical-benchmark-evidence). They do not
+change the compact SDK default or establish a universal compression/speed win.
+Choose profiles with the required semantic fallback and reader versions in mind.
 
-```text
-Aura0: .aura0 -> .aura1 uncompressed bytes
-Zstd:  .aura1.zst -> .aura1 uncompressed bytes
-```
-
-Fresh 10-run warm results after real byte-lane integration:
-
-```text
-grimoire-50mb-huff:   compact Aura0 80.608 ms, zstd L3 61.386 ms
-grimoire-50mb-nohuff: compact Aura0 104.173 ms, zstd L3 62.798 ms
-```
-
-Real Aura0 fast/hybrid byte-lane files reverse that product target:
-
-```text
-grimoire-50mb-huff:   fast raw 24.753 ms, fast lz4 44.373 ms, hybrid lz4 43.761 ms
-grimoire-50mb-nohuff: fast raw 25.271 ms, fast lz4 43.281 ms, hybrid lz4 44.058 ms
-```
-
-Compatibility recommendation:
-
-- Keep the current semantic Aura0 stream layout as the stable compact/canonical
-  cold format.
-- Use Aura0-hybrid + lz4 when the product requirement is faster-than-zstd
-  Aura1 byte expansion while retaining the semantic lane for verification or
-  fallback.
-- Use Aura0-fast + lz4 when byte-output speed and smaller-than-raw size matter
-  more than semantic-lane fallback.
-- Do not claim current compact `.aura0` files are faster than zstd for byte
-  expansion; claim that fast/hybrid byte-lane profiles beat external zstd L3 in
-  the measured huff/nohuff runs.
-
-Old readers may reject new fast/hybrid files because the `AURP` footer has an
-optional trailing `AUBL` extension. New readers read old compact files because
-the extension is omitted when no byte lanes are present.
-
-## Byte-lane safety limits
-
-Fast and hybrid byte lanes use all-memory expansion in the current reader, so
-the supported V2 byte-lane subset has fixed fail-closed limits:
-
-- at most 65,536 byte-lane descriptors;
-- at most 1 GiB (`1 << 30` bytes) of compressed payload per lane;
-- at most 1 GiB of uncompressed output per lane; and
-- at most 1 GiB of total expanded output across all lanes.
-
-Descriptor tables, offsets, lengths, row ranges, and cumulative output are
-checked before allocation or decompression. Output allocation is fallible, and
-raw, LZ4, and Zstd payloads must produce the exact declared bounded length.
-These are normative security ceilings for the current all-memory byte-lane
-implementation, not benchmark tuning parameters. Experimental V2 fast/hybrid
-artifacts above these ceilings are outside the promised compatibility subset
-and reject with a typed error. Compact semantic Aura0 files do not use this
-byte-lane output limit.
-
-Ingest and compiled V2 footers also support at most 65,536 chunk descriptors.
-Each chunk descriptor is a fixed 76-byte record; decoders validate the count,
-checked table size, and remaining footer bytes before fallible allocation.
+Old readers may reject fast/hybrid files because their `AURP` footer has an
+optional trailing `AUBL` extension. Current readers decode old compact files
+without that extension through the semantic path. A fast-only file has no
+semantic lane; requesting `--use-byte-lane never` cannot decode it.

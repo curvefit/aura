@@ -30,7 +30,7 @@ cold storage, and `.aura1` is the fixed-width replay/transport candidate.
 Command:
 
 ```bash
-target/release/aura_sdk_bench \
+target/release/aura-sdk-bench \
   --fixture-dir /tmp/aura-dbn-closeout-fixtures \
   --output-dir /tmp/aura-dbn-closeout-event-50 \
   --iterations 50 \
@@ -63,7 +63,7 @@ target/release/aura_sdk_bench \
 Command:
 
 ```bash
-target/release/aura_sdk_bench \
+target/release/aura-sdk-bench \
   --fixture-dir /tmp/aura-dbn-closeout-fixtures \
   --output-dir /tmp/aura-dbn-closeout-book \
   --iterations 10 \
