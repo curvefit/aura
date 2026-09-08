@@ -1,0 +1,97 @@
+{
+  "owner": "w05-aura-cleanup",
+  "base_commit": "cc04f75c9217e6c6a575145ab0ed98df232f622d",
+  "worktree": "/home/anton/Downloads/lean-node-20260907/aura-w05",
+  "remote": "https://github.com/curvefit/aura.git",
+  "scope": [
+    "Cargo.toml",
+    "Cargo.lock",
+    ".gitignore",
+    "package inventory"
+  ],
+  "changes": [
+    {
+      "path": "Cargo.toml",
+      "kind": "metadata",
+      "before": "https://github.com/L3data/aura",
+      "after": "https://github.com/curvefit/aura",
+      "evidence": "git remote -v and git ls-remote origin show curvefit/aura as the current remote/main"
+    },
+    {
+      "path": "Cargo.toml",
+      "kind": "dependency_features",
+      "before": "arrow default features plus prettyprint and ipc_compression",
+      "after": "arrow default-features=false with ipc_compression",
+      "evidence": "rg found Arrow array/datatype/IPC APIs only; no pretty_format/prettyprint, CSV, or JSON APIs. cargo tree -e features confirms only arrow ipc_compression -> arrow-ipc lz4/zstd. Shadow v1/v2 uses Arrow IPC and tests use LZ4_FRAME, so IPC compression remains enabled."
+    },
+    {
+      "path": "Cargo.lock",
+      "kind": "resolution",
+      "evidence": "lock regeneration removes 11 unused package sections (arrow-csv, arrow-json, comfy-table, csv, csv-core, equivalent, hashbrown 0.17, indexmap, lazy_static, unicode-segmentation, unicode-width); cargo metadata --locked and cargo tree --locked succeed"
+    }
+  ],
+  "targets": {
+    "binaries": [
+      "aura",
+      "aura-bench",
+      "aura-fixture-gen",
+      "aura-json-i64",
+      "aura-parquet-ohlcv",
+      "aura-sdk-bench",
+      "aura-size",
+      "aura-verify-random"
+    ],
+    "examples": [
+      "columnar_write",
+      "convert_aura",
+      "order_book_aura0",
+      "read_aura",
+      "replay_aura1",
+      "roundtrip",
+      "stream_batches",
+      "write_aura0_compact",
+      "write_aura0_hybrid",
+      "write_aura1"
+    ],
+    "auto_discovery": "No unregistered src/bin target remains; cargo metadata lists all eight binaries with their explicit dashed names, including aura-sdk-bench and aura."
+  },
+  "dependency_consumers": {
+    "anyhow": "aura-bench, aura-fixture-gen, aura-sdk-bench, aura-json-i64, aura-parquet-ohlcv",
+    "arrow": "public shadow_protocol and shadow_protocol_v2 APIs, aura CLI, parquet OHLCV adapter, IPC tests",
+    "flatbuffers": "shadow_protocol_v2 IPC validation and its tests",
+    "parquet": "aura-parquet-ohlcv default-supported converter",
+    "lz4_flex": "records byte-lane codec",
+    "serde": "schema_json derives",
+    "serde_json": "CLI reports, schema JSON, verification reports, tests",
+    "sha2": "provenance, container/body/value hashes, benchmark/CLI reports",
+    "zstd": "V2/V3 compression and benchmark/fixture paths"
+  },
+  "packaging_audit": {
+    "cargo_package_list": "passed; tracked source/docs/examples/tests/LICENSE and small checked-in fixtures only",
+    "tracked_private_or_secret_names": [],
+    "tracked_large_data_names": [],
+    "historical_path_references": {
+      "count": 202,
+      "files": "docs and one verification binary contain historical /tmp or machine-local benchmark path references; no credentials or secret values were printed or found",
+      "action": "retained as research evidence; no package manifest exclusion added because these are text references, not bundled private data"
+    },
+    "license": "LICENSE present; Cargo.toml declares Apache-2.0",
+    "gitignore": "Local .env/.ENV files ignored; package/fixture inventory will be rechecked after commit.",
+    "sibling_consumers": {
+      "grimoire": "v2/book Cargo.lock pins aura-codec from curvefit/aura at cc04f75; home docs and reproduction use curvefit/aura",
+      "aura-ar": "research/reproduction docs use aura-fixture-gen, aura-bench, aura-sdk-bench and curvefit/aura; no package metadata consumer requiring CSV/JSON/pretty-print Arrow features"
+    },
+    "common_credential_pattern_scan": "No matches in packaged text; private key, GitHub token, AWS key, and long credential-assignment patterns checked without printing values"
+  },
+  "commands": [
+    "git remote -v",
+    "git ls-remote origin refs/heads/main",
+    "cargo metadata --no-deps --format-version 1",
+    "cargo metadata --locked --no-deps --format-version 1",
+    "cargo tree --depth 1 --edges normal,build,dev",
+    "cargo tree -e features --depth 2",
+    "cargo tree --locked --depth 1 --edges normal,build,dev",
+    "cargo package --allow-dirty --list"
+  ],
+  "heavy_validation": "Clean isolated example checks pass; integrated all-target release build passes; full host test suite PASS reported by w01. Clippy and full release smoke script unconfirmed."
+}

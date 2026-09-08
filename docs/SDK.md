@@ -1,6 +1,15 @@
 # Aura SDK
 
-Aura exposes a small Rust library facade for dynamic fixed-width schemas.
+This guide documents the **default V2** Rust facade for dynamic fixed-width
+schemas. Start with `cargo run --locked --release --example roundtrip` for a
+self-contained write/convert/decode check. Explicit repeated events use the
+[event writer/reader contract](ORDER_BOOK_AURA0.md); V3 exact and planned APIs
+are separate development surfaces described in [FORMAT.md](FORMAT.md).
+
+The caller supplies field meanings, integer scales, ordering, event boundaries,
+and provenance. The facade validates representability; it does not ingest raw
+venue messages or infer missing source facts. [FORMAT.md](FORMAT.md#choosing-a-profile-and-preserving-facts)
+defines these responsibilities and the archival/replay tradeoffs.
 
 ```rust
 use aura_codec::{
@@ -153,7 +162,12 @@ while let Some(batch) = reader.next_batch(1024)? {
 # Ok::<(), aura_codec::AuraError>(())
 ```
 
-Aura1 reads stream fixed-width rows directly from the Aura1 body. Aura0 compact reads parse metadata during open and lazily build bounded row batches from compact stream columns. `read_batches()` is a convenience collector implemented on top of the batch reader.
+Aura1 reads stream fixed-width rows directly from the Aura1 body. Aura0 compact
+reads parse metadata during open, then materialize the complete decoded columns
+on first data access before returning bounded row batches. Batch size therefore
+does not bound total Aura0 decoding memory. File-backed non-Aura1 inputs fall
+back to a full-file copy; only Aura1 has the range-read behavior described above.
+`read_batches()` collects all batches into memory.
 
 For faster Aura1 parsing into SDK batches, use column batches:
 

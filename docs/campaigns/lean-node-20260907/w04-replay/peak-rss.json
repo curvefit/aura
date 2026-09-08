@@ -1,0 +1,52 @@
+{
+  "scope": "whole benchmark child process including setup, independent Parquet decode, exact replay verification and one timed iteration; not decode-only peak",
+  "repetitions": 1,
+  "clock": "Linux wait4 rusage",
+  "finished_utc": "2026-09-08T01:42:15.055910+00:00",
+  "results": [
+    {
+      "sample": "book-bybit",
+      "variant": "baseline",
+      "peak_rss_kib": 1330704,
+      "process_wall_seconds": 13.762616937980056,
+      "process_cpu_seconds": 12.248407,
+      "events": 187822,
+      "levels": 1067492,
+      "source_rows_exact": true,
+      "final_maps_exact": true
+    },
+    {
+      "sample": "book-bybit",
+      "variant": "candidate",
+      "peak_rss_kib": 1330488,
+      "process_wall_seconds": 13.04664605204016,
+      "process_cpu_seconds": 11.781723,
+      "events": 187822,
+      "levels": 1067492,
+      "source_rows_exact": true,
+      "final_maps_exact": true
+    },
+    {
+      "sample": "book-okx",
+      "variant": "baseline",
+      "peak_rss_kib": 705980,
+      "process_wall_seconds": 6.776348588056862,
+      "process_cpu_seconds": 5.895316,
+      "events": 76108,
+      "levels": 564384,
+      "source_rows_exact": true,
+      "final_maps_exact": true
+    },
+    {
+      "sample": "book-okx",
+      "variant": "candidate",
+      "peak_rss_kib": 706140,
+      "process_wall_seconds": 6.254642924061045,
+      "process_cpu_seconds": 5.412706999999999,
+      "events": 76108,
+      "levels": 564384,
+      "source_rows_exact": true,
+      "final_maps_exact": true
+    }
+  ]
+}

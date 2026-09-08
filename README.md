@@ -1,171 +1,65 @@
 # Aura
 
-Aura is a binary event-file library and format laboratory. It provides a
-generic, versioned container for normalized facts, compact cold storage, and
-replay-oriented storage without tying the format to a venue or dataset name.
+Aura is a Rust library for storing normalized facts as versioned binary event
+files. Callers supply schemas, exact values, units, event boundaries, and source
+semantics. Aura encodes and validates those facts; capture and venue adapters
+live outside this repository.
 
-The current implementation has two deliberately separate surfaces:
+The supported default SDK uses **container V2**:
 
-* V2 is the default production container used by the existing SDK writer,
-  reader, and conversion paths. It remains the compatibility baseline for
-  `.aura`, `.aura0`, and `.aura1` files.
-* V3 has two complete, explicitly bounded, uncompressed Aura0 SDK flavors:
-  flat event-scoped values in `AURAV3VB` blocks and grouped exact events in
-  `AURAV3EB` chunks. It also has a separate planned-flat development route
-  whose complete artifacts are all-memory reference outputs. Flat and grouped
-  flavors have self-contained schema/footers, checksums, hashes, seekable
-  writer/reader APIs, and the developer CLI complete-seal/auto-dispatch path.
-  No V3 route is production-ready or the default.
+| Profile | Use |
+| --- | --- |
+| `.aura` | Sealed ingest values, statistics, and physical plans. |
+| `.aura0` | Compact storage; the SDK defaults to the semantic `compact` profile. |
+| `.aura1` | Fixed-width replay derived from the compiled field plan. |
 
-The public model is intentionally generic:
+V2 supports conversion between these profiles. Aura0 favors archive size;
+Aura1 favors predictable field access. Optional Aura0 `fast`/`hybrid` profiles
+store an Aura1 byte lane and have different size and fallback tradeoffs.
+Container V3 APIs and the `aura v3` CLI are explicit development surfaces, with
+separate exact/planned flat and grouped formats; they are not the V2 default or
+an Aura1 conversion route. File extensions alone do not select a version.
 
-- `.aura` is the V2 ingest/preservation profile: normalized logical facts and
-  seal-time statistics where available;
-- a versioned schema header can declare positional fields, relationships,
-  derived-expression references, repeated groups, timestamps, and opaque
-  streams;
-- `.aura0` is a compact cold-storage profile. The established V2 writer uses
-  compiled instructions; the explicit V3 APIs use exact-value or exact-event
-  blocks;
-- `.aura1` is the V2 replay-oriented fixed/block profile.
+## Start here
 
-## Format Levels
-
-| File | Current container | Purpose |
-|---:|---|---|
-| `.aura` | V2 ingest | Normalized facts plus seal-time optimization stats when known. |
-| `.aura0` | V2 or explicit V3 | V2 compact instruction streams, or the supported V3 flat/grouped exact subset. |
-| `.aura1` | V2 | Replay-oriented fixed/block encoding compiled from the V2 plan. |
-
-The V2 levels trade disk for parsing speed. The generic V2 writer emits V2
-containers even when its profile is `.aura0` or `.aura1`; V3 is selected only
-through an explicit V3 API or V3 CLI. V3 flat and grouped Aura0 files
-are self-contained and are not converted by the V2 compiled-profile conversion
-path.
-
-## Repository Scope
-
-Aura contains generic binary codec mechanics and research prototypes:
-
-- varint and zigzag delta encoding,
-- fixed-width replay records,
-- dynamic padded level blocks,
-- chunk directories for independent compression frames,
-- ingest-to-compiled conversion paths,
-- synthetic benchmark inputs.
-
-It does not include venue-specific adapters, private source semantics, capture
-daemons, or production data. A caller or external schema author supplies the
-logical schema; Aura validates it and the V2 planner, where applicable, selects
-physical instructions from declared relationships and observed values. The V3
-exact profiles do not run a physical relationship planner, compression, or
-Plan v2. Dataset names and venue labels are not part of a V3 seal decision.
-
-
-## Docs
-
-- [SDK](docs/SDK.md) explains the public schema, writer, reader, and converter API.
-- [Schema API](docs/SCHEMA.md), [writer API](docs/WRITER.md), [reader API](docs/READER.md), [conversion API](docs/CONVERSION.md), and [errors](docs/ERRORS.md) document the current library surface.
-- [Format levels](docs/tiers.md) explains ingest, Aura0, and Aura1.
-- [Aura container](docs/container.md) explains the header/body/footer shape.
-- [Format specification](docs/FORMAT.md) records the V2 and V3 wire layouts,
-  compatibility boundary, and current limits.
-- [Field programs](docs/field-programs.md) explains compact decode instructions.
-- [Schemas](docs/schemas.md) explains logical schema construction.
-- [Production explicit-event Aura0 repeated groups](docs/ORDER_BOOK_AURA0.md) documents the generic QTY1/QTY2 parent-child contract, exact decoding, and selection rules.
-- [Shadow Arrow protocol](docs/SHADOW_PROTOCOL.md) specifies the offline external-compiler boundary and safe reference-block publication.
-- [Chunked storage](docs/chunking.md) explains independent compression chunks.
-- [Compression policy](docs/compression.md) explains why chunks beat whole-file streams.
-- [Aura1 block padding](docs/hot-padding.md) explains fixed-width replay blocks.
-- [Conversion flow](docs/conversion.md) explains compiled materialization.
-- [Naming](docs/naming.md) lists prototype file extensions and magic values.
-
-## Quick checks
+Install Rust/Cargo (stable), a C/C++ toolchain for native compression libraries,
+and Python 3 for the smoke report check. No dataset, credentials, or `.env` is
+needed. From the repository root:
 
 ```bash
-cargo test
-cargo run --bin aura -- schema validate --input schema.json
-cargo run --bin aura -- schema canonicalize --input schema.json --output canonical-schema.json
-cargo run --bin aura -- shadow handshake --protocol aura-logical-arrow-ipc-v1 --json
-cargo run --release --bin aura -- v3 aura0 seal \
-  --protocol aura-logical-arrow-ipc-v1 \
-  --schema <canonical-schema.json> \
-  --output <new-file.aura0> --json < <arrow-ipc-stream.bin>
-cargo run --release --bin aura -- v3 aura0 seal \
-  --protocol aura-logical-arrow-ipc-v1 --mode planned \
-  --schema <canonical-schema.json> \
-  --output <new-planned-file.aura0> --json < <arrow-ipc-stream.bin>
-cargo run --release --bin aura -- v3 aura0 seal \
-  --protocol aura-logical-arrow-ipc-v2 \
-  --schema <canonical-grouped-schema.json> \
-  --output <new-grouped-file.aura0> --json < <grouped-arrow-ipc-stream.bin>
-cargo run --release --bin aura -- v3 aura0 verify \
-  --input <new-file.aura0> --json
-cargo test --test v3_aura0_container
-cargo test --test v3_grouped_container --test v3_grouped_writer_reader
-cargo run --bin aura-size -- 10000 1 8
-cargo run --example roundtrip
+cargo build --locked --release --lib --bins --examples -j 2
+cargo run --locked --release --example roundtrip
+cargo run --locked --release --example order_book_aura0
+bash scripts/check-onboarding.sh
 ```
 
-The V3 seal command reads one protocol-specific Arrow IPC stream from standard input and requires
-the schema file to already be Aura's canonical external schema JSON. It writes
-an absent `.aura0` destination through a temporary file, syncs it, and
-publishes it atomically. Verification reopens the complete file and checks the
-header, footer, schema fingerprint, per-chunk stored and logical hashes, body
-hash, statistics, global logical hash, and exact file length. A write that fails
-before the complete seal, or any writer/flush/sync error, is a failed and
-uncommitted result that must not be published even if bytes happen to end in a
-seal. The shared flat/grouped CLI publisher syncs a mode-0600 temporary file
-before create-once publication and never silently replaces an existing
-destination. Verification boundedly routes the held file from its footer tuple
-and verifies the exact embedded flat, planned-flat, or grouped schema and
-complete file. The optional flat `--mode planned` route is development-only:
-it scores exact and plan-bound fixed/absolute-varint lane encodings, one
-canonical exact-byte dictionary/bitpacked-index candidate, the existing
-deterministic per-chunk zstd19 wrapper, and one additional wrapped temporal
-candidate as complete files
-using conservative bounds and publishes the smallest result (fixed ties,
-including an auditable exact fallback). Dictionaries apply generically only to
-Utf8 and DecimalText and never normalize bytes. Its receipt reports every
-candidate cost, per-lane dictionary and temporal attribution,
-wrapper/base/compressed-byte facts, and the actual selected wire tuple. The
-temporal candidate is limited to the non-null event-scope primary TimestampNs
-or TimestampMs field stamped by compact schema byte 100; it resets each chunk
-and uses only explicitly schema-authorized previous-delta or delta-of-delta
-math. Compression is independently
-decodable per chunk with a fixed 8 MiB window cap, but compilation and planned
-verification remain bounded all-memory reference paths, not seekable/streaming
-readiness or a production/Parquet-size claim. No measured-size target is
-claimed by this additive development route.
+`roundtrip` writes synthetic facts in memory, converts V2 profiles, and checks
+decoded rows against the supplied values, including repeated rows and exact
+scaled integers. `order_book_aura0` checks explicit event/child boundaries.
+The smoke script also saves a tiny fixture and runs `aura-bench` conversion and
+parse checks; it prints the output directory. Its timings are smoke evidence,
+not a throughput claim.
 
-The supported V3 flat subset is intentionally narrow: event-scoped fields,
-exact fixed and variable values, and optional validity bitmaps. It rejects
-groups, repeated fields, derived expressions, byte-200 dual-domain execution,
-and V3 Aura1 conversion. The grouped subset accepts exactly one V3 repeated
-group with two domains: its byte-200 non-null U8 side field, all repeated child
-slots, authoritative event-to-child offsets, exact null validity, and stable
-source order are encoded and hashed. Grouped batches and chunks preserve event
-and child ranges; rechunking does not change the global logical hash.
+Use the crate as `aura_codec`; the package name is `aura-codec`. The
+[SDK guide](docs/SDK.md) covers schemas, writers, readers, and conversion.
+For larger Aura1 files, use file-backed `open_path`/`open_file` and bounded
+batches; the generic `open(Read)` interface buffers its input.
 
-Flat hard ceilings are a 16 MiB front header, 64 MiB footer, 1 TiB body, 65,536
-chunks, 16,777,216 rows, 1 GiB per exact-value block, and 16 MiB per variable
-value. Flat defaults are 256 MiB body/block, 4,194,304 rows, and 4,096 chunks.
-Grouped hard ceilings are a 16 MiB front header, 64 MiB footer, 1 TiB body,
-65,536 chunks, 16,777,216 events, 67,108,864 children, and 16 MiB schema;
-grouped defaults are 256 MiB body, 4,096 chunks, 1,048,576 events, and
-4,194,304 children. Grouped event-block hard/default ceilings are 1 GiB /
-256 MiB block, 4,194,304 / 1,048,576 events, 16,777,216 / 4,194,304
-children, and 67,108,864 / 16,777,216 values. `V3FlatLimits::HARD` and
-`V3GroupedLimits::HARD` are explicit opt-ins;
-caller limits are clamped to these format ceilings. These limits and checks are
-safety ceilings, not performance claims.
+## Documentation
 
-Both complete V3 writers reject non-empty derived-expression tables. Grouped
-Flag 200 is exact logical discriminator execution only; V3 does not select
-physical relationship transforms, compression, or Plan v2. Failed or
-interrupted SDK writes are discarded and re-written rather than recovered;
-writer/flush/sync failures must not be published even when bytes end in a seal.
-Readers reject bad trailer lengths, hashes, ranges, schema,
-null/value planes, and trailing bytes; they do not promise concurrent-mutation
-exclusion. Aura0 is therefore an explicit SDK/shadow surface, not a blanket
-replacement for Parquet in Grimoire.
+- [Architecture and format](docs/FORMAT.md): supported components, caller
+  responsibilities, V2/V3 boundaries, and links to wire details.
+- [Benchmarks and reproduction](docs/BENCHMARKING.md): runnable synthetic
+  commands, measurement boundaries, and labeled historical evidence.
+- [Compatibility](docs/COMPATIBILITY.md): frozen fixtures, historical readers,
+  and explicit development limits.
+- [Contributing](CONTRIBUTING.md): development commands and required checks.
+
+The 0.1 API remains experimental. Exactness applies to the declared, supported
+schema and retained facts; Aura cannot reconstruct source fields an adapter
+omitted. Unsupported types and versions reject. Hashes check identity and
+integrity; first-time conversions still need decoded comparisons to retained
+source facts. See the format and compatibility guides before choosing an
+archival contract.
+
+Licensed under [Apache-2.0](LICENSE).

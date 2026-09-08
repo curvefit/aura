@@ -1,0 +1,79 @@
+{
+  "source_commit": "d8afc37878f3bf6f3520ce601d01481f63bf8b74",
+  "environment": "/usr/bin/env -i; PATH=/usr/bin:/bin; CARGO_HOME=/tmp/aura-w05-cargo-home (public registry cache only); CARGO_NET_OFFLINE=true; 2 build jobs, 1 test thread; no .env/private inputs",
+  "lock_path": "/tmp/lean-node-20260907-1000/bench.lock",
+  "started_utc": "2026-09-08T01:13:03Z",
+  "finished_utc": "2026-09-08T01:13:32Z",
+  "exit_code": 0,
+  "cargo_build_seconds": 29.3,
+  "command": "cargo build --locked --example roundtrip --example order_book_aura0 -j 2",
+  "example_rows": 4,
+  "source_fact_comparison": "Exact AuraValue rows in examples/roundtrip.rs; repetitions and nonmonotonic timestamps preserved, scaled signed integer values exact; schema and metadata assertions passed for ingest, Aura0, Aura1 and both compiled conversion directions",
+  "explicit_event_example": "passed exact event/child assertion; 584 bytes",
+  "benchmark": "Frozen cc04f75 baseline aura-bench executed on newly generated fixture; correctness smoke only, no timing claim",
+  "benchmark_checks": {
+    "operation": "transcode-aura0-to-aura1",
+    "record_count": 4,
+    "decoded_row_equality": true,
+    "record_count_equality": true,
+    "schema_footer_validation": true,
+    "output_preserved": true
+  },
+  "fixture_files": {
+    "converted.aura1": {
+      "bytes": 581,
+      "sha256": "5a1d10cdcc8d283e094611de7eeff2ec5a927f9b6b41866d9d285e09d0ef93ae"
+    },
+    "roundtrip.aura": {
+      "bytes": 1275,
+      "sha256": "3bd7a9f1964903a863cbd932a0804242270c8b4f0a152bfa9f81db042a023946"
+    },
+    "roundtrip.aura0": {
+      "bytes": 639,
+      "sha256": "c8c5c0a68c217e669aaf33ec9f402faebab6f96d611ae7360b681986908ad97b"
+    },
+    "roundtrip.aura1": {
+      "bytes": 581,
+      "sha256": "5a1d10cdcc8d283e094611de7eeff2ec5a927f9b6b41866d9d285e09d0ef93ae"
+    }
+  },
+  "integrated_validation": {
+    "source_commit": "e88f8ea4a596788e4e7921f7a34543c7436adb2f",
+    "cleanup_files_identical_to_d8": true,
+    "release_build": {
+      "state": "PASS",
+      "command": "cargo build --offline --locked --release --lib --bins --examples -j 2",
+      "duration_seconds": 277.176,
+      "binary": "/home/anton/campaigns/lean-node-20260907/integration-validation/build-sdk-e88f8ea4/release/aura_replay_bench"
+    },
+    "all_target_tests": {
+      "state": "PASS_REPORTED_BY_INTEGRATION_OWNER",
+      "owner": "w01-home",
+      "reported_at_utc": "2026-09-08T01:50:59.790767+00:00",
+      "command": "cargo test --offline --locked --release --all-targets -j 2",
+      "passing_host_log": "Requested but not delivered before closeout; owner closeout status reports PASS",
+      "prior_runs": "650 passed, 4 ignored before one environment failure; sandbox denied UnixListener::bind, then a long TMPDIR exceeded SUN_LEN. No source assertion failure reported."
+    },
+    "clippy": "NOT_CONFIRMED",
+    "full_release_onboarding_script": "NOT_CONFIRMED; individual fresh debug examples and frozen release benchmark smoke passed",
+    "source_logs": {
+      "run-writable.log": {
+        "path": "/home/anton/campaigns/lean-node-20260907/integration-validation/evidence/sdk-e88f8ea4/run-writable.log",
+        "sha256": "6d25999fa09fef0ee70b8a3d578c629ba51b7a15382a9961773cc2675d85a874"
+      },
+      "run-escalated.log": {
+        "path": "/home/anton/campaigns/lean-node-20260907/integration-validation/evidence/sdk-e88f8ea4/run-escalated.log",
+        "sha256": "cfadb947814edfe45da7c74f77b31cfdd5a8735e2ef9094a48d850282d6f2a85"
+      },
+      "validation-summary.json": {
+        "path": "/home/anton/campaigns/lean-node-20260907/integration-validation/evidence/sdk-e88f8ea4/validation-summary.json",
+        "sha256": "ddea240628733606c35c0a896a8d5e3c336980eea29ff5ca0cf3129daccbc7bd"
+      }
+    }
+  },
+  "final_package_inventory": {
+    "file_count": 229,
+    "command": "cargo package --locked --allow-dirty --list",
+    "note": "One added validation JSON after the 228-file implementation inventory; source/license/fixtures unchanged."
+  }
+}

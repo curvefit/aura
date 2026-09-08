@@ -1,0 +1,40 @@
+{
+  "owner": "w04-replay",
+  "phase": "verified-handoff",
+  "updated_at_utc": "2026-09-08T01:50:20.417258+00:00",
+  "campaign": "lean-node-20260907",
+  "branch": "campaign/lean-node-20260907/w04-replay",
+  "completed_evidence": [
+    "37 Aura compatibility tests passed",
+    "4 Grimoire adapter/example tests passed with baseline and candidate SDK",
+    "88 matched cases passed exact source/events/checkpoint/final-state comparisons",
+    "Immutable corpus rehashed unchanged after sweep",
+    "4 Linux wait4 peak-RSS diagnostics passed; whole-process peak approximately unchanged"
+  ],
+  "blockers": [
+    "Public Aura report push requires explicit approval after automatic-review rejection; Grimoire private code push succeeded"
+  ],
+  "next_step": "Integration owner review; optional public Aura branch publication after approval",
+  "background_processes": {},
+  "activation": "No w04 runtime service or SDK pin change",
+  "measured_interval_utc": [
+    "2026-09-08T01:24:58.453967+00:00",
+    "2026-09-08T01:30:54.384266+00:00"
+  ],
+  "derived_restart_journal_utc": "2026-09-08T01:31:20+00:00",
+  "compatibility": "Same stored formats and returned event facts; explicit profile and malformed-input checks retained",
+  "source_code_commits": {
+    "aura_decoder": "cad9e07",
+    "aura_cli": "351b5b8",
+    "grimoire_bridge": "53857f293ad7213e6a7674dddaba99def1e4a1cf"
+  },
+  "starting_commit": "cc04f75c9217e6c6a575145ab0ed98df232f622d",
+  "current_commit": "351b5b8",
+  "claimed_paths": [
+    "src/records.rs Aura1 event decode",
+    "src/bin/aura_replay_bench.rs",
+    "tests/aura1_event_decode.rs",
+    "Cargo.toml single bin target",
+    "docs/campaigns/lean-node-20260907/w04-replay/"
+  ]
+}

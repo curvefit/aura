@@ -1,0 +1,44 @@
+{
+  "owner": "w03-transmute",
+  "phase": "handoff",
+  "updated_at_utc": "2026-09-08T02:08:29.064819+00:00",
+  "starting_commit": "cc04f75c9217e6c6a575145ab0ed98df232f622d",
+  "current_commit": "dc6b352feb313830ca322acfe26a4d83feb86d97",
+  "worktree": "/home/anton/Downloads/lean-node-20260907/aura-w03",
+  "branch": "campaign/lean-node-20260907/w03-transmute",
+  "claimed_paths": [
+    "src/records.rs::try_compile_explicit_i64_events",
+    "src/generic_planner.rs::decode_generic_i64_events_body and shared row reconstruction",
+    "src/bin/aura_bench.rs JSON measurement reporting",
+    "tests/explicit_transmutation.rs",
+    "tests/generic_event_decode.rs",
+    "tests/aura_bench_cli.rs reporting assertions",
+    "examples/transmutation_probe.rs",
+    "examples/structural_frontier.rs",
+    "docs/campaigns/lean-node-20260907/w03-transmute/"
+  ],
+  "completed_evidence": [
+    "Clean Aura main at 420052c; actual remote curvefit/aura; existing aura-bench has fair byte routes and Huffman timers",
+    "Locked baseline build current cc04f75 and fair runs: historic Bybit/OKX projection plus synthetic tiny/larger candlesticks; 1 warmup and 3 samples, Zstd3/19",
+    "48 focused release regressions passed with shared lock",
+    "c8a4dba codec and dc6b352 benchmark reporting commits PUSHED after explicit user approval",
+    "6 modern full-generation Aura0 converted to preserved Aura1; every maintained row/schema verification passed",
+    "w01 reports codec commit locally integrated with w05; integrated SDK checks still pending",
+    "Clean currentBitget 3baseline18.406s median ->candidate0.8566s (95.35% less), OKX12.667s ->0.7229s (94.29% less)",
+    "All6 currentfiles: Aura0 smaller than Zstd3Aura1, Zstd3byteexpansion faster; individualcandidate samples+fullstored/outputbytes in final-candidate/"
+  ],
+  "blockers": [],
+  "next_step": "No pending implementation; optional clean late-probe rerun and canonical-reader comparison documented",
+  "benchmark_lock": "/tmp/lean-node-20260907-1000/bench.lock",
+  "background_processes": [],
+  "message_to_peers": "W04 please publish sample paths/output consumer boundary early. W05 protect generic_planner.rs/records.rs and aura_bench transmute operations; no hot-path renames. W01 exact retained facts preserved; no semantic format change planned. Current Aura main 420052c; own worktree available for cross-lane reuse.",
+  "original_checkout_commit": "420052ceb50ea7a720dbf6bf46ebd6e4d3d61634",
+  "working_tree_dirty": true,
+  "activation": "No runtime activation by w03",
+  "integration": "e88f8ea4 local integration all-target tests passed",
+  "limitations": [
+    "Late probe timing contended by unrelated package build; sizes/parity accepted",
+    "Canonical Parquet route unmeasured"
+  ],
+  "current_commit_scope": "Last committed codec/reporting source head before the handoff evidence commit; live coordination status records final evidence HEAD."
+}

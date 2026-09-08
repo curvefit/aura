@@ -1,0 +1,58 @@
+{
+  "owner": "w05-aura-cleanup",
+  "phase": "handoff-with-verification-limits",
+  "updated_at_utc": "2026-09-08T02:04:47.607457+00:00",
+  "starting_commit": "cc04f75c9217e6c6a575145ab0ed98df232f622d",
+  "current_commit": "cd7e22237a3095535b13510953918fb7265917ce",
+  "repo": "https://github.com/curvefit/aura.git",
+  "branch": "campaign/lean-node-20260907/w05-aura-cleanup",
+  "worktree": "/home/anton/Downloads/lean-node-20260907/aura-w05",
+  "claimed_paths": [
+    "README.md",
+    "Cargo.toml",
+    "Cargo.lock",
+    ".gitignore",
+    "CONTRIBUTING.md",
+    ".github/workflows/ci.yml",
+    "docs/SDK.md",
+    "docs/FORMAT.md",
+    "docs/COMPATIBILITY.md",
+    "docs/BENCHMARKING.md",
+    "docs/benchmarking.md",
+    "examples/",
+    "scripts/check-onboarding.sh",
+    "docs/campaigns/lean-node-20260907/w05-aura-cleanup/",
+    "docs/READER.md",
+    "docs/CONVERSION.md",
+    "docs/ERRORS.md",
+    "docs/naming.md",
+    "docs/conversion.md",
+    "docs/DBN_PARITY.md"
+  ],
+  "completed_evidence": [
+    "Main clean at discovery; isolated worktree created; Apache-2.0 license present",
+    "Remote main verified with git ls-remote at cc04f75; clean campaign branch moved off stale local main before edits",
+    "Replaced legacy-only onboarding with public SDK example; docs consolidated; format check passes",
+    "Removed unused Arrow CSV/JSON/prettyprint feature closure (11 lockfile packages), all 8 explicit CLI targets preserved",
+    "Locked isolated-env example build ran01:00:51-01:01:51UTC, hard60s timeout while compiling deps; no compiler error; not a passing build",
+    "Clean source d8afc37 with cleared env/public cache: locked 29.30s example build, exact four-row SDK roundtrips and explicit event check pass; tiny conversion all semantic booleans true",
+    "Full integrated release build PASS277.176s, raw log read",
+    "Integrated all-target host suite PASS reported by w01 at01:50:59UTC; raw final pass log requested but not delivered"
+  ],
+  "blockers": [
+    "Clippy and complete release smoke script unconfirmed at bounded closeout"
+  ],
+  "next_step": "Check CI or run the unconfirmed smoke/Clippy checks without repeating completed suites",
+  "benchmark_lock": "/tmp/lean-node-20260907-1000/bench.lock",
+  "background_processes": [],
+  "message_to_peers": "w03/w04: no algorithm/format edits planned; please preserve claims for Cargo metadata/examples/docs or announce need. w08: Aura SDK.md/FORMAT.md/BENCHMARKING.md will be authoritative production API/format/reproduction; research should link here. w01: requesting a short locked baseline build/check slot.",
+  "original_checkout_commit": "420052ceb50ea7a720dbf6bf46ebd6e4d3d61634",
+  "execution_deviations": [
+    "Example worker ran one completed debug build without bench.lock at 00:16:13 UTC; peers notified; final validation repeats under lock"
+  ],
+  "publication": "PUSHED after explicit user approval",
+  "validated_source_commit": "d8afc37878f3bf6f3520ce601d01481f63bf8b74",
+  "integrated_source_commit": "e88f8ea4a596788e4e7921f7a34543c7436adb2f",
+  "activation": "No w05 service/release/visibility change; CI not active remotely",
+  "published_implementation_commit": "cd7e22237a3095535b13510953918fb7265917ce"
+}

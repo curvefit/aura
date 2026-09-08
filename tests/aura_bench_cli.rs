@@ -162,6 +162,12 @@ fn aura_bench_reports_required_json_fields_for_core_operations() {
             assert!(json["compression_ratio"].is_null());
         }
         assert!(json["runtime_ns"].as_u64().unwrap() > 0);
+        assert_eq!(json["runtime_samples_ns"].as_array().unwrap().len(), 1);
+        assert_eq!(json["runtime_samples_ns"][0], json["median_runtime_ns"]);
+        assert_eq!(
+            json["total_runtime_samples_ns"].as_array().unwrap().len(),
+            1
+        );
         assert!(json["median_runtime_ns"].as_u64().unwrap() > 0);
         assert!(json["p95_runtime_ns"].as_u64().unwrap() > 0);
         assert!(json["total_runtime_ns"].as_u64().unwrap() >= json["runtime_ns"].as_u64().unwrap());

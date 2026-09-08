@@ -1,0 +1,864 @@
+{
+  "scope": "historical parent projection screen; current production validation pending",
+  "candidate": "one reusable row scratch; complete I64Event output unchanged",
+  "warmups": 1,
+  "iterations": 3,
+  "results": [
+    {
+      "allocation_proxy": {
+        "allocation_calls": null,
+        "bytes_estimate": 15130144,
+        "caveat": "capacity-based retained materialization estimate; allocator calls and transient decoder buffers are unavailable",
+        "child_values_buffer_bytes": 7271648,
+        "child_vec_count": 227239,
+        "children_outer_buffer_bytes": 7761024,
+        "event_struct_bytes": 146208,
+        "event_values_buffer_bytes": 97472,
+        "kind": "retained_decoded_vec_capacity_estimate",
+        "vector_count_proxy": 233332
+      },
+      "benchmark": "aura_replay_bench",
+      "code": {
+        "code_revision": "1fdb6c8-plus-row-scratch-candidate",
+        "package_version": "0.1.0",
+        "profile": null,
+        "rustc": null,
+        "target": null
+      },
+      "consumer": {
+        "digest_definition": "black_box fold over every event_value and every child value; liveness guard, not a semantic hash",
+        "measured_digests": [
+          3150455801397872299,
+          3150455801397872299,
+          3150455801397872299
+        ],
+        "warmup_digests": [
+          3150455801397872299
+        ]
+      },
+      "file_backed": false,
+      "input": {
+        "bytes": 6604899,
+        "path": "related.aura1",
+        "profile": "aura1",
+        "schema_fields": 6,
+        "sha256": "d3cfb09dabd1221e23882ab5c616ce95a29f8dd243a5521b6df189d48d4cd326"
+      },
+      "iterations": 3,
+      "mode": "consume",
+      "reference": {
+        "bytes": 476602,
+        "path": "related.aura0",
+        "profile": "aura0",
+        "schema_fields": 6,
+        "sha256": "06bc6bf8a865c26a8acce710ad8534cbb6421c588b1458a341c1fe7f38c07a8f"
+      },
+      "rss_kib": {
+        "individual": [
+          59544,
+          59544,
+          59544
+        ],
+        "peak_measured": 59544,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "samples": [
+        {
+          "child_levels_per_sec": 19004203.456599157,
+          "consume_digest": 3150455801397872299,
+          "cpu_ns": 11893106,
+          "events_per_sec": 254739.73978410847,
+          "first_event_latency_ns": 10390892,
+          "rss_kib": 59544,
+          "wall_ns": 11957302
+        },
+        {
+          "child_levels_per_sec": 21718046.070673607,
+          "consume_digest": 3150455801397872299,
+          "cpu_ns": 9950585,
+          "events_per_sec": 291117.1424415343,
+          "first_event_latency_ns": 8904152,
+          "rss_kib": 59544,
+          "wall_ns": 10463142
+        },
+        {
+          "child_levels_per_sec": 17397064.871646702,
+          "consume_digest": 3150455801397872299,
+          "cpu_ns": 13771177,
+          "events_per_sec": 233197.0286748131,
+          "first_event_latency_ns": 11376935,
+          "rss_kib": 59544,
+          "wall_ns": 13061916
+        }
+      ],
+      "throughput": {
+        "median_child_levels_per_sec": 19004203.456599157,
+        "median_events_per_sec": 254739.73978410847
+      },
+      "timings": {
+        "cpu_ns": {
+          "individual": [
+            11893106,
+            9950585,
+            13771177
+          ],
+          "source": "/proc/self/schedstat running time; null when unavailable",
+          "summary": {
+            "individual": [
+              11893106,
+              9950585,
+              13771177
+            ],
+            "max": 13771177,
+            "median": 11893106,
+            "min": 9950585,
+            "range": 3820592
+          }
+        },
+        "first_event_latency_definition": "decode end; full event materialization is complete before consume begins",
+        "first_event_latency_ns": {
+          "individual": [
+            10390892,
+            8904152,
+            11376935
+          ],
+          "max": 11376935,
+          "median": 10390892,
+          "min": 8904152,
+          "range": 2472783
+        },
+        "wall_ns": {
+          "individual": [
+            11957302,
+            10463142,
+            13061916
+          ],
+          "max": 13061916,
+          "median": 11957302,
+          "min": 10463142,
+          "range": 2598774
+        }
+      },
+      "version": 1,
+      "warmups": 1,
+      "workload": {
+        "child_level_count": 227239,
+        "equality_scope": "all event_values and all child values, checked against independently decoded Aura0 before and after every timed iteration",
+        "event_count": 3046,
+        "exact_event_equality": true,
+        "header_equal_except_profile": true,
+        "schema_equal": true
+      },
+      "sample_name": "btc-current-parent-solhigh-20260830-02-consume",
+      "baseline_median_ns": 19912531,
+      "time_reduction_fraction": 0.3995086812419777
+    },
+    {
+      "allocation_proxy": {
+        "allocation_calls": null,
+        "bytes_estimate": 15130144,
+        "caveat": "capacity-based retained materialization estimate; allocator calls and transient decoder buffers are unavailable",
+        "child_values_buffer_bytes": 7271648,
+        "child_vec_count": 227239,
+        "children_outer_buffer_bytes": 7761024,
+        "event_struct_bytes": 146208,
+        "event_values_buffer_bytes": 97472,
+        "kind": "retained_decoded_vec_capacity_estimate",
+        "vector_count_proxy": 233332
+      },
+      "benchmark": "aura_replay_bench",
+      "code": {
+        "code_revision": "1fdb6c8-plus-row-scratch-candidate",
+        "package_version": "0.1.0",
+        "profile": null,
+        "rustc": null,
+        "target": null
+      },
+      "consumer": {
+        "digest_definition": "black_box fold over every event_value and every child value; liveness guard, not a semantic hash",
+        "measured_digests": [],
+        "warmup_digests": []
+      },
+      "file_backed": false,
+      "input": {
+        "bytes": 6604899,
+        "path": "related.aura1",
+        "profile": "aura1",
+        "schema_fields": 6,
+        "sha256": "d3cfb09dabd1221e23882ab5c616ce95a29f8dd243a5521b6df189d48d4cd326"
+      },
+      "iterations": 3,
+      "mode": "decode",
+      "reference": {
+        "bytes": 476602,
+        "path": "related.aura0",
+        "profile": "aura0",
+        "schema_fields": 6,
+        "sha256": "06bc6bf8a865c26a8acce710ad8534cbb6421c588b1458a341c1fe7f38c07a8f"
+      },
+      "rss_kib": {
+        "individual": [
+          59544,
+          59544,
+          59544
+        ],
+        "peak_measured": 59544,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "samples": [
+        {
+          "child_levels_per_sec": 23492909.863602195,
+          "consume_digest": null,
+          "cpu_ns": 8491635,
+          "events_per_sec": 314908.1075190979,
+          "first_event_latency_ns": 9666313,
+          "rss_kib": 59544,
+          "wall_ns": 9672663
+        },
+        {
+          "child_levels_per_sec": 22147316.755585097,
+          "consume_digest": null,
+          "cpu_ns": 9291575,
+          "events_per_sec": 296871.2537791145,
+          "first_event_latency_ns": 10256080,
+          "rss_kib": 59544,
+          "wall_ns": 10260340
+        },
+        {
+          "child_levels_per_sec": 22369832.527734276,
+          "consume_digest": null,
+          "cpu_ns": 9474215,
+          "events_per_sec": 299853.94179466815,
+          "first_event_latency_ns": 10155149,
+          "rss_kib": 59544,
+          "wall_ns": 10158279
+        }
+      ],
+      "throughput": {
+        "median_child_levels_per_sec": 22369832.527734276,
+        "median_events_per_sec": 299853.94179466815
+      },
+      "timings": {
+        "cpu_ns": {
+          "individual": [
+            8491635,
+            9291575,
+            9474215
+          ],
+          "source": "/proc/self/schedstat running time; null when unavailable",
+          "summary": {
+            "individual": [
+              8491635,
+              9291575,
+              9474215
+            ],
+            "max": 9474215,
+            "median": 9291575,
+            "min": 8491635,
+            "range": 982580
+          }
+        },
+        "first_event_latency_definition": "decode end; full event materialization is complete before consume begins",
+        "first_event_latency_ns": {
+          "individual": [
+            9666313,
+            10256080,
+            10155149
+          ],
+          "max": 10256080,
+          "median": 10155149,
+          "min": 9666313,
+          "range": 589767
+        },
+        "wall_ns": {
+          "individual": [
+            9672663,
+            10260340,
+            10158279
+          ],
+          "max": 10260340,
+          "median": 10158279,
+          "min": 9672663,
+          "range": 587677
+        }
+      },
+      "version": 1,
+      "warmups": 1,
+      "workload": {
+        "child_level_count": 227239,
+        "equality_scope": "all event_values and all child values, checked against independently decoded Aura0 before and after every timed iteration",
+        "event_count": 3046,
+        "exact_event_equality": true,
+        "header_equal_except_profile": true,
+        "schema_equal": true
+      },
+      "sample_name": "btc-current-parent-solhigh-20260830-02-decode",
+      "baseline_median_ns": 15918232,
+      "time_reduction_fraction": 0.36184627790322443
+    },
+    {
+      "allocation_proxy": {
+        "allocation_calls": null,
+        "bytes_estimate": 15130144,
+        "caveat": "capacity-based retained materialization estimate; allocator calls and transient decoder buffers are unavailable",
+        "child_values_buffer_bytes": 7271648,
+        "child_vec_count": 227239,
+        "children_outer_buffer_bytes": 7761024,
+        "event_struct_bytes": 146208,
+        "event_values_buffer_bytes": 97472,
+        "kind": "retained_decoded_vec_capacity_estimate",
+        "vector_count_proxy": 233332
+      },
+      "benchmark": "aura_replay_bench",
+      "code": {
+        "code_revision": "1fdb6c8-plus-row-scratch-candidate",
+        "package_version": "0.1.0",
+        "profile": null,
+        "rustc": null,
+        "target": null
+      },
+      "consumer": {
+        "digest_definition": "black_box fold over every event_value and every child value; liveness guard, not a semantic hash",
+        "measured_digests": [],
+        "warmup_digests": []
+      },
+      "file_backed": false,
+      "input": {
+        "bytes": 6604899,
+        "path": "related.aura1",
+        "profile": "aura1",
+        "schema_fields": 6,
+        "sha256": "d3cfb09dabd1221e23882ab5c616ce95a29f8dd243a5521b6df189d48d4cd326"
+      },
+      "iterations": 3,
+      "mode": "open",
+      "reference": {
+        "bytes": 476602,
+        "path": "related.aura0",
+        "profile": "aura0",
+        "schema_fields": 6,
+        "sha256": "06bc6bf8a865c26a8acce710ad8534cbb6421c588b1458a341c1fe7f38c07a8f"
+      },
+      "rss_kib": {
+        "individual": [
+          59572,
+          59572,
+          59572
+        ],
+        "peak_measured": 59572,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "samples": [
+        {
+          "child_levels_per_sec": 18032737.45047205,
+          "consume_digest": null,
+          "cpu_ns": 11845837,
+          "events_per_sec": 241717.8313323763,
+          "first_event_latency_ns": null,
+          "rss_kib": 59572,
+          "wall_ns": 12601470
+        },
+        {
+          "child_levels_per_sec": 17234376.954129767,
+          "consume_digest": null,
+          "cpu_ns": 12926326,
+          "events_per_sec": 231016.29650843062,
+          "first_event_latency_ns": null,
+          "rss_kib": 59572,
+          "wall_ns": 13185217
+        },
+        {
+          "child_levels_per_sec": 18396154.892031405,
+          "consume_digest": null,
+          "cpu_ns": 11947716,
+          "events_per_sec": 246589.2201652342,
+          "first_event_latency_ns": null,
+          "rss_kib": 59572,
+          "wall_ns": 12352527
+        }
+      ],
+      "throughput": {
+        "median_child_levels_per_sec": 18032737.45047205,
+        "median_events_per_sec": 241717.8313323763
+      },
+      "timings": {
+        "cpu_ns": {
+          "individual": [
+            11845837,
+            12926326,
+            11947716
+          ],
+          "source": "/proc/self/schedstat running time; null when unavailable",
+          "summary": {
+            "individual": [
+              11845837,
+              12926326,
+              11947716
+            ],
+            "max": 12926326,
+            "median": 11947716,
+            "min": 11845837,
+            "range": 1080489
+          }
+        },
+        "first_event_latency_definition": "not applicable to open-only mode",
+        "first_event_latency_ns": null,
+        "wall_ns": {
+          "individual": [
+            12601470,
+            13185217,
+            12352527
+          ],
+          "max": 13185217,
+          "median": 12601470,
+          "min": 12352527,
+          "range": 832690
+        }
+      },
+      "version": 1,
+      "warmups": 1,
+      "workload": {
+        "child_level_count": 227239,
+        "equality_scope": "all event_values and all child values, checked against independently decoded Aura0 before and after every timed iteration",
+        "event_count": 3046,
+        "exact_event_equality": true,
+        "header_equal_except_profile": true,
+        "schema_equal": true
+      },
+      "sample_name": "btc-current-parent-solhigh-20260830-02-open",
+      "baseline_median_ns": 21704091,
+      "time_reduction_fraction": 0.41939655523928643
+    },
+    {
+      "allocation_proxy": {
+        "allocation_calls": null,
+        "bytes_estimate": 7604352,
+        "caveat": "capacity-based retained materialization estimate; allocator calls and transient decoder buffers are unavailable",
+        "child_values_buffer_bytes": 3630752,
+        "child_vec_count": 113461,
+        "children_outer_buffer_bytes": 3835776,
+        "event_struct_bytes": 206736,
+        "event_values_buffer_bytes": 137824,
+        "kind": "retained_decoded_vec_capacity_estimate",
+        "vector_count_proxy": 122076
+      },
+      "benchmark": "aura_replay_bench",
+      "code": {
+        "code_revision": "1fdb6c8-plus-row-scratch-candidate",
+        "package_version": "0.1.0",
+        "profile": null,
+        "rustc": null,
+        "target": null
+      },
+      "consumer": {
+        "digest_definition": "black_box fold over every event_value and every child value; liveness guard, not a semantic hash",
+        "measured_digests": [
+          15806495364203616370,
+          15806495364203616370,
+          15806495364203616370
+        ],
+        "warmup_digests": [
+          15806495364203616370
+        ]
+      },
+      "file_backed": false,
+      "input": {
+        "bytes": 3295288,
+        "path": "related.aura1",
+        "profile": "aura1",
+        "schema_fields": 6,
+        "sha256": "5e8b0852e7cdedb2e7eb4a8c32ad3ab76f906830859da93c5dfa8bb78c2fe121"
+      },
+      "iterations": 3,
+      "mode": "consume",
+      "reference": {
+        "bytes": 343868,
+        "path": "related.aura0",
+        "profile": "aura0",
+        "schema_fields": 6,
+        "sha256": "b15aa9a4998e234b966711edbb7ef97b4db65cf345d56d12cbc7ad72905fa4ee"
+      },
+      "rss_kib": {
+        "individual": [
+          32188,
+          32188,
+          32188
+        ],
+        "peak_measured": 32188,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "samples": [
+        {
+          "child_levels_per_sec": 20647517.624664705,
+          "consume_digest": 15806495364203616370,
+          "cpu_ns": 5755953,
+          "events_per_sec": 783783.4886827269,
+          "first_event_latency_ns": 4555908,
+          "rss_kib": 32188,
+          "wall_ns": 5495140
+        },
+        {
+          "child_levels_per_sec": 22296990.306220308,
+          "consume_digest": 15806495364203616370,
+          "cpu_ns": 5774013,
+          "events_per_sec": 846397.7688270935,
+          "first_event_latency_ns": 4429686,
+          "rss_kib": 32188,
+          "wall_ns": 5088624
+        },
+        {
+          "child_levels_per_sec": 21722066.446040113,
+          "consume_digest": 15806495364203616370,
+          "cpu_ns": 4811602,
+          "events_per_sec": 824573.5555221157,
+          "first_event_latency_ns": 4460846,
+          "rss_kib": 32188,
+          "wall_ns": 5223306
+        }
+      ],
+      "throughput": {
+        "median_child_levels_per_sec": 21722066.446040113,
+        "median_events_per_sec": 824573.5555221157
+      },
+      "timings": {
+        "cpu_ns": {
+          "individual": [
+            5755953,
+            5774013,
+            4811602
+          ],
+          "source": "/proc/self/schedstat running time; null when unavailable",
+          "summary": {
+            "individual": [
+              5755953,
+              5774013,
+              4811602
+            ],
+            "max": 5774013,
+            "median": 5755953,
+            "min": 4811602,
+            "range": 962411
+          }
+        },
+        "first_event_latency_definition": "decode end; full event materialization is complete before consume begins",
+        "first_event_latency_ns": {
+          "individual": [
+            4555908,
+            4429686,
+            4460846
+          ],
+          "max": 4555908,
+          "median": 4460846,
+          "min": 4429686,
+          "range": 126222
+        },
+        "wall_ns": {
+          "individual": [
+            5495140,
+            5088624,
+            5223306
+          ],
+          "max": 5495140,
+          "median": 5223306,
+          "min": 5088624,
+          "range": 406516
+        }
+      },
+      "version": 1,
+      "warmups": 1,
+      "workload": {
+        "child_level_count": 113461,
+        "equality_scope": "all event_values and all child values, checked against independently decoded Aura0 before and after every timed iteration",
+        "event_count": 4307,
+        "exact_event_equality": true,
+        "header_equal_except_profile": true,
+        "schema_equal": true
+      },
+      "sample_name": "eth-current-parent-solhigh-20260830-01-consume",
+      "baseline_median_ns": 10770444,
+      "time_reduction_fraction": 0.5150333635270746
+    },
+    {
+      "allocation_proxy": {
+        "allocation_calls": null,
+        "bytes_estimate": 7604352,
+        "caveat": "capacity-based retained materialization estimate; allocator calls and transient decoder buffers are unavailable",
+        "child_values_buffer_bytes": 3630752,
+        "child_vec_count": 113461,
+        "children_outer_buffer_bytes": 3835776,
+        "event_struct_bytes": 206736,
+        "event_values_buffer_bytes": 137824,
+        "kind": "retained_decoded_vec_capacity_estimate",
+        "vector_count_proxy": 122076
+      },
+      "benchmark": "aura_replay_bench",
+      "code": {
+        "code_revision": "1fdb6c8-plus-row-scratch-candidate",
+        "package_version": "0.1.0",
+        "profile": null,
+        "rustc": null,
+        "target": null
+      },
+      "consumer": {
+        "digest_definition": "black_box fold over every event_value and every child value; liveness guard, not a semantic hash",
+        "measured_digests": [],
+        "warmup_digests": []
+      },
+      "file_backed": false,
+      "input": {
+        "bytes": 3295288,
+        "path": "related.aura1",
+        "profile": "aura1",
+        "schema_fields": 6,
+        "sha256": "5e8b0852e7cdedb2e7eb4a8c32ad3ab76f906830859da93c5dfa8bb78c2fe121"
+      },
+      "iterations": 3,
+      "mode": "decode",
+      "reference": {
+        "bytes": 343868,
+        "path": "related.aura0",
+        "profile": "aura0",
+        "schema_fields": 6,
+        "sha256": "b15aa9a4998e234b966711edbb7ef97b4db65cf345d56d12cbc7ad72905fa4ee"
+      },
+      "rss_kib": {
+        "individual": [
+          32264,
+          32264,
+          32264
+        ],
+        "peak_measured": 32264,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "samples": [
+        {
+          "child_levels_per_sec": 25319294.556131862,
+          "consume_digest": null,
+          "cpu_ns": 3825532,
+          "events_per_sec": 961124.9826218695,
+          "first_event_latency_ns": 4477937,
+          "rss_kib": 32264,
+          "wall_ns": 4481207
+        },
+        {
+          "child_levels_per_sec": 21611717.84404348,
+          "consume_digest": null,
+          "cpu_ns": 5538503,
+          "events_per_sec": 820384.7027110219,
+          "first_event_latency_ns": 5243626,
+          "rss_kib": 32264,
+          "wall_ns": 5249976
+        },
+        {
+          "child_levels_per_sec": 22368774.365208324,
+          "consume_digest": null,
+          "cpu_ns": 4741052,
+          "events_per_sec": 849122.7046381775,
+          "first_event_latency_ns": 5069004,
+          "rss_kib": 32264,
+          "wall_ns": 5072294
+        }
+      ],
+      "throughput": {
+        "median_child_levels_per_sec": 22368774.365208324,
+        "median_events_per_sec": 849122.7046381775
+      },
+      "timings": {
+        "cpu_ns": {
+          "individual": [
+            3825532,
+            5538503,
+            4741052
+          ],
+          "source": "/proc/self/schedstat running time; null when unavailable",
+          "summary": {
+            "individual": [
+              3825532,
+              5538503,
+              4741052
+            ],
+            "max": 5538503,
+            "median": 4741052,
+            "min": 3825532,
+            "range": 1712971
+          }
+        },
+        "first_event_latency_definition": "decode end; full event materialization is complete before consume begins",
+        "first_event_latency_ns": {
+          "individual": [
+            4477937,
+            5243626,
+            5069004
+          ],
+          "max": 5243626,
+          "median": 5069004,
+          "min": 4477937,
+          "range": 765689
+        },
+        "wall_ns": {
+          "individual": [
+            4481207,
+            5249976,
+            5072294
+          ],
+          "max": 5249976,
+          "median": 5072294,
+          "min": 4481207,
+          "range": 768769
+        }
+      },
+      "version": 1,
+      "warmups": 1,
+      "workload": {
+        "child_level_count": 113461,
+        "equality_scope": "all event_values and all child values, checked against independently decoded Aura0 before and after every timed iteration",
+        "event_count": 4307,
+        "exact_event_equality": true,
+        "header_equal_except_profile": true,
+        "schema_equal": true
+      },
+      "sample_name": "eth-current-parent-solhigh-20260830-01-decode",
+      "baseline_median_ns": 8895643,
+      "time_reduction_fraction": 0.42980018420253596
+    },
+    {
+      "allocation_proxy": {
+        "allocation_calls": null,
+        "bytes_estimate": 7604352,
+        "caveat": "capacity-based retained materialization estimate; allocator calls and transient decoder buffers are unavailable",
+        "child_values_buffer_bytes": 3630752,
+        "child_vec_count": 113461,
+        "children_outer_buffer_bytes": 3835776,
+        "event_struct_bytes": 206736,
+        "event_values_buffer_bytes": 137824,
+        "kind": "retained_decoded_vec_capacity_estimate",
+        "vector_count_proxy": 122076
+      },
+      "benchmark": "aura_replay_bench",
+      "code": {
+        "code_revision": "1fdb6c8-plus-row-scratch-candidate",
+        "package_version": "0.1.0",
+        "profile": null,
+        "rustc": null,
+        "target": null
+      },
+      "consumer": {
+        "digest_definition": "black_box fold over every event_value and every child value; liveness guard, not a semantic hash",
+        "measured_digests": [],
+        "warmup_digests": []
+      },
+      "file_backed": false,
+      "input": {
+        "bytes": 3295288,
+        "path": "related.aura1",
+        "profile": "aura1",
+        "schema_fields": 6,
+        "sha256": "5e8b0852e7cdedb2e7eb4a8c32ad3ab76f906830859da93c5dfa8bb78c2fe121"
+      },
+      "iterations": 3,
+      "mode": "open",
+      "reference": {
+        "bytes": 343868,
+        "path": "related.aura0",
+        "profile": "aura0",
+        "schema_fields": 6,
+        "sha256": "b15aa9a4998e234b966711edbb7ef97b4db65cf345d56d12cbc7ad72905fa4ee"
+      },
+      "rss_kib": {
+        "individual": [
+          32032,
+          32032,
+          32032
+        ],
+        "peak_measured": 32032,
+        "scope": "includes retained input bytes and the independently decoded Aura0 reference event vectors used for post-timing equality checks",
+        "source": "/proc/self/status VmRSS sampled after each timed iteration"
+      },
+      "samples": [
+        {
+          "child_levels_per_sec": 18288778.00091846,
+          "consume_digest": null,
+          "cpu_ns": 5989333,
+          "events_per_sec": 694245.3076383587,
+          "first_event_latency_ns": null,
+          "rss_kib": 32032,
+          "wall_ns": 6203859
+        },
+        {
+          "child_levels_per_sec": 18040382.689335294,
+          "consume_digest": null,
+          "cpu_ns": 5872013,
+          "events_per_sec": 684816.1768622445,
+          "first_event_latency_ns": null,
+          "rss_kib": 32032,
+          "wall_ns": 6289279
+        },
+        {
+          "child_levels_per_sec": 18212450.7151767,
+          "consume_digest": null,
+          "cpu_ns": 5795753,
+          "events_per_sec": 691347.9101212403,
+          "first_event_latency_ns": null,
+          "rss_kib": 32032,
+          "wall_ns": 6229859
+        }
+      ],
+      "throughput": {
+        "median_child_levels_per_sec": 18212450.7151767,
+        "median_events_per_sec": 691347.9101212403
+      },
+      "timings": {
+        "cpu_ns": {
+          "individual": [
+            5989333,
+            5872013,
+            5795753
+          ],
+          "source": "/proc/self/schedstat running time; null when unavailable",
+          "summary": {
+            "individual": [
+              5989333,
+              5872013,
+              5795753
+            ],
+            "max": 5989333,
+            "median": 5872013,
+            "min": 5795753,
+            "range": 193580
+          }
+        },
+        "first_event_latency_definition": "not applicable to open-only mode",
+        "first_event_latency_ns": null,
+        "wall_ns": {
+          "individual": [
+            6203859,
+            6289279,
+            6229859
+          ],
+          "max": 6289279,
+          "median": 6229859,
+          "min": 6203859,
+          "range": 85420
+        }
+      },
+      "version": 1,
+      "warmups": 1,
+      "workload": {
+        "child_level_count": 113461,
+        "equality_scope": "all event_values and all child values, checked against independently decoded Aura0 before and after every timed iteration",
+        "event_count": 4307,
+        "exact_event_equality": true,
+        "header_equal_except_profile": true,
+        "schema_equal": true
+      },
+      "sample_name": "eth-current-parent-solhigh-20260830-01-open",
+      "baseline_median_ns": 10428048,
+      "time_reduction_fraction": 0.40258627501522815
+    }
+  ]
+}
