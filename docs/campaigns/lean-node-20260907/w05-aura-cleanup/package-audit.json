@@ -93,5 +93,5 @@
     "cargo tree --locked --depth 1 --edges normal,build,dev",
     "cargo package --allow-dirty --list"
   ],
-  "heavy_validation": "Clean isolated source/env example build and SDK/event checks passed under canonical lock at 01:13:03-01:13:32 UTC; all-target/full release/Clippy checks pending integration owner"
+  "heavy_validation": "Clean isolated example checks pass; integrated all-target release build passes; full host test suite PASS reported by w01. Clippy and full release smoke script unconfirmed."
 }
