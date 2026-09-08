@@ -142,7 +142,7 @@ create-once publication and recovery state machine. Verification boundedly
 routes from the held footer tuple, then fully verifies and hashes that exact
 held file without an external schema.
 
-## Default Path Matrix
+## Execution and storage choices
 
 | Role | Current default candidate | Reference/experimental alternatives |
 | --- | --- | --- |
@@ -151,12 +151,12 @@ held file without an external schema.
 | `.aura1` replay | `aura1-scan-fixed` / fixed replay visitor | `aura1-parse-to-rows` materializes rows for comparison only |
 | guard mode | `no_guard` | strict modes for verification only |
 | canonical hash | `none` | `verify` for correctness checks |
-| Aura0 profile | `hybrid` for speed + semantic fallback, `compact` for smallest archive | `fast` for byte-lane-only speed files |
+| Aura0 profile | `compact` is the SDK writer/converter default | `hybrid` adds a byte lane with semantic fallback; `fast` is byte-lane-only |
 | V3 flat/grouped SDK | no production/default candidate; select the explicit API or CLI | `V3FlatLimits::HARD` / `V3GroupedLimits::HARD` for explicit hard-envelope tests |
 
-The default candidates are conservative. They are chosen from current test and
-benchmark evidence, not from an assertion that remaining materialization is
-unavoidable.
+The execution candidates describe benchmark paths, not a universal speed
+promise. Optional storage profiles must be chosen explicitly. Historical
+workload results are labeled in [BENCHMARKING.md](BENCHMARKING.md#historical-benchmark-evidence).
 
 ## Guard Modes
 
@@ -269,66 +269,14 @@ silently mislabeled: the current public writer/planner did not select a
 Use the external `grimoire-50mb-huff` artifact for Huffman-heavy benchmarking
 until a repo-native Huffman fixture generator or fixture blob is added.
 
-## Aura0 Versus Zstd Status
+## Aura0 profile reader compatibility
 
-The current fair product comparison for compact semantic Aura0 remains in favor
-of zstd:
+The workload-specific compact/fast/hybrid versus zstd results are retained in
+[BENCHMARKING.md](BENCHMARKING.md#historical-benchmark-evidence). They do not
+change the compact SDK default or establish a universal compression/speed win.
+Choose profiles with the required semantic fallback and reader versions in mind.
 
-```text
-Aura0: .aura0 -> .aura1 uncompressed bytes
-Zstd:  .aura1.zst -> .aura1 uncompressed bytes
-```
-
-Fresh 10-run warm results after real byte-lane integration:
-
-```text
-grimoire-50mb-huff:   compact Aura0 80.608 ms, zstd L3 61.386 ms
-grimoire-50mb-nohuff: compact Aura0 104.173 ms, zstd L3 62.798 ms
-```
-
-Real Aura0 fast/hybrid byte-lane files reverse that product target:
-
-```text
-grimoire-50mb-huff:   fast raw 24.753 ms, fast lz4 44.373 ms, hybrid lz4 43.761 ms
-grimoire-50mb-nohuff: fast raw 25.271 ms, fast lz4 43.281 ms, hybrid lz4 44.058 ms
-```
-
-Compatibility recommendation:
-
-- Keep the current semantic Aura0 stream layout as the stable compact/canonical
-  cold format.
-- Use Aura0-hybrid + lz4 when the product requirement is faster-than-zstd
-  Aura1 byte expansion while retaining the semantic lane for verification or
-  fallback.
-- Use Aura0-fast + lz4 when byte-output speed and smaller-than-raw size matter
-  more than semantic-lane fallback.
-- Do not claim current compact `.aura0` files are faster than zstd for byte
-  expansion; claim that fast/hybrid byte-lane profiles beat external zstd L3 in
-  the measured huff/nohuff runs.
-
-Old readers may reject new fast/hybrid files because the `AURP` footer has an
-optional trailing `AUBL` extension. New readers read old compact files because
-the extension is omitted when no byte lanes are present.
-
-## Byte-lane safety limits
-
-Fast and hybrid byte lanes use all-memory expansion in the current reader, so
-the supported V2 byte-lane subset has fixed fail-closed limits:
-
-- at most 65,536 byte-lane descriptors;
-- at most 1 GiB (`1 << 30` bytes) of compressed payload per lane;
-- at most 1 GiB of uncompressed output per lane; and
-- at most 1 GiB of total expanded output across all lanes.
-
-Descriptor tables, offsets, lengths, row ranges, and cumulative output are
-checked before allocation or decompression. Output allocation is fallible, and
-raw, LZ4, and Zstd payloads must produce the exact declared bounded length.
-These are normative security ceilings for the current all-memory byte-lane
-implementation, not benchmark tuning parameters. Experimental V2 fast/hybrid
-artifacts above these ceilings are outside the promised compatibility subset
-and reject with a typed error. Compact semantic Aura0 files do not use this
-byte-lane output limit.
-
-Ingest and compiled V2 footers also support at most 65,536 chunk descriptors.
-Each chunk descriptor is a fixed 76-byte record; decoders validate the count,
-checked table size, and remaining footer bytes before fallible allocation.
+Old readers may reject fast/hybrid files because their `AURP` footer has an
+optional trailing `AUBL` extension. Current readers decode old compact files
+without that extension through the semantic path. A fast-only file has no
+semantic lane; requesting `--use-byte-lane never` cannot decode it.

@@ -1,0 +1,28 @@
+name: Rust checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: 2
+      RUST_TEST_THREADS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust tooling
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - name: Select stable toolchain
+        run: rustup default stable
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check all targets
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test compatibility and behavior
+        run: cargo test --locked
+      - name: Build documented targets
+        run: cargo build --locked --release --lib --bins --examples
+      - name: Run public onboarding and tiny benchmark
+        run: bash scripts/check-onboarding.sh
+      - name: Inspect distributable inventory
+        run: cargo package --locked --list

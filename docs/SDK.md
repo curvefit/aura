@@ -1,6 +1,15 @@
 # Aura SDK
 
-Aura exposes a small Rust library facade for dynamic fixed-width schemas.
+This guide documents the **default V2** Rust facade for dynamic fixed-width
+schemas. Start with `cargo run --locked --release --example roundtrip` for a
+self-contained write/convert/decode check. Explicit repeated events use the
+[event writer/reader contract](ORDER_BOOK_AURA0.md); V3 exact and planned APIs
+are separate development surfaces described in [FORMAT.md](FORMAT.md).
+
+The caller supplies field meanings, integer scales, ordering, event boundaries,
+and provenance. The facade validates representability; it does not ingest raw
+venue messages or infer missing source facts. [FORMAT.md](FORMAT.md#choosing-a-profile-and-preserving-facts)
+defines these responsibilities and the archival/replay tradeoffs.
 
 ```rust
 use aura_codec::{

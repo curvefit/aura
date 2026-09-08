@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Experimental binary event-file format and replay codec lab"
-repository = "https://github.com/L3data/aura"
+repository = "https://github.com/curvefit/aura"
 
 [lib]
 name = "aura_codec"
@@ -36,7 +36,7 @@ path = "src/bin/parquet_ohlcv.rs"
 
 [dependencies]
 anyhow = "1"
-arrow = { version = "54", features = ["prettyprint", "ipc_compression"] }
+arrow = { version = "54", default-features = false, features = ["ipc_compression"] }
 flatbuffers = "24.12.23"
 parquet = { version = "54", features = ["zstd"] }
 lz4_flex = "0.11.6"

@@ -1,6 +1,63 @@
 # AURA Format
 
-This document describes the current implementation.
+This is the maintained architecture and format entry point. Start with the
+V2 SDK for supported ingest/archive/replay work; the V3 sections below describe
+explicit development formats, not an implicit upgrade of existing files.
+
+## Supported components and ownership
+
+| Component | Boundary and entry point |
+| --- | --- |
+| V2 SDK | `schema`, `options`, `writer`, `reader`, `convert`; start at [SDK](SDK.md). |
+| Explicit repeated events | `AuraI64EventWriter` / `AuraI64EventReader`; [event contract](ORDER_BOOK_AURA0.md). |
+| Physical codec implementation | `records`, `generic_planner`, `program`, `body`, `instructions`; decoded plans govern historical reads. |
+| Replay | `source` and `orderbook`; callers supply field mapping and lifecycle semantics. |
+| Container and schema encoding | `header`, `footer`, `format`, `schema`; [wire layout](container.md), [schema API](SCHEMA.md). |
+| V3 development | `v3_*`, `schema_json`, `shadow_protocol*`, and `aura v3`; [shadow protocol](SHADOW_PROTOCOL.md). |
+| Reproduction tools | `aura-bench`, `aura-sdk-bench`, `aura-fixture-gen`, `aura-verify-random`; [commands](BENCHMARKING.md). |
+| Historical prototypes | `legacy` and `aura-size`; retained for existing consumers and tests, separate from the V2 SDK path. |
+
+Aura is one Rust package, `aura-codec`, with library name `aura_codec` and
+explicit binary targets in `Cargo.toml`. The SDK is the integration boundary;
+low-level public helpers remain available for existing consumers. External
+collectors own capture, source normalization, storage lifecycle, and retention.
+Research tooling belongs in [Aura-ar](https://github.com/L3data/aura-ar); its
+research claims do not override this repository's format or compatibility
+contracts.
+
+## Choosing a profile and preserving facts
+
+V2 `.aura` stores normalized facts and seal-time plans. Its compiled `.aura0`
+and `.aura1` profiles carry decode instructions and can be converted in either
+direction. The default `AuraWriter`/`ConvertOptions` Aura0 profile is `compact`.
+It stores semantic streams for archive size. `fast` stores an Aura1 byte lane;
+`hybrid` keeps both semantic streams and a byte lane. A fast-only file cannot
+provide a semantic-lane fallback. These choices change storage and decoding
+cost, not the caller's logical contract; measure the actual workload before
+choosing an optional profile.
+
+The ordinary V2 facade supports nonnullable scalar integer-compatible schemas.
+Its U64 values must fit the signed physical lane. Scaled integers keep their
+integer value and declared scale; callers must normalize decimal inputs without
+rounding away required facts. Wider typed ingest and explicit event APIs are
+separate surfaces; see [SDK](SDK.md), [writer](WRITER.md), and
+[compatibility](COMPATIBILITY.md) for their limits. V3 exact null/text semantics
+do not imply support for those values in the V2 facade.
+
+Callers supply source ordering, sequence values, snapshot/delta and reset
+meaning, instrument IDs, units/scales, provenance, and explicit event/child
+boundaries where required. Repeated observations are valid. Equal timestamps
+or a sequence minimum/maximum do not prove event identity or continuity.
+Aura's consecutive-run grouping API groups callbacks; it is not deduplication.
+Keep original retained inputs until the application's independent decoding and
+semantic checks establish the intended archival contract. A logical roundtrip
+does not promise byte-identical source text or restoration of omitted columns.
+
+`ConvertOptions::verify(true)` compares decoded rows; ordinary SDK verification
+is off by default. Frozen fixtures protect historical decoding, and unsupported
+versions reject. A checksum alone does not prove a first transformation correct.
+The complete compatibility boundary is maintained in
+[COMPATIBILITY.md](COMPATIBILITY.md).
 
 Current production and default SDK writers still emit container V2. Aura also
 implements three complete, explicitly selected V3 Aura0 flavors: uncompressed
