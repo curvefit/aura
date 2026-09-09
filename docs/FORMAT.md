@@ -4,6 +4,16 @@ This is the maintained architecture and format entry point. Start with the
 V2 SDK for supported ingest/archive/replay work; the V3 sections below describe
 explicit development formats, not an implicit upgrade of existing files.
 
+## Implementation entrypoints
+
+Normal callers start with `src/sdk.rs`. Development V3/Arrow surfaces are
+collected in `src/experimental.rs`. The grouped planner has one ordered
+complete-file selection loop, one call-local absolute integer analysis, and
+separate reversible relationship transforms. `src/expressions.rs` owns the
+shared exact arithmetic used by row/column planning and replay. Format parsing,
+resource limits, and event reconstruction remain in their existing codecs.
+No persistent analysis cache or new format is introduced.
+
 ## Supported components and ownership
 
 | Component | Boundary and entry point |

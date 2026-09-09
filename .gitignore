@@ -27,3 +27,6 @@ tmp-aura-backup/
 .env.*
 !.env.example
 !.env.template
+
+# Local Python benchmark bytecode.
+__pycache__/

@@ -26,9 +26,10 @@ struct Config {
     skip_creation: bool,
     profile_stages: bool,
     file_io: bool,
+    zstd_levels: Vec<i32>,
 }
 fn usage() {
-    println!("usage: transmutation_probe --input <aura0> --output-dir <dir> [--iterations N] [--warmups N] [--skip-creation] [--profile-stages] [--file-io]");
+    println!("usage: transmutation_probe --input <aura0> --output-dir <dir> [--iterations N] [--warmups N] [--skip-creation] [--profile-stages] [--file-io] [--zstd-levels 3,19]");
 }
 fn config() -> Result<Option<Config>> {
     let mut a = std::env::args().skip(1);
@@ -39,6 +40,7 @@ fn config() -> Result<Option<Config>> {
     let mut skip_creation = false;
     let mut profile_stages = false;
     let mut file_io = false;
+    let mut zstd_levels = vec![3, 19];
     while let Some(flag) = a.next() {
         let next = |a: &mut std::iter::Skip<std::env::Args>, f: &str| {
             a.next().with_context(|| format!("missing value for {f}"))
@@ -58,6 +60,18 @@ fn config() -> Result<Option<Config>> {
                     .context("iterations")?
             }
             "--warmups" => warmups = next(&mut a, "--warmups")?.parse().context("warmups")?,
+            "--zstd-levels" => {
+                zstd_levels = next(&mut a, "--zstd-levels")?
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<std::result::Result<Vec<i32>, _>>()?;
+                ensure!(
+                    !zstd_levels.is_empty() && zstd_levels.iter().all(|x| (1..=19).contains(x)),
+                    "levels must be 1..=19"
+                );
+                zstd_levels.sort_unstable();
+                zstd_levels.dedup();
+            }
             "--skip-creation" => skip_creation = true,
             "--profile-stages" => profile_stages = true,
             "--file-io" => file_io = true,
@@ -75,6 +89,7 @@ fn config() -> Result<Option<Config>> {
         skip_creation,
         profile_stages,
         file_io,
+        zstd_levels,
     }))
 }
 #[derive(Clone)]
@@ -297,7 +312,7 @@ fn decode_consumer(bytes: &[u8], facts: &Facts) -> Result<usize> {
         Ok(decoded.rows.len())
     }
 }
-fn reconstruct(facts: &Facts) -> Result<Vec<u8>> {
+fn reconstruct(facts: &Facts, profile: Profile) -> Result<Vec<u8>> {
     if let Some(events) = &facts.events {
         return encode_i64_events_profile_with_search(
             I64EventFileInput {
@@ -307,10 +322,14 @@ fn reconstruct(facts: &Facts) -> Result<Vec<u8>> {
                 dictionary_id: facts.dictionary_id,
                 header_comment: Some(facts.comment.clone()),
             },
-            Profile::Aura0,
-            aura_codec::generic_planner::I64SearchEffort::Fast,
+            profile,
+            if profile == Profile::Aura0 {
+                aura_codec::generic_planner::I64SearchEffort::Fast
+            } else {
+                aura_codec::generic_planner::I64SearchEffort::Full
+            },
         )
-        .context("reconstruct Aura0 events");
+        .context("reconstruct explicit events");
     }
     let ingest = encode_ingest_i64_file(I64FileInput {
         schema: facts.schema.clone(),
@@ -319,18 +338,40 @@ fn reconstruct(facts: &Facts) -> Result<Vec<u8>> {
         dictionary_id: facts.dictionary_id,
         header_comment: Some(facts.comment.clone()),
     })?;
-    compile_i64_file(&ingest, Profile::Aura0).context("compile reconstructed Aura0")
+    compile_i64_file(&ingest, profile).context("compile reconstructed Aura0")
 }
 fn creation(facts: &Facts, c: &Config) -> Result<Value> {
-    let work = || timed("create_aura0", || reconstruct(facts)).map(|(b, s)| with_output(s, &b));
+    let aura1_work = || {
+        timed("create_aura1", || reconstruct(facts, Profile::Aura1))
+            .map(|(b, s)| with_output(s, &b))
+    };
+    let (aura1_samples, aura1_warm) = runs(c.warmups, c.iterations, aura1_work)?;
+    let zstd_work = || {
+        timed("create_aura1_and_zstd3", || {
+            let aura1 = reconstruct(facts, Profile::Aura1)?;
+            Ok(zstd::stream::encode_all(Cursor::new(aura1), 3)?)
+        })
+        .map(|(b, s)| with_output(s, &b))
+    };
+    let (zstd_samples, zstd_warm) = runs(c.warmups, c.iterations, zstd_work)?;
+    let direct_aura1 = reconstruct(facts, Profile::Aura1)?;
+    verify_facts(&direct_aura1, facts)?;
+
+    let work = || {
+        timed("create_aura0", || reconstruct(facts, Profile::Aura0))
+            .map(|(b, s)| with_output(s, &b))
+    };
     let (samples, warm) = runs(c.warmups, c.iterations, work)?;
-    let last = reconstruct(facts)?;
+    let last = reconstruct(facts, Profile::Aura0)?;
     verify_facts(&last, facts)?;
     let checked = true;
     Ok(
         json!({"api": if facts.events.is_some() {"encode_i64_events_profile_with_search(Aura0, Fast)"} else {"encode_ingest_i64_file + compile_i64_file(Aura0)"},
         "warmup_samples": warm, "samples": samples, "output_bytes": last.len(),
-        "output_sha256": hash(&last), "output_semantics_match_input": checked}),
+        "output_sha256": hash(&last), "output_semantics_match_input": checked,
+        "direct_aura1": {"samples": aura1_samples, "warmup_samples": aura1_warm,
+            "output_bytes": direct_aura1.len(), "output_sha256": hash(&direct_aura1)},
+        "direct_aura1_and_zstd3": {"samples": zstd_samples, "warmup_samples": zstd_warm}}),
     )
 }
 fn transmutation_sample(input: &[u8], facts: &Facts) -> Result<(Value, Vec<u8>)> {
@@ -468,7 +509,7 @@ fn zstd(
     c: &Config,
 ) -> Result<Value> {
     let mut reports = Vec::new();
-    for level in [3_i32, 19_i32] {
+    for level in c.zstd_levels.iter().copied() {
         let mut warm = Vec::new();
         for _ in 0..c.warmups {
             warm.push(zstd_sample(source, level, facts)?.0);
@@ -597,14 +638,14 @@ fn main() -> Result<()> {
     let file_io_report = c.file_io.then(|| file_io(&c, &aura1)).transpose()?;
     let report_path = c.output.join("transmutation_probe.json");
     let report = json!({"tool": "aura-transmutation-probe", "version": env!("CARGO_PKG_VERSION"), "zstd_version": zstd::zstd_safe::version_string(),
-        "configuration": {"warmups": c.warmups, "iterations": c.iterations, "skip_creation": c.skip_creation, "profile_stages": c.profile_stages},
+        "configuration": {"warmups": c.warmups, "iterations": c.iterations, "skip_creation": c.skip_creation, "profile_stages": c.profile_stages, "zstd_levels": c.zstd_levels},
         "input": input_json, "source_kind": if facts.events.is_some() {"explicit_events"} else {"flat_rows"}, "generic_plan": plan_json,
         "creation": creation_json, "transmutation": transmutation_json, "profile_stages": stages_json, "file_io": file_io_report,
         "zstd": [aura1_zstd, aura0_zstd], "outputs": {"report_path": report_path.display().to_string(), "aura1_path": aura1_path.display().to_string()},
         "notes": ["wall_ns is the timed API boundary; warmups and measured samples are retained",
             "cpu ticks and VmRSS are Linux /proc/self values when available",
             "rss is whole-process before/after state, not peak allocation; compile_and_consume and zstd_decompress_and_consume include decoded-object drop",
-            "Zstd levels 3 and 19 save only final outputs under --output-dir"]});
+            "Selected Zstd levels save only final outputs under --output-dir"]});
     let bytes = serde_json::to_vec_pretty(&report).context("serialize report")?;
     fs::write(&report_path, &bytes).with_context(|| format!("write {}", report_path.display()))?;
     println!("{}", String::from_utf8(bytes).context("report UTF-8")?);

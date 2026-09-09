@@ -1,11 +1,14 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use aura_codec::{
+use aura_codec::experimental::{
     canonical_v3_event_batch_sha256, decode_v3_event_block, encode_v3_event_block,
     validate_v3_event_batch, validate_v3_grouped_exact_subset, AuraV3Column,
-    AuraV3ColumnValues as Values, AuraV3EventBatch, AuraV3VariableColumn, DerivedExpression,
-    DerivedExpressionOp, FieldRole, FieldScope, FieldType, GroupDescriptor,
-    RelationshipPermissions, SchemaBuilder, V3EventLimits, MAX_V3_EVENT_EVENTS,
+    AuraV3ColumnValues as Values, AuraV3EventBatch, AuraV3VariableColumn, V3EventLimits,
+    MAX_V3_EVENT_EVENTS,
+};
+use aura_codec::{
+    DerivedExpression, DerivedExpressionOp, FieldRole, FieldScope, FieldType, GroupDescriptor,
+    RelationshipPermissions, SchemaBuilder,
 };
 use sha2::{Digest, Sha256};
 

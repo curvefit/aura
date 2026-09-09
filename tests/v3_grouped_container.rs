@@ -1,14 +1,15 @@
 use std::io::Cursor;
 
-use aura_codec::{
+use aura_codec::experimental::{
     canonical_v3_event_batch_sha256, decode_v3_grouped_aura0, decode_v3_grouped_aura0_with_limits,
     decode_v3_grouped_footer, encode_v3_grouped_footer, AnyCompiledFooter, AuraV3Column,
-    AuraV3ColumnValues as Values, AuraV3EventBatch, CanonicalV3EventHasher, FieldRole, FieldType,
-    RelationshipPermissions, SchemaBuilder, V3EventLimits, V3GroupedAura0Writer, V3GroupedLimits,
-    V3GroupedWriterOptions, V3_GROUPED_BODY_ENCODING_EXACT_EVENTS, V3_GROUPED_BODY_LAYOUT_VERSION,
+    AuraV3ColumnValues as Values, AuraV3EventBatch, CanonicalV3EventHasher, V3EventLimits,
+    V3GroupedAura0Writer, V3GroupedLimits, V3GroupedWriterOptions,
+    V3_GROUPED_BODY_ENCODING_EXACT_EVENTS, V3_GROUPED_BODY_LAYOUT_VERSION,
     V3_GROUPED_CHUNK_DESCRIPTOR_BYTES, V3_GROUPED_EVENT_BLOCK_VERSION,
     V3_GROUPED_FOOTER_LAYOUT_VERSION, V3_GROUPED_FOOTER_PREFIX_BYTES,
 };
+use aura_codec::{FieldRole, FieldType, RelationshipPermissions, SchemaBuilder};
 use sha2::{Digest, Sha256};
 
 const FOOTER_DOMAIN: &[u8] = b"aura-v3-grouped-aura0-footer-v1\0";

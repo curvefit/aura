@@ -1,21 +1,8 @@
-//! Reference planned-grouped Aura0 V3 container (layout 2, body encoding 3).
-//!
-//! Attempt 1 stores exact direct `AURAV3EB` chunks. Attempt 2 adds a distinct
-//! plan-bound compact-stream block and scores registry-1 direct, compact
-//! registry-2 direct, and schema-authorized compact split-domain direct by
-//! actual complete-file bytes. Attempt 3 adds a distinct Direct-only integer
-//! codec block and scores registry-1 Direct, registry-2 compact Direct,
-//! registry-3 all-fixed, and registry-3 per-stream fixed/absolute-varint files.
-//! Attempt 4 separately scores schema-authorized previous-within-domain math,
-//! with event/domain resets and checked inverse, against all accepted absolute
-//! fallbacks. Attempt 5 adds both schema-authorized cross-domain same-slot
-//! orientations, pairing ordinal occurrences per event and retaining unmatched
-//! tails as absolute values. Attempt 6 adds only explicit same-child nonnullable `I64`
-//! `DeltaFromField(parent)` residuals, stored as checked `child - parent`.
-//! Field roles such as price or quantity carry no economic meaning. Cross-event
-//! state remains excluded. Nothing here
-//! claims compression, Parquet comparison, holdout evidence, production
-//! readiness, or the campaign size goal.
+//! Planned grouped container encoding and decoding. Search policies share one
+//! complete-file selection loop and one absolute integer analysis. Relationship
+//! transforms remain distinct: within-domain, cross-domain ordinal pairing,
+//! and explicit same-child parent residuals all have different inverse rules.
+//! Registry/layout numbers describe retained wire formats, not research attempts.
 
 use sha2::{Digest, Sha256};
 
@@ -71,8 +58,8 @@ const HEADER_HASH_DOMAIN: &[u8] = b"aura-v3-planned-grouped-header-v1\0";
 const BODY_HASH_DOMAIN: &[u8] = b"aura-v3-planned-grouped-body-v1\0";
 const CHUNK_TABLE_VERSION: u16 = 1;
 const TRAILER_BYTES: usize = 12;
-const ATTEMPT2_BLOCK_MAGIC: &[u8; 8] = b"AUPGDB02";
-const ATTEMPT2_BLOCK_HEADER_BYTES: usize = 72;
+const COMPACT_BLOCK_MAGIC: &[u8; 8] = b"AUPGDB02";
+const COMPACT_BLOCK_HEADER_BYTES: usize = 72;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V3PlannedGroupedChunkDescriptor {
@@ -350,638 +337,279 @@ pub fn compile_v3_planned_grouped(
     })
 }
 
-/// Score complete registry-1 direct, compact registry-2 direct, and compact
-/// registry-2 split-domain-direct files. Ties select the earliest candidate.
-pub fn compile_v3_planned_grouped_attempt2(
-    schema: &SchemaDescriptor,
-    batches: &[AuraV3EventBatch],
-    limits: V3GroupedLimits,
-) -> Result<V3PlannedGroupedArtifact> {
-    let registry1 = compile_v3_planned_grouped(schema, batches, limits)?;
-    let direct = compile_attempt2_candidate(schema, batches, limits, PlanV2Selection::Direct)?;
-    let authorized = schema
-        .groups
-        .first()
-        .is_some_and(|group| group.relationships.allows_split());
-    let split = if authorized {
-        compile_attempt2_candidate(schema, batches, limits, PlanV2Selection::SplitDomainDirect)
-            .map_err(|error| error.to_string())
-    } else {
-        Err("schema does not authorize split-domain direct".to_owned())
-    };
-    let registry1_bytes = registry1.summary.file_bytes;
-    let direct_bytes = direct.summary.file_bytes;
-    let split_bytes = split.as_ref().ok().map(|value| value.summary.file_bytes);
-    let best_direct = registry1_bytes.min(direct_bytes);
-    let select_split = split_bytes.is_some_and(|bytes| bytes < best_direct);
-    let select_compact_direct = !select_split && direct_bytes < registry1_bytes;
-    let split_rejection = split
-        .as_ref()
-        .err()
-        .cloned()
-        .or_else(|| (!select_split).then(|| "complete cost did not beat direct".to_owned()));
-    let mut selected = if select_split {
-        split.unwrap()
-    } else if select_compact_direct {
-        direct
-    } else {
-        registry1
-    };
-    selected.inspection.candidates = vec![
-        V3PlannedGroupedCandidateInspection {
-            candidate_id: "registry1-direct".to_owned(),
-            selection: PlanV2Selection::Direct,
-            authorized: true,
-            applicable: true,
-            rejection: (select_split || select_compact_direct)
-                .then(|| "complete cost did not beat selected candidate".to_owned()),
-            complete_bytes: Some(registry1_bytes),
-            selected: !select_split && !select_compact_direct,
-        },
-        V3PlannedGroupedCandidateInspection {
-            candidate_id: "registry2-compact-direct".to_owned(),
-            selection: PlanV2Selection::Direct,
-            authorized: true,
-            applicable: true,
-            rejection: (!select_compact_direct)
-                .then(|| "complete cost did not beat earlier direct".to_owned()),
-            complete_bytes: Some(direct_bytes),
-            selected: select_compact_direct,
-        },
-        V3PlannedGroupedCandidateInspection {
-            candidate_id: "registry2-compact-split-domain-direct".to_owned(),
-            selection: PlanV2Selection::SplitDomainDirect,
-            authorized,
-            applicable: split_bytes.is_some(),
-            rejection: split_rejection,
-            complete_bytes: split_bytes,
-            selected: select_split,
-        },
-    ];
-    Ok(selected)
+/// Explicit research search boundaries. The SDK grouped writer uses `CrossDomain`.
+/// Earlier boundaries remain useful controls and share one selection algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GroupedSearch {
+    Compact,
+    Integer,
+    WithinDomain,
+    CrossDomain,
+    SameChildParent,
 }
 
-/// Encode one attempt-2 candidate for development inverse/cost auditing.
-/// Selection callers should use [`compile_v3_planned_grouped_attempt2`].
-pub fn compile_v3_planned_grouped_attempt2_candidate(
-    schema: &SchemaDescriptor,
-    batches: &[AuraV3EventBatch],
-    limits: V3GroupedLimits,
-    selection: PlanV2Selection,
-) -> Result<V3PlannedGroupedArtifact> {
-    compile_attempt2_candidate(schema, batches, limits, selection)
-}
-
-/// Size-attempt 3: select exact absolute integer codecs without relationship math.
-/// Compact SplitDomainDirect is deliberately not a candidate: for absolute
-/// fixed/varint lanes it preserves the same selector and value bytes, cannot
-/// reduce summed validity bytes, adds one variable offset at a domain split,
-/// and stamps extra dependency/physical-stream metadata. Its contribution is
-/// therefore structurally non-negative relative to compact Direct and belongs
-/// to the separately accounted relationship attempt.
-pub fn compile_v3_planned_grouped_attempt3(
-    schema: &SchemaDescriptor,
-    batches: &[AuraV3EventBatch],
-    limits: V3GroupedLimits,
-) -> Result<V3PlannedGroupedArtifact> {
-    validate_attempt3_inputs(schema, batches, limits)?;
-    let fixed_plan = AuraPlanV2::integer_codec_direct_for_schema(schema);
-    let mixed_plan_and_rows = fixed_plan
-        .clone()
-        .and_then(|plan| select_integer_codecs(schema, batches, plan));
-    let mixed_rows = mixed_plan_and_rows
-        .as_ref()
-        .ok()
-        .map(|(_, rows)| rows.clone());
-    let mut fixed_rows = mixed_rows.clone().unwrap_or_default();
-    for row in &mut fixed_rows {
-        row.selected = PlanV2PhysicalCodec::FixedWidth;
-        row.rejection = Some("registry 3 all-fixed candidate".to_owned());
-    }
-    let candidates = vec![
-        compile_v3_planned_grouped(schema, batches, limits),
-        compile_attempt2_candidate(schema, batches, limits, PlanV2Selection::Direct),
-        fixed_plan
-            .and_then(|plan| compile_compact_candidate_with_plan(schema, batches, limits, plan)),
-        mixed_plan_and_rows.and_then(|(plan, _)| {
-            compile_compact_candidate_with_plan(schema, batches, limits, plan)
-        }),
-    ];
-    if let Some(error) = candidates
-        .iter()
-        .filter_map(|candidate| candidate.as_ref().err())
-        .find(|error| !is_expected_candidate_limit(error))
-    {
-        return Err(error.clone());
-    }
-    let sizes = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .as_ref()
-                .ok()
-                .map(|value| value.summary.file_bytes)
-        })
-        .collect::<Vec<_>>();
-    let selected_index = sizes
-        .iter()
-        .enumerate()
-        .filter_map(|(index, bytes)| bytes.map(|bytes| (index, bytes)))
-        .min_by_key(|(index, bytes)| (*bytes, *index))
-        .map(|(index, _)| index)
-        .ok_or(AuraError::InvalidValue(
-            "v3 planned no applicable candidate",
-        ))?;
-    let ids = [
-        "registry1-direct",
-        "registry2-compact-direct",
-        "registry3-compact-fixed",
-        "registry3-compact-integer-codecs",
-    ];
-    let candidate_rows = ids
-        .iter()
-        .enumerate()
-        .map(|(index, id)| V3PlannedGroupedCandidateInspection {
-            candidate_id: (*id).to_owned(),
-            selection: PlanV2Selection::Direct,
-            authorized: true,
-            applicable: candidates[index].is_ok(),
-            rejection: match &candidates[index] {
-                Err(error) => Some(sanitize_candidate_error(error)),
-                Ok(_) if index != selected_index => {
-                    Some("complete cost did not beat selected candidate".to_owned())
-                }
-                Ok(_) => None,
-            },
-            complete_bytes: sizes[index],
-            selected: index == selected_index,
-        })
-        .collect::<Vec<_>>();
-    let mut selected = candidates
-        .into_iter()
-        .nth(selected_index)
-        .ok_or(AuraError::InvalidValue("v3 planned candidate count"))??;
-    selected.inspection.candidates = candidate_rows;
-    selected.inspection.codecs = match selected_index {
-        2 => fixed_rows,
-        3 => mixed_rows.unwrap_or_default(),
-        _ => Vec::new(),
-    };
-    Ok(selected)
-}
-
-/// Size-attempt 4: score previous-within-domain-per-event relationship math
-/// separately from the accepted absolute physical codecs.
-/// This remains an all-memory reference compiler: complete candidate artifacts
-/// are retained together for exact scoring, so peak memory is approximately
-/// the sum of six candidate files plus transform scratch. Streaming/reread
-/// planning is intentionally deferred rather than hidden by this attempt.
-pub fn compile_v3_planned_grouped_attempt4(
-    schema: &SchemaDescriptor,
-    batches: &[AuraV3EventBatch],
-    limits: V3GroupedLimits,
-) -> Result<V3PlannedGroupedArtifact> {
-    validate_attempt3_inputs(schema, batches, limits)?;
-    let r3_fixed_plan = AuraPlanV2::integer_codec_direct_for_schema(schema);
-    let r3_mixed = r3_fixed_plan
-        .clone()
-        .and_then(|plan| select_integer_codecs(schema, batches, plan));
-    let r4_base = AuraPlanV2::within_domain_direct_for_schema(schema);
-    let r4_absolute = r4_base.and_then(|plan| select_integer_codecs(schema, batches, plan));
-    let r4_codec_rows = r4_absolute.as_ref().ok().map(|(_, rows)| rows.clone());
-    let within_authorized = schema
-        .groups
-        .first()
-        .is_some_and(|group| group.relationships.allows_within_domain());
-    let r4_within = if within_authorized {
-        r4_absolute
-            .clone()
-            .and_then(|(plan, _)| select_previous_within_domain(schema, batches, plan))
-    } else {
-        Err(AuraError::InvalidValue("v3 planned within unauthorized"))
-    };
-    let within_rows = r4_within.as_ref().ok().map(|(_, rows)| rows.clone());
-    let candidates = vec![
-        compile_v3_planned_grouped(schema, batches, limits),
-        compile_attempt2_candidate(schema, batches, limits, PlanV2Selection::Direct),
-        r3_fixed_plan
-            .and_then(|plan| compile_compact_candidate_with_plan(schema, batches, limits, plan)),
-        r3_mixed.and_then(|(plan, _)| {
-            compile_compact_candidate_with_plan(schema, batches, limits, plan)
-        }),
-        r4_absolute.clone().and_then(|(plan, _)| {
-            compile_compact_candidate_with_plan(schema, batches, limits, plan)
-        }),
-        r4_within.clone().and_then(|(plan, _)| {
-            compile_compact_candidate_with_plan(schema, batches, limits, plan)
-        }),
-    ];
-    if let Some(error) = candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| {
-            (index != 5 || within_authorized)
-                .then(|| candidate.as_ref().err())
-                .flatten()
-        })
-        .find(|error| !is_expected_candidate_limit(error))
-    {
-        return Err(error.clone());
-    }
-    let sizes = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .as_ref()
-                .ok()
-                .map(|value| value.summary.file_bytes)
-        })
-        .collect::<Vec<_>>();
-    let selected_index = sizes
-        .iter()
-        .enumerate()
-        .filter_map(|(index, bytes)| bytes.map(|bytes| (index, bytes)))
-        .min_by_key(|(index, bytes)| (*bytes, *index))
-        .map(|(index, _)| index)
-        .ok_or(AuraError::InvalidValue(
-            "v3 planned no applicable candidate",
-        ))?;
-    let ids = [
-        "registry1-direct",
-        "registry2-compact-direct",
-        "registry3-compact-fixed",
-        "registry3-compact-integer-codecs",
-        "registry4-absolute-integer-codecs",
-        "registry4-previous-within-domain",
-    ];
-    let candidate_rows = ids
-        .iter()
-        .enumerate()
-        .map(|(index, id)| V3PlannedGroupedCandidateInspection {
-            candidate_id: (*id).to_owned(),
-            selection: if index == 5 {
-                PlanV2Selection::PreviousWithinDomainMixed
-            } else {
-                PlanV2Selection::Direct
-            },
-            authorized: index != 5 || within_authorized,
-            applicable: candidates[index].is_ok() && (index != 5 || within_authorized),
-            rejection: match &candidates[index] {
-                _ if index == 5 && !within_authorized => {
-                    Some("schema does not authorize within-domain".to_owned())
-                }
-                Err(error) => Some(sanitize_candidate_error(error)),
-                Ok(_) if index != selected_index => {
-                    Some("complete cost did not beat selected candidate".to_owned())
-                }
-                Ok(_) => None,
-            },
-            complete_bytes: if index == 5 && !within_authorized {
-                None
-            } else {
-                sizes[index]
-            },
-            selected: index == selected_index,
-        })
-        .collect::<Vec<_>>();
-    let mut selected = candidates.into_iter().nth(selected_index).unwrap()?;
-    selected.inspection.candidates = candidate_rows;
-    selected.inspection.codecs = if selected_index == 4 {
-        r4_codec_rows.unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let mut relationship_rows = within_rows.unwrap_or_default();
-    if selected_index == 5 {
-        for row in &mut relationship_rows {
-            row.selected = row.candidate_selected;
-            row.selected_plan_bytes = u64::from(row.selected) * 2;
-        }
-    }
-    selected.inspection.within_domain = relationship_rows;
-    Ok(selected)
-}
-
-/// Encode an explicit registry-4 candidate for bounded inverse/wire auditing.
-pub fn compile_v3_planned_grouped_attempt4_candidate(
-    schema: &SchemaDescriptor,
-    batches: &[AuraV3EventBatch],
-    limits: V3GroupedLimits,
-    slots: &[u16],
-    codec: PlanV2PhysicalCodec,
-) -> Result<V3PlannedGroupedArtifact> {
-    let mut plan = AuraPlanV2::within_domain_direct_for_schema(schema)?;
-    plan.select_previous_within_domain(slots);
-    for slot in slots {
-        let physical = plan.streams[usize::from(*slot)].physical_stream_ids[0];
-        plan.physical_stream_codecs[usize::from(physical)] = codec;
-    }
-    plan.validate(schema)?;
-    compile_compact_candidate_with_plan(schema, batches, limits, plan)
-}
-
-/// Size-attempt 5: score both reversible cross-domain same-slot orientations.
-/// Pairing restarts at each event and uses ordinal occurrence within each
-/// discriminator domain. The source domain and every unmatched tail value are
-/// absolute, so asymmetric and empty domains require no side metadata.
-pub fn compile_v3_planned_grouped_attempt5(
-    schema: &SchemaDescriptor,
-    batches: &[AuraV3EventBatch],
-    limits: V3GroupedLimits,
-) -> Result<V3PlannedGroupedArtifact> {
-    validate_attempt3_inputs(schema, batches, limits)?;
-    let r3_fixed_plan = AuraPlanV2::integer_codec_direct_for_schema(schema);
-    let r3_mixed = r3_fixed_plan
-        .clone()
-        .and_then(|plan| select_integer_codecs(schema, batches, plan));
-    let r4_absolute = AuraPlanV2::within_domain_direct_for_schema(schema)
-        .and_then(|plan| select_integer_codecs(schema, batches, plan));
-    let within_authorized = schema
-        .groups
-        .first()
-        .is_some_and(|group| group.relationships.allows_within_domain());
-    let r4_within = if within_authorized {
-        r4_absolute
-            .clone()
-            .and_then(|(plan, _)| select_previous_within_domain(schema, batches, plan))
-    } else {
-        Err(AuraError::InvalidValue("v3 planned within unauthorized"))
-    };
-    let cross_authorized = schema
-        .groups
-        .first()
-        .is_some_and(|group| group.relationships.allows_across_domain_same_field());
-    let r5_cross = if cross_authorized {
-        AuraPlanV2::cross_domain_direct_for_schema(schema)
-            .and_then(|plan| select_integer_codecs(schema, batches, plan))
-            .and_then(|(plan, _)| select_cross_domain_same_field(schema, batches, plan))
-    } else {
-        Err(AuraError::InvalidValue("v3 planned cross unauthorized"))
-    };
-    let cross_rows = r5_cross.as_ref().ok().map(|(_, rows)| rows.clone());
-    // Compile and score one complete artifact at a time. The retained winner
-    // is the only whole candidate kept in memory; ties remain with the earlier
-    // Direct candidate by replacing only on a strict complete-byte win.
-    let mut outcomes = Vec::new();
-    outcomes
-        .try_reserve_exact(7)
-        .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
-    let mut winner = None;
-    consider_attempt5_candidate(
-        0,
-        true,
-        compile_v3_planned_grouped(schema, batches, limits),
-        &mut outcomes,
-        &mut winner,
-    )?;
-    consider_attempt5_candidate(
-        1,
-        true,
-        compile_attempt2_candidate(schema, batches, limits, PlanV2Selection::Direct),
-        &mut outcomes,
-        &mut winner,
-    )?;
-    consider_attempt5_candidate(
-        2,
-        true,
-        r3_fixed_plan
-            .and_then(|plan| compile_compact_candidate_with_plan(schema, batches, limits, plan)),
-        &mut outcomes,
-        &mut winner,
-    )?;
-    consider_attempt5_candidate(
-        3,
-        true,
-        r3_mixed.and_then(|(plan, _)| {
-            compile_compact_candidate_with_plan(schema, batches, limits, plan)
-        }),
-        &mut outcomes,
-        &mut winner,
-    )?;
-    consider_attempt5_candidate(
-        4,
-        true,
-        r4_absolute.clone().and_then(|(plan, _)| {
-            compile_compact_candidate_with_plan(schema, batches, limits, plan)
-        }),
-        &mut outcomes,
-        &mut winner,
-    )?;
-    consider_attempt5_candidate(
-        5,
-        within_authorized,
-        r4_within.and_then(|(plan, _)| {
-            compile_compact_candidate_with_plan(schema, batches, limits, plan)
-        }),
-        &mut outcomes,
-        &mut winner,
-    )?;
-    consider_attempt5_candidate(
-        6,
-        cross_authorized,
-        r5_cross.clone().and_then(|(plan, _)| {
-            compile_compact_candidate_with_plan(schema, batches, limits, plan)
-        }),
-        &mut outcomes,
-        &mut winner,
-    )?;
-    let (selected_index, mut selected) = winner.ok_or(AuraError::InvalidValue(
-        "v3 planned no applicable candidate",
-    ))?;
-    let ids = [
-        "registry1-direct",
-        "registry2-compact-direct",
-        "registry3-compact-fixed",
-        "registry3-compact-integer-codecs",
-        "registry4-absolute-integer-codecs",
-        "registry4-previous-within-domain",
-        "registry5-cross-domain-same-field",
-    ];
-    let candidate_rows = ids
-        .iter()
-        .enumerate()
-        .map(|(index, id)| {
-            let (selection, authorized, unauthorized_reason) = match index {
-                5 => (
-                    PlanV2Selection::PreviousWithinDomainMixed,
-                    within_authorized,
-                    "schema does not authorize within-domain",
-                ),
-                6 => (
-                    PlanV2Selection::CrossDomainSameFieldMixed,
-                    cross_authorized,
-                    "schema does not authorize cross-domain same-field",
-                ),
-                _ => (PlanV2Selection::Direct, true, ""),
-            };
-            V3PlannedGroupedCandidateInspection {
-                candidate_id: (*id).to_owned(),
-                selection,
-                authorized,
-                applicable: authorized && outcomes[index].is_ok(),
-                rejection: if !authorized {
-                    Some(unauthorized_reason.to_owned())
+impl GroupedSearch {
+    /// Score complete files in a fixed order. Strictly smaller wins; ties keep
+    /// the earlier candidate. Only candidate-size limits permit fallback.
+    pub fn compile(
+        self,
+        schema: &SchemaDescriptor,
+        batches: &[AuraV3EventBatch],
+        limits: V3GroupedLimits,
+    ) -> Result<V3PlannedGroupedArtifact> {
+        validate_planned_inputs(schema, batches, limits)?;
+        let mut selection = CandidateSelection::default();
+        selection.consider(
+            "registry1-direct",
+            PlanV2Selection::Direct,
+            None,
+            compile_v3_planned_grouped(schema, batches, limits),
+        )?;
+        selection.consider(
+            "registry2-compact-direct",
+            PlanV2Selection::Direct,
+            None,
+            compile_compact_candidate(schema, batches, limits, PlanV2Selection::Direct),
+        )?;
+        if self == Self::Compact {
+            let authorized = schema
+                .groups
+                .first()
+                .is_some_and(|group| group.relationships.allows_split());
+            selection.consider(
+                "registry2-compact-split-domain-direct",
+                PlanV2Selection::SplitDomainDirect,
+                (!authorized).then_some("schema does not authorize split-domain direct"),
+                if authorized {
+                    compile_compact_candidate(
+                        schema,
+                        batches,
+                        limits,
+                        PlanV2Selection::SplitDomainDirect,
+                    )
                 } else {
-                    match &outcomes[index] {
-                        Err(error) => Some(sanitize_candidate_error(error)),
-                        Ok(_) if index != selected_index => {
-                            Some("complete cost did not beat selected candidate".to_owned())
-                        }
-                        Ok(_) => None,
-                    }
+                    Err(AuraError::InvalidValue("v3 planned candidate unauthorized"))
                 },
-                complete_bytes: authorized
-                    .then(|| outcomes[index].as_ref().ok().copied())
-                    .flatten(),
-                selected: index == selected_index,
+            )?;
+            return selection.finish();
+        }
+
+        // Absolute lane costs depend on these immutable batches and field types,
+        // not the registry header. Analyze once and reuse only during this call.
+        let fixed = AuraPlanV2::integer_codec_direct_for_schema(schema)?;
+        let (mixed, codec_rows) = select_integer_codecs(schema, batches, fixed.clone())?;
+        selection.consider(
+            "registry3-compact-fixed",
+            PlanV2Selection::Direct,
+            None,
+            compile_v3_grouped_with_plan(schema, batches, limits, fixed),
+        )?;
+        selection.consider(
+            "registry3-compact-integer-codecs",
+            PlanV2Selection::Direct,
+            None,
+            compile_v3_grouped_with_plan(schema, batches, limits, mixed),
+        )?;
+        if self == Self::Integer {
+            let mut selected = selection.finish()?;
+            if selected.inspection.candidates[2].selected
+                || selected.inspection.candidates[3].selected
+            {
+                let fixed = selected.inspection.candidates[2].selected;
+                selected.inspection.codecs = codec_rows;
+                if fixed {
+                    for row in &mut selected.inspection.codecs {
+                        row.selected = PlanV2PhysicalCodec::FixedWidth;
+                        row.rejection = Some("registry 3 all-fixed candidate".to_owned());
+                    }
+                }
             }
-        })
-        .collect::<Vec<_>>();
-    selected.inspection.candidates = candidate_rows;
-    let mut rows = cross_rows.unwrap_or_default();
-    if selected_index == 6 {
-        for row in &mut rows {
-            row.selected = row.candidate_selected;
+            return Ok(selected);
         }
-    }
-    selected.inspection.cross_domain = rows;
-    Ok(selected)
-}
-
-/// Encode an explicit registry-5 candidate for inverse and corruption tests.
-pub fn compile_v3_planned_grouped_attempt5_candidate(
-    schema: &SchemaDescriptor,
-    batches: &[AuraV3EventBatch],
-    limits: V3GroupedLimits,
-    ops: &[(u16, u8)],
-    codec: PlanV2PhysicalCodec,
-) -> Result<V3PlannedGroupedArtifact> {
-    let mut plan = AuraPlanV2::cross_domain_direct_for_schema(schema)?;
-    plan.select_cross_domain_same_field(ops);
-    for (slot, _) in ops {
-        let physical = plan
-            .streams
-            .get(usize::from(*slot))
-            .and_then(|stream| stream.physical_stream_ids.first())
-            .copied()
-            .ok_or(AuraError::InvalidValue("v3 planned cross slot"))?;
-        plan.physical_stream_codecs[usize::from(physical)] = codec;
-    }
-    plan.validate(schema)?;
-    compile_compact_candidate_with_plan(schema, batches, limits, plan)
-}
-
-/// Size-attempt 6: add explicit same-child parent residuals to the complete
-/// v1-v5 candidate set. An eligible lane is exactly a repeated nonnullable
-/// `I64` field related to a repeated nonnullable `I64` parent. A transform is
-/// selected only when its encoded lane plus the two-byte plan dependency is
-/// strictly smaller than the best absolute lane; ties stay direct.
-pub fn compile_v3_planned_grouped_attempt6(
-    schema: &SchemaDescriptor,
-    batches: &[AuraV3EventBatch],
-    limits: V3GroupedLimits,
-) -> Result<V3PlannedGroupedArtifact> {
-    validate_attempt3_inputs(schema, batches, limits)?;
-    let mut selected = compile_v3_planned_grouped_attempt5(schema, batches, limits)?;
-    let mut prior_candidates = selected.inspection.candidates.clone();
-    let authorized = schema.fields.iter().any(|field| {
-        field.scope == FieldScope::Repeated
-            && matches!(field.relation, FieldRelation::DeltaFromField(_))
-    });
-    let planned = AuraPlanV2::same_child_parent_direct_for_schema(schema)
-        .and_then(|plan| select_integer_codecs(schema, batches, plan))
-        .and_then(|(plan, _)| select_same_child_parent(schema, batches, plan));
-    let rows = planned.as_ref().ok().map(|(_, rows)| rows.clone());
-    let candidate = planned
-        .and_then(|(plan, _)| compile_compact_candidate_with_plan(schema, batches, limits, plan));
-    let (candidate_bytes, candidate_error, candidate_artifact) = match candidate {
-        Ok(artifact) => (Some(artifact.summary.file_bytes), None, Some(artifact)),
-        Err(error) if is_expected_candidate_limit(&error) => {
-            (None, Some(sanitize_candidate_error(&error)), None)
-        }
-        Err(error) => return Err(error),
-    };
-    let parent_wins =
-        authorized && candidate_bytes.is_some_and(|bytes| bytes < selected.summary.file_bytes);
-    if parent_wins {
-        for candidate in &mut prior_candidates {
-            candidate.selected = false;
-            if candidate.rejection.is_none() {
-                candidate.rejection =
-                    Some("complete cost did not beat selected candidate".to_owned());
+        let apply_codecs = |mut plan: AuraPlanV2| -> Result<AuraPlanV2> {
+            for row in &codec_rows {
+                let physical = plan.streams[usize::from(row.logical_slot)].physical_stream_ids[0];
+                plan.physical_stream_codecs[usize::from(physical)] = row.selected;
             }
-        }
-        selected =
-            candidate_artifact.ok_or(AuraError::InvalidValue("v3 planned selected candidate"))?;
-    }
-    let mut parent_rows = rows.unwrap_or_default();
-    if parent_wins {
-        for row in &mut parent_rows {
-            row.selected = row.candidate_selected;
-        }
-    }
-    let parent_row = V3PlannedGroupedCandidateInspection {
-        candidate_id: "registry6-same-child-parent".to_owned(),
-        selection: PlanV2Selection::SameChildParentMixed,
-        authorized,
-        applicable: authorized && candidate_bytes.is_some(),
-        rejection: if !authorized {
-            Some("schema has no repeated DeltaFromField relation".to_owned())
-        } else if parent_wins {
-            None
-        } else if let Some(error) = candidate_error {
-            Some(error)
-        } else {
-            Some("complete cost did not beat selected candidate".to_owned())
-        },
-        complete_bytes: authorized.then_some(candidate_bytes).flatten(),
-        selected: parent_wins,
-    };
-    if parent_wins {
-        // The registry-6 artifact starts with an empty inspection assembled
-        // from its footer; restore the complete v1-v5 comparison rows.
-        selected.inspection.candidates = prior_candidates;
-    }
-    selected.inspection.candidates.push(parent_row);
-    selected.inspection.same_child_parent = parent_rows;
-    Ok(selected)
-}
-
-/// Encode an explicit registry-6 candidate for inverse/footer auditing.
-pub fn compile_v3_planned_grouped_attempt6_candidate(
-    schema: &SchemaDescriptor,
-    batches: &[AuraV3EventBatch],
-    limits: V3GroupedLimits,
-    slots: &[u16],
-    codec: PlanV2PhysicalCodec,
-) -> Result<V3PlannedGroupedArtifact> {
-    let mut plan = AuraPlanV2::same_child_parent_direct_for_schema(schema)?;
-    let mut relations = Vec::new();
-    relations
-        .try_reserve_exact(slots.len())
-        .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
-    for slot in slots {
-        let field = schema
-            .fields
-            .get(usize::from(*slot))
-            .filter(|field| field.index == *slot)
-            .ok_or(AuraError::InvalidValue("v3 planned parent slot"))?;
-        let FieldRelation::DeltaFromField(parent) = field.relation else {
-            return Err(AuraError::InvalidValue("v3 planned parent relation"));
+            plan.validate(schema)?;
+            Ok(plan)
         };
-        relations.push((*slot, parent));
-        let physical = plan.streams[usize::from(*slot)].physical_stream_ids[0];
-        plan.physical_stream_codecs[usize::from(physical)] = codec;
+        let absolute = apply_codecs(AuraPlanV2::within_domain_direct_for_schema(schema)?)?;
+        selection.consider(
+            "registry4-absolute-integer-codecs",
+            PlanV2Selection::Direct,
+            None,
+            compile_v3_grouped_with_plan(schema, batches, limits, absolute.clone()),
+        )?;
+        let within_authorized = schema
+            .groups
+            .first()
+            .is_some_and(|group| group.relationships.allows_within_domain());
+        let mut within_rows = Vec::new();
+        let within = if within_authorized {
+            select_previous_within_domain(schema, batches, absolute, &codec_rows).and_then(
+                |(plan, rows)| {
+                    within_rows = rows;
+                    compile_v3_grouped_with_plan(schema, batches, limits, plan)
+                },
+            )
+        } else {
+            Err(AuraError::InvalidValue("v3 planned within unauthorized"))
+        };
+        selection.consider(
+            "registry4-previous-within-domain",
+            PlanV2Selection::PreviousWithinDomainMixed,
+            (!within_authorized).then_some("schema does not authorize within-domain"),
+            within,
+        )?;
+        if self == Self::WithinDomain {
+            let mut selected = selection.finish()?;
+            if selected.inspection.candidates[4].selected {
+                selected.inspection.codecs = codec_rows;
+            }
+            if selected.inspection.candidates[5].selected {
+                for row in &mut within_rows {
+                    row.selected = row.candidate_selected;
+                    row.selected_plan_bytes = u64::from(row.selected) * 2;
+                }
+            }
+            selected.inspection.within_domain = within_rows;
+            return Ok(selected);
+        }
+        let cross_authorized = schema
+            .groups
+            .first()
+            .is_some_and(|group| group.relationships.allows_across_domain_same_field());
+        let mut cross_rows = Vec::new();
+        let cross = if cross_authorized {
+            apply_codecs(AuraPlanV2::cross_domain_direct_for_schema(schema)?)
+                .and_then(|plan| select_cross_domain_same_field(schema, batches, plan, &codec_rows))
+                .and_then(|(plan, rows)| {
+                    cross_rows = rows;
+                    compile_v3_grouped_with_plan(schema, batches, limits, plan)
+                })
+        } else {
+            Err(AuraError::InvalidValue("v3 planned cross unauthorized"))
+        };
+        selection.consider(
+            "registry5-cross-domain-same-field",
+            PlanV2Selection::CrossDomainSameFieldMixed,
+            (!cross_authorized).then_some("schema does not authorize cross-domain same-field"),
+            cross,
+        )?;
+        let mut parent_rows = Vec::new();
+        if self == Self::SameChildParent {
+            let authorized = schema.fields.iter().any(|field| {
+                field.scope == FieldScope::Repeated
+                    && matches!(field.relation, FieldRelation::DeltaFromField(_))
+            });
+            let parent = if authorized {
+                apply_codecs(AuraPlanV2::same_child_parent_direct_for_schema(schema)?)
+                    .and_then(|plan| select_same_child_parent(schema, batches, plan, &codec_rows))
+                    .and_then(|(plan, rows)| {
+                        parent_rows = rows;
+                        compile_v3_grouped_with_plan(schema, batches, limits, plan)
+                    })
+            } else {
+                Err(AuraError::InvalidValue("v3 planned parent unauthorized"))
+            };
+            selection.consider(
+                "registry6-same-child-parent",
+                PlanV2Selection::SameChildParentMixed,
+                (!authorized).then_some("schema has no repeated DeltaFromField relation"),
+                parent,
+            )?;
+        }
+        let mut selected = selection.finish()?;
+        if selected.inspection.candidates[6].selected {
+            for row in &mut cross_rows {
+                row.selected = row.candidate_selected;
+            }
+        }
+        if selected
+            .inspection
+            .candidates
+            .get(7)
+            .is_some_and(|row| row.selected)
+        {
+            for row in &mut parent_rows {
+                row.selected = row.candidate_selected;
+            }
+        }
+        selected.inspection.cross_domain = cross_rows;
+        selected.inspection.same_child_parent = parent_rows;
+        Ok(selected)
     }
-    plan.select_same_child_parent(&relations);
-    plan.validate(schema)?;
-    compile_compact_candidate_with_plan(schema, batches, limits, plan)
+}
+
+/// Holds one winner and the current candidate, never a vector of complete files.
+#[derive(Default)]
+struct CandidateSelection {
+    rows: Vec<V3PlannedGroupedCandidateInspection>,
+    winner: Option<(usize, V3PlannedGroupedArtifact)>,
+}
+
+impl CandidateSelection {
+    fn consider(
+        &mut self,
+        id: &str,
+        selection: PlanV2Selection,
+        unauthorized: Option<&str>,
+        candidate: Result<V3PlannedGroupedArtifact>,
+    ) -> Result<()> {
+        let mut row = V3PlannedGroupedCandidateInspection {
+            candidate_id: id.to_owned(),
+            selection,
+            authorized: unauthorized.is_none(),
+            applicable: false,
+            rejection: unauthorized.map(str::to_owned),
+            complete_bytes: None,
+            selected: false,
+        };
+        if unauthorized.is_none() {
+            match candidate {
+                Ok(artifact) => {
+                    let bytes = artifact.summary.file_bytes;
+                    row.applicable = true;
+                    row.complete_bytes = Some(bytes);
+                    if self
+                        .winner
+                        .as_ref()
+                        .is_none_or(|(_, current)| bytes < current.summary.file_bytes)
+                    {
+                        self.winner = Some((self.rows.len(), artifact));
+                    }
+                }
+                Err(error) if is_expected_candidate_limit(&error) => {
+                    row.rejection = Some(sanitize_candidate_error(&error))
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.rows.push(row);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<V3PlannedGroupedArtifact> {
+        let (index, mut selected) = self.winner.ok_or(AuraError::InvalidValue(
+            "v3 planned no applicable candidate",
+        ))?;
+        for (i, row) in self.rows.iter_mut().enumerate() {
+            row.selected = i == index;
+            if row.applicable && !row.selected {
+                row.rejection = Some("complete cost did not beat selected candidate".to_owned());
+            }
+        }
+        selected.inspection.candidates = self.rows;
+        Ok(selected)
+    }
 }
 
 fn select_same_child_parent(
     schema: &SchemaDescriptor,
     batches: &[AuraV3EventBatch],
     mut plan: AuraPlanV2,
+    absolute_costs: &[V3PlannedGroupedCodecInspection],
 ) -> Result<(AuraPlanV2, Vec<V3PlannedGroupedParentInspection>)> {
     let mut selected_relations = Vec::new();
     let mut rows = Vec::new();
@@ -998,7 +626,16 @@ fn select_same_child_parent(
             .ok_or(AuraError::InvalidValue("v3 planned parent slot"))?;
         let physical = plan.streams[usize::from(field.index)].physical_stream_ids[0];
         let absolute_codec = plan.physical_stream_codecs[usize::from(physical)];
-        let absolute_bytes = encoded_codec_bytes(schema, batches, field.index, absolute_codec)?;
+        let costs = absolute_costs
+            .iter()
+            .find(|row| row.logical_slot == field.index)
+            .ok_or(AuraError::InvalidValue("v3 planned codec slot"))?;
+        let absolute_bytes = match absolute_codec {
+            PlanV2PhysicalCodec::FixedWidth => costs.fixed_bytes as usize,
+            _ => costs
+                .varint_bytes
+                .ok_or(AuraError::InvalidValue("v3 planned codec cost"))? as usize,
+        };
         let eligible = !field.nullable
             && field.field_type == crate::FieldType::I64
             && parent.scope == FieldScope::Repeated
@@ -1077,6 +714,7 @@ fn select_cross_domain_same_field(
     schema: &SchemaDescriptor,
     batches: &[AuraV3EventBatch],
     mut plan: AuraPlanV2,
+    absolute_costs: &[V3PlannedGroupedCodecInspection],
 ) -> Result<(AuraPlanV2, Vec<V3PlannedGroupedCrossInspection>)> {
     let authorized = schema
         .groups
@@ -1090,7 +728,16 @@ fn select_cross_domain_same_field(
         }
         let physical = plan.streams[usize::from(field.index)].physical_stream_ids[0];
         let absolute_codec = plan.physical_stream_codecs[usize::from(physical)];
-        let absolute_bytes = encoded_codec_bytes(schema, batches, field.index, absolute_codec)?;
+        let costs = absolute_costs
+            .iter()
+            .find(|row| row.logical_slot == field.index)
+            .ok_or(AuraError::InvalidValue("v3 planned codec slot"))?;
+        let absolute_bytes = match absolute_codec {
+            PlanV2PhysicalCodec::FixedWidth => costs.fixed_bytes as usize,
+            _ => costs
+                .varint_bytes
+                .ok_or(AuraError::InvalidValue("v3 planned codec cost"))? as usize,
+        };
         let eligible = authorized && !field.nullable && is_within_field_type(field.field_type);
         let orientation = |op| {
             if eligible {
@@ -1196,6 +843,7 @@ fn select_previous_within_domain(
     schema: &SchemaDescriptor,
     batches: &[AuraV3EventBatch],
     mut plan: AuraPlanV2,
+    absolute_costs: &[V3PlannedGroupedCodecInspection],
 ) -> Result<(AuraPlanV2, Vec<V3PlannedGroupedWithinInspection>)> {
     let authorized = schema
         .groups
@@ -1209,7 +857,16 @@ fn select_previous_within_domain(
         }
         let physical = plan.streams[usize::from(field.index)].physical_stream_ids[0];
         let absolute_codec = plan.physical_stream_codecs[usize::from(physical)];
-        let absolute_bytes = encoded_codec_bytes(schema, batches, field.index, absolute_codec)?;
+        let costs = absolute_costs
+            .iter()
+            .find(|row| row.logical_slot == field.index)
+            .ok_or(AuraError::InvalidValue("v3 planned codec slot"))?;
+        let absolute_bytes = match absolute_codec {
+            PlanV2PhysicalCodec::FixedWidth => costs.fixed_bytes as usize,
+            _ => costs
+                .varint_bytes
+                .ok_or(AuraError::InvalidValue("v3 planned codec cost"))? as usize,
+        };
         let eligible = authorized && !field.nullable && is_within_field_type(field.field_type);
         let transformed = if eligible {
             encoded_previous_within_bytes(schema, batches, field.index)
@@ -1290,7 +947,7 @@ fn select_previous_within_domain(
     Ok((plan, rows))
 }
 
-fn validate_attempt3_inputs(
+fn validate_planned_inputs(
     schema: &SchemaDescriptor,
     batches: &[AuraV3EventBatch],
     limits: V3GroupedLimits,
@@ -1362,39 +1019,6 @@ fn is_expected_candidate_limit(error: &AuraError) -> bool {
                 | "v3 planned grouped footer length"
         )
     )
-}
-
-fn consider_attempt5_candidate(
-    index: usize,
-    authorized: bool,
-    candidate: Result<V3PlannedGroupedArtifact>,
-    outcomes: &mut Vec<Result<u64>>,
-    winner: &mut Option<(usize, V3PlannedGroupedArtifact)>,
-) -> Result<()> {
-    if !authorized {
-        outcomes.push(Err(AuraError::InvalidValue(
-            "v3 planned candidate unauthorized",
-        )));
-        return Ok(());
-    }
-    match candidate {
-        Ok(artifact) => {
-            let bytes = artifact.summary.file_bytes;
-            let replace = winner
-                .as_ref()
-                .is_none_or(|(_, current)| bytes < current.summary.file_bytes);
-            if replace {
-                *winner = Some((index, artifact));
-            }
-            outcomes.push(Ok(bytes));
-            Ok(())
-        }
-        Err(error) if is_expected_candidate_limit(&error) => {
-            outcomes.push(Err(error));
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
 }
 
 fn select_integer_codecs(
@@ -1616,17 +1240,18 @@ const fn is_within_field_type(field_type: crate::FieldType) -> bool {
     )
 }
 
-fn compile_attempt2_candidate(
+fn compile_compact_candidate(
     schema: &SchemaDescriptor,
     batches: &[AuraV3EventBatch],
     limits: V3GroupedLimits,
     selection: PlanV2Selection,
 ) -> Result<V3PlannedGroupedArtifact> {
     let plan = AuraPlanV2::candidate_for_schema(schema, selection)?;
-    compile_compact_candidate_with_plan(schema, batches, limits, plan)
+    compile_v3_grouped_with_plan(schema, batches, limits, plan)
 }
 
-fn compile_compact_candidate_with_plan(
+/// Encode a validated explicit plan for development inverse/cost auditing.
+pub fn compile_v3_grouped_with_plan(
     schema: &SchemaDescriptor,
     batches: &[AuraV3EventBatch],
     limits: V3GroupedLimits,
@@ -1672,7 +1297,7 @@ fn compile_compact_candidate_with_plan(
         structural_limits,
     )?;
     for (index, batch) in batches.iter().enumerate() {
-        let block = encode_attempt2_block(schema, batch, &plan, limits.event_limits)?;
+        let block = encode_compact_block(schema, batch, &plan, limits.event_limits)?;
         let next_body = body
             .len()
             .checked_add(block.len())
@@ -1787,7 +1412,7 @@ fn seal_artifact(
     })
 }
 
-fn encode_attempt2_block(
+fn encode_compact_block(
     schema: &SchemaDescriptor,
     batch: &AuraV3EventBatch,
     plan: &AuraPlanV2,
@@ -1817,9 +1442,9 @@ fn encode_attempt2_block(
             .ok_or(AuraError::InvalidValue("v3 planned physical stream count"))
     })?;
     let mut out = Vec::new();
-    out.try_reserve_exact(ATTEMPT2_BLOCK_HEADER_BYTES)
+    out.try_reserve_exact(COMPACT_BLOCK_HEADER_BYTES)
         .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
-    out.extend_from_slice(ATTEMPT2_BLOCK_MAGIC);
+    out.extend_from_slice(COMPACT_BLOCK_MAGIC);
     let block_version = body_versions(plan).1;
     put_u16(&mut out, block_version);
     out.push(plan.selection as u8);
@@ -1845,7 +1470,7 @@ fn encode_attempt2_block(
     );
     put_u16(&mut out, 0);
     put_u64(&mut out, 0);
-    debug_assert_eq!(out.len(), ATTEMPT2_BLOCK_HEADER_BYTES);
+    debug_assert_eq!(out.len(), COMPACT_BLOCK_HEADER_BYTES);
     for offset in &batch.child_offsets {
         put_u32(&mut out, *offset);
     }
@@ -1921,24 +1546,24 @@ fn encode_attempt2_block(
     if out.len() > limits.max_block_bytes {
         return Err(AuraError::InvalidValue("v3 planned block length"));
     }
-    let decoded = decode_attempt2_block(schema, &out, plan, limits)?;
+    let decoded = decode_compact_block(schema, &out, plan, limits)?;
     if decoded != *batch {
         return Err(AuraError::InvalidValue("v3 planned split inverse"));
     }
     Ok(out)
 }
 
-fn decode_attempt2_block(
+fn decode_compact_block(
     schema: &SchemaDescriptor,
     bytes: &[u8],
     plan: &AuraPlanV2,
     limits: crate::V3EventLimits,
 ) -> Result<AuraV3EventBatch> {
-    if bytes.len() > limits.max_block_bytes || bytes.len() < ATTEMPT2_BLOCK_HEADER_BYTES {
+    if bytes.len() > limits.max_block_bytes || bytes.len() < COMPACT_BLOCK_HEADER_BYTES {
         return Err(AuraError::InvalidValue("v3 planned block length"));
     }
     let mut reader = ByteReader::new(bytes);
-    if reader.read_exact(8)? != ATTEMPT2_BLOCK_MAGIC
+    if reader.read_exact(8)? != COMPACT_BLOCK_MAGIC
         || reader.read_u16_le()? != body_versions(plan).1
         || reader.read_u8()? != plan.selection as u8
         || reader.read_u8()? != 0
@@ -2975,7 +2600,7 @@ pub fn decode_v3_planned_grouped(
         let batch = if footer.block_version == V3_PLANNED_GROUPED_DIRECT_BLOCK_VERSION {
             decode_v3_event_block(&footer.schema, block, limits.event_limits)?
         } else {
-            decode_attempt2_block(&footer.schema, block, &footer.plan, limits.event_limits)?
+            decode_compact_block(&footer.schema, block, &footer.plan, limits.event_limits)?
         };
         if batch.event_count != chunk.event_count
             || batch.child_count() != chunk.child_count

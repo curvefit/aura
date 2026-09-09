@@ -3,11 +3,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use aura_codec::{
+use aura_codec::experimental::{
     canonical_v3_schema_fingerprint, compile_v3_planned_flat, decode_v3_planned_flat, AuraV3Batch,
-    AuraV3Column, AuraV3ColumnValues as Values, AuraV3VariableColumn, FieldRole, FieldType,
-    PlanV2PhysicalCodec, SchemaBuilder, V3FlatLimits,
+    AuraV3Column, AuraV3ColumnValues as Values, AuraV3VariableColumn, PlanV2PhysicalCodec,
 };
+use aura_codec::{FieldRole, FieldType, SchemaBuilder, V3FlatLimits};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -94,7 +94,7 @@ fn without_schema_ids(mut batches: Vec<AuraV3Batch>) -> Vec<AuraV3Batch> {
 
 fn fixture_manifest(
     schema: &aura_codec::SchemaDescriptor,
-    artifact: &aura_codec::V3PlannedFlatArtifact,
+    artifact: &aura_codec::experimental::V3PlannedFlatArtifact,
     schema_json: &[u8],
 ) -> Value {
     let decoded = decode_v3_planned_flat(&artifact.bytes, V3FlatLimits::HARD).unwrap();

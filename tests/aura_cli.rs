@@ -10,10 +10,13 @@ use arrow::array::{Int64Array, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use aura_codec::experimental::{
+    canonical_v3_batch_sha256, canonical_v3_schema_fingerprint, decode_v3_value_block,
+    ShadowProtocolLimits, V3ValueLimits,
+};
 use aura_codec::{
-    canonical_v3_batch_sha256, canonical_v3_schema_fingerprint, canonicalize_schema_json,
-    decode_v3_value_block, parse_schema_json, FieldRole, FieldType, RelationshipPermissions,
-    SchemaBuilder, ShadowProtocolLimits, V3ValueLimits, MAX_SCHEMA_JSON_BYTES,
+    canonicalize_schema_json, parse_schema_json, FieldRole, FieldType, RelationshipPermissions,
+    SchemaBuilder, MAX_SCHEMA_JSON_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;

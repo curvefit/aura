@@ -12,7 +12,7 @@ venue messages or infer missing source facts. [FORMAT.md](FORMAT.md#choosing-a-p
 defines these responsibilities and the archival/replay tradeoffs.
 
 ```rust
-use aura_codec::{
+use aura_codec::sdk::{
     AuraRecordBatch, AuraSchema, AuraType, AuraValue, AuraWriter, WriterOptions,
 };
 
@@ -42,6 +42,14 @@ writer.write_batch(batch)?;
 writer.finish()?;
 # Ok::<(), aura_codec::AuraError>(())
 ```
+
+## Supported entrypoints
+
+`aura_codec::sdk` contains the common V2 facade. The existing root and low-level
+V2 paths used by consumers remain compatible. `records` exposes the explicit
+i64 event decoder and bounded limits; `generic_planner::I64SearchEffort` remains
+the supported advanced encoding-effort choice. V3 and shadow protocol types
+belong to `aura_codec::experimental`; they are not implicit V2 upgrades.
 
 ## Public Types
 

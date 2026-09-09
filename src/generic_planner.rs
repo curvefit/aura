@@ -3889,90 +3889,11 @@ fn evaluate_expression_row_value(
     literals: &[i64],
     row: &[i64],
 ) -> Result<i64> {
-    let input_terms = || {
-        input_slots.iter().map(|slot| {
-            row.get(usize::from(*slot))
-                .copied()
-                .ok_or(AuraError::InvalidValue("input slots"))
-        })
-    };
-    match op {
-        DerivedExpressionOp::Add => {
-            let sum = input_terms()
-                .chain(literals.iter().copied().map(Ok))
-                .try_fold(0i128, |sum, term| {
-                    sum.checked_add(i128::from(term?))
-                        .ok_or(AuraError::InvalidValue("expression value"))
-                })?;
-            i64::try_from(sum).map_err(|_| AuraError::InvalidValue("expression value"))
-        }
-        DerivedExpressionOp::Sub | DerivedExpressionOp::Div => {
-            let mut terms = input_terms().chain(literals.iter().copied().map(Ok));
-            let first = terms
-                .next()
-                .transpose()?
-                .ok_or(AuraError::InvalidValue("expression terms"))?;
-            let value = terms.try_fold(i128::from(first), |value, term| {
-                let term = i128::from(term?);
-                match op {
-                    DerivedExpressionOp::Sub => value
-                        .checked_sub(term)
-                        .ok_or(AuraError::InvalidValue("expression value")),
-                    DerivedExpressionOp::Div if term != 0 => value
-                        .checked_div(term)
-                        .ok_or(AuraError::InvalidValue("expression value")),
-                    _ => Err(AuraError::InvalidValue("expression value")),
-                }
-            })?;
-            i64::try_from(value).map_err(|_| AuraError::InvalidValue("expression value"))
-        }
-        DerivedExpressionOp::Mul => {
-            let product = input_terms()
-                .chain(literals.iter().copied().map(Ok))
-                .try_fold(1i128, |product, term| {
-                    product
-                        .checked_mul(i128::from(term?))
-                        .ok_or(AuraError::InvalidValue("expression value"))
-                })?;
-            i64::try_from(product).map_err(|_| AuraError::InvalidValue("expression value"))
-        }
-        DerivedExpressionOp::MulDiv => {
-            let divisor = *literals
-                .first()
-                .filter(|divisor| **divisor != 0)
-                .ok_or(AuraError::InvalidValue("expression terms"))?;
-            let product = input_terms().try_fold(1i128, |product, term| {
-                product
-                    .checked_mul(i128::from(term?))
-                    .ok_or(AuraError::InvalidValue("expression value"))
-            })?;
-            let value = product
-                .checked_div(i128::from(divisor))
-                .ok_or(AuraError::InvalidValue("expression value"))?;
-            i64::try_from(value).map_err(|_| AuraError::InvalidValue("expression value"))
-        }
-        DerivedExpressionOp::Min | DerivedExpressionOp::Max => input_terms()
-            .chain(literals.iter().copied().map(Ok))
-            .try_fold(None, |value, term| {
-                let term = term?;
-                Ok::<_, AuraError>(Some(value.map_or(term, |value: i64| match op {
-                    DerivedExpressionOp::Min => value.min(term),
-                    DerivedExpressionOp::Max => value.max(term),
-                    _ => unreachable!(),
-                })))
-            })?
-            .ok_or(AuraError::InvalidValue("expression terms")),
-        DerivedExpressionOp::AddResidual
-        | DerivedExpressionOp::SubtractResidual
-        | DerivedExpressionOp::MaxPlusResidual
-        | DerivedExpressionOp::MinMinusResidual
-        | DerivedExpressionOp::FirstOffsetThenDelta
-        | DerivedExpressionOp::PreviousSnapshotSameKeyResidual
-        | DerivedExpressionOp::PreviousMutationSameKeyResidual
-        | DerivedExpressionOp::PreviousOutputByKeyResidual => {
-            Err(AuraError::InvalidValue("derived expression op"))
-        }
-    }
+    crate::expressions::evaluate(op, input_slots, literals, |slot| {
+        row.get(usize::from(slot))
+            .copied()
+            .ok_or(AuraError::InvalidValue("input slots"))
+    })
 }
 
 pub(crate) fn try_encode_generic_i64_aura1_body_streaming(
@@ -11660,103 +11581,15 @@ fn evaluate_expression_terms(
     row_index: usize,
     rows: &[Vec<i64>],
 ) -> Result<i64> {
-    let mut terms = input_slots
-        .iter()
-        .map(|slot| {
-            rows.get(row_index)
-                .and_then(|row| row.get(usize::from(*slot)))
-                .copied()
-                .ok_or(AuraError::InvalidValue("input slots"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    terms.extend_from_slice(literals);
-    match op {
-        DerivedExpressionOp::Add => checked_add_terms(&terms),
-        DerivedExpressionOp::Sub => checked_sub_terms(&terms),
-        DerivedExpressionOp::Mul => checked_mul_terms(&terms),
-        DerivedExpressionOp::Div => checked_div_terms(&terms),
-        DerivedExpressionOp::MulDiv => {
-            checked_mul_div_terms(&terms[..input_slots.len()], literals[0])
-        }
-        DerivedExpressionOp::Min => terms
-            .into_iter()
-            .min()
-            .ok_or(AuraError::InvalidValue("expression terms")),
-        DerivedExpressionOp::Max => terms
-            .into_iter()
-            .max()
-            .ok_or(AuraError::InvalidValue("expression terms")),
-        DerivedExpressionOp::AddResidual
-        | DerivedExpressionOp::SubtractResidual
-        | DerivedExpressionOp::MaxPlusResidual
-        | DerivedExpressionOp::MinMinusResidual
-        | DerivedExpressionOp::FirstOffsetThenDelta
-        | DerivedExpressionOp::PreviousSnapshotSameKeyResidual
-        | DerivedExpressionOp::PreviousMutationSameKeyResidual
-        | DerivedExpressionOp::PreviousOutputByKeyResidual => {
-            Err(AuraError::InvalidValue("derived expression op"))
-        }
-    }
-}
-
-fn checked_add_terms(terms: &[i64]) -> Result<i64> {
-    let sum = terms.iter().try_fold(0i128, |sum, term| {
-        sum.checked_add(i128::from(*term))
-            .ok_or(AuraError::InvalidValue("expression value"))
-    })?;
-    i64::try_from(sum).map_err(|_| AuraError::InvalidValue("expression value"))
-}
-
-fn checked_sub_terms(terms: &[i64]) -> Result<i64> {
-    let Some((first, rest)) = terms.split_first() else {
-        return Err(AuraError::InvalidValue("expression terms"));
-    };
-    let value = rest.iter().try_fold(i128::from(*first), |value, term| {
-        value
-            .checked_sub(i128::from(*term))
-            .ok_or(AuraError::InvalidValue("expression value"))
-    })?;
-    i64::try_from(value).map_err(|_| AuraError::InvalidValue("expression value"))
-}
-
-fn checked_mul_terms(terms: &[i64]) -> Result<i64> {
-    let value = terms.iter().try_fold(1i128, |value, term| {
-        value
-            .checked_mul(i128::from(*term))
-            .ok_or(AuraError::InvalidValue("expression value"))
-    })?;
-    i64::try_from(value).map_err(|_| AuraError::InvalidValue("expression value"))
-}
-
-fn checked_div_terms(terms: &[i64]) -> Result<i64> {
-    let Some((first, rest)) = terms.split_first() else {
-        return Err(AuraError::InvalidValue("expression terms"));
-    };
-    let value = rest.iter().try_fold(i128::from(*first), |value, term| {
-        let divisor = i128::from(*term);
-        if divisor == 0 {
-            return Err(AuraError::InvalidValue("expression value"));
-        }
-        value
-            .checked_div(divisor)
-            .ok_or(AuraError::InvalidValue("expression value"))
-    })?;
-    i64::try_from(value).map_err(|_| AuraError::InvalidValue("expression value"))
-}
-
-fn checked_mul_div_terms(terms: &[i64], divisor: i64) -> Result<i64> {
-    if terms.is_empty() || divisor == 0 {
+    if op == DerivedExpressionOp::MulDiv && input_slots.is_empty() {
         return Err(AuraError::InvalidValue("expression terms"));
     }
-    let product = terms.iter().try_fold(1i128, |product, term| {
-        product
-            .checked_mul(i128::from(*term))
-            .ok_or(AuraError::InvalidValue("expression value"))
-    })?;
-    let value = product
-        .checked_div(i128::from(divisor))
-        .ok_or(AuraError::InvalidValue("expression value"))?;
-    i64::try_from(value).map_err(|_| AuraError::InvalidValue("expression value"))
+    crate::expressions::evaluate(op, input_slots, literals, |slot| {
+        rows.get(row_index)
+            .and_then(|row| row.get(usize::from(slot)))
+            .copied()
+            .ok_or(AuraError::InvalidValue("input slots"))
+    })
 }
 
 fn validate_rows(schema: &SchemaDescriptor, rows: &[Vec<i64>]) -> Result<()> {
@@ -11893,38 +11726,12 @@ fn evaluate_expression_terms_from_columns(
     row_index: usize,
     columns: &[Vec<i64>],
 ) -> Result<i64> {
-    let mut terms = input_slots
-        .iter()
-        .map(|slot| column_value(columns, row_index, *slot))
-        .collect::<Result<Vec<_>>>()?;
-    terms.extend_from_slice(literals);
-    match op {
-        DerivedExpressionOp::Add => checked_add_terms(&terms),
-        DerivedExpressionOp::Sub => checked_sub_terms(&terms),
-        DerivedExpressionOp::Mul => checked_mul_terms(&terms),
-        DerivedExpressionOp::Div => checked_div_terms(&terms),
-        DerivedExpressionOp::MulDiv => {
-            checked_mul_div_terms(&terms[..input_slots.len()], literals[0])
-        }
-        DerivedExpressionOp::Min => terms
-            .into_iter()
-            .min()
-            .ok_or(AuraError::InvalidValue("expression terms")),
-        DerivedExpressionOp::Max => terms
-            .into_iter()
-            .max()
-            .ok_or(AuraError::InvalidValue("expression terms")),
-        DerivedExpressionOp::AddResidual
-        | DerivedExpressionOp::SubtractResidual
-        | DerivedExpressionOp::MaxPlusResidual
-        | DerivedExpressionOp::MinMinusResidual
-        | DerivedExpressionOp::FirstOffsetThenDelta
-        | DerivedExpressionOp::PreviousSnapshotSameKeyResidual
-        | DerivedExpressionOp::PreviousMutationSameKeyResidual
-        | DerivedExpressionOp::PreviousOutputByKeyResidual => {
-            Err(AuraError::InvalidValue("derived expression op"))
-        }
+    if op == DerivedExpressionOp::MulDiv && input_slots.is_empty() {
+        return Err(AuraError::InvalidValue("expression terms"));
     }
+    crate::expressions::evaluate(op, input_slots, literals, |slot| {
+        column_value(columns, row_index, slot)
+    })
 }
 
 fn partition_runs_for_group_from_columns(

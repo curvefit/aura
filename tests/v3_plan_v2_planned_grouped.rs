@@ -1,17 +1,14 @@
+use aura_codec::experimental::GroupedSearch;
+use aura_codec::experimental::{compile_v3_grouped_with_plan, V3PlannedGroupedArtifact};
+use aura_codec::{AuraError, FieldRelation, Result, SchemaDescriptor};
 use std::io::Cursor;
 
-use aura_codec::{
-    canonical_v3_event_batch_sha256, compile_v3_planned_grouped,
-    compile_v3_planned_grouped_attempt2, compile_v3_planned_grouped_attempt2_candidate,
-    compile_v3_planned_grouped_attempt3, compile_v3_planned_grouped_attempt4,
-    compile_v3_planned_grouped_attempt4_candidate, compile_v3_planned_grouped_attempt5,
-    compile_v3_planned_grouped_attempt5_candidate, compile_v3_planned_grouped_attempt6,
-    compile_v3_planned_grouped_attempt6_candidate, decode_any_compiled_footer,
+use aura_codec::experimental::{
+    canonical_v3_event_batch_sha256, compile_v3_planned_grouped, decode_any_compiled_footer,
     decode_v3_planned_grouped, decode_v3_planned_grouped_footer, encode_v3_planned_grouped_footer,
-    AnyCompiledFooter, AuraHeader, AuraPlanV2, AuraV3Column, AuraV3ColumnValues as Values,
-    AuraV3EventBatch, AuraV3VariableColumn, FieldRole, FieldScope, FieldType, PlanV2PhysicalCodec,
-    PlanV2Selection, RelationshipPermissions, SchemaBuilder, V3EventLimits, V3GroupedAura0Reader,
-    V3GroupedAura0Writer, V3GroupedLimits, V3GroupedWriterOptions,
+    AnyCompiledFooter, AuraPlanV2, AuraV3Column, AuraV3ColumnValues as Values, AuraV3EventBatch,
+    AuraV3VariableColumn, PlanV2PhysicalCodec, PlanV2Selection, V3EventLimits,
+    V3GroupedAura0Reader, V3GroupedAura0Writer, V3GroupedLimits, V3GroupedWriterOptions,
     AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION, AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP,
     AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP, AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION,
     AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP, AURA_PLAN_V2_REGISTRY_VERSION,
@@ -19,6 +16,9 @@ use aura_codec::{
     AURA_PLAN_V2_VERSION, AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION, MAX_AURA_PLAN_V2_BYTES,
     V3_PLANNED_GROUPED_BODY_ENCODING, V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION,
     V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION, V3_PLANNED_GROUPED_FOOTER_LAYOUT_VERSION,
+};
+use aura_codec::{
+    AuraHeader, FieldRole, FieldScope, FieldType, RelationshipPermissions, SchemaBuilder,
 };
 use sha2::{Digest, Sha256};
 
@@ -321,14 +321,14 @@ fn planned_direct_roundtrips_every_grouped_exact_type_and_complete_accounting() 
     assert!(!artifact.inspection.plan.relationships_attempted);
     let decoded = decode_v3_planned_grouped(&artifact.bytes, V3GroupedLimits::default()).unwrap();
     assert_eq!(decoded.batches, vec![batch.clone()]);
-    let split = compile_v3_planned_grouped_attempt2_candidate(
+    let split = compact_candidate(
         &schema,
         std::slice::from_ref(&batch),
         Default::default(),
         PlanV2Selection::SplitDomainDirect,
     )
     .unwrap();
-    let split_repeat = compile_v3_planned_grouped_attempt2_candidate(
+    let split_repeat = compact_candidate(
         &schema,
         std::slice::from_ref(&batch),
         V3GroupedLimits::default(),
@@ -735,17 +735,17 @@ fn planned_direct_preserves_nullable_event_scope_null_and_zero() {
 }
 
 #[test]
-fn attempt2_scores_real_direct_and_split_files_and_preserves_exact_inverse() {
+fn compact_scores_real_direct_and_split_files_and_preserves_exact_inverse() {
     let schema = all_types_schema();
     let batch = all_types_batch(schema.schema_id);
-    let direct = compile_v3_planned_grouped_attempt2_candidate(
+    let direct = compact_candidate(
         &schema,
         std::slice::from_ref(&batch),
         V3GroupedLimits::default(),
         PlanV2Selection::Direct,
     )
     .unwrap();
-    let split = compile_v3_planned_grouped_attempt2_candidate(
+    let split = compact_candidate(
         &schema,
         std::slice::from_ref(&batch),
         V3GroupedLimits::default(),
@@ -803,12 +803,13 @@ fn attempt2_scores_real_direct_and_split_files_and_preserves_exact_inverse() {
     assert!(split.bytes.windows(3).all(|window| window != b"bid"));
     assert!(split.bytes.windows(3).all(|window| window != b"ask"));
 
-    let selected = compile_v3_planned_grouped_attempt2(
-        &schema,
-        std::slice::from_ref(&batch),
-        V3GroupedLimits::default(),
-    )
-    .unwrap();
+    let selected = GroupedSearch::Compact
+        .compile(
+            &schema,
+            std::slice::from_ref(&batch),
+            V3GroupedLimits::default(),
+        )
+        .unwrap();
     assert_eq!(selected.inspection.candidates.len(), 3);
     assert!(selected.inspection.candidates[2].authorized);
     assert!(selected.inspection.candidates[2].applicable);
@@ -839,7 +840,7 @@ fn attempt2_scores_real_direct_and_split_files_and_preserves_exact_inverse() {
     assert_eq!(selected.inspection.plan.selected, PlanV2Selection::Direct);
     assert!(selected.inspection.candidates[1].selected);
     eprintln!(
-        "development attempt2 all-types complete bytes: registry1={} compact_direct={} compact_split={} selected={}",
+        "development registry2 all-types complete bytes: registry1={} compact_direct={} compact_split={} selected={}",
         registry1_bytes,
         direct.summary.file_bytes,
         split.summary.file_bytes,
@@ -848,7 +849,7 @@ fn attempt2_scores_real_direct_and_split_files_and_preserves_exact_inverse() {
 }
 
 #[test]
-fn attempt2_generic_and_okx_like_asymmetry_zero_child_and_cost_fallback() {
+fn compact_generic_and_okx_like_asymmetry_zero_child_and_cost_fallback() {
     let generic = small_schema();
     let generic_batches = vec![
         small_batch(generic.schema_id, &[1], &[-1], &[0, 0], &[], &[]),
@@ -861,32 +862,33 @@ fn attempt2_generic_and_okx_like_asymmetry_zero_child_and_cost_fallback() {
             &[0, 1, 2, 3],
         ),
     ];
-    let generic_direct = compile_v3_planned_grouped_attempt2_candidate(
+    let generic_direct = compact_candidate(
         &generic,
         &generic_batches,
         V3GroupedLimits::default(),
         PlanV2Selection::Direct,
     )
     .unwrap();
-    let generic_split = compile_v3_planned_grouped_attempt2_candidate(
+    let generic_split = compact_candidate(
         &generic,
         &generic_batches,
         V3GroupedLimits::default(),
         PlanV2Selection::SplitDomainDirect,
     )
     .unwrap();
-    let selected =
-        compile_v3_planned_grouped_attempt2(&generic, &generic_batches, V3GroupedLimits::default())
-            .unwrap();
-    let empty_selected =
-        compile_v3_planned_grouped_attempt2(&generic, &[], V3GroupedLimits::default()).unwrap();
+    let selected = GroupedSearch::Compact
+        .compile(&generic, &generic_batches, V3GroupedLimits::default())
+        .unwrap();
+    let empty_selected = GroupedSearch::Compact
+        .compile(&generic, &[], V3GroupedLimits::default())
+        .unwrap();
     assert_eq!(
         empty_selected.inspection.plan.selected,
         PlanV2Selection::Direct
     );
     assert_eq!(
         empty_selected.inspection.candidates[2].rejection.as_deref(),
-        Some("complete cost did not beat direct")
+        Some("complete cost did not beat selected candidate")
     );
     assert_eq!(
         decode_v3_planned_grouped(&generic_split.bytes, Default::default())
@@ -961,7 +963,7 @@ fn attempt2_generic_and_okx_like_asymmetry_zero_child_and_cost_fallback() {
             },
         ],
     };
-    let okx_split = compile_v3_planned_grouped_attempt2_candidate(
+    let okx_split = compact_candidate(
         &okx,
         std::slice::from_ref(&okx_batch),
         Default::default(),
@@ -975,7 +977,7 @@ fn attempt2_generic_and_okx_like_asymmetry_zero_child_and_cost_fallback() {
         vec![okx_batch]
     );
     eprintln!(
-        "development attempt2 generic complete bytes: registry1={} compact_direct={} compact_split={} selected={}; okx_split={}",
+        "development registry2 generic complete bytes: registry1={} compact_direct={} compact_split={} selected={}; okx_split={}",
         selected.inspection.candidates[0].complete_bytes.unwrap(),
         generic_direct.summary.file_bytes,
         generic_split.summary.file_bytes,
@@ -985,10 +987,10 @@ fn attempt2_generic_and_okx_like_asymmetry_zero_child_and_cost_fallback() {
 }
 
 #[test]
-fn attempt2_forbidden_split_invalid_selector_corruption_and_bounds_fail_closed() {
+fn compact_forbidden_split_invalid_selector_corruption_and_bounds_fail_closed() {
     let schema = small_schema();
     let batch = small_batch(schema.schema_id, &[1], &[-1], &[0, 1], &[0], &[1]);
-    let split = compile_v3_planned_grouped_attempt2_candidate(
+    let split = compact_candidate(
         &schema,
         std::slice::from_ref(&batch),
         Default::default(),
@@ -1006,12 +1008,12 @@ fn attempt2_forbidden_split_invalid_selector_corruption_and_bounds_fail_closed()
     bad_mapping.plan.streams[0].physical_stream_ids[0] = u16::MAX;
     assert!(encode_v3_planned_grouped_footer(&bad_mapping, V3GroupedLimits::HARD).is_err());
     for block_offset in [60usize, 64] {
-        let resigned = resign_attempt2_body_mutation(&split, block_offset);
+        let resigned = resign_compact_body_mutation(&split, block_offset);
         assert!(decode_v3_planned_grouped(&resigned, V3GroupedLimits::HARD).is_err());
     }
     let mut lower = V3GroupedLimits::default();
     lower.event_limits.max_block_bytes = split.summary.body_bytes as usize - 1;
-    assert!(compile_v3_planned_grouped_attempt2_candidate(
+    assert!(compact_candidate(
         &schema,
         std::slice::from_ref(&batch),
         lower,
@@ -1035,24 +1037,24 @@ fn attempt2_forbidden_split_invalid_selector_corruption_and_bounds_fail_closed()
     let groups = forbidden.groups.clone();
     let forbidden = forbidden.with_v3_groups(groups).unwrap();
     let forbidden_batch = small_batch(forbidden.schema_id, &[1], &[-1], &[0, 1], &[0], &[1]);
-    assert!(compile_v3_planned_grouped_attempt2_candidate(
+    assert!(compact_candidate(
         &forbidden,
         std::slice::from_ref(&forbidden_batch),
         Default::default(),
         PlanV2Selection::SplitDomainDirect
     )
     .is_err());
-    let selected =
-        compile_v3_planned_grouped_attempt2(&forbidden, &[forbidden_batch], Default::default())
-            .unwrap();
+    let selected = GroupedSearch::Compact
+        .compile(&forbidden, &[forbidden_batch], Default::default())
+        .unwrap();
     assert_eq!(selected.inspection.plan.selected, PlanV2Selection::Direct);
     assert!(!selected.inspection.candidates[2].authorized);
 
     let mut invalid_side = batch;
     invalid_side.repeated_columns[0].values = Values::U8(vec![2]);
-    assert!(
-        compile_v3_planned_grouped_attempt2(&schema, &[invalid_side], Default::default()).is_err()
-    );
+    assert!(GroupedSearch::Compact
+        .compile(&schema, &[invalid_side], Default::default())
+        .is_err());
     assert_eq!(
         split.inspection.body_layout_version,
         V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION
@@ -1064,7 +1066,7 @@ fn attempt2_forbidden_split_invalid_selector_corruption_and_bounds_fail_closed()
 }
 
 #[test]
-fn attempt2_physical_ids_follow_direct_and_split_order_when_side_is_not_first() {
+fn compact_physical_ids_follow_direct_and_split_order_when_side_is_not_first() {
     let schema = SchemaBuilder::new("discriminator_not_first")
         .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
         .repeated_field("value_before_side", FieldType::I64, FieldRole::Value)
@@ -1103,7 +1105,7 @@ fn attempt2_physical_ids_follow_direct_and_split_order_when_side_is_not_first() 
         ],
     };
     for selection in [PlanV2Selection::Direct, PlanV2Selection::SplitDomainDirect] {
-        let artifact = compile_v3_planned_grouped_attempt2_candidate(
+        let artifact = compact_candidate(
             &schema,
             std::slice::from_ref(&batch),
             Default::default(),
@@ -1144,7 +1146,7 @@ fn attempt2_physical_ids_follow_direct_and_split_order_when_side_is_not_first() 
 }
 
 #[test]
-fn attempt3_selects_absolute_varints_by_complete_file_cost() {
+fn integer_selects_absolute_varints_by_complete_file_cost() {
     let schema = small_schema();
     let batches = vec![
         small_batch(schema.schema_id, &[1], &[-1], &[0, 0], &[], &[]),
@@ -1157,8 +1159,9 @@ fn attempt3_selects_absolute_varints_by_complete_file_cost() {
             &[0, 1, -1, 2],
         ),
     ];
-    let artifact =
-        compile_v3_planned_grouped_attempt3(&schema, &batches, Default::default()).unwrap();
+    let artifact = GroupedSearch::Integer
+        .compile(&schema, &batches, Default::default())
+        .unwrap();
     assert_eq!(artifact.summary.file_bytes, artifact.bytes.len() as u64);
     assert_eq!(
         artifact.summary.file_bytes,
@@ -1197,7 +1200,9 @@ fn attempt3_selects_absolute_varints_by_complete_file_cost() {
             .batches,
         batches
     );
-    let empty = compile_v3_planned_grouped_attempt3(&schema, &[], Default::default()).unwrap();
+    let empty = GroupedSearch::Integer
+        .compile(&schema, &[], Default::default())
+        .unwrap();
     assert!(empty.inspection.candidates[0].selected);
     assert_eq!(
         empty.inspection.plan.registry_version,
@@ -1205,7 +1210,7 @@ fn attempt3_selects_absolute_varints_by_complete_file_cost() {
     );
     assert!(empty.inspection.codecs.is_empty());
     eprintln!(
-        "development attempt3 small integer complete bytes: r1={} r2={} r3_fixed={} r3_mixed={}",
+        "development registry3 small integer complete bytes: r1={} r2={} r3_fixed={} r3_mixed={}",
         artifact.inspection.candidates[0].complete_bytes.unwrap(),
         artifact.inspection.candidates[1].complete_bytes.unwrap(),
         artifact.inspection.candidates[2].complete_bytes.unwrap(),
@@ -1214,15 +1219,12 @@ fn attempt3_selects_absolute_varints_by_complete_file_cost() {
 }
 
 #[test]
-fn attempt3_extremes_nulls_and_fixed_only_types_round_trip() {
+fn integer_extremes_nulls_and_fixed_only_types_round_trip() {
     let schema = all_types_schema();
     let batch = all_types_batch(schema.schema_id);
-    let artifact = compile_v3_planned_grouped_attempt3(
-        &schema,
-        std::slice::from_ref(&batch),
-        Default::default(),
-    )
-    .unwrap();
+    let artifact = GroupedSearch::Integer
+        .compile(&schema, std::slice::from_ref(&batch), Default::default())
+        .unwrap();
     assert_eq!(
         decode_v3_planned_grouped(&artifact.bytes, Default::default())
             .unwrap()
@@ -1304,12 +1306,13 @@ fn attempt3_extremes_nulls_and_fixed_only_types_round_trip() {
             },
         ],
     };
-    let extremes = compile_v3_planned_grouped_attempt3(
-        &extreme_schema,
-        std::slice::from_ref(&extreme_batch),
-        Default::default(),
-    )
-    .unwrap();
+    let extremes = GroupedSearch::Integer
+        .compile(
+            &extreme_schema,
+            std::slice::from_ref(&extreme_batch),
+            Default::default(),
+        )
+        .unwrap();
     assert_eq!(
         decode_v3_planned_grouped(&extremes.bytes, Default::default())
             .unwrap()
@@ -1323,7 +1326,7 @@ fn attempt3_extremes_nulls_and_fixed_only_types_round_trip() {
         .filter(|row| matches!(row.logical_slot, 0 | 1 | 3))
         .all(|row| row.selected == PlanV2PhysicalCodec::FixedWidth));
     eprintln!(
-        "development attempt3 all-types complete bytes: r1={} r2={} r3_fixed={} r3_mixed={}",
+        "development registry3 all-types complete bytes: r1={} r2={} r3_fixed={} r3_mixed={}",
         artifact.inspection.candidates[0].complete_bytes.unwrap(),
         artifact.inspection.candidates[1].complete_bytes.unwrap(),
         artifact.inspection.candidates[2].complete_bytes.unwrap(),
@@ -1332,7 +1335,7 @@ fn attempt3_extremes_nulls_and_fixed_only_types_round_trip() {
 }
 
 #[test]
-fn attempt3_codec_plan_is_canonical_and_rechunking_stable() {
+fn integer_codec_plan_is_canonical_and_rechunking_stable() {
     let schema = small_schema();
     let whole = small_batch(
         schema.schema_id,
@@ -1353,13 +1356,12 @@ fn attempt3_codec_plan_is_canonical_and_rechunking_stable() {
             &[0, 1, -1, 2],
         ),
     ];
-    let one = compile_v3_planned_grouped_attempt3(
-        &schema,
-        std::slice::from_ref(&whole),
-        Default::default(),
-    )
-    .unwrap();
-    let many = compile_v3_planned_grouped_attempt3(&schema, &split, Default::default()).unwrap();
+    let one = GroupedSearch::Integer
+        .compile(&schema, std::slice::from_ref(&whole), Default::default())
+        .unwrap();
+    let many = GroupedSearch::Integer
+        .compile(&schema, &split, Default::default())
+        .unwrap();
     assert_eq!(one.summary.plan_sha256, many.summary.plan_sha256);
     assert_eq!(
         one.summary.global_logical_sha256,
@@ -1399,7 +1401,7 @@ fn attempt3_codec_plan_is_canonical_and_rechunking_stable() {
 }
 
 #[test]
-fn attempt3_fixed_width_wins_exact_codec_ties() {
+fn integer_fixed_width_wins_exact_codec_ties() {
     let schema = SchemaBuilder::new("integer_codec_tie")
         .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
         .field("tiny", FieldType::U8, FieldRole::Value)
@@ -1439,8 +1441,9 @@ fn attempt3_fixed_width_wins_exact_codec_ties() {
             },
         ],
     };
-    let artifact =
-        compile_v3_planned_grouped_attempt3(&schema, &[batch], Default::default()).unwrap();
+    let artifact = GroupedSearch::Integer
+        .compile(&schema, &[batch], Default::default())
+        .unwrap();
     let tiny = artifact
         .inspection
         .codecs
@@ -1452,7 +1455,7 @@ fn attempt3_fixed_width_wins_exact_codec_ties() {
 }
 
 #[test]
-fn attempt3_candidate_limit_failure_falls_back_to_smaller_valid_artifact() {
+fn integer_candidate_limit_failure_falls_back_to_smaller_valid_artifact() {
     let schema = small_schema();
     let batch = small_batch(
         schema.schema_id,
@@ -1462,7 +1465,7 @@ fn attempt3_candidate_limit_failure_falls_back_to_smaller_valid_artifact() {
         &[0, 1, 0, 1],
         &[0, 1, -1, 2],
     );
-    let compact = compile_v3_planned_grouped_attempt2_candidate(
+    let compact = compact_candidate(
         &schema,
         std::slice::from_ref(&batch),
         V3GroupedLimits::default(),
@@ -1480,7 +1483,9 @@ fn attempt3_candidate_limit_failure_falls_back_to_smaller_valid_artifact() {
         max_body_bytes: compact.summary.body_bytes,
         ..Default::default()
     };
-    let selected = compile_v3_planned_grouped_attempt3(&schema, &[batch], limits).unwrap();
+    let selected = GroupedSearch::Integer
+        .compile(&schema, &[batch], limits)
+        .unwrap();
     assert!(!selected.inspection.candidates[0].applicable);
     assert!(selected.inspection.candidates[0].complete_bytes.is_none());
     assert!(selected.inspection.candidates[0]
@@ -1498,7 +1503,7 @@ fn attempt3_candidate_limit_failure_falls_back_to_smaller_valid_artifact() {
 }
 
 #[test]
-fn attempt3_candidate_block_limit_uses_actual_physical_block_size() {
+fn integer_candidate_block_limit_uses_actual_physical_block_size() {
     let schema = small_schema();
     let batch = small_batch(
         schema.schema_id,
@@ -1511,7 +1516,7 @@ fn attempt3_candidate_block_limit_uses_actual_physical_block_size() {
     let registry1 =
         compile_v3_planned_grouped(&schema, std::slice::from_ref(&batch), Default::default())
             .unwrap();
-    let compact = compile_v3_planned_grouped_attempt2_candidate(
+    let compact = compact_candidate(
         &schema,
         std::slice::from_ref(&batch),
         Default::default(),
@@ -1527,7 +1532,9 @@ fn attempt3_candidate_block_limit_uses_actual_physical_block_size() {
         },
         ..defaults
     };
-    let selected = compile_v3_planned_grouped_attempt3(&schema, &[batch], limits).unwrap();
+    let selected = GroupedSearch::Integer
+        .compile(&schema, &[batch], limits)
+        .unwrap();
     assert!(!selected.inspection.candidates[0].applicable);
     assert!(selected.inspection.candidates[0]
         .rejection
@@ -1540,13 +1547,13 @@ fn attempt3_candidate_block_limit_uses_actual_physical_block_size() {
 }
 
 #[test]
-fn attempt3_footer_limit_keeps_registry1_when_larger_plans_are_inapplicable() {
+fn integer_footer_limit_keeps_registry1_when_larger_plans_are_inapplicable() {
     let schema = all_types_schema();
     let batch = all_types_batch(schema.schema_id);
     let registry1 =
         compile_v3_planned_grouped(&schema, std::slice::from_ref(&batch), Default::default())
             .unwrap();
-    let compact = compile_v3_planned_grouped_attempt2_candidate(
+    let compact = compact_candidate(
         &schema,
         std::slice::from_ref(&batch),
         Default::default(),
@@ -1558,7 +1565,9 @@ fn attempt3_footer_limit_keeps_registry1_when_larger_plans_are_inapplicable() {
         max_footer_bytes: registry1.summary.footer_bytes as usize,
         ..Default::default()
     };
-    let selected = compile_v3_planned_grouped_attempt3(&schema, &[batch], limits).unwrap();
+    let selected = GroupedSearch::Integer
+        .compile(&schema, &[batch], limits)
+        .unwrap();
     assert!(selected.inspection.candidates[0].selected);
     assert_eq!(selected.summary.file_bytes, registry1.summary.file_bytes);
     for candidate in &selected.inspection.candidates[1..] {
@@ -1573,7 +1582,7 @@ fn attempt3_footer_limit_keeps_registry1_when_larger_plans_are_inapplicable() {
 }
 
 #[test]
-fn attempt3_excludes_structurally_dominated_absolute_split_candidate() {
+fn integer_excludes_structurally_dominated_absolute_split_candidate() {
     let small = small_schema();
     let small_batch = small_batch(
         small.schema_id,
@@ -1589,14 +1598,10 @@ fn attempt3_excludes_structurally_dominated_absolute_split_candidate() {
         (&small, std::slice::from_ref(&small_batch)),
         (&all, std::slice::from_ref(&all_batch)),
     ] {
-        let direct = compile_v3_planned_grouped_attempt2_candidate(
-            schema,
-            batches,
-            Default::default(),
-            PlanV2Selection::Direct,
-        )
-        .unwrap();
-        let split = compile_v3_planned_grouped_attempt2_candidate(
+        let direct =
+            compact_candidate(schema, batches, Default::default(), PlanV2Selection::Direct)
+                .unwrap();
+        let split = compact_candidate(
             schema,
             batches,
             Default::default(),
@@ -1607,8 +1612,9 @@ fn attempt3_excludes_structurally_dominated_absolute_split_candidate() {
         // summed validity, adds variable-lane offsets, and stamps more plan
         // metadata. It is therefore not an attempt-3 codec candidate.
         assert!(split.summary.file_bytes >= direct.summary.file_bytes);
-        let attempt3 =
-            compile_v3_planned_grouped_attempt3(schema, batches, Default::default()).unwrap();
+        let attempt3 = GroupedSearch::Integer
+            .compile(schema, batches, Default::default())
+            .unwrap();
         assert!(attempt3
             .inspection
             .candidates
@@ -1623,15 +1629,12 @@ fn attempt3_excludes_structurally_dominated_absolute_split_candidate() {
 }
 
 #[test]
-fn attempt3_rejects_rehashed_noncanonical_and_overflow_varints() {
+fn integer_rejects_rehashed_noncanonical_and_overflow_varints() {
     let schema = small_schema();
     let batch = small_batch(schema.schema_id, &[0], &[0], &[0, 1], &[0], &[0]);
-    let artifact = compile_v3_planned_grouped_attempt3(
-        &schema,
-        std::slice::from_ref(&batch),
-        Default::default(),
-    )
-    .unwrap();
+    let artifact = GroupedSearch::Integer
+        .compile(&schema, std::slice::from_ref(&batch), Default::default())
+        .unwrap();
     assert_eq!(
         artifact.inspection.plan.registry_version,
         AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
@@ -1661,7 +1664,7 @@ fn attempt3_rejects_rehashed_noncanonical_and_overflow_varints() {
 }
 
 #[test]
-fn attempt3_every_prefix_and_single_byte_mutation_fails_closed() {
+fn integer_every_prefix_and_single_byte_mutation_fails_closed() {
     let schema = small_schema();
     let batch = small_batch(
         schema.schema_id,
@@ -1671,8 +1674,9 @@ fn attempt3_every_prefix_and_single_byte_mutation_fails_closed() {
         &[0, 1],
         &[1, 2],
     );
-    let artifact =
-        compile_v3_planned_grouped_attempt3(&schema, &[batch], Default::default()).unwrap();
+    let artifact = GroupedSearch::Integer
+        .compile(&schema, &[batch], Default::default())
+        .unwrap();
     assert_eq!(
         artifact.inspection.plan.registry_version,
         AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION
@@ -1703,7 +1707,7 @@ fn registry1_registry2_plan_and_container_hashes_are_golden() {
     let registry1 =
         compile_v3_planned_grouped(&schema, std::slice::from_ref(&batch), Default::default())
             .unwrap();
-    let registry2 = compile_v3_planned_grouped_attempt2_candidate(
+    let registry2 = compact_candidate(
         &schema,
         std::slice::from_ref(&batch),
         Default::default(),
@@ -1739,7 +1743,7 @@ fn registry1_registry2_plan_and_container_hashes_are_golden() {
 }
 
 #[test]
-fn attempt4_previous_within_domain_roundtrips_and_wins_complete_cost() {
+fn within_domain_previous_within_domain_roundtrips_and_wins_complete_cost() {
     let schema = small_schema();
     let make_batch = |start_event: usize, events: usize| {
         let mut timestamps = Vec::new();
@@ -1768,12 +1772,9 @@ fn attempt4_previous_within_domain_roundtrips_and_wins_complete_cost() {
     };
     let whole = make_batch(0, 2);
     let split = vec![make_batch(0, 1), make_batch(1, 1)];
-    let artifact = compile_v3_planned_grouped_attempt4(
-        &schema,
-        std::slice::from_ref(&whole),
-        Default::default(),
-    )
-    .unwrap();
+    let artifact = GroupedSearch::WithinDomain
+        .compile(&schema, std::slice::from_ref(&whole), Default::default())
+        .unwrap();
     assert_eq!(artifact.inspection.candidates.len(), 6);
     assert!(artifact.inspection.candidates[5].selected);
     assert_eq!(
@@ -1803,15 +1804,16 @@ fn attempt4_previous_within_domain_roundtrips_and_wins_complete_cost() {
             .batches,
         vec![whole]
     );
-    let rechunked =
-        compile_v3_planned_grouped_attempt4(&schema, &split, Default::default()).unwrap();
+    let rechunked = GroupedSearch::WithinDomain
+        .compile(&schema, &split, Default::default())
+        .unwrap();
     assert_eq!(artifact.summary.plan_sha256, rechunked.summary.plan_sha256);
     assert_eq!(
         artifact.summary.global_logical_sha256,
         rechunked.summary.global_logical_sha256
     );
     eprintln!(
-        "development attempt4 generic complete bytes: r1={} r2={} r3f={} r3m={} r4a={} r4w={}",
+        "development registry4 generic complete bytes: r1={} r2={} r3f={} r3m={} r4a={} r4w={}",
         artifact.inspection.candidates[0].complete_bytes.unwrap(),
         artifact.inspection.candidates[1].complete_bytes.unwrap(),
         artifact.inspection.candidates[2].complete_bytes.unwrap(),
@@ -1822,7 +1824,7 @@ fn attempt4_previous_within_domain_roundtrips_and_wins_complete_cost() {
 }
 
 #[test]
-fn attempt4_okx_like_shape_nullable_and_overflow_streams_fall_back_exactly() {
+fn within_domain_okx_like_shape_nullable_and_overflow_streams_fall_back_exactly() {
     let mut schema = SchemaBuilder::new("generic_count_extension")
         .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
         .repeated_field("side", FieldType::U8, FieldRole::Side)
@@ -1876,12 +1878,9 @@ fn attempt4_okx_like_shape_nullable_and_overflow_streams_fall_back_exactly() {
             },
         ],
     };
-    let artifact = compile_v3_planned_grouped_attempt4(
-        &schema,
-        std::slice::from_ref(&batch),
-        Default::default(),
-    )
-    .unwrap();
+    let artifact = GroupedSearch::WithinDomain
+        .compile(&schema, std::slice::from_ref(&batch), Default::default())
+        .unwrap();
     assert_eq!(
         decode_v3_planned_grouped(&artifact.bytes, Default::default())
             .unwrap()
@@ -1889,7 +1888,7 @@ fn attempt4_okx_like_shape_nullable_and_overflow_streams_fall_back_exactly() {
         vec![batch]
     );
     eprintln!(
-        "development attempt4 generic-count complete bytes: r1={} r2={} r3f={} r3m={} r4a={} r4w={}",
+        "development registry4 generic-count complete bytes: r1={} r2={} r3f={} r3m={} r4a={} r4w={}",
         artifact.inspection.candidates[0].complete_bytes.unwrap(),
         artifact.inspection.candidates[1].complete_bytes.unwrap(),
         artifact.inspection.candidates[2].complete_bytes.unwrap(),
@@ -1927,9 +1926,9 @@ fn attempt4_okx_like_shape_nullable_and_overflow_streams_fall_back_exactly() {
         &[0, 0],
         &[i64::MIN, i64::MAX],
     );
-    let overflow_artifact =
-        compile_v3_planned_grouped_attempt4(&overflow_schema, &[overflow], Default::default())
-            .unwrap();
+    let overflow_artifact = GroupedSearch::WithinDomain
+        .compile(&overflow_schema, &[overflow], Default::default())
+        .unwrap();
     let row = overflow_artifact
         .inspection
         .within_domain
@@ -1952,7 +1951,7 @@ fn attempt4_okx_like_shape_nullable_and_overflow_streams_fall_back_exactly() {
 }
 
 #[test]
-fn attempt4_forbidden_permission_and_corruption_fail_closed() {
+fn within_domain_forbidden_permission_and_corruption_fail_closed() {
     let schema = SchemaBuilder::new("within_forbidden")
         .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
         .repeated_field("side", FieldType::U8, FieldRole::Side)
@@ -1989,12 +1988,9 @@ fn attempt4_forbidden_permission_and_corruption_fail_closed() {
             },
         ],
     };
-    let forbidden = compile_v3_planned_grouped_attempt4(
-        &schema,
-        std::slice::from_ref(&batch),
-        Default::default(),
-    )
-    .unwrap();
+    let forbidden = GroupedSearch::WithinDomain
+        .compile(&schema, std::slice::from_ref(&batch), Default::default())
+        .unwrap();
     assert!(forbidden
         .inspection
         .within_domain
@@ -2022,9 +2018,9 @@ fn attempt4_forbidden_permission_and_corruption_fail_closed() {
             .map(|index| 1_000_000 + (index / 2) as i64)
             .collect::<Vec<_>>(),
     );
-    let artifact =
-        compile_v3_planned_grouped_attempt4(&allowed, &[allowed_batch], Default::default())
-            .unwrap();
+    let artifact = GroupedSearch::WithinDomain
+        .compile(&allowed, &[allowed_batch], Default::default())
+        .unwrap();
     assert!(artifact.inspection.candidates[5].selected);
     for length in 0..artifact.bytes.len() {
         assert!(
@@ -2056,12 +2052,12 @@ fn attempt4_forbidden_permission_and_corruption_fail_closed() {
         .iter_mut()
         .find(|stream| stream.op == AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP)
         .unwrap();
-    transformed.op = aura_codec::AURA_PLAN_V2_SPLIT_DOMAIN_DIRECT_OP;
+    transformed.op = aura_codec::experimental::AURA_PLAN_V2_SPLIT_DOMAIN_DIRECT_OP;
     assert!(wrong_op.encode(&allowed).is_err());
 }
 
 #[test]
-fn attempt4_bounded_property_inverse_is_exact() {
+fn within_domain_bounded_property_inverse_is_exact() {
     let schema = small_schema();
     for seed in 0..24u64 {
         let events = (seed as usize % 4) + 1;
@@ -2092,12 +2088,9 @@ fn attempt4_bounded_property_inverse_is_exact() {
             &sides,
             &values,
         );
-        let artifact = compile_v3_planned_grouped_attempt4(
-            &schema,
-            std::slice::from_ref(&batch),
-            Default::default(),
-        )
-        .unwrap();
+        let artifact = GroupedSearch::WithinDomain
+            .compile(&schema, std::slice::from_ref(&batch), Default::default())
+            .unwrap();
         assert_eq!(
             decode_v3_planned_grouped(&artifact.bytes, Default::default())
                 .unwrap()
@@ -2109,7 +2102,7 @@ fn attempt4_bounded_property_inverse_is_exact() {
 }
 
 #[test]
-fn attempt4_op2_physical_i64_roundtrips_every_reachable_signed_type() {
+fn within_domain_op2_physical_i64_roundtrips_every_reachable_signed_type() {
     let schema = SchemaBuilder::new("within_signed_types")
         .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
         .repeated_field("side", FieldType::U8, FieldRole::Side)
@@ -2170,7 +2163,7 @@ fn attempt4_op2_physical_i64_roundtrips_every_reachable_signed_type() {
         ],
     };
     let slots = [2u16, 3, 4, 5, 6];
-    let artifact = compile_v3_planned_grouped_attempt4_candidate(
+    let artifact = within_candidate(
         &schema,
         std::slice::from_ref(&batch),
         Default::default(),
@@ -2198,7 +2191,7 @@ fn attempt4_op2_physical_i64_roundtrips_every_reachable_signed_type() {
             PlanV2PhysicalCodec::SignedZigZagUleb128
         );
     }
-    let fixed = compile_v3_planned_grouped_attempt4_candidate(
+    let fixed = within_candidate(
         &schema,
         std::slice::from_ref(&batch),
         Default::default(),
@@ -2230,7 +2223,7 @@ fn attempt4_op2_physical_i64_roundtrips_every_reachable_signed_type() {
 }
 
 #[test]
-fn attempt4_rehashed_registry4_plan_mutations_fail_closed() {
+fn within_domain_rehashed_registry4_plan_mutations_fail_closed() {
     let schema = small_schema();
     let batch = small_batch(
         schema.schema_id,
@@ -2240,7 +2233,7 @@ fn attempt4_rehashed_registry4_plan_mutations_fail_closed() {
         &[0, 1, 0, 1],
         &[1_000_000, -1_000_000, 1_000_001, -999_999],
     );
-    let artifact = compile_v3_planned_grouped_attempt4_candidate(
+    let artifact = within_candidate(
         &schema,
         &[batch],
         Default::default(),
@@ -2275,7 +2268,7 @@ fn attempt4_rehashed_registry4_plan_mutations_fail_closed() {
     wrong_selection[57] = PlanV2Selection::SplitDomainDirect as u8;
     mutations.push(wrong_selection);
     let mut wrong_op = encoded.clone();
-    wrong_op[transformed_start + 5] = aura_codec::AURA_PLAN_V2_DIRECT_OP;
+    wrong_op[transformed_start + 5] = aura_codec::experimental::AURA_PLAN_V2_DIRECT_OP;
     mutations.push(wrong_op);
     let mut wrong_dependency = encoded.clone();
     wrong_dependency[dependency_start..dependency_start + 2].copy_from_slice(&3u16.to_le_bytes());
@@ -2297,7 +2290,7 @@ fn attempt4_rehashed_registry4_plan_mutations_fail_closed() {
 }
 
 #[test]
-fn attempt5_both_cross_orientations_preserve_transitions_empty_events_and_unequal_tails() {
+fn cross_domain_both_cross_orientations_preserve_transitions_empty_events_and_unequal_tails() {
     let schema = small_schema();
     let batch = small_batch(
         schema.schema_id,
@@ -2315,7 +2308,7 @@ fn attempt5_both_cross_orientations_preserve_transitions_empty_events_and_unequa
             PlanV2PhysicalCodec::FixedWidth,
             PlanV2PhysicalCodec::SignedZigZagUleb128,
         ] {
-            let artifact = compile_v3_planned_grouped_attempt5_candidate(
+            let artifact = cross_candidate(
                 &schema,
                 std::slice::from_ref(&batch),
                 Default::default(),
@@ -2335,7 +2328,7 @@ fn attempt5_both_cross_orientations_preserve_transitions_empty_events_and_unequa
 }
 
 #[test]
-fn attempt5_cross_candidate_wins_only_on_complete_cost_and_is_rechunking_stable() {
+fn cross_domain_cross_candidate_wins_only_on_complete_cost_and_is_rechunking_stable() {
     let schema = small_schema();
     let make_batch = |first_event: usize, events: usize| {
         let mut offsets = vec![0u32];
@@ -2367,12 +2360,9 @@ fn attempt5_cross_candidate_wins_only_on_complete_cost_and_is_rechunking_stable(
         )
     };
     let whole = make_batch(0, 2);
-    let artifact = compile_v3_planned_grouped_attempt5(
-        &schema,
-        std::slice::from_ref(&whole),
-        Default::default(),
-    )
-    .unwrap();
+    let artifact = GroupedSearch::CrossDomain
+        .compile(&schema, std::slice::from_ref(&whole), Default::default())
+        .unwrap();
     assert_eq!(artifact.inspection.candidates.len(), 7);
     assert!(artifact.inspection.candidates[6].selected);
     assert_eq!(
@@ -2397,12 +2387,13 @@ fn attempt5_cross_candidate_wins_only_on_complete_cost_and_is_rechunking_stable(
             .batches,
         vec![whole]
     );
-    let rechunked = compile_v3_planned_grouped_attempt5(
-        &schema,
-        &[make_batch(0, 1), make_batch(1, 1)],
-        Default::default(),
-    )
-    .unwrap();
+    let rechunked = GroupedSearch::CrossDomain
+        .compile(
+            &schema,
+            &[make_batch(0, 1), make_batch(1, 1)],
+            Default::default(),
+        )
+        .unwrap();
     assert_eq!(artifact.summary.plan_sha256, rechunked.summary.plan_sha256);
     assert_eq!(
         artifact.summary.global_logical_sha256,
@@ -2411,7 +2402,7 @@ fn attempt5_cross_candidate_wins_only_on_complete_cost_and_is_rechunking_stable(
 }
 
 #[test]
-fn attempt5_overflow_nullable_and_unauthorized_relationships_fall_back() {
+fn cross_domain_overflow_nullable_and_unauthorized_relationships_fall_back() {
     let schema = small_schema();
     let overflow = small_batch(
         schema.schema_id,
@@ -2421,8 +2412,9 @@ fn attempt5_overflow_nullable_and_unauthorized_relationships_fall_back() {
         &[0, 1],
         &[i64::MIN, i64::MAX],
     );
-    let artifact =
-        compile_v3_planned_grouped_attempt5(&schema, &[overflow], Default::default()).unwrap();
+    let artifact = GroupedSearch::CrossDomain
+        .compile(&schema, &[overflow], Default::default())
+        .unwrap();
     let row = artifact
         .inspection
         .cross_domain
@@ -2469,9 +2461,9 @@ fn attempt5_overflow_nullable_and_unauthorized_relationships_fall_back() {
             },
         ],
     };
-    let nullable_artifact =
-        compile_v3_planned_grouped_attempt5(&nullable, &[nullable_batch], Default::default())
-            .unwrap();
+    let nullable_artifact = GroupedSearch::CrossDomain
+        .compile(&nullable, &[nullable_batch], Default::default())
+        .unwrap();
     let row = nullable_artifact
         .inspection
         .cross_domain
@@ -2516,9 +2508,9 @@ fn attempt5_overflow_nullable_and_unauthorized_relationships_fall_back() {
             },
         ],
     };
-    let forbidden_artifact =
-        compile_v3_planned_grouped_attempt5(&forbidden, &[forbidden_batch], Default::default())
-            .unwrap();
+    let forbidden_artifact = GroupedSearch::CrossDomain
+        .compile(&forbidden, &[forbidden_batch], Default::default())
+        .unwrap();
     assert!(!forbidden_artifact.inspection.candidates[6].authorized);
     assert!(forbidden_artifact.inspection.candidates[6]
         .complete_bytes
@@ -2526,7 +2518,7 @@ fn attempt5_overflow_nullable_and_unauthorized_relationships_fall_back() {
 }
 
 #[test]
-fn attempt5_registry_plan_mutations_and_anonymous_label_bias_fail_closed() {
+fn cross_domain_registry_plan_mutations_and_anonymous_label_bias_fail_closed() {
     let schema = small_schema();
     let batch = small_batch(
         schema.schema_id,
@@ -2536,7 +2528,7 @@ fn attempt5_registry_plan_mutations_and_anonymous_label_bias_fail_closed() {
         &[0, 1, 0, 1],
         &[9_000_000, 9_000_001, -8_000_000, -7_999_999],
     );
-    let artifact = compile_v3_planned_grouped_attempt5_candidate(
+    let artifact = cross_candidate(
         &schema,
         &[batch],
         Default::default(),
@@ -2567,7 +2559,7 @@ fn attempt5_registry_plan_mutations_and_anonymous_label_bias_fail_closed() {
     encoded[57] = PlanV2Selection::PreviousWithinDomainMixed as u8;
     resign_plan_with_domain(&mut encoded, PLAN_HASH_DOMAIN_V5);
     assert!(AuraPlanV2::decode(&schema, &encoded).is_err());
-    assert!(compile_v3_planned_grouped_attempt5_candidate(
+    assert!(cross_candidate(
         &schema,
         &[],
         Default::default(),
@@ -2600,18 +2592,20 @@ fn attempt5_registry_plan_mutations_and_anonymous_label_bias_fail_closed() {
         }
         small_batch(schema_id, &[1], &[1], &[0, 192], &sides, &values)
     };
-    let original_artifact = compile_v3_planned_grouped_attempt5(
-        &schema,
-        &[make_bias_batch(schema.schema_id)],
-        Default::default(),
-    )
-    .unwrap();
-    let renamed_artifact = compile_v3_planned_grouped_attempt5(
-        &renamed,
-        &[make_bias_batch(renamed.schema_id)],
-        Default::default(),
-    )
-    .unwrap();
+    let original_artifact = GroupedSearch::CrossDomain
+        .compile(
+            &schema,
+            &[make_bias_batch(schema.schema_id)],
+            Default::default(),
+        )
+        .unwrap();
+    let renamed_artifact = GroupedSearch::CrossDomain
+        .compile(
+            &renamed,
+            &[make_bias_batch(renamed.schema_id)],
+            Default::default(),
+        )
+        .unwrap();
     assert_eq!(
         original_artifact.inspection.plan.selected,
         renamed_artifact.inspection.plan.selected
@@ -2693,7 +2687,8 @@ fn same_child_parent_batch(
 }
 
 #[test]
-fn attempt6_same_child_parent_wins_and_roundtrips_dual_domains_with_changing_cardinality() {
+fn same_child_parent_same_child_parent_wins_and_roundtrips_dual_domains_with_changing_cardinality()
+{
     let schema = same_child_parent_schema(false, false);
     let mut sides = Vec::new();
     let mut parents = Vec::new();
@@ -2717,12 +2712,9 @@ fn attempt6_same_child_parent_wins_and_roundtrips_dual_domains_with_changing_car
         None,
         None,
     );
-    let artifact = compile_v3_planned_grouped_attempt6(
-        &schema,
-        std::slice::from_ref(&batch),
-        Default::default(),
-    )
-    .unwrap();
+    let artifact = GroupedSearch::SameChildParent
+        .compile(&schema, std::slice::from_ref(&batch), Default::default())
+        .unwrap();
     assert_eq!(artifact.inspection.candidates.len(), 8);
     assert!(artifact.inspection.candidates[7].selected);
     assert_eq!(
@@ -2740,7 +2732,7 @@ fn attempt6_same_child_parent_wins_and_roundtrips_dual_domains_with_changing_car
     assert!(row.authorized && row.eligible && row.applicable);
     assert!(row.candidate_selected && row.selected);
 
-    let explicit = compile_v3_planned_grouped_attempt6_candidate(
+    let explicit = parent_candidate(
         &schema,
         &[batch],
         Default::default(),
@@ -2760,7 +2752,7 @@ fn attempt6_same_child_parent_wins_and_roundtrips_dual_domains_with_changing_car
 }
 
 #[test]
-fn attempt6_overflow_nullable_mixed_presence_and_tie_remain_direct() {
+fn same_child_parent_overflow_nullable_mixed_presence_and_tie_remain_direct() {
     let schema = same_child_parent_schema(false, false);
     let overflow = same_child_parent_batch(
         schema.schema_id,
@@ -2771,8 +2763,9 @@ fn attempt6_overflow_nullable_mixed_presence_and_tie_remain_direct() {
         None,
         None,
     );
-    let overflow_artifact =
-        compile_v3_planned_grouped_attempt6(&schema, &[overflow], Default::default()).unwrap();
+    let overflow_artifact = GroupedSearch::SameChildParent
+        .compile(&schema, &[overflow], Default::default())
+        .unwrap();
     let row = overflow_artifact
         .inspection
         .same_child_parent
@@ -2803,12 +2796,13 @@ fn attempt6_overflow_nullable_mixed_presence_and_tie_remain_direct() {
         None,
         Some(vec![0b0000_0101]),
     );
-    let nullable_artifact = compile_v3_planned_grouped_attempt6(
-        &nullable,
-        std::slice::from_ref(&nullable_batch),
-        Default::default(),
-    )
-    .unwrap();
+    let nullable_artifact = GroupedSearch::SameChildParent
+        .compile(
+            &nullable,
+            std::slice::from_ref(&nullable_batch),
+            Default::default(),
+        )
+        .unwrap();
     let row = nullable_artifact
         .inspection
         .same_child_parent
@@ -2841,12 +2835,13 @@ fn attempt6_overflow_nullable_mixed_presence_and_tie_remain_direct() {
         Some(vec![0b0000_0101]),
         None,
     );
-    let nullable_parent_artifact = compile_v3_planned_grouped_attempt6(
-        &nullable_parent,
-        std::slice::from_ref(&nullable_parent_batch),
-        Default::default(),
-    )
-    .unwrap();
+    let nullable_parent_artifact = GroupedSearch::SameChildParent
+        .compile(
+            &nullable_parent,
+            std::slice::from_ref(&nullable_parent_batch),
+            Default::default(),
+        )
+        .unwrap();
     let row = nullable_parent_artifact
         .inspection
         .same_child_parent
@@ -2870,8 +2865,9 @@ fn attempt6_overflow_nullable_mixed_presence_and_tie_remain_direct() {
         None,
         None,
     );
-    let tie_artifact =
-        compile_v3_planned_grouped_attempt6(&schema, &[tie], Default::default()).unwrap();
+    let tie_artifact = GroupedSearch::SameChildParent
+        .compile(&schema, &[tie], Default::default())
+        .unwrap();
     let row = tie_artifact.inspection.same_child_parent.first().unwrap();
     assert!(row.applicable && !row.candidate_selected && !row.selected);
     assert!(row
@@ -2881,7 +2877,7 @@ fn attempt6_overflow_nullable_mixed_presence_and_tie_remain_direct() {
 }
 
 #[test]
-fn attempt6_footer_rejects_wrong_parent_dependency_or_version_contract() {
+fn same_child_parent_footer_rejects_wrong_parent_dependency_or_version_contract() {
     let schema = same_child_parent_schema(false, false);
     let batch = same_child_parent_batch(
         schema.schema_id,
@@ -2892,7 +2888,7 @@ fn attempt6_footer_rejects_wrong_parent_dependency_or_version_contract() {
         None,
         None,
     );
-    let artifact = compile_v3_planned_grouped_attempt6_candidate(
+    let artifact = parent_candidate(
         &schema,
         &[batch],
         Default::default(),
@@ -2993,8 +2989,8 @@ fn footer_start(file: &[u8]) -> usize {
     footer_len_offset - footer_len
 }
 
-fn resign_attempt2_body_mutation(
-    artifact: &aura_codec::V3PlannedGroupedArtifact,
+fn resign_compact_body_mutation(
+    artifact: &aura_codec::experimental::V3PlannedGroupedArtifact,
     block_offset: usize,
 ) -> Vec<u8> {
     let header_len = AuraHeader::encoded_len(&artifact.bytes).unwrap();
@@ -3016,7 +3012,7 @@ fn resign_attempt2_body_mutation(
 }
 
 fn rebuild_with_replaced_body_range(
-    artifact: &aura_codec::V3PlannedGroupedArtifact,
+    artifact: &aura_codec::experimental::V3PlannedGroupedArtifact,
     range: std::ops::Range<usize>,
     replacement: &[u8],
 ) -> Vec<u8> {
@@ -3044,4 +3040,87 @@ fn rebuild_with_replaced_body_range(
 
 fn footer_bytes(file: &[u8]) -> &[u8] {
     &file[footer_start(file)..file.len() - 12]
+}
+
+fn compact_candidate(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    limits: V3GroupedLimits,
+    selection: PlanV2Selection,
+) -> Result<V3PlannedGroupedArtifact> {
+    compile_v3_grouped_with_plan(
+        schema,
+        batches,
+        limits,
+        AuraPlanV2::candidate_for_schema(schema, selection)?,
+    )
+}
+
+fn within_candidate(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    limits: V3GroupedLimits,
+    slots: &[u16],
+    codec: PlanV2PhysicalCodec,
+) -> Result<V3PlannedGroupedArtifact> {
+    let mut plan = AuraPlanV2::within_domain_direct_for_schema(schema)?;
+    plan.select_previous_within_domain(slots);
+    for slot in slots {
+        let physical = plan.streams[usize::from(*slot)].physical_stream_ids[0];
+        plan.physical_stream_codecs[usize::from(physical)] = codec;
+    }
+    plan.validate(schema)?;
+    compile_v3_grouped_with_plan(schema, batches, limits, plan)
+}
+
+fn cross_candidate(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    limits: V3GroupedLimits,
+    ops: &[(u16, u8)],
+    codec: PlanV2PhysicalCodec,
+) -> Result<V3PlannedGroupedArtifact> {
+    let mut plan = AuraPlanV2::cross_domain_direct_for_schema(schema)?;
+    plan.select_cross_domain_same_field(ops);
+    for (slot, _) in ops {
+        let physical = plan
+            .streams
+            .get(usize::from(*slot))
+            .and_then(|stream| stream.physical_stream_ids.first())
+            .copied()
+            .ok_or(AuraError::InvalidValue("v3 planned cross slot"))?;
+        plan.physical_stream_codecs[usize::from(physical)] = codec;
+    }
+    plan.validate(schema)?;
+    compile_v3_grouped_with_plan(schema, batches, limits, plan)
+}
+
+fn parent_candidate(
+    schema: &SchemaDescriptor,
+    batches: &[AuraV3EventBatch],
+    limits: V3GroupedLimits,
+    slots: &[u16],
+    codec: PlanV2PhysicalCodec,
+) -> Result<V3PlannedGroupedArtifact> {
+    let mut plan = AuraPlanV2::same_child_parent_direct_for_schema(schema)?;
+    let mut relations = Vec::new();
+    relations
+        .try_reserve_exact(slots.len())
+        .map_err(|_| AuraError::InvalidValue("v3 planned grouped allocation"))?;
+    for slot in slots {
+        let field = schema
+            .fields
+            .get(usize::from(*slot))
+            .filter(|field| field.index == *slot)
+            .ok_or(AuraError::InvalidValue("v3 planned parent slot"))?;
+        let FieldRelation::DeltaFromField(parent) = field.relation else {
+            return Err(AuraError::InvalidValue("v3 planned parent relation"));
+        };
+        relations.push((*slot, parent));
+        let physical = plan.streams[usize::from(*slot)].physical_stream_ids[0];
+        plan.physical_stream_codecs[usize::from(physical)] = codec;
+    }
+    plan.select_same_child_parent(&relations);
+    plan.validate(schema)?;
+    compile_v3_grouped_with_plan(schema, batches, limits, plan)
 }

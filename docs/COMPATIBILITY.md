@@ -1,4 +1,19 @@
-# AURA Compatibility
+# Compatibility
+
+The current API cleanup keeps V2 consumer imports and wire bytes. Grimoire's
+`decode_v3_selected_flat`, `AuraV3ValueRef`, `DecodedV3SelectedFlat`, and
+`V3FlatLimits` root imports also remain available. Other V3/shadow root exports
+now live under `aura_codec::experimental`; module paths remain accessible.
+
+Development migration: replace `compile_v3_planned_grouped_attempt2` through
+`attempt6` with `GroupedSearch::{Compact,Integer,WithinDomain,CrossDomain,
+SameChildParent}.compile(schema, batches, limits)`. The grouped writer still
+uses `CrossDomain` and the same ordered seven candidates. For an explicit plan,
+use `compile_v3_grouped_with_plan`; the old forced-candidate helpers were only
+used by corruption tests and have been removed from the library. This is an
+intentional development API cleanup, with no new file version. All historical
+layout readers below remain present.
+
 
 The current format version is checked during footer decode. Unsupported versions
 return an error instead of falling back silently.

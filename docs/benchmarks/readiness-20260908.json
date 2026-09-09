@@ -1,0 +1,972 @@
+{
+  "source_revision": "d432c97331db95663df92b5c4f0011161bef668e",
+  "toolchain": "rustc 1.97.1, release, one codec thread",
+  "method": {
+    "started_utc": "2026-09-09T00:49:44.878375+00:00",
+    "commit": "d432c97331db95663df92b5c4f0011161bef668e",
+    "threads": 1,
+    "encoder_slots": 4,
+    "loadavg": "46.90 50.37 51.29 14/3494 3263430",
+    "services": "unchanged; existing codec jobs drained naturally",
+    "cache": "memory and warm file; no cold-disk claim",
+    "rss": "wait4 process peak includes setup, references, warmup and verification",
+    "unrelated_build_processes_observed": false,
+    "source": "bounded retained W03 inputs; no source data included"
+  },
+  "cases": [
+    {
+      "dataset": "huffman",
+      "counts": {
+        "child_count": 738656,
+        "event_count": 105576,
+        "field_count": 33,
+        "record_count": 738656,
+        "schema_count": 1
+      },
+      "input_sha256": "71414f9a6de8937d03b8ab235dc00dc6114c3320436a4350db6ee92eff570f98",
+      "aura1_sha256": "44829a976305b67875e6688cab4778f72c5867d26ca3ec8e4898e1112b3526bb",
+      "aura0_container_bytes": 3530961,
+      "required_metadata_bytes": 14252,
+      "aura0_plus_metadata_bytes": 3545213,
+      "zstd3_aura1_plus_metadata_bytes": 7622490,
+      "logical_aura1_bytes": 121986834,
+      "input_byte_accounting": {
+        "body_bytes": 3528911,
+        "body_end": 3528982,
+        "footer_bytes": 1967,
+        "footer_end": 3530949,
+        "header_bytes": 71,
+        "header_end": 71,
+        "total_bytes": 3530961,
+        "trailer_bytes": 12
+      },
+      "timings": {
+        "aura0_expansion_ns": {
+          "samples": [
+            1068985576,
+            988891308,
+            965499019
+          ],
+          "median": 988891308,
+          "minimum": 965499019,
+          "maximum": 1068985576,
+          "events_or_rows_per_second": 106761.98602000454,
+          "level_updates_per_second": 746953.6783510691,
+          "logical_mib_per_second": 117.64256555232326
+        },
+        "aura1_consume_ns": {
+          "samples": [
+            304735840,
+            293554620,
+            269555982
+          ],
+          "median": 293554620,
+          "minimum": 269555982,
+          "maximum": 304735840,
+          "events_or_rows_per_second": 359646.8691243899,
+          "level_updates_per_second": 2516247.231946137,
+          "logical_mib_per_second": 396.30004980167814
+        },
+        "aura0_expand_and_consume_ns": {
+          "samples": [
+            1338291822,
+            1251607672,
+            1288737049
+          ],
+          "median": 1288737049,
+          "minimum": 1251607672,
+          "maximum": 1338291822,
+          "events_or_rows_per_second": 81922.06477025089,
+          "level_updates_per_second": 573162.6948826859,
+          "logical_mib_per_second": 90.27109961320953
+        },
+        "zstd3_creation_from_aura1_ns": {
+          "samples": [
+            172704787,
+            161149512,
+            202729226
+          ],
+          "median": 172704787,
+          "minimum": 161149512,
+          "maximum": 202729226,
+          "events_or_rows_per_second": 611309.0542186303,
+          "level_updates_per_second": 4276986.254005803,
+          "logical_mib_per_second": 673.6102255550837
+        },
+        "zstd3_expansion_ns": {
+          "samples": [
+            70572895,
+            66013249,
+            120409103
+          ],
+          "median": 70572895,
+          "minimum": 66013249,
+          "maximum": 120409103,
+          "events_or_rows_per_second": 1495985.1087304836,
+          "level_updates_per_second": 10466567.936599456,
+          "logical_mib_per_second": 1648.447474423611
+        },
+        "zstd3_expand_and_consume_ns": {
+          "samples": [
+            374232640,
+            422648152,
+            469794529
+          ],
+          "median": 422648152,
+          "minimum": 374232640,
+          "maximum": 469794529,
+          "events_or_rows_per_second": 249796.43114587662,
+          "level_updates_per_second": 1747685.3891461,
+          "logical_mib_per_second": 275.2542746845198
+        },
+        "warm_file_aura0_expand_write_close_ns": {
+          "samples": [
+            1477914200,
+            1404000571,
+            1787905702
+          ],
+          "median": 1477914200,
+          "minimum": 1404000571,
+          "maximum": 1787905702
+        },
+        "warm_file_zstd3_expand_write_close_ns": {
+          "samples": [
+            1147056605,
+            1496252969,
+            935835883
+          ],
+          "median": 1147056605,
+          "minimum": 935835883,
+          "maximum": 1496252969
+        }
+      },
+      "process_peak_rss_kib": 1010284,
+      "process_cpu_s": 27.808659,
+      "configuration": {
+        "iterations": 3,
+        "profile_stages": false,
+        "skip_creation": true,
+        "warmups": 1,
+        "zstd_levels": [
+          3
+        ]
+      },
+      "exact_source_semantics": true,
+      "unchanged_companion_aura0_bytes": 4257,
+      "unchanged_companion_zstd3_aura1_bytes": 6361,
+      "complete_generation_aura0_and_metadata_bytes": 3549470,
+      "complete_generation_zstd3_and_metadata_bytes": 7628851,
+      "timing_scope": "delta only; complete generation size includes unchanged snapshot and shared restoration metadata"
+    },
+    {
+      "dataset": "packed",
+      "counts": {
+        "child_count": 738656,
+        "event_count": 105576,
+        "field_count": 33,
+        "record_count": 738656,
+        "schema_count": 1
+      },
+      "input_sha256": "b886ebc92887bba0eb57bff812fa01c8c9b26df8dcc8315c3c18e739265a32fd",
+      "aura1_sha256": "0e87d42700cf2dd6f0a325be6a577a78b3fc5ff06a7e930dfa902beec82514d0",
+      "aura0_container_bytes": 3635839,
+      "required_metadata_bytes": 14252,
+      "aura0_plus_metadata_bytes": 3650091,
+      "zstd3_aura1_plus_metadata_bytes": 7622358,
+      "logical_aura1_bytes": 121986690,
+      "input_byte_accounting": {
+        "body_bytes": 3633933,
+        "body_end": 3634004,
+        "footer_bytes": 1823,
+        "footer_end": 3635827,
+        "header_bytes": 71,
+        "header_end": 71,
+        "total_bytes": 3635839,
+        "trailer_bytes": 12
+      },
+      "timings": {
+        "aura0_expansion_ns": {
+          "samples": [
+            1025573734,
+            973955775,
+            970091618
+          ],
+          "median": 973955775,
+          "minimum": 970091618,
+          "maximum": 1025573734,
+          "events_or_rows_per_second": 108399.1724367567,
+          "level_updates_per_second": 758408.152567297,
+          "logical_mib_per_second": 119.44646377440611
+        },
+        "aura1_consume_ns": {
+          "samples": [
+            306723621,
+            258463218,
+            268487505
+          ],
+          "median": 268487505,
+          "minimum": 258463218,
+          "maximum": 306723621,
+          "events_or_rows_per_second": 393225.00315238134,
+          "level_updates_per_second": 2751174.584455988,
+          "logical_mib_per_second": 433.29976639475694
+        },
+        "aura0_expand_and_consume_ns": {
+          "samples": [
+            1234204659,
+            1272885766,
+            1252783486
+          ],
+          "median": 1252783486,
+          "minimum": 1234204659,
+          "maximum": 1272885766,
+          "events_or_rows_per_second": 84273.14151233951,
+          "level_updates_per_second": 589611.8589162182,
+          "logical_mib_per_second": 92.86167521880245
+        },
+        "zstd3_creation_from_aura1_ns": {
+          "samples": [
+            143744094,
+            138504336,
+            145811092
+          ],
+          "median": 143744094,
+          "minimum": 138504336,
+          "maximum": 145811092,
+          "events_or_rows_per_second": 734471.9150687332,
+          "level_updates_per_second": 5138687.645838166,
+          "logical_mib_per_second": 809.3241952355353
+        },
+        "zstd3_expansion_ns": {
+          "samples": [
+            72538725,
+            64835270,
+            63384504
+          ],
+          "median": 64835270,
+          "minimum": 63384504,
+          "maximum": 72538725,
+          "events_or_rows_per_second": 1628372.9519442117,
+          "level_updates_per_second": 11392811.350982266,
+          "logical_mib_per_second": 1794.325421894767
+        },
+        "zstd3_expand_and_consume_ns": {
+          "samples": [
+            325698791,
+            333923504,
+            318019757
+          ],
+          "median": 325698791,
+          "minimum": 318019757,
+          "maximum": 333923504,
+          "events_or_rows_per_second": 324152.26251177577,
+          "level_updates_per_second": 2267911.396699044,
+          "logical_mib_per_second": 357.18761140998873
+        },
+        "warm_file_aura0_expand_write_close_ns": {
+          "samples": [
+            1280269783,
+            1314434758,
+            1155793006
+          ],
+          "median": 1280269783,
+          "minimum": 1155793006,
+          "maximum": 1314434758
+        },
+        "warm_file_zstd3_expand_write_close_ns": {
+          "samples": [
+            360493233,
+            391525572,
+            673620032
+          ],
+          "median": 391525572,
+          "minimum": 360493233,
+          "maximum": 673620032
+        }
+      },
+      "process_peak_rss_kib": 1032640,
+      "process_cpu_s": 25.472209000000003,
+      "configuration": {
+        "iterations": 3,
+        "profile_stages": false,
+        "skip_creation": true,
+        "warmups": 1,
+        "zstd_levels": [
+          3
+        ]
+      },
+      "exact_source_semantics": true,
+      "unchanged_companion_aura0_bytes": 4257,
+      "unchanged_companion_zstd3_aura1_bytes": 6361,
+      "complete_generation_aura0_and_metadata_bytes": 3654348,
+      "complete_generation_zstd3_and_metadata_bytes": 7628719,
+      "timing_scope": "delta only; complete generation size includes unchanged snapshot and shared restoration metadata"
+    },
+    {
+      "dataset": "production",
+      "counts": {
+        "child_count": 738656,
+        "event_count": 105576,
+        "field_count": 33,
+        "record_count": 738656,
+        "schema_count": 1
+      },
+      "input_sha256": "636fd78ce2e097ba91b4ca98b65c44b60e0811b55ebbfc316211bfa03fbd46ce",
+      "aura1_sha256": "d8539c5f38508956b9569fbdb3b73f9c3443819f10955c2816d4083afce9ef70",
+      "aura0_container_bytes": 3517675,
+      "required_metadata_bytes": 14252,
+      "aura0_plus_metadata_bytes": 3531927,
+      "zstd3_aura1_plus_metadata_bytes": 7622343,
+      "logical_aura1_bytes": 121986684,
+      "input_byte_accounting": {
+        "body_bytes": 3515775,
+        "body_end": 3515846,
+        "footer_bytes": 1817,
+        "footer_end": 3517663,
+        "header_bytes": 71,
+        "header_end": 71,
+        "total_bytes": 3517675,
+        "trailer_bytes": 12
+      },
+      "timings": {
+        "aura0_expansion_ns": {
+          "samples": [
+            1134932070,
+            1070504507,
+            1172169557
+          ],
+          "median": 1134932070,
+          "minimum": 1070504507,
+          "maximum": 1172169557,
+          "events_or_rows_per_second": 93024.06971370542,
+          "level_updates_per_second": 650837.1906346782,
+          "logical_mib_per_second": 102.50443224709055
+        },
+        "aura1_consume_ns": {
+          "samples": [
+            315169687,
+            302323914,
+            351922962
+          ],
+          "median": 315169687,
+          "minimum": 302323914,
+          "maximum": 351922962,
+          "events_or_rows_per_second": 334981.4539746648,
+          "level_updates_per_second": 2343677.1696892283,
+          "logical_mib_per_second": 369.12042075405947
+        },
+        "aura0_expand_and_consume_ns": {
+          "samples": [
+            1349778492,
+            1401322652,
+            1633362930
+          ],
+          "median": 1401322652,
+          "minimum": 1349778492,
+          "maximum": 1633362930,
+          "events_or_rows_per_second": 75340.25076189234,
+          "level_updates_per_second": 527113.4373984272,
+          "logical_mib_per_second": 83.01840215622607
+        },
+        "zstd3_creation_from_aura1_ns": {
+          "samples": [
+            171867288,
+            173037950,
+            170584954
+          ],
+          "median": 171867288,
+          "minimum": 170584954,
+          "maximum": 173037950,
+          "events_or_rows_per_second": 614287.9266239426,
+          "level_updates_per_second": 4297827.751840711,
+          "logical_mib_per_second": 676.891855501701
+        },
+        "zstd3_expansion_ns": {
+          "samples": [
+            72347925,
+            74482304,
+            72732642
+          ],
+          "median": 72732642,
+          "minimum": 72347925,
+          "maximum": 74482304,
+          "events_or_rows_per_second": 1451562.8347448178,
+          "level_updates_per_second": 10155770.224873723,
+          "logical_mib_per_second": 1599.4959659840933
+        },
+        "zstd3_expand_and_consume_ns": {
+          "samples": [
+            423985028,
+            436162146,
+            401552417
+          ],
+          "median": 423985028,
+          "minimum": 401552417,
+          "maximum": 436162146,
+          "events_or_rows_per_second": 249008.79282935435,
+          "level_updates_per_second": 1742174.7260377316,
+          "logical_mib_per_second": 274.386027315958
+        },
+        "warm_file_aura0_expand_write_close_ns": {
+          "samples": [
+            1846549784,
+            1549988434,
+            1270715508
+          ],
+          "median": 1549988434,
+          "minimum": 1270715508,
+          "maximum": 1846549784
+        },
+        "warm_file_zstd3_expand_write_close_ns": {
+          "samples": [
+            598296383,
+            527125874,
+            512688424
+          ],
+          "median": 527125874,
+          "minimum": 512688424,
+          "maximum": 598296383
+        }
+      },
+      "process_peak_rss_kib": 1032188,
+      "process_cpu_s": 30.145958999999998,
+      "configuration": {
+        "iterations": 3,
+        "profile_stages": false,
+        "skip_creation": true,
+        "warmups": 1,
+        "zstd_levels": [
+          3
+        ]
+      },
+      "exact_source_semantics": true,
+      "unchanged_companion_aura0_bytes": 4257,
+      "unchanged_companion_zstd3_aura1_bytes": 6361,
+      "complete_generation_aura0_and_metadata_bytes": 3536184,
+      "complete_generation_zstd3_and_metadata_bytes": 7628704,
+      "timing_scope": "delta only; complete generation size includes unchanged snapshot and shared restoration metadata"
+    },
+    {
+      "dataset": "real-candles-es-16384",
+      "counts": {
+        "child_count": null,
+        "event_count": null,
+        "field_count": 10,
+        "record_count": 16384,
+        "schema_count": 1
+      },
+      "input_sha256": "5c6742ea9618e2e9605bca593d8c5cd6df3ed8c28824252da1d8c893e53798c4",
+      "aura1_sha256": "b04f2c657da2a827e80afa8b06865512bd0368444835050e7860a1913f3dbe4c",
+      "aura0_container_bytes": 62901,
+      "required_metadata_bytes": 5463,
+      "aura0_plus_metadata_bytes": 68364,
+      "zstd3_aura1_plus_metadata_bytes": 201431,
+      "logical_aura1_bytes": 836318,
+      "input_byte_accounting": {
+        "body_bytes": 62167,
+        "body_end": 62202,
+        "footer_bytes": 687,
+        "footer_end": 62889,
+        "header_bytes": 35,
+        "header_end": 35,
+        "total_bytes": 62901,
+        "trailer_bytes": 12
+      },
+      "timings": {
+        "aura0_expansion_ns": {
+          "samples": [
+            1694292,
+            1923687,
+            1769793
+          ],
+          "median": 1769793,
+          "minimum": 1694292,
+          "maximum": 1923687,
+          "events_or_rows_per_second": 9257579.84125827,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 450.6600472192184
+        },
+        "aura1_consume_ns": {
+          "samples": [
+            1429347,
+            1408097,
+            1309465
+          ],
+          "median": 1408097,
+          "minimum": 1309465,
+          "maximum": 1429347,
+          "events_or_rows_per_second": 11635562.038694777,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 566.420493011662
+        },
+        "aura0_expand_and_consume_ns": {
+          "samples": [
+            3021337,
+            3625808,
+            2598378
+          ],
+          "median": 3021337,
+          "minimum": 2598378,
+          "maximum": 3625808,
+          "events_or_rows_per_second": 5422764.822328658,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 263.9808127819711
+        },
+        "zstd3_creation_from_aura1_ns": {
+          "samples": [
+            2966735,
+            3536187,
+            3530977
+          ],
+          "median": 3530977,
+          "minimum": 2966735,
+          "maximum": 3536187,
+          "events_or_rows_per_second": 4640075.5371671915,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 225.8794087155601
+        },
+        "zstd3_expansion_ns": {
+          "samples": [
+            1008239,
+            1234813,
+            1244633
+          ],
+          "median": 1234813,
+          "minimum": 1008239,
+          "maximum": 1244633,
+          "events_or_rows_per_second": 13268405.823391883,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 645.9075155090221
+        },
+        "zstd3_expand_and_consume_ns": {
+          "samples": [
+            2998036,
+            2971196,
+            2309413
+          ],
+          "median": 2971196,
+          "minimum": 2309413,
+          "maximum": 2998036,
+          "events_or_rows_per_second": 5514277.752124061,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 268.4356726881169
+        },
+        "aura0_creation_from_facts_ns": {
+          "samples": [
+            1283997839,
+            1275065977,
+            1207608256
+          ],
+          "median": 1275065977,
+          "minimum": 1207608256,
+          "maximum": 1283997839,
+          "events_or_rows_per_second": 12849.531158025715,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 0.625516648812787
+        },
+        "aura1_and_zstd3_creation_from_facts_ns": {
+          "samples": [
+            1117962050,
+            1175137513,
+            1147908228
+          ],
+          "median": 1147908228,
+          "minimum": 1117962050,
+          "maximum": 1175137513,
+          "events_or_rows_per_second": 14272.917991489472,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 0.6948072829287554
+        },
+        "warm_file_aura0_expand_write_close_ns": {
+          "samples": [
+            2819893,
+            3100278,
+            2207871
+          ],
+          "median": 2819893,
+          "minimum": 2207871,
+          "maximum": 3100278
+        },
+        "warm_file_zstd3_expand_write_close_ns": {
+          "samples": [
+            1764744,
+            1901036,
+            1420346
+          ],
+          "median": 1764744,
+          "minimum": 1420346,
+          "maximum": 1901036
+        }
+      },
+      "process_peak_rss_kib": 49756,
+      "process_cpu_s": 16.688914,
+      "configuration": {
+        "iterations": 3,
+        "profile_stages": false,
+        "skip_creation": false,
+        "warmups": 1,
+        "zstd_levels": [
+          3
+        ]
+      },
+      "exact_source_semantics": true
+    },
+    {
+      "dataset": "real-candles-es-tiny16",
+      "counts": {
+        "child_count": null,
+        "event_count": null,
+        "field_count": 10,
+        "record_count": 16,
+        "schema_count": 1
+      },
+      "input_sha256": "8657ce3b3b0817827088b3271421abb9b347932909a71d9df550faf967ef7338",
+      "aura1_sha256": "4380230294abc476428b56139e070ddbcf8e48dcfcac117a36179929f89707c3",
+      "aura0_container_bytes": 741,
+      "required_metadata_bytes": 5345,
+      "aura0_plus_metadata_bytes": 6086,
+      "zstd3_aura1_plus_metadata_bytes": 5949,
+      "logical_aura1_bytes": 1280,
+      "input_byte_accounting": {
+        "body_bytes": 245,
+        "body_end": 280,
+        "footer_bytes": 449,
+        "footer_end": 729,
+        "header_bytes": 35,
+        "header_end": 35,
+        "total_bytes": 741,
+        "trailer_bytes": 12
+      },
+      "timings": {
+        "aura0_expansion_ns": {
+          "samples": [
+            25181,
+            23981,
+            49341
+          ],
+          "median": 25181,
+          "minimum": 23981,
+          "maximum": 49341,
+          "events_or_rows_per_second": 635399.7061276359,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 48.47715043088043
+        },
+        "aura1_consume_ns": {
+          "samples": [
+            6620,
+            8001,
+            14930
+          ],
+          "median": 8001,
+          "minimum": 6620,
+          "maximum": 14930,
+          "events_or_rows_per_second": 1999750.0312460943,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 152.5688195225597
+        },
+        "aura0_expand_and_consume_ns": {
+          "samples": [
+            29650,
+            35951,
+            45371
+          ],
+          "median": 35951,
+          "minimum": 29650,
+          "maximum": 45371,
+          "events_or_rows_per_second": 445050.20722650277,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 33.95463617145559
+        },
+        "zstd3_creation_from_aura1_ns": {
+          "samples": [
+            42751,
+            34561,
+            38881
+          ],
+          "median": 38881,
+          "minimum": 34561,
+          "maximum": 42751,
+          "events_or_rows_per_second": 411512.04958720197,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 31.395877806640776
+        },
+        "zstd3_expansion_ns": {
+          "samples": [
+            5130,
+            6140,
+            7440
+          ],
+          "median": 6140,
+          "minimum": 5130,
+          "maximum": 7440,
+          "events_or_rows_per_second": 2605863.1921824105,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 198.8115838762215
+        },
+        "zstd3_expand_and_consume_ns": {
+          "samples": [
+            11180,
+            32960,
+            25881
+          ],
+          "median": 25881,
+          "minimum": 11180,
+          "maximum": 32960,
+          "events_or_rows_per_second": 618214.1339206367,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 47.16599532475561
+        },
+        "aura0_creation_from_facts_ns": {
+          "samples": [
+            1266383,
+            1511799,
+            1491528
+          ],
+          "median": 1491528,
+          "minimum": 1266383,
+          "maximum": 1511799,
+          "events_or_rows_per_second": 10727.254198379112,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 0.818424545164422
+        },
+        "aura1_and_zstd3_creation_from_facts_ns": {
+          "samples": [
+            1622280,
+            1480428,
+            1404146
+          ],
+          "median": 1480428,
+          "minimum": 1404146,
+          "maximum": 1622280,
+          "events_or_rows_per_second": 10807.685345048863,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 0.8245609546698658
+        },
+        "warm_file_aura0_expand_write_close_ns": {
+          "samples": [
+            135943,
+            105241,
+            89302
+          ],
+          "median": 105241,
+          "minimum": 89302,
+          "maximum": 135943
+        },
+        "warm_file_zstd3_expand_write_close_ns": {
+          "samples": [
+            43130,
+            144592,
+            40840
+          ],
+          "median": 43130,
+          "minimum": 40840,
+          "maximum": 144592
+        }
+      },
+      "process_peak_rss_kib": 77360,
+      "process_cpu_s": 0.030098,
+      "configuration": {
+        "iterations": 3,
+        "profile_stages": false,
+        "skip_creation": false,
+        "warmups": 1,
+        "zstd_levels": [
+          3
+        ]
+      },
+      "exact_source_semantics": true
+    },
+    {
+      "dataset": "real-candles-nq-16384",
+      "counts": {
+        "child_count": null,
+        "event_count": null,
+        "field_count": 10,
+        "record_count": 16384,
+        "schema_count": 1
+      },
+      "input_sha256": "3fcb3ee087f8bb46e52dd950b93578034f16f47a8b064c4a129da9f4f4d86fa1",
+      "aura1_sha256": "34c2b245df10f523a9187533bfd1fb0f00ddea76622f9cdbfbcfa0ea3b908aad",
+      "aura0_container_bytes": 60836,
+      "required_metadata_bytes": 5370,
+      "aura0_plus_metadata_bytes": 66206,
+      "zstd3_aura1_plus_metadata_bytes": 210081,
+      "logical_aura1_bytes": 803422,
+      "input_byte_accounting": {
+        "body_bytes": 60230,
+        "body_end": 60265,
+        "footer_bytes": 559,
+        "footer_end": 60824,
+        "header_bytes": 35,
+        "header_end": 35,
+        "total_bytes": 60836,
+        "trailer_bytes": 12
+      },
+      "timings": {
+        "aura0_expansion_ns": {
+          "samples": [
+            1971757,
+            1770603,
+            1916036
+          ],
+          "median": 1916036,
+          "minimum": 1770603,
+          "maximum": 1971757,
+          "events_or_rows_per_second": 8550987.559732698,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 399.8896297542124
+        },
+        "aura1_consume_ns": {
+          "samples": [
+            1168652,
+            1322895,
+            1045600
+          ],
+          "median": 1168652,
+          "minimum": 1045600,
+          "maximum": 1322895,
+          "events_or_rows_per_second": 14019571.266724396,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 655.6296713099727
+        },
+        "aura0_expand_and_consume_ns": {
+          "samples": [
+            3301352,
+            2871404,
+            3291892
+          ],
+          "median": 3291892,
+          "minimum": 2871404,
+          "maximum": 3301352,
+          "events_or_rows_per_second": 4977077.01224706,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 232.7545759811507
+        },
+        "zstd3_creation_from_aura1_ns": {
+          "samples": [
+            2923855,
+            3008316,
+            3300492
+          ],
+          "median": 3008316,
+          "minimum": 2923855,
+          "maximum": 3300492,
+          "events_or_rows_per_second": 5446236.366126431,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 254.69496111304204
+        },
+        "zstd3_expansion_ns": {
+          "samples": [
+            885957,
+            1068130,
+            895086
+          ],
+          "median": 895086,
+          "minimum": 885957,
+          "maximum": 1068130,
+          "events_or_rows_per_second": 18304386.394156538,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 856.0104019454468
+        },
+        "zstd3_expand_and_consume_ns": {
+          "samples": [
+            2056749,
+            2476356,
+            2195941
+          ],
+          "median": 2195941,
+          "minimum": 2056749,
+          "maximum": 2476356,
+          "events_or_rows_per_second": 7461038.343015591,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 348.9178109228537
+        },
+        "aura0_creation_from_facts_ns": {
+          "samples": [
+            1299925588,
+            1251227211,
+            1219687255
+          ],
+          "median": 1251227211,
+          "minimum": 1219687255,
+          "maximum": 1299925588,
+          "events_or_rows_per_second": 13094.344381230054,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 0.6123611442428438
+        },
+        "aura1_and_zstd3_creation_from_facts_ns": {
+          "samples": [
+            1127677547,
+            1138449737,
+            1111260634
+          ],
+          "median": 1127677547,
+          "minimum": 1111260634,
+          "maximum": 1138449737,
+          "events_or_rows_per_second": 14528.975985721208,
+          "level_updates_per_second": null,
+          "logical_mib_per_second": 0.6794521436328129
+        },
+        "warm_file_aura0_expand_write_close_ns": {
+          "samples": [
+            1933066,
+            1871246,
+            4578736
+          ],
+          "median": 1933066,
+          "minimum": 1871246,
+          "maximum": 4578736
+        },
+        "warm_file_zstd3_expand_write_close_ns": {
+          "samples": [
+            1213022,
+            1242543,
+            1147471
+          ],
+          "median": 1213022,
+          "minimum": 1147471,
+          "maximum": 1242543
+        }
+      },
+      "process_peak_rss_kib": 77360,
+      "process_cpu_s": 16.061854,
+      "configuration": {
+        "iterations": 3,
+        "profile_stages": false,
+        "skip_creation": false,
+        "warmups": 1,
+        "zstd_levels": [
+          3
+        ]
+      },
+      "exact_source_semantics": true
+    }
+  ],
+  "completed_inputs_rechecked": true,
+  "unfinished_job": {
+    "name": "bitget-creation",
+    "initial_failure": "Fast search only supports Aura0; corrected in 2be42d9, bounded rerun pending",
+    "status": "corrected; private timing blocked by shared host lock"
+  },
+  "metadata_note": "Candle metadata files counted exactly. Book comparison counts the existing 14252-byte restoration receipt payload; experimental candidates require an owner-resealed binding before publication and are not published production archives.",
+  "machine": {
+    "Architecture": "x86_64",
+    "CPU(s)": "16",
+    "Model name": "AMD Ryzen 7 5800X 8-Core Processor"
+  },
+  "build_flags": {
+    "RUSTFLAGS": null,
+    "CARGO_ENCODED_RUSTFLAGS": null,
+    "CARGO_BUILD_TARGET": null
+  },
+  "executables_sha256": {
+    "probe-d432": "a620e144a0191c777aea6350649d237f359dc653c7feb55f2831d8536a178773",
+    "structural-d432": "ce6999182fc4b08db7082005797261004be0873384f912bc37e9d611bb729990"
+  },
+  "timing_limits": [
+    "No cold-storage case measured; warm file includes buffered writes/close, not fsync.",
+    "First direct event-creation probe used an unsupported search mode. Corrected code builds and passes the final gate; private rerun could not acquire the host lock within60seconds.",
+    "OKX repeat could not acquire the host lock within60seconds; retain W04 warm-file7.1percent regression.",
+    "One ordered entropy run cannot establish a speed advantage between forced candidates."
+  ]
+}

@@ -12,10 +12,10 @@ use arrow::ipc::root_as_message;
 use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 use arrow::ipc::MetadataVersion;
 use arrow::record_batch::RecordBatch;
-use aura_codec::{
-    decode_v3_value_block, encode_shadow_arrow_ipc, AuraV3ValueRef, FieldRole, FieldType,
-    SchemaBuilder, SchemaDescriptor, ShadowProtocolLimits, V3ValueLimits,
+use aura_codec::experimental::{
+    decode_v3_value_block, encode_shadow_arrow_ipc, ShadowProtocolLimits, V3ValueLimits,
 };
+use aura_codec::{AuraV3ValueRef, FieldRole, FieldType, SchemaBuilder, SchemaDescriptor};
 
 fn aura_schema() -> SchemaDescriptor {
     SchemaBuilder::new("shadow_test")

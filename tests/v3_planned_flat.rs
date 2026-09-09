@@ -1,13 +1,11 @@
 use std::io::Cursor;
 
-use aura_codec::{
+use aura_codec::experimental::{
     canonical_v3_batch_sha256, compile_v3_planned_flat, decode_any_compiled_footer,
-    decode_v3_planned_flat, decode_v3_planned_flat_footer, decode_v3_selected_flat,
-    encode_v3_planned_flat_footer, encode_v3_value_block, parse_schema_json, AnyCompiledFooter,
-    AuraHeader, AuraV3Batch, AuraV3Column, AuraV3ColumnValues as Values, AuraV3VariableColumn,
-    DecodedV3SelectedFlat, FieldRole, FieldTransform, FieldType, FlatAuraPlanV2,
-    PlanV2PhysicalCodec, SchemaBuilder, TransformCandidates, V3FlatAura0Writer, V3FlatLimits,
-    V3FlatWriterOptions, FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION,
+    decode_v3_planned_flat, decode_v3_planned_flat_footer, encode_v3_planned_flat_footer,
+    encode_v3_value_block, AnyCompiledFooter, AuraV3Batch, AuraV3Column,
+    AuraV3ColumnValues as Values, AuraV3VariableColumn, FlatAuraPlanV2, PlanV2PhysicalCodec,
+    V3FlatAura0Writer, V3FlatWriterOptions, FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION,
     FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION, FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION,
     V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION, V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION,
     V3_PLANNED_FLAT_PREFIX_SUFFIX_BLOCK_VERSION, V3_PLANNED_FLAT_PREFIX_SUFFIX_BODY_LAYOUT_VERSION,
@@ -15,6 +13,10 @@ use aura_codec::{
     V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_TEMPORAL_BLOCK_VERSION,
     V3_PLANNED_FLAT_TEMPORAL_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_TEMPORAL_ZSTD_BLOCK_VERSION,
     V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION,
+};
+use aura_codec::{
+    decode_v3_selected_flat, parse_schema_json, AuraHeader, DecodedV3SelectedFlat, FieldRole,
+    FieldTransform, FieldType, SchemaBuilder, TransformCandidates, V3FlatLimits,
 };
 use sha2::{Digest, Sha256};
 
@@ -1058,7 +1060,7 @@ fn dictionary_candidate_mixes_eligible_lanes_and_high_cardinality_falls_back() {
         &tiny_schema,
         &[tiny],
         V3FlatLimits {
-            value_limits: aura_codec::V3ValueLimits {
+            value_limits: aura_codec::experimental::V3ValueLimits {
                 max_block_bytes: zstd.inner_body_bytes as usize,
                 ..V3FlatLimits::HARD.value_limits
             },
@@ -1281,18 +1283,22 @@ fn planned_flat_dispatch_corruption_prefixes_and_limits_fail_closed() {
     let defaults = V3FlatLimits::default();
     let input = batch(schema.schema_id, 0, 32);
     let logical_cap = V3FlatLimits {
-        value_limits: aura_codec::V3ValueLimits {
+        value_limits: aura_codec::experimental::V3ValueLimits {
             max_block_bytes: artifact.summary.body_bytes as usize,
             ..defaults.value_limits
         },
         ..defaults
     };
     assert!(compile_v3_planned_flat(&schema, std::slice::from_ref(&input), logical_cap).is_err());
-    let exact_block_bytes = encode_v3_value_block(&schema, &input, aura_codec::V3ValueLimits::HARD)
-        .unwrap()
-        .len();
+    let exact_block_bytes = encode_v3_value_block(
+        &schema,
+        &input,
+        aura_codec::experimental::V3ValueLimits::HARD,
+    )
+    .unwrap()
+    .len();
     let compact_limit = V3FlatLimits {
-        value_limits: aura_codec::V3ValueLimits {
+        value_limits: aura_codec::experimental::V3ValueLimits {
             max_block_bytes: exact_block_bytes - 1,
             ..defaults.value_limits
         },
@@ -1428,7 +1434,7 @@ fn planned_flat_row_limit_precedes_variable_lane_arithmetic() {
 
     let at_boundary = V3FlatLimits {
         max_rows: rows as u64,
-        value_limits: aura_codec::V3ValueLimits {
+        value_limits: aura_codec::experimental::V3ValueLimits {
             max_rows: rows,
             ..V3FlatLimits::HARD.value_limits
         },
@@ -1437,7 +1443,7 @@ fn planned_flat_row_limit_precedes_variable_lane_arithmetic() {
     assert!(decode_v3_planned_flat(&artifact.bytes, at_boundary).is_ok());
     let below_boundary = V3FlatLimits {
         max_rows: rows as u64 - 1,
-        value_limits: aura_codec::V3ValueLimits {
+        value_limits: aura_codec::experimental::V3ValueLimits {
             max_rows: rows - 1,
             ..V3FlatLimits::HARD.value_limits
         },

@@ -22,7 +22,7 @@ an Aura1 conversion route. File extensions alone do not select a version.
 
 ## Start here
 
-Install Rust/Cargo (stable), a C/C++ toolchain for native compression libraries,
+Install Rust/Cargo 1.97.1 (pinned in `rust-toolchain.toml`), a C/C++ toolchain for native compression libraries,
 and Python 3 for the smoke report check. No dataset, credentials, or `.env` is
 needed. From the repository root:
 
@@ -40,7 +40,9 @@ The smoke script also saves a tiny fixture and runs `aura-bench` conversion and
 parse checks; it prints the output directory. Its timings are smoke evidence,
 not a throughput claim.
 
-Use the crate as `aura_codec`; the package name is `aura-codec`. The
+Use `aura_codec::sdk` for the small supported facade; existing root imports remain
+compatible. The package name is `aura-codec`. Development V3 and shadow APIs
+are explicit under `aura_codec::experimental`. The
 [SDK guide](docs/SDK.md) covers schemas, writers, readers, and conversion.
 For larger Aura1 files, use file-backed `open_path`/`open_file` and bounded
 batches; the generic `open(Read)` interface buffers its input.
@@ -62,4 +64,4 @@ integrity; first-time conversions still need decoded comparisons to retained
 source facts. See the format and compatibility guides before choosing an
 archival contract.
 
-Licensed under [Apache-2.0](LICENSE).
+Licensed under [Apache-2.0](LICENSE); see [dependency notices and fixture provenance](docs/THIRD_PARTY.md).

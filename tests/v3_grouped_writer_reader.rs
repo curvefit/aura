@@ -1,11 +1,11 @@
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 
-use aura_codec::{
-    AuraV3Column, AuraV3ColumnValues as Values, AuraV3EventBatch, FieldRole, FieldType,
-    RelationshipPermissions, SchemaBuilder, V3GroupedAura0Reader, V3GroupedAura0Writer,
-    V3GroupedReaderState, V3GroupedWriterOptions, V3GroupedWriterState,
+use aura_codec::experimental::{
+    AuraV3Column, AuraV3ColumnValues as Values, AuraV3EventBatch, V3GroupedAura0Reader,
+    V3GroupedAura0Writer, V3GroupedReaderState, V3GroupedWriterOptions, V3GroupedWriterState,
 };
+use aura_codec::{FieldRole, FieldType, RelationshipPermissions, SchemaBuilder};
 
 fn permissions() -> RelationshipPermissions {
     RelationshipPermissions::none()
@@ -306,7 +306,7 @@ fn multiple_signed_sequence_capabilities_do_not_block_exact_container() {
     .unwrap();
     writer.write_batch(&batch).unwrap();
     let bytes = writer.finish().unwrap().0.into_inner();
-    let decoded = aura_codec::decode_v3_grouped_aura0(&bytes).unwrap();
+    let decoded = aura_codec::experimental::decode_v3_grouped_aura0(&bytes).unwrap();
     assert_eq!(decoded.footer.primary_sequence_slot, None);
     assert!(!decoded.footer.chunks[0].has_sequence_bounds());
     assert_eq!(decoded.batches[0], batch);
