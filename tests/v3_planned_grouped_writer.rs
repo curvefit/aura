@@ -5,163 +5,18 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use aura_codec::experimental::{
-    decode_v3_planned_grouped, AuraV3Column, AuraV3ColumnValues as Values, AuraV3EventBatch,
-    V3GroupedLimits, V3PlannedGroupedCreateOnceWriter, V3PlannedGroupedIngestWriter,
+    decode_v3_planned_grouped, AuraV3ColumnValues as Values, AuraV3EventBatch, V3GroupedLimits,
+    V3PlannedGroupedCreateOnceWriter, V3PlannedGroupedIngestWriter,
     V3PlannedGroupedPublicationOutcome, V3PlannedGroupedWriterOptions, V3PlannedGroupedWriterState,
     AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP, AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP,
 };
-use aura_codec::{FieldRole, FieldType, RelationshipPermissions, SchemaBuilder};
 
-fn schema(name: &str) -> aura_codec::SchemaDescriptor {
-    let mut schema = SchemaBuilder::new(name)
-        .field("ts", FieldType::TimestampMs, FieldRole::Timestamp)
-        .repeated_field("side", FieldType::U8, FieldRole::Side)
-        .repeated_field("value", FieldType::I64, FieldRole::Value)
-        .repeated_field("optional", FieldType::I64, FieldRole::Quantity)
-        .repeated_field("count", FieldType::U32, FieldRole::Count)
-        .dual_domain_repeated_group(
-            7,
-            vec![1, 2, 3, 4],
-            1,
-            RelationshipPermissions::none()
-                .with_split()
-                .with_within_domain()
-                .with_across_domain_same_field(),
-        )
-        .finish()
-        .unwrap();
-    schema.fields[3].nullable = true;
-    schema.fields[4].nullable = true;
-    let groups = schema.groups.clone();
-    schema.with_v3_groups(groups).unwrap()
-}
-
-fn cross_only_schema(name: &str) -> aura_codec::SchemaDescriptor {
-    let mut schema = schema(name);
-    schema.groups[0].relationships =
-        RelationshipPermissions::none().with_across_domain_same_field();
-    let groups = schema.groups.clone();
-    schema.with_v3_groups(groups).unwrap()
-}
-
-fn paired_batch(schema_id: u32, domain0_is_cheaper: bool) -> AuraV3EventBatch {
-    let mut sides = Vec::new();
-    let mut values = Vec::new();
-    for ordinal in 0..192i64 {
-        let shift = ((ordinal % 6) * 7 + 6) as u32;
-        let cheap = (1i64 << shift).saturating_sub(1);
-        let expensive = cheap + 1;
-        sides.extend_from_slice(&[0, 1]);
-        if domain0_is_cheaper {
-            values.extend_from_slice(&[cheap, expensive]);
-        } else {
-            values.extend_from_slice(&[expensive, cheap]);
-        }
-    }
-    let children = sides.len();
-    AuraV3EventBatch {
-        schema_id,
-        event_count: 1,
-        child_offsets: vec![0, children as u32],
-        event_columns: vec![AuraV3Column {
-            slot: 0,
-            validity: None,
-            values: Values::TimestampMs(vec![1]),
-        }],
-        repeated_columns: vec![
-            AuraV3Column {
-                slot: 1,
-                validity: None,
-                values: Values::U8(sides),
-            },
-            AuraV3Column {
-                slot: 2,
-                validity: None,
-                values: Values::I64(values),
-            },
-            AuraV3Column {
-                slot: 3,
-                validity: Some(vec![0; children.div_ceil(8)]),
-                values: Values::I64(vec![0; children]),
-            },
-            AuraV3Column {
-                slot: 4,
-                validity: Some(vec![0; children.div_ceil(8)]),
-                values: Values::U32(vec![0; children]),
-            },
-        ],
-    }
-}
-
-fn batch(schema_id: u32, first_event: usize, events: usize) -> AuraV3EventBatch {
-    let mut offsets = vec![0u32];
-    let mut sides = Vec::new();
-    let mut values = Vec::new();
-    let mut optional = Vec::new();
-    let mut counts = Vec::new();
-    for event in first_event..first_event + events {
-        if event % 3 != 0 {
-            for ordinal in 0..48i64 {
-                let base = if ordinal % 2 == 0 {
-                    4_000_000_000 + ordinal * 1_000_003 + event as i64
-                } else {
-                    -4_000_000_000 - ordinal * 999_983 - event as i64
-                };
-                sides.extend_from_slice(&[0, 1]);
-                values.extend_from_slice(&[base, base + 1]);
-                optional.extend_from_slice(&[0, 0]);
-                counts.extend_from_slice(&[0, 0]);
-            }
-            if event % 2 == 0 {
-                sides.push(0);
-                values.push(-77);
-                optional.push(0);
-                counts.push(0);
-            }
-        }
-        offsets.push(sides.len() as u32);
-    }
-    let validity_len = sides.len().div_ceil(8);
-    AuraV3EventBatch {
-        schema_id,
-        event_count: events as u32,
-        child_offsets: offsets,
-        event_columns: vec![AuraV3Column {
-            slot: 0,
-            validity: None,
-            values: Values::TimestampMs(
-                (first_event..first_event + events)
-                    .map(|value| value as i64)
-                    .collect(),
-            ),
-        }],
-        repeated_columns: vec![
-            AuraV3Column {
-                slot: 1,
-                validity: None,
-                values: Values::U8(sides),
-            },
-            AuraV3Column {
-                slot: 2,
-                validity: None,
-                values: Values::I64(values),
-            },
-            AuraV3Column {
-                slot: 3,
-                validity: Some(vec![0; validity_len]),
-                values: Values::I64(optional),
-            },
-            AuraV3Column {
-                slot: 4,
-                validity: Some(vec![0; validity_len]),
-                values: Values::U32(counts),
-            },
-        ],
-    }
-}
+#[path = "support/grouped_fixture.rs"]
+mod fixture;
+use fixture::{batch, cross_only_schema, paired_batch, schema};
 
 #[test]
-fn incremental_writer_matches_attempt5_reference_complete_bytes() {
+fn incremental_writer_matches_cross_domain_reference_complete_bytes() {
     let schema = schema("incremental_reference");
     let batches = vec![batch(schema.schema_id, 0, 2), batch(schema.schema_id, 2, 2)];
     let reference = GroupedSearch::CrossDomain
@@ -558,4 +413,52 @@ fn publication_rejects_untrusted_parent_and_symlink_components() {
     fs::remove_file(link).unwrap();
     fs::remove_dir(real).unwrap();
     fs::remove_dir(directory).unwrap();
+}
+
+#[test]
+fn selected_bytes_match_pre_cleanup_writer() {
+    use sha2::{Digest, Sha256};
+    // Frozen from dfd4c048, before selector/analysis consolidation. These check
+    // complete selection and bytes independently of the new encoder/decoder pair.
+    for (mode, expected) in [
+        (
+            "mixed",
+            "55c478c6dc19524644033d0a8876b901d775c49c047b3c831e6613c43eb58a38",
+        ),
+        (
+            "cross0",
+            "cf8d117699157ad7c0b8d67a41ce3ca842f706a447ecebb07dc1b11f1a7b912d",
+        ),
+        (
+            "cross1",
+            "cf9cf0790b520240d4d5e004027f1d494ce1b5a719d765683d2d7694e2c57e8f",
+        ),
+        (
+            "empty",
+            "b5c764d48fc2ed63cfe38477e0e5909ecef2169ef165d93b4b2e18c47da733f9",
+        ),
+    ] {
+        let schema = if mode.starts_with("cross") {
+            cross_only_schema("frozen-selection")
+        } else {
+            schema("frozen-selection")
+        };
+        let batches = match mode {
+            "mixed" => vec![
+                batch(schema.schema_id, 0, 64),
+                batch(schema.schema_id, 64, 64),
+            ],
+            "cross0" => vec![paired_batch(schema.schema_id, true)],
+            "cross1" => vec![paired_batch(schema.schema_id, false)],
+            _ => vec![],
+        };
+        let artifact = GroupedSearch::CrossDomain
+            .compile(&schema, &batches, Default::default())
+            .unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&artifact.bytes)),
+            expected,
+            "{mode}"
+        );
+    }
 }

@@ -840,7 +840,7 @@ fn compact_scores_real_direct_and_split_files_and_preserves_exact_inverse() {
     assert_eq!(selected.inspection.plan.selected, PlanV2Selection::Direct);
     assert!(selected.inspection.candidates[1].selected);
     eprintln!(
-        "development attempt2 all-types complete bytes: registry1={} compact_direct={} compact_split={} selected={}",
+        "development registry2 all-types complete bytes: registry1={} compact_direct={} compact_split={} selected={}",
         registry1_bytes,
         direct.summary.file_bytes,
         split.summary.file_bytes,
@@ -977,7 +977,7 @@ fn compact_generic_and_okx_like_asymmetry_zero_child_and_cost_fallback() {
         vec![okx_batch]
     );
     eprintln!(
-        "development attempt2 generic complete bytes: registry1={} compact_direct={} compact_split={} selected={}; okx_split={}",
+        "development registry2 generic complete bytes: registry1={} compact_direct={} compact_split={} selected={}; okx_split={}",
         selected.inspection.candidates[0].complete_bytes.unwrap(),
         generic_direct.summary.file_bytes,
         generic_split.summary.file_bytes,
@@ -1008,7 +1008,7 @@ fn compact_forbidden_split_invalid_selector_corruption_and_bounds_fail_closed() 
     bad_mapping.plan.streams[0].physical_stream_ids[0] = u16::MAX;
     assert!(encode_v3_planned_grouped_footer(&bad_mapping, V3GroupedLimits::HARD).is_err());
     for block_offset in [60usize, 64] {
-        let resigned = resign_attempt2_body_mutation(&split, block_offset);
+        let resigned = resign_compact_body_mutation(&split, block_offset);
         assert!(decode_v3_planned_grouped(&resigned, V3GroupedLimits::HARD).is_err());
     }
     let mut lower = V3GroupedLimits::default();
@@ -1210,7 +1210,7 @@ fn integer_selects_absolute_varints_by_complete_file_cost() {
     );
     assert!(empty.inspection.codecs.is_empty());
     eprintln!(
-        "development attempt3 small integer complete bytes: r1={} r2={} r3_fixed={} r3_mixed={}",
+        "development registry3 small integer complete bytes: r1={} r2={} r3_fixed={} r3_mixed={}",
         artifact.inspection.candidates[0].complete_bytes.unwrap(),
         artifact.inspection.candidates[1].complete_bytes.unwrap(),
         artifact.inspection.candidates[2].complete_bytes.unwrap(),
@@ -1326,7 +1326,7 @@ fn integer_extremes_nulls_and_fixed_only_types_round_trip() {
         .filter(|row| matches!(row.logical_slot, 0 | 1 | 3))
         .all(|row| row.selected == PlanV2PhysicalCodec::FixedWidth));
     eprintln!(
-        "development attempt3 all-types complete bytes: r1={} r2={} r3_fixed={} r3_mixed={}",
+        "development registry3 all-types complete bytes: r1={} r2={} r3_fixed={} r3_mixed={}",
         artifact.inspection.candidates[0].complete_bytes.unwrap(),
         artifact.inspection.candidates[1].complete_bytes.unwrap(),
         artifact.inspection.candidates[2].complete_bytes.unwrap(),
@@ -1813,7 +1813,7 @@ fn within_domain_previous_within_domain_roundtrips_and_wins_complete_cost() {
         rechunked.summary.global_logical_sha256
     );
     eprintln!(
-        "development attempt4 generic complete bytes: r1={} r2={} r3f={} r3m={} r4a={} r4w={}",
+        "development registry4 generic complete bytes: r1={} r2={} r3f={} r3m={} r4a={} r4w={}",
         artifact.inspection.candidates[0].complete_bytes.unwrap(),
         artifact.inspection.candidates[1].complete_bytes.unwrap(),
         artifact.inspection.candidates[2].complete_bytes.unwrap(),
@@ -1888,7 +1888,7 @@ fn within_domain_okx_like_shape_nullable_and_overflow_streams_fall_back_exactly(
         vec![batch]
     );
     eprintln!(
-        "development attempt4 generic-count complete bytes: r1={} r2={} r3f={} r3m={} r4a={} r4w={}",
+        "development registry4 generic-count complete bytes: r1={} r2={} r3f={} r3m={} r4a={} r4w={}",
         artifact.inspection.candidates[0].complete_bytes.unwrap(),
         artifact.inspection.candidates[1].complete_bytes.unwrap(),
         artifact.inspection.candidates[2].complete_bytes.unwrap(),
@@ -2989,7 +2989,7 @@ fn footer_start(file: &[u8]) -> usize {
     footer_len_offset - footer_len
 }
 
-fn resign_attempt2_body_mutation(
+fn resign_compact_body_mutation(
     artifact: &aura_codec::experimental::V3PlannedGroupedArtifact,
     block_offset: usize,
 ) -> Vec<u8> {
