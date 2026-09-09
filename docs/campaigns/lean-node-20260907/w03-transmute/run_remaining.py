@@ -70,6 +70,7 @@ def main() -> None:
     def remember(path: Path) -> Path:
         if path not in frozen:
             frozen[path] = digest(path)
+            save(args.output / "identities.json", {str(p): sha for p, sha in frozen.items()})
         return path
 
     def binary(name: str, example: bool = False) -> Path:

@@ -323,9 +323,13 @@ fn reconstruct(facts: &Facts, profile: Profile) -> Result<Vec<u8>> {
                 header_comment: Some(facts.comment.clone()),
             },
             profile,
-            aura_codec::generic_planner::I64SearchEffort::Fast,
+            if profile == Profile::Aura0 {
+                aura_codec::generic_planner::I64SearchEffort::Fast
+            } else {
+                aura_codec::generic_planner::I64SearchEffort::Full
+            },
         )
-        .context("reconstruct Aura0 events");
+        .context("reconstruct explicit events");
     }
     let ingest = encode_ingest_i64_file(I64FileInput {
         schema: facts.schema.clone(),
