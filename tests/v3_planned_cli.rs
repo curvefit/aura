@@ -9,9 +9,8 @@ use arrow::array::{Int64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use aura_codec::{
-    decode_v3_planned_flat, FieldRole, FieldType, SchemaBuilder, V3FlatAura0Reader, V3FlatLimits,
-};
+use aura_codec::experimental::{decode_v3_planned_flat, V3FlatAura0Reader};
+use aura_codec::{FieldRole, FieldType, SchemaBuilder, V3FlatLimits};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 

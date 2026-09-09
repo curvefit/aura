@@ -8,24 +8,22 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use aura_codec::{
+use aura_codec::experimental::{
     arrow_rust_version, build_provenance, canonical_v3_batch_sha256,
     canonical_v3_event_batch_sha256, canonical_v3_schema_fingerprint, cargo_lock_sha256,
     compile_shadow_grouped_arrow_ipc, compile_v3_planned_flat, decode_shadow_arrow_ipc_batch,
     decode_shadow_grouped_arrow_ipc_batch, decode_v3_event_block, decode_v3_planned_flat,
-    decode_v3_selected_flat, decode_v3_value_block, encode_shadow_arrow_ipc, parse_schema_json,
-    DecodedV3SelectedFlat, SchemaEncodingVersion, ShadowEncodeResult, ShadowGroupedEncodeResult,
+    decode_v3_value_block, encode_shadow_arrow_ipc, ShadowEncodeResult, ShadowGroupedEncodeResult,
     ShadowGroupedProtocolLimits, ShadowProtocolLimits, V3FlatAura0Reader, V3FlatAura0Writer,
-    V3FlatLimits, V3FlatWriteSummary, V3FlatWriterOptions, V3GroupedAura0Reader,
-    V3GroupedAura0Writer, V3GroupedWriteSummary, V3GroupedWriterOptions, V3PlannedFlatArtifact,
-    V3PlannedFlatSummary, V3ValueLimits, DEFAULT_V3_FLAT_IN_MEMORY_BODY_BYTES,
-    FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION, FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION,
-    FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION, MAX_SCHEMA_JSON_BYTES, MAX_V3_EVENT_BLOCK_BYTES,
-    MAX_V3_FLAT_FOOTER_BYTES, MAX_V3_FLAT_SCHEMA_BYTES, MAX_V3_GROUPED_FOOTER_BYTES,
-    MAX_V3_PLANNED_FLAT_FOOTER_BYTES, MAX_V3_VALUE_BLOCK_BYTES, SHADOW_ARROW_PROTOCOL,
-    SHADOW_ARTIFACT_KIND, SHADOW_ARTIFACT_KIND_V2, SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL,
-    SHADOW_PROTOCOL_V2, SHADOW_RESULT_SCHEMA, SHADOW_RESULT_SCHEMA_V2, SHADOW_SCHEMA_FORMAT,
-    SHADOW_VERIFY_RESULT_SCHEMA, SHADOW_VERIFY_RESULT_SCHEMA_V2,
+    V3FlatWriteSummary, V3FlatWriterOptions, V3GroupedAura0Reader, V3GroupedAura0Writer,
+    V3GroupedWriteSummary, V3GroupedWriterOptions, V3PlannedFlatArtifact, V3PlannedFlatSummary,
+    V3ValueLimits, DEFAULT_V3_FLAT_IN_MEMORY_BODY_BYTES, FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION,
+    FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION, FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION,
+    MAX_V3_EVENT_BLOCK_BYTES, MAX_V3_FLAT_FOOTER_BYTES, MAX_V3_FLAT_SCHEMA_BYTES,
+    MAX_V3_GROUPED_FOOTER_BYTES, MAX_V3_PLANNED_FLAT_FOOTER_BYTES, MAX_V3_VALUE_BLOCK_BYTES,
+    SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND, SHADOW_ARTIFACT_KIND_V2, SHADOW_HANDSHAKE_SCHEMA,
+    SHADOW_PROTOCOL, SHADOW_PROTOCOL_V2, SHADOW_RESULT_SCHEMA, SHADOW_RESULT_SCHEMA_V2,
+    SHADOW_SCHEMA_FORMAT, SHADOW_VERIFY_RESULT_SCHEMA, SHADOW_VERIFY_RESULT_SCHEMA_V2,
     V3_FLAT_BODY_ENCODING_EXACT_BLOCKS, V3_FLAT_FOOTER_LAYOUT_VERSION,
     V3_GROUPED_BODY_ENCODING_EXACT_EVENTS, V3_GROUPED_BODY_LAYOUT_VERSION,
     V3_GROUPED_EVENT_BLOCK_VERSION, V3_GROUPED_FOOTER_LAYOUT_VERSION,
@@ -41,6 +39,10 @@ use aura_codec::{
     V3_PLANNED_FLAT_TEMPORAL_ZSTD_WRAPPER_VERSION, V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION,
     V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_ZSTD_LEVEL,
     V3_PLANNED_FLAT_ZSTD_WINDOW_LOG, V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION,
+};
+use aura_codec::{
+    decode_v3_selected_flat, parse_schema_json, DecodedV3SelectedFlat, SchemaEncodingVersion,
+    V3FlatLimits, MAX_SCHEMA_JSON_BYTES,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -971,28 +973,32 @@ fn planned_flat_v3_seal_json(
     result
 }
 
-fn planned_flat_physical_codec_name(codec: aura_codec::PlanV2PhysicalCodec) -> &'static str {
+fn planned_flat_physical_codec_name(
+    codec: aura_codec::experimental::PlanV2PhysicalCodec,
+) -> &'static str {
     match codec {
-        aura_codec::PlanV2PhysicalCodec::FixedWidth => "fixed_width",
-        aura_codec::PlanV2PhysicalCodec::UnsignedUleb128 => "unsigned_uleb128",
-        aura_codec::PlanV2PhysicalCodec::SignedZigZagUleb128 => "signed_zigzag_uleb128",
-        aura_codec::PlanV2PhysicalCodec::VariableByteDictionaryBitpacked => {
+        aura_codec::experimental::PlanV2PhysicalCodec::FixedWidth => "fixed_width",
+        aura_codec::experimental::PlanV2PhysicalCodec::UnsignedUleb128 => "unsigned_uleb128",
+        aura_codec::experimental::PlanV2PhysicalCodec::SignedZigZagUleb128 => {
+            "signed_zigzag_uleb128"
+        }
+        aura_codec::experimental::PlanV2PhysicalCodec::VariableByteDictionaryBitpacked => {
             "variable_byte_dictionary_bitpacked"
         }
-        aura_codec::PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128 => {
+        aura_codec::experimental::PlanV2PhysicalCodec::TimestampPreviousDeltaZigZagUleb128 => {
             "timestamp_previous_delta_zigzag_uleb128"
         }
-        aura_codec::PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128 => {
+        aura_codec::experimental::PlanV2PhysicalCodec::TimestampDeltaOfDeltaZigZagUleb128 => {
             "timestamp_delta_of_delta_zigzag_uleb128"
         }
-        aura_codec::PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes => {
+        aura_codec::experimental::PlanV2PhysicalCodec::PreviousCommonPrefixSuffixBytes => {
             "previous_common_prefix_suffix_bytes"
         }
     }
 }
 
 fn planned_flat_codec_inspection_json(
-    codec: &aura_codec::V3PlannedFlatCodecInspection,
+    codec: &aura_codec::experimental::V3PlannedFlatCodecInspection,
 ) -> serde_json::Value {
     let selected_physical_codec = planned_flat_physical_codec_name(codec.selected);
     let prefix_suffix_baseline_codec = codec
@@ -1316,7 +1322,7 @@ fn require_v3_seal_mode(mode: Option<String>) -> Result<V3SealMode, CliError> {
     }
 }
 
-fn build_json(provenance: aura_codec::BuildProvenance) -> serde_json::Value {
+fn build_json(provenance: aura_codec::experimental::BuildProvenance) -> serde_json::Value {
     json!({
         "git_commit": provenance.git_commit,
         "dirty": provenance.dirty,
@@ -1713,7 +1719,7 @@ fn publish_verified_block(
 fn publish_verified_v3_flat(
     output: &Path,
     schema: &aura_codec::SchemaDescriptor,
-    batch: &aura_codec::AuraV3Batch,
+    batch: &aura_codec::experimental::AuraV3Batch,
 ) -> Result<(PublicationOutcome, V3FlatWriteSummary, [u8; 32]), CliError> {
     #[cfg(not(unix))]
     {
@@ -1749,7 +1755,7 @@ fn publish_verified_v3_planned(
 fn publish_verified_v3_grouped(
     output: &Path,
     schema: &aura_codec::SchemaDescriptor,
-    batch: &aura_codec::AuraV3EventBatch,
+    batch: &aura_codec::experimental::AuraV3EventBatch,
 ) -> Result<(PublicationOutcome, V3GroupedWriteSummary, [u8; 32]), CliError> {
     #[cfg(not(unix))]
     {
@@ -1768,7 +1774,7 @@ fn publish_verified_v3_grouped(
 fn publish_verified_v3_flat_with_ops(
     output: &Path,
     schema: &aura_codec::SchemaDescriptor,
-    batch: &aura_codec::AuraV3Batch,
+    batch: &aura_codec::experimental::AuraV3Batch,
     ops: &impl PublicationOps,
 ) -> Result<(PublicationOutcome, V3FlatWriteSummary, [u8; 32]), CliError> {
     publish_verified_complete_v3_with_ops(
@@ -1820,7 +1826,7 @@ fn publish_verified_v3_planned_with_ops(
 fn publish_verified_v3_grouped_with_ops(
     output: &Path,
     schema: &aura_codec::SchemaDescriptor,
-    batch: &aura_codec::AuraV3EventBatch,
+    batch: &aura_codec::experimental::AuraV3EventBatch,
     ops: &impl PublicationOps,
 ) -> Result<(PublicationOutcome, V3GroupedWriteSummary, [u8; 32]), CliError> {
     publish_verified_complete_v3_with_ops(
@@ -2003,7 +2009,7 @@ fn publish_verified_complete_v3_with_ops<T>(
 fn seal_v3_flat_temp(
     temp: File,
     schema: &aura_codec::SchemaDescriptor,
-    batch: &aura_codec::AuraV3Batch,
+    batch: &aura_codec::experimental::AuraV3Batch,
 ) -> Result<(File, V3FlatWriteSummary), CliError> {
     let mut writer =
         V3FlatAura0Writer::try_new(temp, schema.clone(), V3FlatWriterOptions::default())
@@ -2022,7 +2028,7 @@ fn seal_v3_flat_temp(
 fn seal_v3_grouped_temp(
     temp: File,
     schema: &aura_codec::SchemaDescriptor,
-    batch: &aura_codec::AuraV3EventBatch,
+    batch: &aura_codec::experimental::AuraV3EventBatch,
 ) -> Result<(File, V3GroupedWriteSummary), CliError> {
     let mut writer =
         V3GroupedAura0Writer::try_new(temp, schema.clone(), V3GroupedWriterOptions::default())
@@ -3000,11 +3006,11 @@ mod publication_tests {
     use std::cell::Cell;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    use aura_codec::{
+    use aura_codec::experimental::{
         canonical_v3_batch_sha256, canonical_v3_schema_fingerprint, encode_v3_value_block,
-        AuraV3Batch, AuraV3Column, AuraV3ColumnValues, AuraV3EventBatch, FieldRole, FieldType,
-        RelationshipPermissions, SchemaBuilder,
+        AuraV3Batch, AuraV3Column, AuraV3ColumnValues, AuraV3EventBatch,
     };
+    use aura_codec::{FieldRole, FieldType, RelationshipPermissions, SchemaBuilder};
 
     use super::*;
 

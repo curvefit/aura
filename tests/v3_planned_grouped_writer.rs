@@ -1,15 +1,16 @@
+use aura_codec::experimental::GroupedSearch;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use aura_codec::{
-    compile_v3_planned_grouped_attempt5, decode_v3_planned_grouped, AuraV3Column,
-    AuraV3ColumnValues as Values, AuraV3EventBatch, FieldRole, FieldType, RelationshipPermissions,
-    SchemaBuilder, V3GroupedLimits, V3PlannedGroupedCreateOnceWriter, V3PlannedGroupedIngestWriter,
+use aura_codec::experimental::{
+    decode_v3_planned_grouped, AuraV3Column, AuraV3ColumnValues as Values, AuraV3EventBatch,
+    V3GroupedLimits, V3PlannedGroupedCreateOnceWriter, V3PlannedGroupedIngestWriter,
     V3PlannedGroupedPublicationOutcome, V3PlannedGroupedWriterOptions, V3PlannedGroupedWriterState,
     AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP, AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP,
 };
+use aura_codec::{FieldRole, FieldType, RelationshipPermissions, SchemaBuilder};
 
 fn schema(name: &str) -> aura_codec::SchemaDescriptor {
     let mut schema = SchemaBuilder::new(name)
@@ -163,8 +164,9 @@ fn batch(schema_id: u32, first_event: usize, events: usize) -> AuraV3EventBatch 
 fn incremental_writer_matches_attempt5_reference_complete_bytes() {
     let schema = schema("incremental_reference");
     let batches = vec![batch(schema.schema_id, 0, 2), batch(schema.schema_id, 2, 2)];
-    let reference =
-        compile_v3_planned_grouped_attempt5(&schema, &batches, Default::default()).unwrap();
+    let reference = GroupedSearch::CrossDomain
+        .compile(&schema, &batches, Default::default())
+        .unwrap();
     let mut writer = V3PlannedGroupedIngestWriter::try_new(
         Cursor::new(Vec::new()),
         schema,
@@ -422,8 +424,9 @@ fn held_file_sync_and_atomic_create_once_publish_exact_reference() {
     let _ = fs::remove_file(&output);
     let schema = schema("incremental_publish");
     let batches = vec![batch(schema.schema_id, 0, 2), batch(schema.schema_id, 2, 2)];
-    let reference =
-        compile_v3_planned_grouped_attempt5(&schema, &batches, Default::default()).unwrap();
+    let reference = GroupedSearch::CrossDomain
+        .compile(&schema, &batches, Default::default())
+        .unwrap();
     let mut publisher =
         V3PlannedGroupedCreateOnceWriter::create(&output, schema.clone(), Default::default())
             .unwrap();
@@ -484,12 +487,9 @@ fn file_finish_rewrites_and_truncates_held_scratch_to_exact_artifact() {
         .unwrap();
     let schema = schema("incremental_held");
     let batch = batch(schema.schema_id, 0, 2);
-    let reference = compile_v3_planned_grouped_attempt5(
-        &schema,
-        std::slice::from_ref(&batch),
-        Default::default(),
-    )
-    .unwrap();
+    let reference = GroupedSearch::CrossDomain
+        .compile(&schema, std::slice::from_ref(&batch), Default::default())
+        .unwrap();
     let mut writer =
         V3PlannedGroupedIngestWriter::try_new(file, schema, Default::default()).unwrap();
     writer.write_batch(&batch).unwrap();

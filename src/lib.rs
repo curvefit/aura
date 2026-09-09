@@ -1,55 +1,103 @@
-//! Aura binary event-file format experiments.
+//! Exact, versioned binary event storage and replay.
+//! Start with [`sdk`] for ordinary use and [`experimental`] for V3 research.
 //!
 //! Aura keeps ingest facts, logical schemas, seal-time stats, and compiled
 //! physical layouts separate so one canonical stream can become compact `.aura0`
 //! files or fast replay `.aura1` files.
 
+#[doc(hidden)]
 pub mod bitpack;
+#[doc(hidden)]
 pub mod body;
+#[doc(hidden)]
 pub mod bytes;
+#[doc(hidden)]
 pub mod chunk;
+#[doc(hidden)]
 pub mod convert;
+#[doc(hidden)]
 pub mod error;
+#[doc(hidden)]
 pub mod execution;
+mod expressions;
 mod fixed_width;
+#[doc(hidden)]
 pub mod footer;
+#[doc(hidden)]
 pub mod format;
+#[doc(hidden)]
 pub mod generic_planner;
+#[doc(hidden)]
 pub mod header;
+#[doc(hidden)]
 pub mod instructions;
+#[doc(hidden)]
 pub mod legacy;
+#[doc(hidden)]
 pub mod metadata;
+#[doc(hidden)]
 pub mod ohlcv;
+#[doc(hidden)]
 pub mod options;
+#[doc(hidden)]
 pub mod orderbook;
+#[doc(hidden)]
 pub mod plan;
+#[doc(hidden)]
 pub mod program;
+#[doc(hidden)]
 pub mod random_verify;
+#[doc(hidden)]
 pub mod reader;
+#[doc(hidden)]
 pub mod records;
+#[doc(hidden)]
 pub mod schema;
+#[doc(hidden)]
 pub mod schema_json;
+#[doc(hidden)]
 pub mod scoped;
+#[doc(hidden)]
 pub mod shadow_protocol;
+#[doc(hidden)]
 pub mod shadow_protocol_v2;
+#[doc(hidden)]
 pub mod source;
+#[doc(hidden)]
 pub mod stats;
+#[doc(hidden)]
 pub mod types;
+#[doc(hidden)]
 pub mod v3_codecs;
+#[doc(hidden)]
 pub mod v3_container;
+#[doc(hidden)]
 pub mod v3_events;
+#[doc(hidden)]
 pub mod v3_flat_plan_v2;
+#[doc(hidden)]
 pub mod v3_grouped_container;
+#[doc(hidden)]
 pub mod v3_grouped_reader;
+#[doc(hidden)]
 pub mod v3_grouped_writer;
+#[doc(hidden)]
 pub mod v3_plan_v2;
+#[doc(hidden)]
 pub mod v3_planned_flat;
+#[doc(hidden)]
 pub mod v3_planned_grouped;
+#[doc(hidden)]
 pub mod v3_planned_grouped_writer;
+#[doc(hidden)]
 pub mod v3_reader;
+#[doc(hidden)]
 pub mod v3_values;
+#[doc(hidden)]
 pub mod v3_writer;
+#[doc(hidden)]
 pub mod varint;
+#[doc(hidden)]
 pub mod writer;
 
 pub use body::{decode_generic_stream_body, encode_generic_stream_body, GenericStreamBodyValue};
@@ -115,23 +163,6 @@ pub use schema::{
     AURA_V3_GROUP_DESCRIPTOR_TABLE_VERSION, MAX_DUAL_DOMAIN_COUNT,
 };
 pub use schema_json::{canonicalize_schema_json, parse_schema_json, MAX_SCHEMA_JSON_BYTES};
-pub use shadow_protocol::{
-    arrow_rust_version, build_provenance, cargo_lock_sha256, decode_shadow_arrow_ipc_batch,
-    encode_shadow_arrow_ipc, BuildProvenance, ShadowEncodeResult, ShadowProtocolLimits,
-    DEFAULT_SHADOW_ARROW_IPC_BYTES, DEFAULT_SHADOW_RECORD_BATCHES,
-    DEFAULT_SHADOW_VALUE_BLOCK_BYTES, DEFAULT_SHADOW_VALUE_ROWS, MAX_SHADOW_ARROW_IPC_BYTES,
-    MAX_SHADOW_RECORD_BATCHES, SHADOW_ARROW_PROTOCOL, SHADOW_ARTIFACT_KIND,
-    SHADOW_HANDSHAKE_SCHEMA, SHADOW_PROTOCOL, SHADOW_RESULT_SCHEMA, SHADOW_SCHEMA_FORMAT,
-    SHADOW_VERIFY_RESULT_SCHEMA,
-};
-pub use shadow_protocol_v2::{
-    compile_shadow_grouped_arrow_ipc, decode_shadow_grouped_arrow_ipc_batch,
-    encode_shadow_grouped_arrow_ipc, shadow_grouped_arrow_protocol, shadow_grouped_schema_format,
-    ShadowGroupedEncodeResult, ShadowGroupedProtocolLimits, DEFAULT_SHADOW_GROUPED_ARROW_IPC_BYTES,
-    DEFAULT_SHADOW_GROUPED_RECORD_BATCHES, MAX_SHADOW_GROUPED_ARROW_IPC_BYTES,
-    MAX_SHADOW_GROUPED_RECORD_BATCHES, SHADOW_ARTIFACT_KIND_V2, SHADOW_PROTOCOL_V2,
-    SHADOW_REPEATED_FIELD_V2, SHADOW_RESULT_SCHEMA_V2, SHADOW_VERIFY_RESULT_SCHEMA_V2,
-};
 pub use source::{
     AuraEventBatch, AuraEventSource, AuraEventSourceStats, AuraFileSource, AuraLiveFrameSource,
     AuraLiveSource, AuraMemorySource,
@@ -141,129 +172,17 @@ pub use types::{
     AuraBatch, AuraColumn, AuraColumnBatch, AuraColumnBatchBuilder, AuraRecordBatch,
     AuraTypedValue, AuraValue, Profile,
 };
-pub use v3_codecs::{fixed_width as v3_physical_fixed_width, integer_varint_codec};
-pub use v3_container::{
-    decode_any_compiled_footer, decode_v3_aura0_file, decode_v3_aura0_footer, decode_v3_flat_aura0,
-    decode_v3_flat_aura0_with_limits, decode_v3_flat_footer, decode_v3_flat_footer_with_limits,
-    encode_v3_aura0_footer, encode_v3_flat_footer, v3_flat_body_sha256, v3_flat_header_sha256,
-    AnyCompiledFooter, DecodedV3Aura0File, DecodedV3FlatAura0, V3Aura0ChunkDescriptor,
-    V3Aura0ColumnStats, V3Aura0Footer, V3FlatChunkDescriptor, V3FlatColumnStats, V3FlatFooter,
-    V3FlatLimits, DEFAULT_V3_FLAT_IN_MEMORY_BODY_BYTES, DEFAULT_V3_FLAT_IN_MEMORY_CHUNKS,
-    DEFAULT_V3_FLAT_IN_MEMORY_ROWS, DEFAULT_V3_FLAT_VALUE_BLOCK_BYTES, MAX_V3_FLAT_BODY_BYTES,
-    MAX_V3_FLAT_CHUNKS, MAX_V3_FLAT_FOOTER_BYTES, MAX_V3_FLAT_ROWS, MAX_V3_FLAT_SCHEMA_BYTES,
-    V3_FLAT_BODY_ENCODING_EXACT_BLOCKS, V3_FLAT_CHUNK_DESCRIPTOR_BYTES,
-    V3_FLAT_FOOTER_LAYOUT_VERSION, V3_FLAT_FOOTER_PREFIX_BYTES, V3_FLAT_STATS_DESCRIPTOR_BYTES,
-};
-pub use v3_events::{
-    canonical_v3_event_batch_sha256, decode_v3_event_block, encode_v3_event_block,
-    validate_v3_event_batch, validate_v3_grouped_exact_subset, AuraV3EventBatch,
-    CanonicalV3EventHasher, V3EventLimits, DEFAULT_V3_EVENT_BLOCK_BYTES, DEFAULT_V3_EVENT_CHILDREN,
-    DEFAULT_V3_EVENT_EVENTS, DEFAULT_V3_EVENT_VALUES, MAX_V3_EVENT_BLOCK_BYTES,
-    MAX_V3_EVENT_CHILDREN, MAX_V3_EVENT_EVENTS, MAX_V3_EVENT_OFFSETS_BYTES, MAX_V3_EVENT_VALUES,
-    V3_EVENT_BLOCK_VERSION,
-};
-pub use v3_flat_plan_v2::{
-    FlatAuraPlanV2, FLAT_PLAN_V2_DICTIONARY_REGISTRY_VERSION, FLAT_PLAN_V2_MAGIC,
-    FLAT_PLAN_V2_PREFIX_SUFFIX_REGISTRY_VERSION, FLAT_PLAN_V2_REGISTRY_VERSION,
-    FLAT_PLAN_V2_TEMPORAL_REGISTRY_VERSION, FLAT_PLAN_V2_VERSION, MAX_FLAT_PLAN_V2_BYTES,
-};
-pub use v3_grouped_container::{
-    decode_v3_grouped_aura0, decode_v3_grouped_aura0_with_limits, decode_v3_grouped_footer,
-    decode_v3_grouped_footer_with_limits, encode_v3_grouped_footer, v3_grouped_body_sha256,
-    v3_grouped_header_sha256, DecodedV3GroupedAura0, V3GroupedChunkDescriptor,
-    V3GroupedColumnStats, V3GroupedFooter, V3GroupedLimits,
-    DEFAULT_V3_GROUPED_IN_MEMORY_BODY_BYTES, DEFAULT_V3_GROUPED_IN_MEMORY_CHILDREN,
-    DEFAULT_V3_GROUPED_IN_MEMORY_CHUNKS, DEFAULT_V3_GROUPED_IN_MEMORY_EVENTS,
-    MAX_V3_GROUPED_BODY_BYTES, MAX_V3_GROUPED_CHILDREN, MAX_V3_GROUPED_CHUNKS,
-    MAX_V3_GROUPED_EVENTS, MAX_V3_GROUPED_FOOTER_BYTES, MAX_V3_GROUPED_SCHEMA_BYTES,
-    V3_GROUPED_BODY_ENCODING_EXACT_EVENTS, V3_GROUPED_BODY_LAYOUT_VERSION,
-    V3_GROUPED_CHUNK_DESCRIPTOR_BYTES, V3_GROUPED_EVENT_BLOCK_VERSION,
-    V3_GROUPED_FOOTER_LAYOUT_VERSION, V3_GROUPED_FOOTER_PREFIX_BYTES,
-    V3_GROUPED_STATS_DESCRIPTOR_BYTES,
-};
-pub use v3_grouped_reader::{
-    AuraV3GroupedReader, V3GroupedAura0Reader, V3GroupedChunkRead, V3GroupedReadAll,
-    V3GroupedReaderState, V3GroupedVerifySummary,
-};
-pub use v3_grouped_writer::{
-    AuraV3GroupedWriter, V3GroupedAura0Writer, V3GroupedWriteSummary, V3GroupedWriterOptions,
-    V3GroupedWriterState,
-};
-pub use v3_plan_v2::{
-    AuraPlanV2, PlanV2Inspection, PlanV2PhysicalCodec, PlanV2Selection, PlanV2StreamDescriptor,
-    AURA_PLAN_V2_AUTHORITATIVE_SOURCE_ORDER, AURA_PLAN_V2_CROSS_DOMAIN_REGISTRY_VERSION,
-    AURA_PLAN_V2_DIRECT_OP, AURA_PLAN_V2_DOMAIN0_FROM_DOMAIN1_OP,
-    AURA_PLAN_V2_DOMAIN1_FROM_DOMAIN0_OP, AURA_PLAN_V2_INTEGER_CODEC_REGISTRY_VERSION,
-    AURA_PLAN_V2_MAGIC, AURA_PLAN_V2_PREVIOUS_WITHIN_DOMAIN_OP, AURA_PLAN_V2_REGISTRY_VERSION,
-    AURA_PLAN_V2_SAME_CHILD_PARENT_OP, AURA_PLAN_V2_SAME_CHILD_PARENT_REGISTRY_VERSION,
-    AURA_PLAN_V2_SPLIT_DOMAIN_DIRECT_OP, AURA_PLAN_V2_SPLIT_REGISTRY_VERSION, AURA_PLAN_V2_VERSION,
-    AURA_PLAN_V2_WITHIN_DOMAIN_REGISTRY_VERSION, MAX_AURA_PLAN_V2_BYTES,
-    MAX_AURA_PLAN_V2_DEPENDENCIES, MAX_AURA_PLAN_V2_STREAMS,
-};
-pub use v3_planned_flat::{
-    compile_v3_planned_flat, decode_v3_planned_flat, decode_v3_planned_flat_footer,
-    decode_v3_selected_flat, encode_v3_planned_flat_footer, DecodedV3PlannedFlat,
-    DecodedV3SelectedFlat, V3PlannedFlatArtifact, V3PlannedFlatCandidateInspection,
-    V3PlannedFlatChunkDescriptor, V3PlannedFlatCodecInspection, V3PlannedFlatFooter,
-    V3PlannedFlatInspection, V3PlannedFlatPrefixSuffixZstdInspection, V3PlannedFlatSummary,
-    V3PlannedFlatZstdInspection, MAX_V3_PLANNED_FLAT_FOOTER_BYTES, V3_PLANNED_FLAT_BLOCK_VERSION,
-    V3_PLANNED_FLAT_BODY_ENCODING, V3_PLANNED_FLAT_BODY_LAYOUT_VERSION,
-    V3_PLANNED_FLAT_CHUNK_DESCRIPTOR_BYTES, V3_PLANNED_FLAT_DICTIONARY_BLOCK_VERSION,
-    V3_PLANNED_FLAT_DICTIONARY_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_FOOTER_LAYOUT_VERSION,
-    V3_PLANNED_FLAT_FOOTER_PREFIX_BYTES, V3_PLANNED_FLAT_PREFIX_SUFFIX_BLOCK_VERSION,
-    V3_PLANNED_FLAT_PREFIX_SUFFIX_BODY_LAYOUT_VERSION,
-    V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BLOCK_VERSION,
-    V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_BODY_LAYOUT_VERSION,
-    V3_PLANNED_FLAT_PREFIX_SUFFIX_ZSTD_WRAPPER_VERSION, V3_PLANNED_FLAT_TEMPORAL_BLOCK_VERSION,
-    V3_PLANNED_FLAT_TEMPORAL_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_TEMPORAL_ZSTD_BLOCK_VERSION,
-    V3_PLANNED_FLAT_TEMPORAL_ZSTD_BODY_LAYOUT_VERSION,
-    V3_PLANNED_FLAT_TEMPORAL_ZSTD_WRAPPER_VERSION, V3_PLANNED_FLAT_ZSTD_BLOCK_VERSION,
-    V3_PLANNED_FLAT_ZSTD_BODY_LAYOUT_VERSION, V3_PLANNED_FLAT_ZSTD_LEVEL,
-    V3_PLANNED_FLAT_ZSTD_WINDOW_LOG, V3_PLANNED_FLAT_ZSTD_WRAPPER_VERSION,
-};
-pub use v3_planned_grouped::{
-    compile_v3_planned_grouped, compile_v3_planned_grouped_attempt2,
-    compile_v3_planned_grouped_attempt2_candidate, compile_v3_planned_grouped_attempt3,
-    compile_v3_planned_grouped_attempt4, compile_v3_planned_grouped_attempt4_candidate,
-    compile_v3_planned_grouped_attempt5, compile_v3_planned_grouped_attempt5_candidate,
-    compile_v3_planned_grouped_attempt6, compile_v3_planned_grouped_attempt6_candidate,
-    decode_v3_planned_grouped, decode_v3_planned_grouped_footer, encode_v3_planned_grouped_footer,
-    DecodedV3PlannedGrouped, V3PlannedGroupedArtifact, V3PlannedGroupedCandidateInspection,
-    V3PlannedGroupedChunkDescriptor, V3PlannedGroupedCodecInspection,
-    V3PlannedGroupedCrossInspection, V3PlannedGroupedFooter, V3PlannedGroupedInspection,
-    V3PlannedGroupedParentInspection, V3PlannedGroupedSummary, V3PlannedGroupedWithinInspection,
-    MAX_V3_PLANNED_GROUPED_FOOTER_BYTES, V3_PLANNED_GROUPED_BODY_ENCODING,
-    V3_PLANNED_GROUPED_BODY_LAYOUT_VERSION, V3_PLANNED_GROUPED_CHUNK_DESCRIPTOR_BYTES,
-    V3_PLANNED_GROUPED_COMPACT_BLOCK_VERSION, V3_PLANNED_GROUPED_COMPACT_BODY_LAYOUT_VERSION,
-    V3_PLANNED_GROUPED_CROSS_DOMAIN_BLOCK_VERSION,
-    V3_PLANNED_GROUPED_CROSS_DOMAIN_BODY_LAYOUT_VERSION, V3_PLANNED_GROUPED_DIRECT_BLOCK_VERSION,
-    V3_PLANNED_GROUPED_FOOTER_LAYOUT_VERSION, V3_PLANNED_GROUPED_FOOTER_PREFIX_BYTES,
-    V3_PLANNED_GROUPED_INTEGER_CODEC_BLOCK_VERSION,
-    V3_PLANNED_GROUPED_INTEGER_CODEC_BODY_LAYOUT_VERSION,
-    V3_PLANNED_GROUPED_SAME_CHILD_PARENT_BLOCK_VERSION,
-    V3_PLANNED_GROUPED_SAME_CHILD_PARENT_BODY_LAYOUT_VERSION,
-    V3_PLANNED_GROUPED_WITHIN_DOMAIN_BLOCK_VERSION,
-    V3_PLANNED_GROUPED_WITHIN_DOMAIN_BODY_LAYOUT_VERSION,
-};
-pub use v3_planned_grouped_writer::{
-    V3PlannedGroupedCreateOnceWriter, V3PlannedGroupedIngestWriter,
-    V3PlannedGroupedPublicationOutcome, V3PlannedGroupedWriteReceipt,
-    V3PlannedGroupedWriterOptions, V3PlannedGroupedWriterState,
-    DEFAULT_V3_PLANNED_GROUPED_SCRATCH_BYTES, MAX_V3_PLANNED_GROUPED_SCRATCH_BYTES,
-};
-pub use v3_reader::{
-    AuraV3FlatReader, V3FlatAura0Reader, V3FlatReadAll, V3FlatReaderState, V3FlatVerifySummary,
-};
-pub use v3_values::{
-    canonical_v3_batch_sha256, canonical_v3_schema_fingerprint, decode_v3_value_block,
-    encode_v3_value_block, validate_decimal_text_v1, validate_v3_batch, AuraV3Batch, AuraV3Column,
-    AuraV3ColumnValues, AuraV3ValueRef, AuraV3VariableColumn, CanonicalV3RowHasher,
-    V3CanonicalRowHasher, V3ValueLimits, MAX_V3_SCHEMA_DESCRIPTOR_BYTES, MAX_V3_VALUE_BLOCK_BYTES,
-    MAX_V3_VALUE_ROWS, MAX_V3_VARIABLE_VALUE_BYTES,
-};
-pub use v3_writer::{
-    AuraV3FlatWriter, V3FlatAura0Writer, V3FlatWriteSummary, V3FlatWriterOptions, V3FlatWriterState,
-};
 pub use writer::{
     AuraI64EventWriter, AuraI64Writer, AuraTypedWriter, AuraWriteSummary, AuraWriter,
+};
+
+/// Explicit development/experimental formats and protocol adapters.
+pub mod experimental;
+/// Supported V2 facade. Root reexports remain compatible with existing consumers.
+pub mod sdk;
+// Existing implementation references use the crate root internally.
+pub(crate) use experimental::*;
+// Retained flat-data consumer contract used by Grimoire. Keep these exact paths.
+pub use experimental::{
+    decode_v3_selected_flat, AuraV3ValueRef, DecodedV3SelectedFlat, V3FlatLimits,
 };

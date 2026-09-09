@@ -2,7 +2,8 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aura_codec::{V3FlatAura0Reader, V3FlatLimits, V3FlatReaderState, V3ValueLimits};
+use aura_codec::experimental::{V3FlatAura0Reader, V3FlatReaderState, V3ValueLimits};
+use aura_codec::V3FlatLimits;
 
 const FILE: &[u8] = include_bytes!("fixtures/v3-container/three-row-two-chunk.aura0");
 
@@ -160,7 +161,7 @@ fn held_stream_in_place_mutation_and_length_change_are_detected() {
 
 #[test]
 fn full_body_rehash_detects_earlier_chunk_mutated_after_it_was_read() {
-    let decoded = aura_codec::decode_v3_flat_aura0(FILE).unwrap();
+    let decoded = aura_codec::experimental::decode_v3_flat_aura0(FILE).unwrap();
     let header_len = aura_codec::AuraHeader::encoded_len(FILE).unwrap();
     let second_chunk_start = header_len as u64 + decoded.footer.chunks[1].body_relative_offset;
     let armed = Arc::new(AtomicBool::new(false));

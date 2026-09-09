@@ -13,10 +13,10 @@ use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 use arrow::ipc::MetadataVersion;
 use arrow::record_batch::RecordBatch;
-use aura_codec::{
+use aura_codec::experimental::{
     canonical_v3_event_batch_sha256, compile_shadow_grouped_arrow_ipc, decode_v3_event_block,
-    FieldRole, FieldType, RelationshipPermissions, SchemaBuilder,
 };
+use aura_codec::{FieldRole, FieldType, RelationshipPermissions, SchemaBuilder};
 use sha2::{Digest, Sha256};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -286,7 +286,7 @@ fn grouped_v2_handshake_advertises_real_protocol_and_kind() {
             "standalone-aura-v3-event-block-v1"
         )));
     assert_eq!(
-        aura_codec::shadow_grouped_arrow_protocol(),
+        aura_codec::experimental::shadow_grouped_arrow_protocol(),
         "aura-logical-arrow-ipc-v2"
     );
 }

@@ -1,39 +1,145 @@
 #!/usr/bin/env python3
-"""Reproduce the bounded remaining probes on the frozen local corpus.
+"""Bounded candle/entropy probes using the existing frozen inputs and Rust tools.
 
-Acquires the canonical benchmark lock and all four existing encoding slots;
-lock descriptors are inherited by children. This does not control collectors.
+No data preparation or expensive level-19 book compression is repeated. Results
+are private local artifacts. This runner owns the host lock and four existing
+encoder slots; do not wrap it in flock.
 """
-import fcntl,os,pathlib,json,subprocess,time,datetime
-R=pathlib.Path('/home/anton/Downloads/lean-node-20260907'); D=R/'results-w03/final-probes';D.mkdir(exist_ok=True)
-B=R/'bin-candidate'; C=R/'corpus-w03/current'; jobs=[]
-def run(name,args):
-    print('START',name,datetime.datetime.now(datetime.timezone.utc).isoformat(),flush=True)
-    started=time.monotonic_ns()
-    with (D/(name+'.stdout')).open('wb') as out,(D/(name+'.stderr')).open('wb') as err:
-        proc=subprocess.Popen([str(x) for x in args],stdout=out,stderr=err,pass_fds=tuple(fds))
-        _,status,ru=os.wait4(proc.pid,0);proc.returncode=os.waitstatus_to_exitcode(status)
-    row={'name':name,'command':[str(x) for x in args],'returncode':proc.returncode,'wall_ns':time.monotonic_ns()-started,'cpu_user_s':ru.ru_utime,'cpu_system_s':ru.ru_stime,'peak_rss_kib':ru.ru_maxrss,'finished_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}
-    jobs.append(row);(D/'commands.json').write_text(json.dumps(jobs,indent=2)+'\n');print('DONE',name,proc.returncode,round(row['wall_ns']/1e9,3),flush=True)
-    if proc.returncode:raise RuntimeError(name+' failed; see stderr')
-fds=[]
-try:
-    fd=os.open('/tmp/lean-node-20260907-1000/bench.lock',os.O_RDONLY);fds.append(fd);fcntl.flock(fd,fcntl.LOCK_EX)
-    for i in range(4):
-        fd=os.open(f'/media/anton/data/grimoire-home/encoder-slots/{i}.lock',os.O_RDONLY|os.O_NOFOLLOW);fds.append(fd);fcntl.flock(fd,fcntl.LOCK_EX)
-    (D/'conditions.json').write_text(json.dumps({'started_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'lock':'/tmp/lean-node-20260907-1000/bench.lock','encoding_slots':'all four existing Grimoire slots held; codec jobs drained naturally; collectors unchanged','threads':1,'loadavg':pathlib.Path('/proc/loadavg').read_text().strip()},indent=2)+'\n')
-    run('candles-prepare',['python3',R/'aura-w03/docs/campaigns/lean-node-20260907/w03-transmute/prepare_candles.py'])
-    candles=R/'corpus-w03/candles'
-    for name in ['real-candles-es-16384','real-candles-nq-16384','real-candles-es-tiny16']:
-        run(name+'-encode',[B/'aura-json-i64','--schema','100,0,0,0,0,5,5,5,0,0','--timestamp-multiplier','1','--decimal-scale','1','--out',candles/(name+'.aura'),candles/(name+'.input.json')])
-    run('bitget-zstd19',[B/'aura-bench','--operation','zstd-aura1-to-aura1-bytes','--dataset','bitget_delta','--input',C/'bitget_delta.aura1','--reference-aura0',C/'bitget_delta.aura0','--reference-aura1',C/'bitget_delta.aura1','--zstd-level','19','--iterations','3','--warmups','1','--output',D/'bitget-zstd19.json'])
-    run('structural-pair',[B/'structural_frontier',C/'bitget_delta.aura0',D/'structural'])
-    for name in ['packed','huffman']:
-        a0=D/'structural'/(name+'.aura0');a1=a0.with_suffix('.aura1')
-        run(name+'-emit',[B/'aura-bench','--operation','transcode-aura0-to-aura1','--input',a0,'--dataset',name,'--unsupported-path','fallback-to-stable','--iterations','1','--warmups','0','--preserve-output',a1,'--verify-output-decodes','--output',D/(name+'-emit.json')])
-        run(name+'-fair',[B/'aura-bench','--operation','aura0-to-aura1-bytes','--input',a0,'--reference-aura0',a0,'--reference-aura1',a1,'--dataset',name,'--unsupported-path','fallback-to-stable','--iterations','3','--warmups','1','--output',D/(name+'-fair.json')])
-    run('bitget-profile',[B/'transmutation_probe','--input',C/'bitget_delta.aura0','--output-dir',D/'bitget-profile','--iterations','1','--warmups','0','--profile-stages','--file-io'])
-    for name in ['real-candles-es-16384','real-candles-nq-16384','real-candles-es-tiny16']:
-        run(name+'-probe',[B/'transmutation_probe','--input',candles/(name+'.aura0'),'--output-dir',D/name,'--iterations','3','--warmups','1','--file-io'])
-finally:
-    for fd in reversed(fds):os.close(fd)
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import time
+
+
+def digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def save(path: Path, value: object) -> None:
+    path.write_text(json.dumps(value, indent=2) + '\n')
+
+
+def utc() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--corpus-root', type=Path, required=True, help='Frozen corpus-w03 directory')
+    parser.add_argument('--bin-dir', type=Path, required=True, help='Cargo release directory; examples are under examples/')
+    parser.add_argument('--output', type=Path, required=True, help='New directory outside the source tree')
+    parser.add_argument('--commit', required=True, help='Exact source revision used to build the binaries')
+    parser.add_argument('--question', choices=['candles', 'entropy', 'creation', 'all'], default='candles')
+    parser.add_argument('--iterations', type=int, default=3)
+    parser.add_argument('--warmups', type=int, default=1)
+    parser.add_argument('--lock', type=Path, default=Path('/tmp/lean-node-20260907-1000/bench.lock'))
+    parser.add_argument('--encoder-slots', type=Path, default=Path('/media/anton/data/grimoire-home/encoder-slots'))
+    parser.add_argument('--lock-timeout', type=float, default=60)
+    args = parser.parse_args()
+    if args.iterations < 1 or args.warmups < 0 or not 0 < args.lock_timeout <= 60:
+        parser.error('positive iterations, nonnegative warmups, and lock timeout in (0,60] required')
+    args.output.mkdir(parents=True, exist_ok=False)
+    fds: list[int] = []
+    jobs: list[dict] = []
+    frozen: dict[Path, str] = {}
+
+    def acquire(path: Path) -> None:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fds.append(fd)
+        deadline = time.monotonic() + args.lock_timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f'No measurement slot: {path}')
+                time.sleep(0.2)
+
+    def remember(path: Path) -> Path:
+        if path not in frozen:
+            frozen[path] = digest(path)
+        return path
+
+    def binary(name: str, example: bool = False) -> Path:
+        return remember(args.bin_dir / ('examples' if example else '') / name)
+
+    def run(name: str, command: list) -> None:
+        command = [str(x) for x in command]
+        print('START', name, utc(), flush=True)
+        start = time.monotonic_ns()
+        with (args.output / (name + '.stdout')).open('wb') as out, (args.output / (name + '.stderr')).open('wb') as err:
+            proc = subprocess.Popen(command, stdout=out, stderr=err, pass_fds=tuple(fds))
+            _, status, usage = os.wait4(proc.pid, 0)
+            proc.returncode = os.waitstatus_to_exitcode(status)
+        jobs.append(dict(name=name, command=command, returncode=proc.returncode,
+                         wall_ns=time.monotonic_ns() - start, cpu_user_s=usage.ru_utime,
+                         cpu_system_s=usage.ru_stime, peak_rss_kib=usage.ru_maxrss, finished_utc=utc()))
+        save(args.output / 'commands.json', jobs)
+        print('DONE', name, proc.returncode, flush=True)
+        if proc.returncode:
+            raise RuntimeError(f'{name} failed; see stderr')
+
+    def probe(name: str, source: Path, creation: bool = True) -> None:
+        command = [binary('transmutation_probe', True), '--input', remember(source),
+                   '--output-dir', args.output / name, '--iterations', args.iterations,
+                   '--warmups', args.warmups, '--file-io', '--zstd-levels', '3']
+        if not creation:
+            command.append('--skip-creation')
+        run(name, command)
+
+    try:
+        acquire(args.lock)
+        for slot in range(4):
+            acquire(args.encoder_slots / f'{slot}.lock')
+        save(args.output / 'conditions.json', dict(started_utc=utc(), commit=args.commit,
+             threads=1, lock=str(args.lock), encoder_slots=4,
+             loadavg=Path('/proc/loadavg').read_text().strip(),
+             services='unchanged; existing codec jobs drained naturally',
+             cache='memory and warm file; no cold-disk claim',
+             rss='wait4 process peak includes setup, references, warmup and verification'))
+        if args.question in ('candles', 'all'):
+            candle_root = args.corpus_root / 'candles'
+            manifest = json.loads(remember(candle_root / 'manifest.json').read_text())
+            for name in ('real-candles-es-16384', 'real-candles-nq-16384', 'real-candles-es-tiny16'):
+                entry = next(row for row in manifest['datasets'] if row['dataset'] == name)
+                metadata = json.loads(remember(candle_root / (name + '.metadata.json')).read_text())
+                facts = json.loads(remember(candle_root / (name + '.sourcefacts.json')).read_text())
+                rows = json.loads(remember(candle_root / (name + '.input.json')).read_text())
+                canonical = lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+                bound = {k: v for k, v in facts.items() if k not in ('format', 'digests')}
+                if (hashlib.sha256(canonical(bound)).hexdigest() != entry['all_facts_sha256']
+                        or metadata['digests'] != facts['digests'] or facts['encoded_rows'] != rows
+                        or hashlib.sha256(canonical(rows)).hexdigest() != facts['digests']['encoded_rows_sha256']):
+                    raise ValueError(f'Frozen candle facts changed: {name}')
+                probe(name, candle_root / (name + '.aura0'))
+        if args.question in ('entropy', 'all'):
+            source = remember(args.corpus_root / 'current/bitget_delta.aura0')
+            run('structural-pair', [binary('structural_frontier', True), source, args.output / 'structural'])
+            probe('production', source, False)
+            for name in ('packed', 'huffman'):
+                probe(name, args.output / 'structural' / (name + '.aura0'), False)
+        if args.question in ('creation', 'all'):
+            probe('bitget-creation', args.corpus_root / 'current/bitget_delta.aura0')
+        for path, sha in frozen.items():
+            if digest(path) != sha:
+                raise RuntimeError(f'Input or executable changed: {path}')
+        save(args.output / 'identities.json', {str(path): sha for path, sha in frozen.items()})
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+if __name__ == '__main__':
+    main()

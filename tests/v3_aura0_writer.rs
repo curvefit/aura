@@ -1,10 +1,10 @@
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 
-use aura_codec::{
-    decode_v3_flat_aura0, parse_schema_json, V3FlatAura0Writer, V3FlatWriterOptions,
-    V3FlatWriterState,
+use aura_codec::experimental::{
+    decode_v3_flat_aura0, V3FlatAura0Writer, V3FlatWriterOptions, V3FlatWriterState,
 };
+use aura_codec::parse_schema_json;
 
 fn schema() -> aura_codec::SchemaDescriptor {
     parse_schema_json(include_str!("fixtures/v3-container/anonymous.schema.json")).unwrap()

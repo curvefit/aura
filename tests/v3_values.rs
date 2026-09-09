@@ -1,10 +1,12 @@
-use aura_codec::{
+use aura_codec::experimental::{
     canonical_v3_batch_sha256, canonical_v3_schema_fingerprint, decode_v3_value_block,
-    encode_v3_value_block, records, validate_decimal_text_v1, validate_v3_batch, AuraError,
-    AuraFooter, AuraHeader, AuraV3Batch, AuraV3Column, AuraV3ColumnValues as Values,
-    AuraV3VariableColumn, DerivedExpression, DerivedExpressionOp, FieldRole, FieldTransform,
-    FieldType, GroupDescriptor, RelationshipPermissions, SchemaBuilder, TransformCandidates,
-    V3ValueLimits, MAX_V3_VALUE_ROWS,
+    encode_v3_value_block, validate_decimal_text_v1, validate_v3_batch, AuraV3Batch, AuraV3Column,
+    AuraV3ColumnValues as Values, AuraV3VariableColumn, V3ValueLimits, MAX_V3_VALUE_ROWS,
+};
+use aura_codec::{
+    records, AuraError, AuraFooter, AuraHeader, DerivedExpression, DerivedExpressionOp, FieldRole,
+    FieldTransform, FieldType, GroupDescriptor, RelationshipPermissions, SchemaBuilder,
+    TransformCandidates,
 };
 use sha2::Digest;
 

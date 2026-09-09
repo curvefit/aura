@@ -13,10 +13,8 @@ use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 use arrow::ipc::MetadataVersion;
 use arrow::record_batch::RecordBatch;
-use aura_codec::{
-    FieldRole, FieldType, RelationshipPermissions, SchemaBuilder, V3GroupedAura0Reader,
-    MAX_V3_GROUPED_FOOTER_BYTES,
-};
+use aura_codec::experimental::{V3GroupedAura0Reader, MAX_V3_GROUPED_FOOTER_BYTES};
+use aura_codec::{FieldRole, FieldType, RelationshipPermissions, SchemaBuilder};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 

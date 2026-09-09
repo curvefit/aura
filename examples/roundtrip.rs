@@ -3,7 +3,7 @@ use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use aura_codec::{
+use aura_codec::sdk::{
     convert_aura, AuraFormat, AuraMetadata, AuraReader, AuraRecordBatch, AuraSchema, AuraType,
     AuraValue, AuraWriter, ConvertOptions, SymbolMap, WriterOptions,
 };

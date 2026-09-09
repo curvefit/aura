@@ -23,8 +23,8 @@ use crate::v3_grouped_container::{
     accumulate_grouped_stats, V3GroupedColumnStats, V3GroupedLimits,
 };
 use crate::v3_planned_grouped::{
-    compile_v3_planned_grouped_attempt5, decode_v3_planned_grouped, V3PlannedGroupedArtifact,
-    V3PlannedGroupedInspection, V3PlannedGroupedSummary,
+    decode_v3_planned_grouped, GroupedSearch, V3PlannedGroupedArtifact, V3PlannedGroupedInspection,
+    V3PlannedGroupedSummary,
 };
 use crate::{AuraError, AuraHeader, Profile, Result, SchemaDescriptor};
 
@@ -281,7 +281,7 @@ impl<W: Read + Write + Seek> V3PlannedGroupedIngestWriter<W> {
             ));
         }
         let artifact =
-            compile_v3_planned_grouped_attempt5(&self.schema, &batches, self.options.limits)?;
+            GroupedSearch::CrossDomain.compile(&self.schema, &batches, self.options.limits)?;
         if artifact.summary.file_bytes > self.options.max_output_bytes {
             return Err(AuraError::InvalidValue("v3 planned writer output length"));
         }

@@ -1,11 +1,14 @@
-use aura_codec::{
+use aura_codec::experimental::{
     canonical_v3_batch_sha256, canonical_v3_schema_fingerprint, decode_v3_flat_aura0,
     decode_v3_flat_aura0_with_limits, decode_v3_flat_footer, encode_v3_flat_footer,
     encode_v3_value_block, v3_flat_body_sha256, v3_flat_header_sha256, AnyCompiledFooter,
-    AuraContainerVersion, AuraError, AuraHeader, AuraV3Batch, AuraV3Column,
-    AuraV3ColumnValues as Values, AuraV3VariableColumn, CanonicalV3RowHasher, FieldRole, FieldType,
-    Profile, SchemaBuilder, V3FlatChunkDescriptor, V3FlatColumnStats, V3FlatFooter, V3FlatLimits,
-    V3ValueLimits, V3_FLAT_FOOTER_PREFIX_BYTES,
+    AuraV3Batch, AuraV3Column, AuraV3ColumnValues as Values, AuraV3VariableColumn,
+    CanonicalV3RowHasher, V3FlatChunkDescriptor, V3FlatColumnStats, V3FlatFooter, V3ValueLimits,
+    V3_FLAT_FOOTER_PREFIX_BYTES,
+};
+use aura_codec::{
+    AuraContainerVersion, AuraError, AuraHeader, FieldRole, FieldType, Profile, SchemaBuilder,
+    V3FlatLimits,
 };
 use sha2::{Digest, Sha256};
 
@@ -534,7 +537,7 @@ fn footer_only_codec_rejects_impossible_stats_and_missing_required_bounds() {
         ..V3FlatLimits::HARD
     };
     assert_eq!(
-        aura_codec::decode_v3_flat_footer_with_limits(&encoded, variable_limited),
+        aura_codec::experimental::decode_v3_flat_footer_with_limits(&encoded, variable_limited),
         Err(AuraError::InvalidValue("v3 flat stats"))
     );
 

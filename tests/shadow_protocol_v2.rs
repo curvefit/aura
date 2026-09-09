@@ -15,14 +15,13 @@ use arrow::ipc::{
     MessageHeader, RecordBatchBuilder,
 };
 use arrow::record_batch::RecordBatch;
-use aura_codec::{
+use aura_codec::experimental::{
     canonical_v3_event_batch_sha256, compile_shadow_grouped_arrow_ipc,
     decode_shadow_grouped_arrow_ipc_batch, decode_v3_event_block, encode_shadow_grouped_arrow_ipc,
-    shadow_grouped_arrow_protocol, AuraV3ColumnValues, FieldRole, FieldType,
-    RelationshipPermissions, SchemaBuilder, SchemaDescriptor, ShadowGroupedProtocolLimits,
-    V3EventLimits, DEFAULT_SHADOW_GROUPED_RECORD_BATCHES, SHADOW_PROTOCOL_V2,
-    SHADOW_REPEATED_FIELD_V2,
+    shadow_grouped_arrow_protocol, AuraV3ColumnValues, ShadowGroupedProtocolLimits, V3EventLimits,
+    DEFAULT_SHADOW_GROUPED_RECORD_BATCHES, SHADOW_PROTOCOL_V2, SHADOW_REPEATED_FIELD_V2,
 };
+use aura_codec::{FieldRole, FieldType, RelationshipPermissions, SchemaBuilder, SchemaDescriptor};
 
 fn permissions() -> RelationshipPermissions {
     RelationshipPermissions::none()
@@ -360,7 +359,7 @@ fn sliced_unused_child_semantics_are_ignored_but_backing_utf8_remains_structural
     );
     assert_eq!(
         decoded.repeated_columns[1].values,
-        AuraV3ColumnValues::DecimalText(aura_codec::AuraV3VariableColumn {
+        AuraV3ColumnValues::DecimalText(aura_codec::experimental::AuraV3VariableColumn {
             offsets: vec![0, 1],
             data: b"1".to_vec(),
         })
